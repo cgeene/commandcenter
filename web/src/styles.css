@@ -117,7 +117,7 @@ dt { color: var(--muted); }
 dd { word-break: break-all; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
-.terminal { flex: 1; padding: 8px; background: #0d1117; min-height: 0; }
+.terminal { flex: 1; padding: 8px; background: #0d1117; min-height: 0; touch-action: none; }
 .terminal .xterm { height: 100%; }
 
 .transcript { overflow-y: auto; padding: 14px; }

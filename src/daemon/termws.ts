@@ -41,6 +41,9 @@ export async function attachTerminal(
     await tmux("new-session", "-d", "-t", session, "-s", viewer);
     // No tmux chrome in the browser: xterm.js renders only the pane.
     await tmux("set-option", "-t", viewer, "status", "off");
+    // Mouse mode: wheel/touch scroll enters tmux copy-mode (scrollback lives
+    // in tmux, not xterm.js — swiping back down to the bottom exits it).
+    await tmux("set-option", "-t", viewer, "mouse", "on");
     await tmux("select-window", "-t", `${viewer}:${windowId}`);
     // Size the shared window to whichever client used it last (i.e. the
     // browser), instead of clamping to the smallest attached client.
