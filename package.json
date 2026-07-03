@@ -1,0 +1,34 @@
+{
+  "name": "commandcenter",
+  "version": "0.1.0",
+  "description": "Personal agent platform: task queue + Claude Code worker orchestration over tmux",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "agentd": "./dist/daemon/index.js",
+    "agp": "./dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev:daemon": "tsx src/daemon/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.0",
+    "better-sqlite3": "^12.2.0",
+    "commander": "^14.0.0",
+    "hono": "^4.8.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  }
+}
