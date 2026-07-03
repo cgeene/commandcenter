@@ -157,6 +157,17 @@ export function buildApp(): Hono {
     c.json(listEvents(Number(c.req.query("limit") ?? 50))),
   );
 
+  app.get("/api/transcript/:sessionId", async (c) => {
+    const sessionId = c.req.param("sessionId");
+    if (!/^[0-9a-f-]{8,64}$/i.test(sessionId)) {
+      return c.json({ error: "invalid session id" }, 400);
+    }
+    const { readTranscript } = await import("./transcript.js");
+    const entries = readTranscript(sessionId);
+    if (!entries) return c.json({ error: "transcript not found" }, 404);
+    return c.json({ session_id: sessionId, entries });
+  });
+
   app.onError((err, c) => {
     if (err instanceof z.ZodError) {
       return c.json({ error: "validation", issues: err.issues }, 400);

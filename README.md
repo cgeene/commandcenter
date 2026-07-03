@@ -27,16 +27,38 @@ its own git worktree and tmux window, managed by a local daemon.
   queue, picks models, spawns/monitors/reviews workers. One live main
   agent at a time.
 
-Later phases add the web dashboard (Tailscale-exposed) and an autonomous
-scheduler.
+- **Web dashboard (Phase 3)** — React SPA served by the daemon at
+  `http://127.0.0.1:4711`: kanban board, agent grid, live terminal
+  (xterm.js ↔ WebSocket ↔ PTY ↔ tmux), transcript viewer, new-task form.
+  Each browser terminal gets its own *grouped* tmux session so viewers
+  don't resize or steal focus from your desktop tmux client.
+- **Push (Phase 3)** — set `CC_NTFY_URL` (e.g. `https://ntfy.sh/<topic>`,
+  ideally self-hosted or token-protected via `CC_NTFY_TOKEN`) to get pushes
+  when an agent needs input, a task hits review, or a task gets blocked.
+
+Phase 4 adds the autonomous scheduler.
 
 ## Setup
 
 ```sh
 npm install
-npm run build
-npm link        # puts `agentd` and `agp` on PATH
+npm run build:all   # backend (dist/) + dashboard (web/dist/)
+npm link            # puts `agentd`, `agp`, `cc-mcp` on PATH
 ```
+
+## Remote access (Tailscale)
+
+The daemon binds to 127.0.0.1 only. To reach the dashboard from your phone,
+install Tailscale on the Mac + phone, then:
+
+```sh
+tailscale serve --bg --https=443 http://127.0.0.1:4711
+```
+
+This gives `https://<mac-name>.<tailnet>.ts.net` with automatic TLS,
+reachable only from your tailnet (WebSockets included). Do NOT use
+`tailscale funnel` — that would expose the daemon to the public internet
+with no auth.
 
 ## Usage
 
@@ -65,10 +87,14 @@ agp attach 2                            # talk to it: "work through the queue"
 
 | var | default | purpose |
 |---|---|---|
-| `CC_DATA_DIR` | `~/.commandcenter` | DB, worktrees, prompt files |
+| `CC_DATA_DIR` | `~/.commandcenter` | DB, worktrees, prompt/settings files |
 | `CC_PORT` | `4711` | daemon port (localhost only) |
 | `CC_CLAUDE_BIN` | `claude` | worker binary (override for testing) |
 | `CC_TMUX_SESSION` | `cc` | tmux session name |
+| `CC_MAIN_MODEL` | `opus` | default model for `agp main` |
+| `CC_NTFY_URL` | unset | ntfy topic URL for push notifications |
+| `CC_NTFY_TOKEN` | unset | ntfy auth token (self-hosted/protected topics) |
+| `CC_CLAUDE_PROJECTS` | `~/.claude/projects` | transcript location |
 
 ## Statuses
 

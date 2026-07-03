@@ -1,5 +1,6 @@
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 // Resolved at call time (not import time) so tests can point CC_DATA_DIR
 // at a temp dir before touching the DB.
@@ -33,4 +34,29 @@ export function claudeBin(): string {
 
 export function tmuxSession(): string {
   return process.env.CC_TMUX_SESSION ?? "cc";
+}
+
+/** Package root (works from both src/ via tsx and dist/ when built). */
+export function pkgRoot(): string {
+  return fileURLToPath(new URL("..", import.meta.url));
+}
+
+export function webDistDir(): string {
+  return path.join(pkgRoot(), "web", "dist");
+}
+
+/** ntfy topic URL, e.g. https://ntfy.sh/my-secret-topic — unset disables push. */
+export function ntfyUrl(): string | undefined {
+  return process.env.CC_NTFY_URL;
+}
+
+export function ntfyToken(): string | undefined {
+  return process.env.CC_NTFY_TOKEN;
+}
+
+export function claudeProjectsDir(): string {
+  return (
+    process.env.CC_CLAUDE_PROJECTS ??
+    path.join(os.homedir(), ".claude", "projects")
+  );
 }

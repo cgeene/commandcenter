@@ -13,7 +13,10 @@
     "build": "tsc",
     "dev:daemon": "tsx src/daemon/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "build:web": "npm --prefix web run build",
+    "build:all": "npm run build && npm run build:web",
+    "postinstall": "chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true"
   },
   "engines": {
     "node": ">=22"
@@ -24,11 +27,14 @@
     "better-sqlite3": "^12.2.0",
     "commander": "^14.0.0",
     "hono": "^4.8.0",
+    "node-pty": "^1.1.0",
+    "ws": "^8.21.0",
     "zod": "^3.25.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
     "tsx": "^4.20.0",
     "typescript": "^5.8.0",
     "vitest": "^3.2.0"

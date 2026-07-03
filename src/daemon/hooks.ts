@@ -3,6 +3,7 @@ import { getAgent, updateAgent, type Agent } from "../db/agents.js";
 import { getDb } from "../db/db.js";
 import { logEvent } from "../db/events.js";
 import { getTask, updateTask, type Task } from "../db/tasks.js";
+import { notify } from "./notify.js";
 import { sendText, windowExists } from "./tmux.js";
 
 export interface HookPayload {
@@ -53,6 +54,11 @@ export async function handleHookEvent(
 
     case "Notification":
       updateAgent(agentId, { state: "waiting_input" });
+      notify(
+        `a${agentId}${agent.task_id ? ` (task #${agent.task_id})` : ""} needs input`,
+        body.message ?? "waiting for input",
+        { priority: "high", tags: "warning" },
+      );
       break;
 
     case "Stop": {
@@ -73,6 +79,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
   if (!task.verify_cmd || !task.worktree) {
     updateTask(task.id, { status: "review" });
     logEvent("task.review", { taskId: task.id, agentId: agent.id });
+    notify(`task #${task.id} ready for review`, task.title, { tags: "eyes" });
     return;
   }
 
@@ -80,6 +87,9 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
   if (result.ok) {
     updateTask(task.id, { status: "review" });
     logEvent("verify.passed", { taskId: task.id, agentId: agent.id });
+    notify(`task #${task.id} ready for review`, `${task.title} — verify passed`, {
+      tags: "eyes,white_check_mark",
+    });
     return;
   }
 
@@ -108,6 +118,11 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
       agentId: agent.id,
       payload: { reason: "verification failed repeatedly" },
     });
+    notify(
+      `task #${task.id} blocked`,
+      `${task.title} — verification failed repeatedly`,
+      { priority: "high", tags: "rotating_light" },
+    );
   }
 }
 
