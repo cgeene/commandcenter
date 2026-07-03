@@ -51,3 +51,14 @@ export interface TranscriptEntry {
   role: "user" | "assistant" | "tool";
   text: string;
 }
+
+export interface SchedulerInfo {
+  config: {
+    enabled: boolean;
+    max_concurrent: number;
+    daily_spawn_limit: number;
+    stall_minutes: number;
+    active_hours: { start: number; end: number } | null;
+  };
+  status: { live_workers: number; spawns_today: number };
+}

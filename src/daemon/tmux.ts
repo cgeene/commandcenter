@@ -43,19 +43,25 @@ export function killWindow(target: string): void {
   tmux("kill-window", "-t", target);
 }
 
-export function windowExists(target: string): boolean {
+export function listWindowIds(): string[] {
   try {
-    const ids = tmux(
+    return tmux(
       "list-windows",
       "-t",
       tmuxSession(),
       "-F",
       "#{session_name}:#{window_id}",
-    );
-    return ids.split("\n").includes(target);
+    )
+      .trim()
+      .split("\n")
+      .filter(Boolean);
   } catch {
-    return false; // session itself is gone
+    return []; // session itself is gone
   }
+}
+
+export function windowExists(target: string): boolean {
+  return listWindowIds().includes(target);
 }
 
 /**

@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
 import { Terminal } from "./Terminal";
-import type { Agent, Event, Task, TaskStatus, TranscriptEntry } from "./types";
+import type {
+  Agent,
+  Event,
+  SchedulerInfo,
+  Task,
+  TaskStatus,
+  TranscriptEntry,
+} from "./types";
 
 const COLUMNS: { title: string; statuses: TaskStatus[] }[] = [
   { title: "Queued", statuses: ["queued", "claimed"] },
@@ -28,18 +35,21 @@ export function App() {
   const [termAgent, setTermAgent] = useState<number | null>(null);
   const [transcript, setTranscript] = useState<TranscriptEntry[] | null>(null);
   const [showNewTask, setShowNewTask] = useState(false);
+  const [scheduler, setScheduler] = useState<SchedulerInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [t, a, e] = await Promise.all([
+      const [t, a, e, s] = await Promise.all([
         api<Task[]>("GET", "/api/tasks"),
         api<Agent[]>("GET", "/api/agents?live=true"),
         api<Event[]>("GET", "/api/events?limit=25"),
+        api<SchedulerInfo>("GET", "/api/scheduler"),
       ]);
       setTasks(t);
       setAgents(a);
       setEvents(e);
+      setScheduler(s);
       setSelTask((cur) => (cur ? (t.find((x) => x.id === cur.id) ?? null) : null));
     } catch {
       /* daemon briefly unreachable — keep last state */
@@ -75,6 +85,23 @@ export function App() {
           queued · {agents.length} live agents
         </span>
         <div className="spacer" />
+        {scheduler && (
+          <button
+            className={scheduler.config.enabled ? "sched-on" : ""}
+            title={`workers ${scheduler.status.live_workers}/${scheduler.config.max_concurrent} · spawns today ${scheduler.status.spawns_today}/${scheduler.config.daily_spawn_limit}`}
+            onClick={() =>
+              act(() =>
+                api("PATCH", "/api/scheduler", {
+                  enabled: !scheduler.config.enabled,
+                }),
+              )
+            }
+          >
+            {scheduler.config.enabled
+              ? `■ auto ON (${scheduler.status.spawns_today}/${scheduler.config.daily_spawn_limit})`
+              : "▶ auto OFF"}
+          </button>
+        )}
         {!liveMain && (
           <button onClick={() => act(() => api("POST", "/api/main", {}))}>
             ▶ spawn main agent

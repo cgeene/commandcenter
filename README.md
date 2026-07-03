@@ -36,7 +36,17 @@ its own git worktree and tmux window, managed by a local daemon.
   ideally self-hosted or token-protected via `CC_NTFY_TOKEN`) to get pushes
   when an agent needs input, a task hits review, or a task gets blocked.
 
-Phase 4 adds the autonomous scheduler.
+- **Scheduler (Phase 4)** — off by default; toggle via `agp scheduler on|off`
+  or the dashboard's auto button (green = on, click = kill switch). Every
+  30s it claims ready tasks up to `max_concurrent` (default 3), bounded by a
+  `daily_spawn_limit` budget (default 20 autonomous spawns/day) and an
+  optional `active_hours` window (`agp scheduler set --hours 22-6` for
+  overnight runs; a summary push is sent when the window closes). The
+  watchdog runs every 60s regardless: a worker whose tmux window vanished is
+  reaped (its task requeued once, failed on the second vanish), and a worker
+  silent for `stall_minutes` (default 15) is flagged stalled + pushed to
+  your phone. Autonomous work still lands in `review` — nothing merges
+  itself.
 
 ## Setup
 

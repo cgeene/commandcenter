@@ -1,7 +1,6 @@
 import { execFile } from "node:child_process";
 import { getAgent, updateAgent, type Agent } from "../db/agents.js";
-import { getDb } from "../db/db.js";
-import { logEvent } from "../db/events.js";
+import { countTaskEvents, logEvent } from "../db/events.js";
 import { getTask, updateTask, type Task } from "../db/tasks.js";
 import { notify } from "./notify.js";
 import { sendText, windowExists } from "./tmux.js";
@@ -93,7 +92,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     return;
   }
 
-  const priorFails = countEvents(task.id, "verify.failed");
+  const priorFails = countTaskEvents(task.id, "verify.failed");
   logEvent("verify.failed", {
     taskId: task.id,
     agentId: agent.id,
@@ -142,9 +141,3 @@ function runVerify(
   });
 }
 
-function countEvents(taskId: number, kind: string): number {
-  const row = getDb()
-    .prepare("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND kind = ?")
-    .get(taskId, kind) as { n: number };
-  return row.n;
-}

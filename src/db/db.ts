@@ -71,6 +71,11 @@ CREATE TABLE IF NOT EXISTS events (
   payload  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
 `;

@@ -38,6 +38,8 @@ button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
 button.primary:hover { background: #388bfd; }
 button.primary:disabled { opacity: 0.5; cursor: default; }
 button.danger:hover { background: #da3633; border-color: #da3633; color: #fff; }
+button.sched-on { background: #238636; border-color: #238636; color: #fff; }
+button.sched-on:hover { background: #da3633; border-color: #da3633; }
 
 .error {
   background: #da36331a; color: var(--red); border-bottom: 1px solid #da3633;

@@ -5,6 +5,7 @@ import { WebSocketServer } from "ws";
 import { dataDir, dbPath, port, webDistDir } from "../config.js";
 import { getDb } from "../db/db.js";
 import { buildApp } from "./api.js";
+import { startScheduler } from "./scheduler.js";
 import { registerStatic } from "./static.js";
 import { attachTerminal } from "./termws.js";
 
@@ -21,6 +22,8 @@ const server = serve(
     console.log(`dashboard: ${webDistDir()}`);
   },
 ) as Server;
+
+startScheduler();
 
 // Live terminal: /ws/term/<agentId> bridges xterm.js <-> tmux via a PTY.
 const wss = new WebSocketServer({ noServer: true });

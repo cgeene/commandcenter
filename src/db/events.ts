@@ -30,3 +30,20 @@ export function listEvents(limit = 50): Event[] {
     .prepare("SELECT * FROM events ORDER BY id DESC LIMIT ?")
     .all(limit) as Event[];
 }
+
+export function countTaskEvents(taskId: number, kind: string): number {
+  const row = getDb()
+    .prepare("SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND kind = ?")
+    .get(taskId, kind) as { n: number };
+  return row.n;
+}
+
+/** Events of `kind` since UTC midnight — used for the daily spawn budget. */
+export function countEventsToday(kind: string): number {
+  const row = getDb()
+    .prepare(
+      "SELECT COUNT(*) AS n FROM events WHERE kind = ? AND ts >= strftime('%Y-%m-%dT00:00:00Z','now')",
+    )
+    .get(kind) as { n: number };
+  return row.n;
+}

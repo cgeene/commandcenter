@@ -2,7 +2,8 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { TASK_STATUSES, type TaskStatus } from "../db/db.js";
 import { getAgent, listAgents } from "../db/agents.js";
-import { listEvents, logEvent } from "../db/events.js";
+import { countEventsToday, listEvents, logEvent } from "../db/events.js";
+import { getSchedulerConfig, setSchedulerConfig } from "../db/settings.js";
 import {
   claimTask,
   createTask,
@@ -156,6 +157,40 @@ export function buildApp(): Hono {
   app.get("/api/events", (c) =>
     c.json(listEvents(Number(c.req.query("limit") ?? 50))),
   );
+
+  const schedulerPatchSchema = z.object({
+    enabled: z.boolean().optional(),
+    max_concurrent: z.number().int().min(1).max(10).optional(),
+    daily_spawn_limit: z.number().int().min(1).max(200).optional(),
+    stall_minutes: z.number().int().min(2).max(240).optional(),
+    active_hours: z
+      .object({
+        start: z.number().int().min(0).max(23),
+        end: z.number().int().min(0).max(23),
+      })
+      .nullable()
+      .optional(),
+  });
+
+  app.get("/api/scheduler", (c) => {
+    const liveWorkers = listAgents({ live: true }).filter(
+      (a) => a.kind === "worker",
+    ).length;
+    return c.json({
+      config: getSchedulerConfig(),
+      status: {
+        live_workers: liveWorkers,
+        spawns_today: countEventsToday("scheduler.spawned"),
+      },
+    });
+  });
+
+  app.patch("/api/scheduler", async (c) => {
+    const patch = schedulerPatchSchema.parse(await c.req.json());
+    const config = setSchedulerConfig(patch);
+    logEvent("scheduler.config", { payload: patch });
+    return c.json({ config });
+  });
 
   app.get("/api/transcript/:sessionId", async (c) => {
     const sessionId = c.req.param("sessionId");

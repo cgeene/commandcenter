@@ -198,6 +198,79 @@ agent
     console.log(`sent to a${id}`);
   });
 
+// ---- scheduler ----
+
+interface SchedulerInfo {
+  config: {
+    enabled: boolean;
+    max_concurrent: number;
+    daily_spawn_limit: number;
+    stall_minutes: number;
+    active_hours: { start: number; end: number } | null;
+  };
+  status: { live_workers: number; spawns_today: number };
+}
+
+const scheduler = program
+  .command("scheduler")
+  .description("autonomous scheduler control");
+
+async function printSchedulerStatus(): Promise<void> {
+  const { config, status } = await api<SchedulerInfo>("GET", "/api/scheduler");
+  const hours = config.active_hours
+    ? `${config.active_hours.start}:00-${config.active_hours.end}:00`
+    : "always";
+  console.log(
+    `scheduler: ${config.enabled ? "ON" : "OFF"} · workers ${status.live_workers}/${config.max_concurrent} · spawns today ${status.spawns_today}/${config.daily_spawn_limit} · window ${hours} · stall ${config.stall_minutes}m`,
+  );
+}
+
+scheduler
+  .command("status", { isDefault: true })
+  .description("show scheduler state")
+  .action(printSchedulerStatus);
+
+scheduler
+  .command("on")
+  .description("enable autonomous spawning")
+  .action(async () => {
+    await api("PATCH", "/api/scheduler", { enabled: true });
+    await printSchedulerStatus();
+  });
+
+scheduler
+  .command("off")
+  .description("disable autonomous spawning (kill switch)")
+  .action(async () => {
+    await api("PATCH", "/api/scheduler", { enabled: false });
+    await printSchedulerStatus();
+  });
+
+scheduler
+  .command("set")
+  .description("update scheduler settings")
+  .option("--max <n>", "max concurrent workers")
+  .option("--limit <n>", "daily autonomous spawn budget")
+  .option("--stall <minutes>", "stall detection threshold")
+  .option("--hours <range>", '"22-6" for overnight, or "always"')
+  .action(async (opts) => {
+    const patch: Record<string, unknown> = {};
+    if (opts.max) patch.max_concurrent = Number(opts.max);
+    if (opts.limit) patch.daily_spawn_limit = Number(opts.limit);
+    if (opts.stall) patch.stall_minutes = Number(opts.stall);
+    if (opts.hours === "always") patch.active_hours = null;
+    else if (opts.hours) {
+      const m = /^(\d{1,2})-(\d{1,2})$/.exec(opts.hours);
+      if (!m) {
+        console.error('error: --hours must be "H-H" (e.g. 22-6) or "always"');
+        process.exit(1);
+      }
+      patch.active_hours = { start: Number(m[1]), end: Number(m[2]) };
+    }
+    await api("PATCH", "/api/scheduler", patch);
+    await printSchedulerStatus();
+  });
+
 // ---- main agent ----
 
 program
