@@ -97,7 +97,10 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
   let capacity = cfg.max_concurrent - liveWorkers.length;
   if (capacity <= 0) return;
 
-  let spawnsToday = countEventsToday("scheduler.spawned");
+  // auto-spawned reviewers draw from the same daily budget as worker spawns
+  let spawnsToday =
+    countEventsToday("scheduler.spawned") +
+    countEventsToday("reviewer.auto_spawned");
 
   for (const task of readyTasks()) {
     if (capacity <= 0) break;

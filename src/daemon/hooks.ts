@@ -1,8 +1,10 @@
 import { execFile } from "node:child_process";
 import { getAgent, updateAgent, type Agent } from "../db/agents.js";
-import { countTaskEvents, logEvent } from "../db/events.js";
+import { countAgentEvents, countTaskEvents, logEvent } from "../db/events.js";
 import { getTask, updateTask, type Task } from "../db/tasks.js";
 import { notify } from "./notify.js";
+import { maybeAutoReview } from "./review.js";
+import { killAgent } from "./spawn.js";
 import { sendText, windowExists } from "./tmux.js";
 
 export interface HookPayload {
@@ -62,9 +64,15 @@ export async function handleHookEvent(
 
     case "Stop": {
       updateAgent(agentId, { state: "idle" });
+      if (agent.kind === "reviewer") {
+        reviewerStopped(agent);
+        break;
+      }
       if (agent.kind !== "worker" || !agent.task_id) break;
       const task = getTask(agent.task_id);
-      if (task && task.status === "in_progress") {
+      // "review" is included so a worker moving its own status there via
+      // update_my_task cannot bypass the verify gate.
+      if (task && ["in_progress", "review"].includes(task.status)) {
         await transitionOnStop(task, agent);
       }
       break;
@@ -72,10 +80,41 @@ export async function handleHookEvent(
   }
 }
 
+/** A reviewer's turn ended. If it submitted a verdict its job is done —
+ *  reap the window and its throwaway worktree. If not, it lost the thread:
+ *  flag it for the human instead of leaving a zombie reviewer around. */
+function reviewerStopped(agent: Agent): void {
+  const submitted =
+    countAgentEvents(agent.id, ["review.approved", "review.rejected"]) > 0;
+  if (submitted) {
+    killAgent(agent.id, { rmWorktree: true });
+    return;
+  }
+  const prior = countAgentEvents(agent.id, ["reviewer.stopped_incomplete"]);
+  logEvent("reviewer.stopped_incomplete", {
+    agentId: agent.id,
+    taskId: agent.task_id ?? undefined,
+  });
+  if (prior === 0) {
+    notify(
+      `reviewer a${agent.id} stopped without a verdict`,
+      `task #${agent.task_id} — peek to see why, or kill it and re-spawn a reviewer`,
+      { priority: "high", tags: "warning" },
+    );
+  }
+}
+
 /** Worker finished a turn on an in-progress task: verify, then move to
  *  review — or push the failure back into the worker's session. */
 async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
+  const wasReview = task.status === "review";
+
   if (!task.verify_cmd || !task.worktree) {
+    if (wasReview) {
+      // Worker moved itself to review; nothing mechanical to run.
+      maybeAutoReview(task.id);
+      return;
+    }
     // No verification gate, so the deliverable is the gate: a worker is only
     // done when it set result_summary (or moved the status itself). A Stop
     // without one is a worker pausing/asking — flagging that as "review"
@@ -85,6 +124,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
       updateTask(task.id, { status: "review" });
       logEvent("task.review", { taskId: task.id, agentId: agent.id });
       notify(`task #${task.id} ready for review`, task.title, { tags: "eyes" });
+      maybeAutoReview(task.id);
     } else {
       const prior = countTaskEvents(task.id, "task.stopped_incomplete");
       logEvent("task.stopped_incomplete", { taskId: task.id, agentId: agent.id });
@@ -99,6 +139,13 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     return;
   }
 
+  // Already in review AND already verified this cycle (each rejection cycle
+  // demands one fresh verify.passed) — an extra Stop, e.g. after the human
+  // messaged the idle worker. Nothing to re-run.
+  if (wasReview && countTaskEvents(task.id, "verify.passed") > task.review_cycles) {
+    return;
+  }
+
   const result = await runVerify(task.verify_cmd, task.worktree);
   if (result.ok) {
     updateTask(task.id, { status: "review" });
@@ -106,6 +153,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     notify(`task #${task.id} ready for review`, `${task.title} — verify passed`, {
       tags: "eyes,white_check_mark",
     });
+    maybeAutoReview(task.id);
     return;
   }
 
@@ -122,6 +170,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     windowExists(agent.tmux_target);
 
   if (canNudge) {
+    if (wasReview) updateTask(task.id, { status: "in_progress" });
     updateAgent(agent.id, { state: "working" });
     await sendText(
       agent.tmux_target!,

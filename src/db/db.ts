@@ -45,6 +45,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   session_id     TEXT,
   verify_cmd     TEXT,
   result_summary TEXT,
+  review_verdict TEXT,
+  review_notes   TEXT,
+  review_cycles  INTEGER NOT NULL DEFAULT 0,
   tokens_used    INTEGER,
   created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -129,6 +132,11 @@ function migrate(db: Database.Database): void {
   );
   if (!cols.includes("cron_id")) {
     db.exec("ALTER TABLE tasks ADD COLUMN cron_id INTEGER");
+  }
+  if (!cols.includes("review_verdict")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN review_verdict TEXT");
+    db.exec("ALTER TABLE tasks ADD COLUMN review_notes TEXT");
+    db.exec("ALTER TABLE tasks ADD COLUMN review_cycles INTEGER NOT NULL DEFAULT 0");
   }
 }
 

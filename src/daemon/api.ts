@@ -26,7 +26,8 @@ import {
   updateTask,
 } from "../db/tasks.js";
 import { handleHookEvent, type HookPayload } from "./hooks.js";
-import { killAgent, spawnMain, spawnWorker } from "./spawn.js";
+import { handleVerdict, taskDiff } from "./review.js";
+import { killAgent, spawnMain, spawnReviewer, spawnWorker } from "./spawn.js";
 import { capturePane, sendText, windowExists } from "./tmux.js";
 
 const newTaskSchema = z.object({
@@ -93,6 +94,32 @@ export function buildApp(): Hono {
     return c.json(task);
   });
 
+  app.get("/api/tasks/:id/diff", (c) => {
+    const task = getTask(Number(c.req.param("id")));
+    if (!task) return c.json({ error: "not found" }, 404);
+    if (!task.branch) return c.json({ error: "task has no branch" }, 409);
+    return c.json(taskDiff(task));
+  });
+
+  app.post("/api/tasks/:id/reviewer", async (c) => {
+    const id = Number(c.req.param("id"));
+    const body = (await c.req.json().catch(() => ({}))) as { model?: string };
+    return c.json(spawnReviewer(id, body.model), 201);
+  });
+
+  app.post("/api/tasks/:id/verdict", async (c) => {
+    const id = Number(c.req.param("id"));
+    const body = z
+      .object({
+        agent_id: z.number().int(),
+        verdict: z.enum(["approve", "reject"]),
+        notes: z.string().min(1),
+      })
+      .parse(await c.req.json());
+    const task = await handleVerdict(id, body.agent_id, body.verdict, body.notes);
+    return c.json(task);
+  });
+
   app.post("/api/tasks/:id/claim", (c) => {
     const id = Number(c.req.param("id"));
     const task = claimTask(id);
@@ -148,6 +175,19 @@ export function buildApp(): Hono {
     await sendText(agent.tmux_target, text);
     logEvent("agent.sent", { agentId: agent.id, taskId: agent.task_id ?? undefined });
     return c.json({ ok: true });
+  });
+
+  app.get("/api/agents/:id/transcript", async (c) => {
+    const agent = getAgent(Number(c.req.param("id")));
+    if (!agent) return c.json({ error: "not found" }, 404);
+    if (!agent.session_id) {
+      return c.json({ error: "agent has no recorded session yet" }, 409);
+    }
+    const limit = Number(c.req.query("limit") ?? 200);
+    const { readTranscript } = await import("./transcript.js");
+    const entries = readTranscript(agent.session_id, limit);
+    if (!entries) return c.json({ error: "transcript not found" }, 404);
+    return c.json({ agent_id: agent.id, session_id: agent.session_id, entries });
   });
 
   app.post("/api/main", async (c) => {
@@ -296,6 +336,7 @@ export function buildApp(): Hono {
       })
       .nullable()
       .optional(),
+    auto_review: z.boolean().optional(),
   });
 
   app.get("/api/scheduler", (c) => {
@@ -306,7 +347,9 @@ export function buildApp(): Hono {
       config: getSchedulerConfig(),
       status: {
         live_workers: liveWorkers,
-        spawns_today: countEventsToday("scheduler.spawned"),
+        spawns_today:
+          countEventsToday("scheduler.spawned") +
+          countEventsToday("reviewer.auto_spawned"),
       },
     });
   });

@@ -11,6 +11,8 @@ export interface SchedulerConfig {
   stall_minutes: number;
   /** Only auto-spawn inside this window (hours, local time); null = always. start > end wraps overnight (e.g. 22 -> 6). */
   active_hours: { start: number; end: number } | null;
+  /** Auto-spawn an adversarial reviewer when a SCHEDULER-spawned task reaches review. Manual tasks are never auto-reviewed. */
+  auto_review: boolean;
 }
 
 export const SCHEDULER_DEFAULTS: SchedulerConfig = {
@@ -19,6 +21,7 @@ export const SCHEDULER_DEFAULTS: SchedulerConfig = {
   daily_spawn_limit: 20,
   stall_minutes: 15,
   active_hours: null,
+  auto_review: true,
 };
 
 function getSetting(key: string): string | undefined {

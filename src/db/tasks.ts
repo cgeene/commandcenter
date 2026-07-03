@@ -15,6 +15,9 @@ export interface Task {
   session_id: string | null;
   verify_cmd: string | null;
   result_summary: string | null;
+  review_verdict: string | null;
+  review_notes: string | null;
+  review_cycles: number;
   tokens_used: number | null;
   cron_id: number | null;
   created_at: string;
@@ -121,6 +124,9 @@ const UPDATABLE = new Set([
   "session_id",
   "verify_cmd",
   "result_summary",
+  "review_verdict",
+  "review_notes",
+  "review_cycles",
   "tokens_used",
 ]);
 

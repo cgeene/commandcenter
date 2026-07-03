@@ -27,6 +27,25 @@ its own git worktree and tmux window, managed by a local daemon.
   queue, picks models, spawns/monitors/reviews workers. One live main
   agent at a time.
 
+- **Adversarial review (Phase 5)** — an independent reviewer agent proofs
+  work before the human sees it. When a task hits `review`, `agp review <id>`
+  (or the main agent's `spawn_reviewer`, or automatically for
+  scheduler-spawned tasks — toggle `agp scheduler set --auto-review on|off`)
+  spawns a fresh Claude session in its own detached worktree at the task's
+  branch, with file-editing tools denied. It gets the same *inputs* as the
+  worker (task prompt, branch, claimed summary) but none of its conversation
+  — independence is the point — and is prompted to find reasons to REJECT:
+  unmet requirements, weakened tests, summary/diff mismatches. It submits
+  `submit_review(approve|reject, notes)`. Rejection notes go straight back
+  into the worker's session (or into the respawn prompt if it's gone) and the
+  task returns to `in_progress`; after 2 rejected cycles the task is blocked
+  and escalated to you with both sides' notes. Approval pings you — the merge
+  is still yours. Auto-reviews draw from the scheduler's daily spawn budget.
+  The main agent also gets `get_task_diff` and `read_worker_transcript` to
+  proof workers with evidence instead of terminal peeks, and the `Stop` hook
+  now re-verifies tasks a worker moved to `review` itself, so `verify_cmd`
+  can't be bypassed.
+
 - **Web dashboard (Phase 3)** — React SPA served by the daemon at
   `http://127.0.0.1:4711`: kanban board, agent grid, live terminal
   (xterm.js ↔ WebSocket ↔ PTY ↔ tmux), transcript viewer, new-task form.
@@ -100,6 +119,8 @@ agp agent ls
 agp agent peek 1                        # see its terminal without attaching
 agp agent send 1 "also update the docs" # message a running worker
 agp attach 1                            # interact; detach with C-b d
+agp task diff 1                         # what actually changed on the branch
+agp review 1                            # adversarial reviewer for a task in review
 agp task update 1 -s done               # after reviewing the branch
 agp agent kill 1 --rm-worktree
 agp events
@@ -124,6 +145,11 @@ agp attach 2                            # talk to it: "work through the queue"
 ## Statuses
 
 Tasks: `queued → claimed → in_progress → blocked / review → done / failed`.
-Agents: `spawning → working → idle / waiting_input / stalled → dead`.
+A reviewer rejection sends `review → in_progress` (live worker) or
+`review → queued` (worker gone, notes baked into the respawn prompt);
+`review_verdict`/`review_notes`/`review_cycles` on the task record who said
+what.
+Agents: `spawning → working → idle / waiting_input / stalled → dead`
+(kinds: `main`, `worker`, `reviewer`).
 Claiming is a single SQLite UPDATE — atomic; two agents can never take the
 same task.

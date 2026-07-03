@@ -13,9 +13,15 @@ import { logEvent } from "../db/events.js";
 import { memorySectionFor } from "../db/memories.js";
 import { claimTask, getTask, updateTask, type Task } from "../db/tasks.js";
 import { ORCHESTRATOR_PROMPT } from "../prompts/orchestrator.js";
+import { buildReviewerPrompt } from "../prompts/reviewer.js";
 import { writeMcpConfigFile, writeSettingsFile } from "./genconfig.js";
 import { killWindow, newWindow, windowExists } from "./tmux.js";
-import { createWorktree, removeWorktree } from "./worktree.js";
+import {
+  createReviewWorktree,
+  createWorktree,
+  removeWorktree,
+  reviewWorktreeDir,
+} from "./worktree.js";
 
 function shellQuote(s: string): string {
   return `'${s.replaceAll("'", `'\\''`)}'`;
@@ -34,6 +40,14 @@ function buildWorkerPrompt(task: Task, branch: string): string {
     "Scope: work ONLY inside this worktree. If you discover the task's real work belongs in a DIFFERENT repo, do not edit that repo — call report_blocked naming the correct repo path so the task can be re-dispatched there with proper isolation.",
     "Your task counts as complete only once you set result_summary. Stopping without it flags the task as incomplete, not done.",
   ];
+  if (task.review_cycles > 0 && task.review_notes) {
+    lines.push(
+      "",
+      "## Review feedback on the previous attempt",
+      "An independent reviewer REJECTED the previous attempt at this task (the branch already contains that work). Address every point below before finishing:",
+      task.review_notes,
+    );
+  }
   if (task.verify_cmd) {
     lines.push(
       `Before finishing, verify with: \`${task.verify_cmd}\` and make it pass. The platform re-runs this after you stop.`,
@@ -46,6 +60,9 @@ function buildWorkerPrompt(task: Task, branch: string): string {
   if (memories) lines.push(memories);
   return lines.join("\n");
 }
+
+/** Test-only export: prompt construction is behavior worth pinning. */
+export const _buildWorkerPromptForTest = buildWorkerPrompt;
 
 function buildClaudeCmd(opts: {
   model?: string;
@@ -136,6 +153,76 @@ export function spawnWorker(
   return { agent: getAgent(agent.id)!, task: getTask(taskId)! };
 }
 
+/**
+ * Spawn an adversarial reviewer for a task in `review`. Fresh context on
+ * purpose — same inputs as the worker, none of its conversation. Own
+ * detached worktree so it can run code without touching the worker's tree;
+ * file-editing tools denied so it can only judge, not fix.
+ */
+export function spawnReviewer(
+  taskId: number,
+  modelOverride?: string,
+): { agent: Agent; task: Task } {
+  const task = getTask(taskId);
+  if (!task) throw new Error(`task ${taskId} not found`);
+  if (task.status !== "review") {
+    throw new Error(`task ${taskId} is ${task.status}; only tasks in review can be reviewed`);
+  }
+  if (!task.branch) throw new Error(`task ${taskId} has no branch to review`);
+  const existing = listAgents({ live: true }).find(
+    (a) => a.kind === "reviewer" && a.task_id === taskId,
+  );
+  if (existing) {
+    throw new Error(`task ${taskId} already has live reviewer a${existing.id}`);
+  }
+
+  const model = modelOverride ?? task.model ?? undefined;
+  const dir = createReviewWorktree(task.repo, taskId, task.branch);
+  const agent = createAgent({
+    kind: "reviewer",
+    model,
+    state: "spawning",
+    task_id: taskId,
+  });
+
+  const tag = `task-${taskId}-review`;
+  const settingsFile = writeSettingsFile(tag, agent.id, {
+    allow: [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git status*)",
+      ...(task.verify_cmd ? [`Bash(${task.verify_cmd})`] : []),
+    ],
+    deny: ["Edit", "Write", "NotebookEdit", "Bash(git commit*)", "Bash(git push*)"],
+  });
+  const mcpFile = writeMcpConfigFile(tag, {
+    CC_ROLE: "reviewer",
+    CC_AGENT_ID: String(agent.id),
+    CC_TASK_ID: String(taskId),
+  });
+
+  fs.mkdirSync(promptsDir(), { recursive: true });
+  const promptFile = path.join(promptsDir(), `${tag}.md`);
+  fs.writeFileSync(promptFile, buildReviewerPrompt(task));
+
+  const target = newWindow(
+    `r${taskId}`,
+    dir,
+    buildClaudeCmd({ model, settingsFile, mcpFile, promptFile }),
+  );
+  updateAgent(agent.id, { tmux_target: target, state: "working" });
+  logEvent("reviewer.spawned", {
+    agentId: agent.id,
+    taskId,
+    payload: { target, model, worktree: dir },
+  });
+  return { agent: getAgent(agent.id)!, task: getTask(taskId)! };
+}
+
 export function spawnMain(model?: string): Agent {
   const existing = listAgents({ live: true }).find((a) => a.kind === "main");
   if (existing) {
@@ -188,7 +275,14 @@ export function killAgent(
   updateAgent(agentId, { state: "dead" });
 
   const task = agent.task_id ? getTask(agent.task_id) : undefined;
-  if (task) {
+  if (task && agent.kind === "reviewer") {
+    // A reviewer only ever owns its own detached worktree — never the
+    // worker's tree, and killing it must not requeue the task.
+    if (opts?.rmWorktree) {
+      const dir = reviewWorktreeDir(task.repo, task.id);
+      if (fs.existsSync(dir)) removeWorktree(task.repo, dir);
+    }
+  } else if (task) {
     if (opts?.rmWorktree && task.worktree) {
       removeWorktree(task.repo, task.worktree);
       updateTask(task.id, { worktree: null });

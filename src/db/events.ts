@@ -38,6 +38,16 @@ export function countTaskEvents(taskId: number, kind: string): number {
   return row.n;
 }
 
+export function countAgentEvents(agentId: number, kinds: string[]): number {
+  const marks = kinds.map(() => "?").join(",");
+  const row = getDb()
+    .prepare(
+      `SELECT COUNT(*) AS n FROM events WHERE agent_id = ? AND kind IN (${marks})`,
+    )
+    .get(agentId, ...kinds) as { n: number };
+  return row.n;
+}
+
 /** Events of `kind` since UTC midnight — used for the daily spawn budget. */
 export function countEventsToday(kind: string): number {
   const row = getDb()

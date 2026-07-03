@@ -21,10 +21,17 @@ export function hookCommand(agentId: number): string {
   return `curl -sf -m 5 -X POST ${baseUrl()}/api/hooks/agent/${agentId} -H 'Content-Type: application/json' --data-binary @- >/dev/null 2>&1 || true`;
 }
 
-export function writeSettingsFile(tag: string, agentId: number): string {
+export function writeSettingsFile(
+  tag: string,
+  agentId: number,
+  permissions?: { allow?: string[]; deny?: string[] },
+): string {
   const hook = [{ hooks: [{ type: "command", command: hookCommand(agentId) }] }];
   const settings = {
-    permissions: { allow: ["mcp__cc"] },
+    permissions: {
+      allow: ["mcp__cc", ...(permissions?.allow ?? [])],
+      ...(permissions?.deny?.length ? { deny: permissions.deny } : {}),
+    },
     hooks: { SessionStart: hook, Stop: hook, Notification: hook },
   };
   const file = path.join(configDir("settings"), `${tag}.json`);

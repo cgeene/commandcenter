@@ -120,6 +120,38 @@ task
     console.log(`task #${t.id} claimed`);
   });
 
+task
+  .command("diff <id>")
+  .description("show the diff on a task's branch")
+  .option("--stat", "stat + commits only")
+  .action(async (id: string, opts) => {
+    const d = await api<{ commits: string; stat: string; diff: string; truncated: boolean }>(
+      "GET",
+      `/api/tasks/${id}/diff`,
+    );
+    console.log(d.commits ? `${d.commits}\n\n${d.stat}` : "(no commits on branch)");
+    if (!opts.stat && d.diff) {
+      console.log(`\n${d.diff}`);
+      if (d.truncated) console.log("[diff truncated]");
+    }
+  });
+
+// ---- review ----
+
+program
+  .command("review <taskId>")
+  .description("spawn an independent adversarial reviewer for a task in review")
+  .option("-m, --model <model>", "reviewer model (default: the task's model)")
+  .action(async (taskId: string, opts) => {
+    const { agent: a } = await api<{ agent: Agent }>(
+      "POST",
+      `/api/tasks/${taskId}/reviewer`,
+      { model: opts.model },
+    );
+    console.log(`reviewer a${a.id} spawned in ${a.tmux_target}${a.model ? ` (${a.model})` : ""}`);
+    console.log(`watch with: agp agent peek ${a.id}`);
+  });
+
 // ---- agent commands ----
 
 const agent = program.command("agent").description("manage worker agents");
@@ -408,6 +440,7 @@ interface SchedulerInfo {
     daily_spawn_limit: number;
     stall_minutes: number;
     active_hours: { start: number; end: number } | null;
+    auto_review: boolean;
   };
   status: { live_workers: number; spawns_today: number };
 }
@@ -422,7 +455,7 @@ async function printSchedulerStatus(): Promise<void> {
     ? `${config.active_hours.start}:00-${config.active_hours.end}:00`
     : "always";
   console.log(
-    `scheduler: ${config.enabled ? "ON" : "OFF"} · workers ${status.live_workers}/${config.max_concurrent} · spawns today ${status.spawns_today}/${config.daily_spawn_limit} · window ${hours} · stall ${config.stall_minutes}m`,
+    `scheduler: ${config.enabled ? "ON" : "OFF"} · workers ${status.live_workers}/${config.max_concurrent} · spawns today ${status.spawns_today}/${config.daily_spawn_limit} · window ${hours} · stall ${config.stall_minutes}m · auto-review ${config.auto_review ? "on" : "off"}`,
   );
 }
 
@@ -454,9 +487,11 @@ scheduler
   .option("--limit <n>", "daily autonomous spawn budget")
   .option("--stall <minutes>", "stall detection threshold")
   .option("--hours <range>", '"22-6" for overnight, or "always"')
+  .option("--auto-review <on|off>", "auto-review scheduler-spawned tasks")
   .action(async (opts) => {
     const patch: Record<string, unknown> = {};
     if (opts.max) patch.max_concurrent = Number(opts.max);
+    if (opts.autoReview) patch.auto_review = opts.autoReview === "on";
     if (opts.limit) patch.daily_spawn_limit = Number(opts.limit);
     if (opts.stall) patch.stall_minutes = Number(opts.stall);
     if (opts.hours === "always") patch.active_hours = null;
