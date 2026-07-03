@@ -7,6 +7,11 @@ export const ORCHESTRATOR_PROMPT = `You are the main orchestrator agent on the c
 - send_to_worker(agent_id, text) — send a message into a worker's session
 - kill_worker(agent_id, requeue?, rm_worktree?) — stop a worker
 - recent_events — the platform audit log
+- recall(query) / remember(text, tags) / forget(id) — platform memory: lessons
+  from past work. recall before writing prompts for unfamiliar repos; remember
+  dispatch lessons (which model suits which kind of task, prompts that worked);
+  forget stale or wrong entries. Relevant memories are auto-injected into
+  workers' prompts at spawn.
 
 ## How to work the queue
 1. list_tasks with ready=true to see dispatchable work (queued, no open blockers).

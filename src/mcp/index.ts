@@ -68,6 +68,46 @@ server.registerTool(
   },
 );
 
+server.registerTool(
+  "remember",
+  {
+    description:
+      "Store a durable lesson in platform memory (repo quirks, build gotchas, workflow insights). One fact per call. Relevant memories are auto-injected into future workers' prompts, so write them to be useful standalone.",
+    inputSchema: {
+      text: z.string().max(2000).describe("the lesson, standalone and specific"),
+      tags: z.string().optional().describe("comma-separated, e.g. 'repo:functions,build'"),
+    },
+  },
+  async ({ text, tags }) =>
+    asText(
+      await call("POST", "/api/memories", {
+        text,
+        tags,
+        task_id: MY_TASK_ID,
+        agent_id: process.env.CC_AGENT_ID ? Number(process.env.CC_AGENT_ID) : undefined,
+      }),
+    ),
+);
+
+server.registerTool(
+  "recall",
+  {
+    description:
+      "Full-text search platform memory for lessons from past work. Use before diving into unfamiliar repos or debugging something that may have happened before.",
+    inputSchema: {
+      query: z.string(),
+      limit: z.number().int().min(1).max(50).optional(),
+    },
+  },
+  async ({ query, limit }) =>
+    asText(
+      await call(
+        "GET",
+        `/api/memories?q=${encodeURIComponent(query)}&limit=${limit ?? 10}`,
+      ),
+    ),
+);
+
 // ---- worker tools ----
 
 if (ROLE === "worker") {
@@ -217,6 +257,15 @@ if (ROLE === "main") {
     },
     async ({ agent_id, ...rest }) =>
       asText(await call("POST", `/api/agents/${agent_id}/kill`, rest)),
+  );
+
+  server.registerTool(
+    "forget",
+    {
+      description: "Delete a memory by id (wrong, stale, or superseded).",
+      inputSchema: { id: z.number().int() },
+    },
+    async ({ id }) => asText(await call("DELETE", `/api/memories/${id}`)),
   );
 
   server.registerTool(

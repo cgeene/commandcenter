@@ -52,6 +52,15 @@ export interface TranscriptEntry {
   text: string;
 }
 
+export interface Memory {
+  id: number;
+  text: string;
+  tags: string | null;
+  task_id: number | null;
+  agent_id: number | null;
+  created_at: string;
+}
+
 export interface SchedulerInfo {
   config: {
     enabled: boolean;

@@ -36,6 +36,12 @@ its own git worktree and tmux window, managed by a local daemon.
   ideally self-hosted or token-protected via `CC_NTFY_TOKEN`) to get pushes
   when an agent needs input, a task hits review, or a task gets blocked.
 
+- **Memory** — a local lessons store (SQLite FTS5, no external services).
+  All agents get `remember(text, tags)` / `recall(query)` MCP tools (main
+  also gets `forget`); the daemon auto-injects the top 5 relevant memories
+  into every worker's prompt at spawn, so repo quirks and build gotchas get
+  learned once and applied forever. Human access: `agp memory
+  ls|search|add|rm` and the dashboard's memory drawer.
 - **Scheduler (Phase 4)** — off by default; toggle via `agp scheduler on|off`
   or the dashboard's auto button (green = on, click = kill switch). Every
   30s it claims ready tasks up to `max_concurrent` (default 3), bounded by a

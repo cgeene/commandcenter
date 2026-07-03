@@ -140,6 +140,18 @@ dd { word-break: break-all; }
 }
 .msg.tool pre { font-family: SF Mono, Menlo, monospace; color: var(--muted); }
 
+.panel-body input, .panel-body textarea {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 9px; font-size: 13px; width: 100%;
+  font-family: inherit; margin-bottom: 10px;
+}
+.memory-add { display: flex; gap: 8px; align-items: flex-start; }
+.memory-add textarea { flex: 1; }
+.memory-item {
+  border-top: 1px solid var(--border); padding: 10px 0; font-size: 13px;
+}
+.memory-meta { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+
 .modal-backdrop {
   position: fixed; inset: 0; background: #000a; z-index: 20;
   display: flex; align-items: center; justify-content: center;

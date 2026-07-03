@@ -3,6 +3,12 @@ import { z } from "zod";
 import { TASK_STATUSES, type TaskStatus } from "../db/db.js";
 import { getAgent, listAgents } from "../db/agents.js";
 import { countEventsToday, listEvents, logEvent } from "../db/events.js";
+import {
+  addMemory,
+  deleteMemory,
+  listMemories,
+  searchMemories,
+} from "../db/memories.js";
 import { getSchedulerConfig, setSchedulerConfig } from "../db/settings.js";
 import {
   claimTask,
@@ -157,6 +163,37 @@ export function buildApp(): Hono {
   app.get("/api/events", (c) =>
     c.json(listEvents(Number(c.req.query("limit") ?? 50))),
   );
+
+  app.get("/api/memories", (c) => {
+    const q = c.req.query("q");
+    const limit = Number(c.req.query("limit") ?? 20);
+    return c.json(q ? searchMemories(q, limit) : listMemories(limit));
+  });
+
+  app.post("/api/memories", async (c) => {
+    const body = z
+      .object({
+        text: z.string().min(1).max(2000),
+        tags: z.string().optional(),
+        task_id: z.number().int().optional(),
+        agent_id: z.number().int().optional(),
+      })
+      .parse(await c.req.json());
+    const memory = addMemory(body);
+    logEvent("memory.added", {
+      taskId: body.task_id,
+      agentId: body.agent_id,
+      payload: { id: memory.id },
+    });
+    return c.json(memory, 201);
+  });
+
+  app.delete("/api/memories/:id", (c) => {
+    const id = Number(c.req.param("id"));
+    if (!deleteMemory(id)) return c.json({ error: "not found" }, 404);
+    logEvent("memory.deleted", { payload: { id } });
+    return c.json({ ok: true });
+  });
 
   const schedulerPatchSchema = z.object({
     enabled: z.boolean().optional(),

@@ -10,6 +10,7 @@ import {
   type Agent,
 } from "../db/agents.js";
 import { logEvent } from "../db/events.js";
+import { memorySectionFor } from "../db/memories.js";
 import { claimTask, getTask, updateTask, type Task } from "../db/tasks.js";
 import { ORCHESTRATOR_PROMPT } from "../prompts/orchestrator.js";
 import { writeMcpConfigFile, writeSettingsFile } from "./genconfig.js";
@@ -29,6 +30,7 @@ function buildWorkerPrompt(task: Task, branch: string): string {
     `You are in a dedicated git worktree on branch \`${branch}\`; the main checkout is untouched.`,
     "Commit your work to this branch with conventional commit messages as you go.",
     "You have the \"cc\" MCP tools: update_my_task (set result_summary, or status blocked/review), report_blocked if you cannot proceed, add_task to file follow-up work you notice but shouldn't do now.",
+    "Memory: recall(query) searches lessons from past work; remember(text, tags) stores durable ones. If you hit a repo quirk, build gotcha, or workflow insight that would help future workers, remember it (one fact per call).",
   ];
   if (task.verify_cmd) {
     lines.push(
@@ -38,6 +40,8 @@ function buildWorkerPrompt(task: Task, branch: string): string {
   lines.push(
     "When done: set result_summary via update_my_task with a short summary of what you did and how you verified it, then stop.",
   );
+  const memories = memorySectionFor(`${task.title} ${task.prompt} ${task.repo}`);
+  if (memories) lines.push(memories);
   return lines.join("\n");
 }
 

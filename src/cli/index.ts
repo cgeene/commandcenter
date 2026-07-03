@@ -198,6 +198,66 @@ agent
     console.log(`sent to a${id}`);
   });
 
+// ---- memory ----
+
+interface Memory {
+  id: number;
+  text: string;
+  tags: string | null;
+  task_id: number | null;
+  created_at: string;
+}
+
+const memory = program.command("memory").description("platform memory");
+
+function printMemories(mems: Memory[]): void {
+  if (mems.length === 0) return console.log("no memories");
+  for (const m of mems) {
+    const tags = m.tags ? ` [${m.tags}]` : "";
+    console.log(`#${m.id}${tags} (${m.created_at.slice(0, 10)})\n  ${m.text}`);
+  }
+}
+
+memory
+  .command("ls")
+  .description("recent memories")
+  .option("-n, --limit <n>", "how many", "20")
+  .action(async (opts) => {
+    printMemories(await api<Memory[]>("GET", `/api/memories?limit=${opts.limit}`));
+  });
+
+memory
+  .command("search <query...>")
+  .description("full-text search memories")
+  .action(async (words: string[]) => {
+    printMemories(
+      await api<Memory[]>(
+        "GET",
+        `/api/memories?q=${encodeURIComponent(words.join(" "))}`,
+      ),
+    );
+  });
+
+memory
+  .command("add <text>")
+  .description("store a memory")
+  .option("-t, --tags <tags>", "comma-separated tags")
+  .action(async (text: string, opts) => {
+    const m = await api<Memory>("POST", "/api/memories", {
+      text,
+      tags: opts.tags,
+    });
+    console.log(`memory #${m.id} stored`);
+  });
+
+memory
+  .command("rm <id>")
+  .description("delete a memory")
+  .action(async (id: string) => {
+    await api("DELETE", `/api/memories/${id}`);
+    console.log(`memory #${id} deleted`);
+  });
+
 // ---- scheduler ----
 
 interface SchedulerInfo {

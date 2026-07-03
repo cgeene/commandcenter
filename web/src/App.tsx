@@ -5,6 +5,7 @@ import { Terminal } from "./Terminal";
 import type {
   Agent,
   Event,
+  Memory,
   SchedulerInfo,
   Task,
   TaskStatus,
@@ -69,6 +70,7 @@ export function App() {
   const [termAgent, setTermAgent] = useState<number | null>(null);
   const [transcript, setTranscript] = useState<TranscriptEntry[] | null>(null);
   const [showNewTask, setShowNewTask] = useState(false);
+  const [showMemory, setShowMemory] = useState(false);
   const [scheduler, setScheduler] = useState<SchedulerInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const keyboardStyle = useKeyboardAwareStyle();
@@ -142,6 +144,7 @@ export function App() {
             ▶ spawn main agent
           </button>
         )}
+        <button onClick={() => setShowMemory(true)}>memory</button>
         <button className="primary" onClick={() => setShowNewTask(true)}>
           + new task
         </button>
@@ -270,6 +273,8 @@ export function App() {
         </div>
       )}
 
+      {showMemory && <MemoryDrawer onClose={() => setShowMemory(false)} />}
+
       {showNewTask && (
         <NewTaskForm
           onClose={() => setShowNewTask(false)}
@@ -381,6 +386,80 @@ function TaskPanel({
             </button>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function MemoryDrawer({ onClose }: { onClose: () => void }) {
+  const [memories, setMemories] = useState<Memory[]>([]);
+  const [query, setQuery] = useState("");
+  const [newText, setNewText] = useState("");
+
+  const load = useCallback(async (q: string) => {
+    const qs = q.trim() ? `?q=${encodeURIComponent(q)}&limit=30` : "?limit=30";
+    setMemories(await api<Memory[]>("GET", `/api/memories${qs}`));
+  }, []);
+
+  useEffect(() => {
+    const t = setTimeout(() => load(query), 250);
+    return () => clearTimeout(t);
+  }, [query, load]);
+
+  return (
+    <div className="drawer">
+      <div className="drawer-head">
+        <b>memory</b>
+        <div className="spacer" />
+        <button onClick={onClose}>close</button>
+      </div>
+      <div className="panel-body">
+        <input
+          placeholder="search memories…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+        <div className="memory-add">
+          <textarea
+            placeholder="store a new memory…"
+            rows={2}
+            value={newText}
+            onChange={(e) => setNewText(e.target.value)}
+          />
+          <button
+            className="primary"
+            disabled={!newText.trim()}
+            onClick={async () => {
+              await api("POST", "/api/memories", { text: newText.trim() });
+              setNewText("");
+              load(query);
+            }}
+          >
+            remember
+          </button>
+        </div>
+        {memories.map((m) => (
+          <div key={m.id} className="memory-item">
+            <div className="memory-meta">
+              <span className="muted">
+                #{m.id} · {m.created_at.slice(0, 10)}
+                {m.tags ? ` · ${m.tags}` : ""}
+                {m.task_id ? ` · task #${m.task_id}` : ""}
+              </span>
+              <button
+                className="danger"
+                onClick={async () => {
+                  await api("DELETE", `/api/memories/${m.id}`);
+                  load(query);
+                }}
+              >
+                forget
+              </button>
+            </div>
+            <div>{m.text}</div>
+          </div>
+        ))}
+        {memories.length === 0 && <span className="muted">no memories</span>}
       </div>
     </div>
   );
