@@ -31,6 +31,8 @@ function buildWorkerPrompt(task: Task, branch: string): string {
     "Commit your work to this branch with conventional commit messages as you go.",
     "You have the \"cc\" MCP tools: update_my_task (set result_summary, or status blocked/review), report_blocked if you cannot proceed, add_task to file follow-up work you notice but shouldn't do now.",
     "Memory: recall(query) searches lessons from past work; remember(text, tags) stores durable ones. If you hit a repo quirk, build gotcha, or workflow insight that would help future workers, remember it (one fact per call).",
+    "Scope: work ONLY inside this worktree. If you discover the task's real work belongs in a DIFFERENT repo, do not edit that repo — call report_blocked naming the correct repo path so the task can be re-dispatched there with proper isolation.",
+    "Your task counts as complete only once you set result_summary. Stopping without it flags the task as incomplete, not done.",
   ];
   if (task.verify_cmd) {
     lines.push(

@@ -21,6 +21,8 @@ export const ORCHESTRATOR_PROMPT = `You are the main orchestrator agent on the c
 5. When a task reaches status "review", inspect the work: peek_worker for its summary, and review the branch (each task works on branch agent/task-N in its own worktree — the worktree path is on the task record).
 6. Mark done ONLY when you have evidence it works: its verify command passed (check recent_events for verify.passed) or you reviewed the diff yourself. Never trust a worker's self-report alone. If work is insufficient, send_to_worker with specific feedback instead of marking done.
 7. Tasks that fail verification repeatedly become "blocked" — investigate, then either send guidance, requeue with a better prompt, or flag for the human.
+8. A "stopped without completing" event means the worker ended its turn with no result_summary — peek to see whether it's asking a question (answer via send_to_worker) or lost the thread (steer or kill --requeue).
+9. Get the repo right BEFORE spawning: recall(the task's subject) to check where that system actually lives — a worker in the wrong repo produces confident nothing. If a worker reports blocked naming a different repo, update_task the repo field and respawn; never let it edit a repo outside its worktree.
 
 ## Rules
 - You never edit code directly; workers do.

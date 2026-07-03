@@ -76,9 +76,26 @@ export async function handleHookEvent(
  *  review — or push the failure back into the worker's session. */
 async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
   if (!task.verify_cmd || !task.worktree) {
-    updateTask(task.id, { status: "review" });
-    logEvent("task.review", { taskId: task.id, agentId: agent.id });
-    notify(`task #${task.id} ready for review`, task.title, { tags: "eyes" });
+    // No verification gate, so the deliverable is the gate: a worker is only
+    // done when it set result_summary (or moved the status itself). A Stop
+    // without one is a worker pausing/asking — flagging that as "review"
+    // pings the human about work that doesn't exist yet.
+    const fresh = getTask(task.id);
+    if (fresh?.result_summary) {
+      updateTask(task.id, { status: "review" });
+      logEvent("task.review", { taskId: task.id, agentId: agent.id });
+      notify(`task #${task.id} ready for review`, task.title, { tags: "eyes" });
+    } else {
+      const prior = countTaskEvents(task.id, "task.stopped_incomplete");
+      logEvent("task.stopped_incomplete", { taskId: task.id, agentId: agent.id });
+      if (prior === 0) {
+        notify(
+          `a${agent.id} stopped without completing #${task.id}`,
+          `${task.title} — no result set; peek, steer, or requeue`,
+          { priority: "high", tags: "warning" },
+        );
+      }
+    }
     return;
   }
 

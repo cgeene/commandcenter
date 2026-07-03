@@ -62,14 +62,27 @@ describe("hook events", () => {
     expect(getAgent(agent.id)?.state).toBe("waiting_input");
   });
 
-  it("Stop with no verify_cmd moves the task to review", async () => {
+  it("Stop with no verify_cmd + a result_summary moves the task to review", async () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");
-    const { getTask } = await import("../src/db/tasks.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
     const { getAgent } = await import("../src/db/agents.js");
     const { task, agent } = await setup();
+    updateTask(task.id, { result_summary: "did the thing, verified by hand" });
     await handleHookEvent(agent.id, { hook_event_name: "Stop" });
     expect(getTask(task.id)?.status).toBe("review");
     expect(getAgent(agent.id)?.state).toBe("idle");
+  });
+
+  it("Stop with no verify_cmd and NO result stays in_progress (stopped_incomplete)", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, agent } = await setup();
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    expect(getTask(task.id)?.status).toBe("in_progress"); // NOT review
+    const kinds = listEvents(10).map((e) => e.kind);
+    expect(kinds.filter((k) => k === "task.stopped_incomplete").length).toBe(2);
   });
 
   it("Stop with passing verify_cmd moves the task to review", async () => {
