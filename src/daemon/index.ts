@@ -25,14 +25,18 @@ const server = serve(
 // Live terminal: /ws/term/<agentId> bridges xterm.js <-> tmux via a PTY.
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
-  const match = req.url?.match(/^\/ws\/term\/(\d+)$/);
+  const url = new URL(req.url ?? "/", "http://localhost");
+  const match = url.pathname.match(/^\/ws\/term\/(\d+)$/);
   if (!match) {
     socket.destroy();
     return;
   }
   const agentId = Number(match[1]);
+  const cols = Number(url.searchParams.get("cols")) || undefined;
+  const rows = Number(url.searchParams.get("rows")) || undefined;
   wss.handleUpgrade(req, socket, head, (ws) => {
-    attachTerminal(ws, agentId).catch((err) => {
+    const size = cols && rows ? { cols, rows } : undefined;
+    attachTerminal(ws, agentId, size).catch((err) => {
       console.error(`terminal attach failed for a${agentId}:`, err);
       ws.close();
     });

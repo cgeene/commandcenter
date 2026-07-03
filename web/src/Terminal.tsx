@@ -21,13 +21,14 @@ export function Terminal({ agentId }: { agentId: number }) {
     term.open(ref.current);
     fit.fit();
 
+    // fit ran above, so cols/rows are the real dimensions — the server
+    // starts the PTY at this size and the first paint is clean.
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(`${proto}//${location.host}/ws/term/${agentId}`);
+    const ws = new WebSocket(
+      `${proto}//${location.host}/ws/term/${agentId}?cols=${term.cols}&rows=${term.rows}`,
+    );
 
     ws.onmessage = (e) => term.write(typeof e.data === "string" ? e.data : "");
-    ws.onopen = () => {
-      ws.send(JSON.stringify({ t: "r", cols: term.cols, rows: term.rows }));
-    };
     ws.onclose = () => term.write("\r\n[disconnected]\r\n");
 
     const dataSub = term.onData((d) => {

@@ -25,6 +25,7 @@ function tmux(...args: string[]): Promise<void> {
 export async function attachTerminal(
   ws: WebSocket,
   agentId: number,
+  size?: { cols: number; rows: number },
 ): Promise<void> {
   const agent = getAgent(agentId);
   if (!agent?.tmux_target || !windowExists(agent.tmux_target)) {
@@ -38,7 +39,19 @@ export async function attachTerminal(
 
   try {
     await tmux("new-session", "-d", "-t", session, "-s", viewer);
+    // No tmux chrome in the browser: xterm.js renders only the pane.
+    await tmux("set-option", "-t", viewer, "status", "off");
     await tmux("select-window", "-t", `${viewer}:${windowId}`);
+    // Size the shared window to whichever client used it last (i.e. the
+    // browser), instead of clamping to the smallest attached client.
+    await tmux(
+      "set-option",
+      "-w",
+      "-t",
+      `${viewer}:${windowId}`,
+      "window-size",
+      "latest",
+    );
   } catch (err) {
     ws.send(`\r\n[commandcenter] failed to create viewer session: ${err}\r\n`);
     ws.close();
@@ -47,10 +60,12 @@ export async function attachTerminal(
 
   let term: pty.IPty;
   try {
+    // Start the PTY at the browser's real dimensions so the first paint is
+    // already correct — a wrong initial size leaves redraw artifacts.
     term = pty.spawn("tmux", ["attach", "-t", viewer], {
       name: "xterm-256color",
-      cols: 200,
-      rows: 50,
+      cols: size?.cols ?? 120,
+      rows: size?.rows ?? 32,
       env: process.env as Record<string, string>,
     });
   } catch (err) {
