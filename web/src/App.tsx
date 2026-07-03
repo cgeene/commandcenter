@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import type { CSSProperties } from "react";
 import { api } from "./api";
 import { Terminal } from "./Terminal";
 import type {
@@ -17,6 +18,39 @@ const COLUMNS: { title: string; statuses: TaskStatus[] }[] = [
   { title: "Review", statuses: ["review"] },
   { title: "Done", statuses: ["done", "failed"] },
 ];
+
+/**
+ * On phones the virtual keyboard overlays the page without resizing it
+ * (especially iOS Safari), hiding the bottom of fixed-position drawers.
+ * Track the visual viewport and, when a keyboard is plausibly open, return
+ * a style that pins the drawer to the *visible* area — the terminal then
+ * re-fits and the input line lands just above the keyboard.
+ */
+function useKeyboardAwareStyle(): CSSProperties | undefined {
+  const [style, setStyle] = useState<CSSProperties | undefined>(undefined);
+
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const update = () => {
+      const covered = window.innerHeight - vv.height - vv.offsetTop;
+      if (covered > 80) {
+        setStyle({ top: vv.offsetTop, height: vv.height, bottom: "auto" });
+      } else {
+        setStyle(undefined);
+      }
+    };
+    vv.addEventListener("resize", update);
+    vv.addEventListener("scroll", update);
+    update();
+    return () => {
+      vv.removeEventListener("resize", update);
+      vv.removeEventListener("scroll", update);
+    };
+  }, []);
+
+  return style;
+}
 
 const STATE_COLORS: Record<string, string> = {
   working: "#3fb950",
@@ -37,6 +71,7 @@ export function App() {
   const [showNewTask, setShowNewTask] = useState(false);
   const [scheduler, setScheduler] = useState<SchedulerInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const keyboardStyle = useKeyboardAwareStyle();
 
   const refresh = useCallback(async () => {
     try {
@@ -207,7 +242,7 @@ export function App() {
       )}
 
       {termAgent !== null && (
-        <div className="drawer terminal-drawer">
+        <div className="drawer terminal-drawer" style={keyboardStyle}>
           <div className="drawer-head">
             <b>terminal — a{termAgent}</b>
             <div className="spacer" />
