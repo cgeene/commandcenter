@@ -47,8 +47,12 @@ function buildClaudeCmd(opts: {
   mcpFile: string;
   promptFile: string;
 }): string {
+  // The prompt positional MUST come before the flags: --mcp-config is
+  // variadic (space-separated configs), so a trailing positional gets
+  // swallowed as a "config file" and claude dies with ENAMETOOLONG.
   return [
     shellQuote(claudeBin()),
+    `"$(cat ${shellQuote(opts.promptFile)})"`,
     ...(opts.model ? ["--model", shellQuote(opts.model)] : []),
     "--permission-mode",
     "acceptEdits",
@@ -56,7 +60,6 @@ function buildClaudeCmd(opts: {
     shellQuote(opts.settingsFile),
     "--mcp-config",
     shellQuote(opts.mcpFile),
-    `"$(cat ${shellQuote(opts.promptFile)})"`,
   ].join(" ");
 }
 
