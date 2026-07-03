@@ -1,7 +1,14 @@
 import { listAgents, updateAgent } from "../db/agents.js";
+import { dueCrons, nextRun, openTasksFor, updateCron } from "../db/crons.js";
 import { countEventsToday, countTaskEvents, logEvent } from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
-import { getTask, listTasks, readyTasks, updateTask } from "../db/tasks.js";
+import {
+  createTask,
+  getTask,
+  listTasks,
+  readyTasks,
+  updateTask,
+} from "../db/tasks.js";
 import { notify } from "./notify.js";
 import { spawnWorker } from "./spawn.js";
 import { listWindowIds } from "./tmux.js";
@@ -37,11 +44,43 @@ export function inActiveWindow(
   return h >= hours.start || h < hours.end; // overnight wrap, e.g. 22 -> 6
 }
 
+/** Enqueue tasks for due crons. Fires even when the scheduler is disabled —
+ *  crons only add to the queue; SPAWNING is still gated by the scheduler.
+ *  The open-task guard stops a stuck queue from accumulating duplicates. */
+export function fireDueCrons(now: Date): void {
+  for (const cron of dueCrons(now)) {
+    const advance = { last_run_at: now.toISOString(), next_run_at: nextRun(cron.schedule, now) };
+    if (openTasksFor(cron.id) > 0) {
+      updateCron(cron.id, advance);
+      logEvent("cron.skipped", {
+        payload: { cron_id: cron.id, name: cron.name, reason: "previous task still open" },
+      });
+      continue;
+    }
+    const task = createTask({
+      title: cron.title,
+      prompt: cron.prompt,
+      repo: cron.repo,
+      model: cron.model ?? undefined,
+      priority: cron.priority,
+      verify_cmd: cron.verify_cmd ?? undefined,
+      cron_id: cron.id,
+    });
+    updateCron(cron.id, advance);
+    logEvent("cron.fired", {
+      taskId: task.id,
+      payload: { cron_id: cron.id, name: cron.name },
+    });
+  }
+}
+
 /** Auto-spawn pass: claim ready tasks up to max_concurrent, within the
  *  active window, capped by the daily spawn budget. Runs every 30s. */
 export function tick(deps: SchedulerDeps = defaultDeps): void {
   const cfg = getSchedulerConfig();
   const now = deps.now();
+
+  fireDueCrons(now);
   const inWin = cfg.active_hours ? inActiveWindow(cfg.active_hours, now) : true;
 
   // leaving the window while enabled -> morning report

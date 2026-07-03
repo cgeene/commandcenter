@@ -16,6 +16,7 @@ export interface Task {
   verify_cmd: string | null;
   result_summary: string | null;
   tokens_used: number | null;
+  cron_id: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -28,14 +29,15 @@ export interface NewTask {
   model?: string;
   blocked_by?: number;
   verify_cmd?: string;
+  cron_id?: number;
 }
 
 export function createTask(t: NewTask): Task {
   const db = getDb();
   const info = db
     .prepare(
-      `INSERT INTO tasks (title, prompt, repo, priority, model, blocked_by, verify_cmd)
-       VALUES (@title, @prompt, @repo, @priority, @model, @blocked_by, @verify_cmd)`,
+      `INSERT INTO tasks (title, prompt, repo, priority, model, blocked_by, verify_cmd, cron_id)
+       VALUES (@title, @prompt, @repo, @priority, @model, @blocked_by, @verify_cmd, @cron_id)`,
     )
     .run({
       title: t.title,
@@ -45,6 +47,7 @@ export function createTask(t: NewTask): Task {
       model: t.model ?? null,
       blocked_by: t.blocked_by ?? null,
       verify_cmd: t.verify_cmd ?? null,
+      cron_id: t.cron_id ?? null,
     });
   return getTask(Number(info.lastInsertRowid))!;
 }

@@ -4,6 +4,7 @@ import { api } from "./api";
 import { Terminal } from "./Terminal";
 import type {
   Agent,
+  CronJob,
   Event,
   Memory,
   SchedulerInfo,
@@ -71,6 +72,7 @@ export function App() {
   const [transcript, setTranscript] = useState<TranscriptEntry[] | null>(null);
   const [showNewTask, setShowNewTask] = useState(false);
   const [showMemory, setShowMemory] = useState(false);
+  const [showCrons, setShowCrons] = useState(false);
   const [scheduler, setScheduler] = useState<SchedulerInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const keyboardStyle = useKeyboardAwareStyle();
@@ -144,6 +146,7 @@ export function App() {
             ▶ spawn main agent
           </button>
         )}
+        <button onClick={() => setShowCrons(true)}>crons</button>
         <button onClick={() => setShowMemory(true)}>memory</button>
         <button className="primary" onClick={() => setShowNewTask(true)}>
           + new task
@@ -274,6 +277,7 @@ export function App() {
       )}
 
       {showMemory && <MemoryDrawer onClose={() => setShowMemory(false)} />}
+      {showCrons && <CronsDrawer onClose={() => setShowCrons(false)} />}
 
       {showNewTask && (
         <NewTaskForm
@@ -386,6 +390,77 @@ function TaskPanel({
             </button>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function CronsDrawer({ onClose }: { onClose: () => void }) {
+  const [crons, setCrons] = useState<CronJob[]>([]);
+
+  const load = useCallback(async () => {
+    setCrons(await api<CronJob[]>("GET", "/api/crons"));
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const patch = async (id: number, body: Record<string, unknown>) => {
+    await api("PATCH", `/api/crons/${id}`, body);
+    load();
+  };
+
+  return (
+    <div className="drawer">
+      <div className="drawer-head">
+        <b>crons</b>
+        <div className="spacer" />
+        <button onClick={onClose}>close</button>
+      </div>
+      <div className="panel-body">
+        {crons.map((c) => (
+          <div key={c.id} className="memory-item">
+            <div className="memory-meta">
+              <b>
+                {c.name} <span className="muted">· {c.schedule}</span>
+              </b>
+              <span>
+                <button onClick={() => patch(c.id, { enabled: !c.enabled })}>
+                  {c.enabled ? "disable" : "enable"}
+                </button>{" "}
+                <button
+                  onClick={async () => {
+                    await api("POST", `/api/crons/${c.id}/run`);
+                    load();
+                  }}
+                >
+                  run now
+                </button>{" "}
+                <button
+                  className="danger"
+                  onClick={async () => {
+                    await api("DELETE", `/api/crons/${c.id}`);
+                    load();
+                  }}
+                >
+                  delete
+                </button>
+              </span>
+            </div>
+            <div className="muted">
+              {c.enabled ? `next ${c.next_run_at?.slice(0, 16) ?? "?"}` : "disabled"}
+              {c.last_run_at ? ` · last ${c.last_run_at.slice(0, 16)}` : " · never run"}
+              {c.model ? ` · ${c.model}` : ""} · {c.repo.split("/").pop()}
+            </div>
+            <div>{c.title}</div>
+          </div>
+        ))}
+        {crons.length === 0 && (
+          <span className="muted">
+            no crons — create one with: agp cron add &lt;name&gt; -s "0 3 * * *" -p "..."
+          </span>
+        )}
       </div>
     </div>
   );

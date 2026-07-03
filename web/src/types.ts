@@ -61,6 +61,21 @@ export interface Memory {
   created_at: string;
 }
 
+export interface CronJob {
+  id: number;
+  name: string;
+  schedule: string;
+  title: string;
+  prompt: string;
+  repo: string;
+  model: string | null;
+  priority: number;
+  verify_cmd: string | null;
+  enabled: number;
+  last_run_at: string | null;
+  next_run_at: string | null;
+}
+
 export interface SchedulerInfo {
   config: {
     enabled: boolean;

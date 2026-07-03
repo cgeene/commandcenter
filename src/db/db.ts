@@ -102,9 +102,35 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
   INSERT INTO memories_fts(rowid, text, tags) VALUES (new.id, new.text, new.tags);
 END;
 
+CREATE TABLE IF NOT EXISTS crons (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  name        TEXT NOT NULL UNIQUE,
+  schedule    TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  prompt      TEXT NOT NULL,
+  repo        TEXT NOT NULL,
+  model       TEXT,
+  priority    INTEGER NOT NULL DEFAULT 2,
+  verify_cmd  TEXT,
+  enabled     INTEGER NOT NULL DEFAULT 1,
+  last_run_at TEXT,
+  next_run_at TEXT,
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
 `;
+
+/** Additive migrations for columns that postdate the original CREATE TABLE. */
+function migrate(db: Database.Database): void {
+  const cols = (db.prepare("PRAGMA table_info(tasks)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!cols.includes("cron_id")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN cron_id INTEGER");
+  }
+}
 
 let db: Database.Database | undefined;
 
@@ -115,6 +141,7 @@ export function getDb(): Database.Database {
     db.pragma("journal_mode = WAL");
     db.pragma("foreign_keys = ON");
     db.exec(SCHEMA);
+    migrate(db);
   }
   return db;
 }

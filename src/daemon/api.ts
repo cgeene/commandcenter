@@ -2,6 +2,13 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { TASK_STATUSES, type TaskStatus } from "../db/db.js";
 import { getAgent, listAgents } from "../db/agents.js";
+import {
+  createCron,
+  deleteCron,
+  getCron,
+  listCrons,
+  updateCron,
+} from "../db/crons.js";
 import { countEventsToday, listEvents, logEvent } from "../db/events.js";
 import {
   addMemory,
@@ -163,6 +170,77 @@ export function buildApp(): Hono {
   app.get("/api/events", (c) =>
     c.json(listEvents(Number(c.req.query("limit") ?? 50))),
   );
+
+  const newCronSchema = z.object({
+    name: z.string().min(1).regex(/^[a-z0-9-_]+$/i, "name must be alphanumeric/dash"),
+    schedule: z.string().min(1),
+    prompt: z.string().min(1),
+    repo: z.string().min(1),
+    title: z.string().optional(),
+    model: z.string().optional(),
+    priority: z.number().int().min(0).max(4).optional(),
+    verify_cmd: z.string().optional(),
+  });
+
+  const cronPatchSchema = z.object({
+    schedule: z.string().min(1).optional(),
+    title: z.string().optional(),
+    prompt: z.string().optional(),
+    repo: z.string().optional(),
+    model: z.string().nullable().optional(),
+    priority: z.number().int().min(0).max(4).optional(),
+    verify_cmd: z.string().nullable().optional(),
+    enabled: z.boolean().optional(),
+  });
+
+  app.get("/api/crons", (c) => c.json(listCrons()));
+
+  app.post("/api/crons", async (c) => {
+    const body = newCronSchema.parse(await c.req.json());
+    const cron = createCron(body); // throws on invalid schedule -> 500 w/ message
+    logEvent("cron.created", { payload: { cron_id: cron.id, name: cron.name } });
+    return c.json(cron, 201);
+  });
+
+  app.patch("/api/crons/:id", async (c) => {
+    const id = Number(c.req.param("id"));
+    if (!getCron(id)) return c.json({ error: "not found" }, 404);
+    const body = cronPatchSchema.parse(await c.req.json());
+    const cron = updateCron(id, {
+      ...body,
+      enabled: body.enabled === undefined ? undefined : body.enabled ? 1 : 0,
+    } as Parameters<typeof updateCron>[1]);
+    logEvent("cron.updated", { payload: { cron_id: id, patch: body } });
+    return c.json(cron);
+  });
+
+  app.delete("/api/crons/:id", (c) => {
+    const id = Number(c.req.param("id"));
+    if (!deleteCron(id)) return c.json({ error: "not found" }, 404);
+    logEvent("cron.deleted", { payload: { cron_id: id } });
+    return c.json({ ok: true });
+  });
+
+  app.post("/api/crons/:id/run", async (c) => {
+    const cron = getCron(Number(c.req.param("id")));
+    if (!cron) return c.json({ error: "not found" }, 404);
+    const { createTask } = await import("../db/tasks.js");
+    const task = createTask({
+      title: cron.title,
+      prompt: cron.prompt,
+      repo: cron.repo,
+      model: cron.model ?? undefined,
+      priority: cron.priority,
+      verify_cmd: cron.verify_cmd ?? undefined,
+      cron_id: cron.id,
+    });
+    updateCron(cron.id, { last_run_at: new Date().toISOString() });
+    logEvent("cron.fired", {
+      taskId: task.id,
+      payload: { cron_id: cron.id, name: cron.name, manual: true },
+    });
+    return c.json(task, 201);
+  });
 
   app.get("/api/memories", (c) => {
     const q = c.req.query("q");

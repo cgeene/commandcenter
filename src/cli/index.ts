@@ -198,6 +198,120 @@ agent
     console.log(`sent to a${id}`);
   });
 
+// ---- cron ----
+
+interface CronJob {
+  id: number;
+  name: string;
+  schedule: string;
+  title: string;
+  repo: string;
+  model: string | null;
+  enabled: number;
+  last_run_at: string | null;
+  next_run_at: string | null;
+}
+
+const cron = program.command("cron").description("recurring task templates");
+
+async function resolveCron(idOrName: string): Promise<CronJob> {
+  const crons = await api<CronJob[]>("GET", "/api/crons");
+  const found = crons.find(
+    (x) => String(x.id) === idOrName || x.name === idOrName,
+  );
+  if (!found) {
+    console.error(`error: no cron "${idOrName}"`);
+    process.exit(1);
+  }
+  return found;
+}
+
+cron
+  .command("add <name>")
+  .description("create a recurring task template")
+  .requiredOption("-s, --schedule <cron>", 'cron expression, e.g. "0 3 * * *"')
+  .option("-p, --prompt <prompt>", "task prompt")
+  .option("-f, --prompt-file <file>", "read prompt from a file")
+  .option("-r, --repo <path>", "target repo (default: current git repo)")
+  .option("--title <title>", "task title (default: cron name)")
+  .option("-m, --model <model>")
+  .option("-P, --priority <n>", "0-4", "2")
+  .option("-v, --verify <cmd>")
+  .action(async (name: string, opts) => {
+    const prompt = opts.promptFile
+      ? fs.readFileSync(opts.promptFile, "utf8")
+      : opts.prompt;
+    if (!prompt) {
+      console.error("error: provide --prompt or --prompt-file");
+      process.exit(1);
+    }
+    const c = await api<CronJob>("POST", "/api/crons", {
+      name,
+      schedule: opts.schedule,
+      prompt,
+      repo: opts.repo ?? gitToplevel(process.cwd()),
+      title: opts.title,
+      model: opts.model,
+      priority: Number(opts.priority),
+      verify_cmd: opts.verify,
+    });
+    console.log(`cron #${c.id} "${c.name}" — next run ${c.next_run_at}`);
+  });
+
+cron
+  .command("ls")
+  .description("list crons")
+  .action(async () => {
+    const crons = await api<CronJob[]>("GET", "/api/crons");
+    if (crons.length === 0) return console.log("no crons");
+    console.log(
+      table(
+        crons.map((x) => [
+          `#${x.id}`,
+          x.enabled ? "on" : "off",
+          x.name,
+          x.schedule,
+          x.model ?? "-",
+          x.next_run_at?.slice(0, 16) ?? "-",
+          x.last_run_at?.slice(0, 16) ?? "never",
+        ]),
+        ["id", "en", "name", "schedule", "model", "next", "last"],
+      ),
+    );
+  });
+
+cron
+  .command("rm <idOrName>")
+  .description("delete a cron")
+  .action(async (idOrName: string) => {
+    const c = await resolveCron(idOrName);
+    await api("DELETE", `/api/crons/${c.id}`);
+    console.log(`cron "${c.name}" deleted`);
+  });
+
+for (const [cmd, enabled] of [
+  ["enable", true],
+  ["disable", false],
+] as const) {
+  cron
+    .command(`${cmd} <idOrName>`)
+    .description(`${cmd} a cron`)
+    .action(async (idOrName: string) => {
+      const c = await resolveCron(idOrName);
+      await api("PATCH", `/api/crons/${c.id}`, { enabled });
+      console.log(`cron "${c.name}" ${cmd}d`);
+    });
+}
+
+cron
+  .command("run <idOrName>")
+  .description("enqueue this cron's task now")
+  .action(async (idOrName: string) => {
+    const c = await resolveCron(idOrName);
+    const task = await api<{ id: number }>("POST", `/api/crons/${c.id}/run`);
+    console.log(`cron "${c.name}" fired -> task #${task.id} queued`);
+  });
+
 // ---- memory ----
 
 interface Memory {
