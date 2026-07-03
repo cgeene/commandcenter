@@ -190,6 +190,26 @@ agent
     console.log(res.content);
   });
 
+agent
+  .command("send <id> <text...>")
+  .description("send a message into an agent's interactive session")
+  .action(async (id: string, words: string[]) => {
+    await api("POST", `/api/agents/${id}/send`, { text: words.join(" ") });
+    console.log(`sent to a${id}`);
+  });
+
+// ---- main agent ----
+
+program
+  .command("main")
+  .description("spawn the orchestrator main agent")
+  .option("-m, --model <model>", "model (default: opus, or CC_MAIN_MODEL)")
+  .action(async (opts) => {
+    const a = await api<Agent>("POST", "/api/main", { model: opts.model });
+    console.log(`main agent a${a.id} spawned in ${a.tmux_target} (${a.model})`);
+    console.log(`attach with: agp attach ${a.id}`);
+  });
+
 // ---- attach / events ----
 
 program

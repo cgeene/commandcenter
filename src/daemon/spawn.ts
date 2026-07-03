@@ -1,9 +1,18 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { claudeBin, promptsDir } from "../config.js";
-import { createAgent, getAgent, updateAgent, type Agent } from "../db/agents.js";
+import {
+  createAgent,
+  getAgent,
+  listAgents,
+  updateAgent,
+  type Agent,
+} from "../db/agents.js";
 import { logEvent } from "../db/events.js";
 import { claimTask, getTask, updateTask, type Task } from "../db/tasks.js";
+import { ORCHESTRATOR_PROMPT } from "../prompts/orchestrator.js";
+import { writeMcpConfigFile, writeSettingsFile } from "./genconfig.js";
 import { killWindow, newWindow, windowExists } from "./tmux.js";
 import { createWorktree, removeWorktree } from "./worktree.js";
 
@@ -11,24 +20,44 @@ function shellQuote(s: string): string {
   return `'${s.replaceAll("'", `'\\''`)}'`;
 }
 
-function buildPrompt(task: Task, branch: string): string {
+function buildWorkerPrompt(task: Task, branch: string): string {
   const lines = [
     task.prompt,
     "",
     "---",
-    `You are worker agent for task #${task.id} ("${task.title}") on the commandcenter platform.`,
+    `You are a worker agent for task #${task.id} ("${task.title}") on the commandcenter platform.`,
     `You are in a dedicated git worktree on branch \`${branch}\`; the main checkout is untouched.`,
     "Commit your work to this branch with conventional commit messages as you go.",
+    "You have the \"cc\" MCP tools: update_my_task (set result_summary, or status blocked/review), report_blocked if you cannot proceed, add_task to file follow-up work you notice but shouldn't do now.",
   ];
   if (task.verify_cmd) {
     lines.push(
-      `Before considering the task complete, verify with: \`${task.verify_cmd}\` and make it pass.`,
+      `Before finishing, verify with: \`${task.verify_cmd}\` and make it pass. The platform re-runs this after you stop.`,
     );
   }
   lines.push(
-    "When you are done, stop and summarize what you did and how you verified it.",
+    "When done: set result_summary via update_my_task with a short summary of what you did and how you verified it, then stop.",
   );
   return lines.join("\n");
+}
+
+function buildClaudeCmd(opts: {
+  model?: string;
+  settingsFile: string;
+  mcpFile: string;
+  promptFile: string;
+}): string {
+  return [
+    shellQuote(claudeBin()),
+    ...(opts.model ? ["--model", shellQuote(opts.model)] : []),
+    "--permission-mode",
+    "acceptEdits",
+    "--settings",
+    shellQuote(opts.settingsFile),
+    "--mcp-config",
+    shellQuote(opts.mcpFile),
+    `"$(cat ${shellQuote(opts.promptFile)})"`,
+  ].join(" ");
 }
 
 export function spawnWorker(
@@ -57,26 +86,32 @@ export function spawnWorker(
   const model = modelOverride ?? task.model ?? undefined;
   const { dir, branch } = createWorktree(task.repo, taskId);
 
-  fs.mkdirSync(promptsDir(), { recursive: true });
-  const promptFile = path.join(promptsDir(), `task-${taskId}.md`);
-  fs.writeFileSync(promptFile, buildPrompt(task, branch));
-
-  const cmd = [
-    shellQuote(claudeBin()),
-    ...(model ? ["--model", shellQuote(model)] : []),
-    "--permission-mode",
-    "acceptEdits",
-    `"$(cat ${shellQuote(promptFile)})"`,
-  ].join(" ");
-
-  const target = newWindow(`t${taskId}`, dir, cmd);
+  // Agent row first: its id is baked into the generated hook + MCP configs.
   const agent = createAgent({
     kind: "worker",
-    model: model ?? null!,
-    state: "working",
+    model,
+    state: "spawning",
     task_id: taskId,
-    tmux_target: target,
   });
+
+  const tag = `task-${taskId}`;
+  const settingsFile = writeSettingsFile(tag, agent.id);
+  const mcpFile = writeMcpConfigFile(tag, {
+    CC_ROLE: "worker",
+    CC_AGENT_ID: String(agent.id),
+    CC_TASK_ID: String(taskId),
+  });
+
+  fs.mkdirSync(promptsDir(), { recursive: true });
+  const promptFile = path.join(promptsDir(), `${tag}.md`);
+  fs.writeFileSync(promptFile, buildWorkerPrompt(task, branch));
+
+  const target = newWindow(
+    `t${taskId}`,
+    dir,
+    buildClaudeCmd({ model, settingsFile, mcpFile, promptFile }),
+  );
+  updateAgent(agent.id, { tmux_target: target, state: "working" });
   updateTask(taskId, {
     status: "in_progress",
     agent_id: agent.id,
@@ -90,6 +125,44 @@ export function spawnWorker(
     payload: { target, model, worktree: dir },
   });
   return { agent: getAgent(agent.id)!, task: getTask(taskId)! };
+}
+
+export function spawnMain(model?: string): Agent {
+  const existing = listAgents({ live: true }).find((a) => a.kind === "main");
+  if (existing) {
+    throw new Error(
+      `main agent a${existing.id} already live (${existing.state}) — attach or kill it first`,
+    );
+  }
+
+  const resolvedModel = model ?? process.env.CC_MAIN_MODEL ?? "opus";
+  const agent = createAgent({
+    kind: "main",
+    model: resolvedModel,
+    state: "spawning",
+  });
+
+  const settingsFile = writeSettingsFile("main", agent.id);
+  const mcpFile = writeMcpConfigFile("main", {
+    CC_ROLE: "main",
+    CC_AGENT_ID: String(agent.id),
+  });
+
+  fs.mkdirSync(promptsDir(), { recursive: true });
+  const promptFile = path.join(promptsDir(), "main.md");
+  fs.writeFileSync(promptFile, ORCHESTRATOR_PROMPT);
+
+  const target = newWindow(
+    "main",
+    os.homedir(),
+    buildClaudeCmd({ model: resolvedModel, settingsFile, mcpFile, promptFile }),
+  );
+  updateAgent(agent.id, { tmux_target: target, state: "working" });
+  logEvent("agent.spawned", {
+    agentId: agent.id,
+    payload: { target, model: resolvedModel, kind: "main" },
+  });
+  return getAgent(agent.id)!;
 }
 
 export function killAgent(

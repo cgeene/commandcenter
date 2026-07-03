@@ -11,8 +11,9 @@ import {
   readyTasks,
   updateTask,
 } from "../db/tasks.js";
-import { killAgent, spawnWorker } from "./spawn.js";
-import { capturePane, windowExists } from "./tmux.js";
+import { handleHookEvent, type HookPayload } from "./hooks.js";
+import { killAgent, spawnMain, spawnWorker } from "./spawn.js";
+import { capturePane, sendText, windowExists } from "./tmux.js";
 
 const newTaskSchema = z.object({
   title: z.string().min(1),
@@ -121,6 +122,35 @@ export function buildApp(): Hono {
     }
     const lines = Number(c.req.query("lines") ?? 50);
     return c.json({ target: agent.tmux_target, content: capturePane(agent.tmux_target, lines) });
+  });
+
+  app.post("/api/agents/:id/send", async (c) => {
+    const agent = getAgent(Number(c.req.param("id")));
+    if (!agent) return c.json({ error: "not found" }, 404);
+    if (!agent.tmux_target || !windowExists(agent.tmux_target)) {
+      return c.json({ error: "no live tmux window" }, 409);
+    }
+    const { text } = z.object({ text: z.string().min(1) }).parse(await c.req.json());
+    await sendText(agent.tmux_target, text);
+    logEvent("agent.sent", { agentId: agent.id, taskId: agent.task_id ?? undefined });
+    return c.json({ ok: true });
+  });
+
+  app.post("/api/main", async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { model?: string };
+    return c.json(spawnMain(body.model), 201);
+  });
+
+  // Claude Code hooks POST their stdin JSON here (see genconfig.ts).
+  // Respond immediately — verification can take minutes and the hook's curl
+  // has a 5s timeout; the transition runs in the background.
+  app.post("/api/hooks/agent/:id", async (c) => {
+    const id = Number(c.req.param("id"));
+    const body = (await c.req.json().catch(() => ({}))) as HookPayload;
+    void handleHookEvent(id, body).catch((err) =>
+      logEvent("hook.error", { agentId: id, payload: { error: String(err) } }),
+    );
+    return c.json({ ok: true });
   });
 
   app.get("/api/events", (c) =>

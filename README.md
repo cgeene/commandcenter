@@ -11,9 +11,24 @@ its own git worktree and tmux window, managed by a local daemon.
 - **Workers** — interactive `claude` sessions launched into tmux windows
   (session `cc`), one git worktree + branch (`agent/task-N`) per task,
   `--permission-mode acceptEdits`.
+- **Hooks (Phase 2)** — each agent gets a generated settings file
+  (`~/.commandcenter/settings/`) whose `SessionStart`/`Stop`/`Notification`
+  hooks POST back to the daemon. `Stop` on an in-progress task runs the
+  task's `verify_cmd` in the worktree: pass → `review`; fail → the failure
+  output is sent back into the worker's session (max 2 nudges, then
+  `blocked`). We never touch `~/.claude/settings.json`.
+- **MCP server (Phase 2)** — `cc-mcp` (stdio) exposes the platform to agents
+  via a generated `--mcp-config`. Workers get a scoped toolset
+  (`get_my_task`, `update_my_task`, `report_blocked`, `add_task`); the main
+  agent gets the full orchestration set (spawn/kill/peek/send workers,
+  full queue CRUD, events).
+- **Main agent (Phase 2)** — `agp main` spawns the orchestrator (default
+  model `opus`, override with `-m` or `CC_MAIN_MODEL`): it triages the
+  queue, picks models, spawns/monitors/reviews workers. One live main
+  agent at a time.
 
-Later phases add hook-based done-detection, an orchestrator main agent with
-MCP tools, a web dashboard (Tailscale-exposed), and an autonomous scheduler.
+Later phases add the web dashboard (Tailscale-exposed) and an autonomous
+scheduler.
 
 ## Setup
 
@@ -36,10 +51,14 @@ agp task ls                             # queue overview
 agp agent spawn --task 1                # worktree + tmux window + claude
 agp agent ls
 agp agent peek 1                        # see its terminal without attaching
+agp agent send 1 "also update the docs" # message a running worker
 agp attach 1                            # interact; detach with C-b d
-agp task update 1 -s review             # after checking the branch
+agp task update 1 -s done               # after reviewing the branch
 agp agent kill 1 --rm-worktree
 agp events
+
+agp main                                # spawn the orchestrator agent
+agp attach 2                            # talk to it: "work through the queue"
 ```
 
 ## Environment

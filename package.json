@@ -6,7 +6,8 @@
   "type": "module",
   "bin": {
     "agentd": "./dist/daemon/index.js",
-    "agp": "./dist/cli/index.js"
+    "agp": "./dist/cli/index.js",
+    "cc-mcp": "./dist/mcp/index.js"
   },
   "scripts": {
     "build": "tsc",
@@ -19,6 +20,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^12.2.0",
     "commander": "^14.0.0",
     "hono": "^4.8.0",
