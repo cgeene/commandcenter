@@ -2,7 +2,8 @@
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { Command } from "commander";
-import { tmuxSession } from "../config.js";
+import { pkgRoot, tmuxSession } from "../config.js";
+import { buildDreamPrompt } from "../prompts/dreamer.js";
 import type { Agent } from "../db/agents.js";
 import type { Event } from "../db/events.js";
 import type { Task } from "../db/tasks.js";
@@ -310,6 +311,32 @@ cron
     const c = await resolveCron(idOrName);
     const task = await api<{ id: number }>("POST", `/api/crons/${c.id}/run`);
     console.log(`cron "${c.name}" fired -> task #${task.id} queued`);
+  });
+
+// ---- dream ----
+
+const dream = program.command("dream").description("nightly reflection run");
+
+dream
+  .command("setup")
+  .description("create the dreaming cron (DISABLED — enable with: agp cron enable dreaming)")
+  .option("-s, --schedule <cron>", "when to dream", "0 4 * * *")
+  .option("-m, --model <model>", "reflection model", "opus")
+  .option("-r, --repo <path>", "repo for the dream worktree + improvement tasks (default: commandcenter)")
+  .action(async (opts) => {
+    const c = await api<CronJob>("POST", "/api/crons", {
+      name: "dreaming",
+      title: "Dreaming run — nightly reflection",
+      schedule: opts.schedule,
+      prompt: buildDreamPrompt(),
+      repo: opts.repo ?? pkgRoot().replace(/\/$/, ""),
+      model: opts.model,
+      priority: 3,
+      enabled: false,
+    });
+    console.log(`dreaming cron #${c.id} created (disabled), schedule "${c.schedule}"`);
+    console.log("test it:   agp cron run dreaming   (enqueues one dream task now)");
+    console.log("enable it: agp cron enable dreaming");
   });
 
 // ---- memory ----

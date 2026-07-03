@@ -180,6 +180,7 @@ export function buildApp(): Hono {
     model: z.string().optional(),
     priority: z.number().int().min(0).max(4).optional(),
     verify_cmd: z.string().optional(),
+    enabled: z.boolean().optional(),
   });
 
   const cronPatchSchema = z.object({
@@ -240,6 +241,16 @@ export function buildApp(): Hono {
       payload: { cron_id: cron.id, name: cron.name, manual: true },
     });
     return c.json(task, 201);
+  });
+
+  app.get("/api/summary", async (c) => {
+    const hours = Math.min(Number(c.req.query("hours") ?? 24), 24 * 14);
+    const until = c.req.query("until") ?? new Date().toISOString();
+    const since =
+      c.req.query("since") ??
+      new Date(Date.parse(until) - hours * 3600_000).toISOString();
+    const { activitySummary } = await import("./summary.js");
+    return c.json(activitySummary(since, until));
   });
 
   app.get("/api/memories", (c) => {

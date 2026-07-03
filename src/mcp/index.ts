@@ -108,6 +108,18 @@ server.registerTool(
     ),
 );
 
+server.registerTool(
+  "activity_summary",
+  {
+    description:
+      "Digest of platform activity for the last N hours: tasks touched (with verify failures and results), current open queue, event counts, friction (stalls, vanished workers, repeated verify failures, cron skips), memories added, spawn counts. Read-only.",
+    inputSchema: {
+      hours: z.number().int().min(1).max(336).optional().describe("default 24"),
+    },
+  },
+  async ({ hours }) => asText(await call("GET", `/api/summary?hours=${hours ?? 24}`)),
+);
+
 // ---- worker tools ----
 
 if (ROLE === "worker") {

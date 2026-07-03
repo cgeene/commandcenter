@@ -42,6 +42,15 @@ its own git worktree and tmux window, managed by a local daemon.
   into every worker's prompt at spawn, so repo quirks and build gotchas get
   learned once and applied forever. Human access: `agp memory
   ls|search|add|rm` and the dashboard's memory drawer.
+- **Dreaming run** — a nightly reflection agent (created disabled by
+  `agp dream setup`; enable with `agp cron enable dreaming`). It reads the
+  day's activity via `activity_summary`, stores durable lessons into memory
+  (max 5/night), files improvement tasks for recurring friction (max
+  3/night, duplicate-checked against the open queue), and leaves a morning
+  report in its task's result summary — which lands in `review`, so the
+  report ping is your normal review push. Guardrails: it's an ordinary
+  worker with the narrow worker toolset — no code changes, no spawning, no
+  merging; everything it produces is human-reviewed.
 - **Scheduler (Phase 4)** — off by default; toggle via `agp scheduler on|off`
   or the dashboard's auto button (green = on, click = kill switch). Every
   30s it claims ready tasks up to `max_concurrent` (default 3), bounded by a

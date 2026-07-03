@@ -33,12 +33,13 @@ export function createCron(c: {
   model?: string;
   priority?: number;
   verify_cmd?: string;
+  enabled?: boolean;
 }): CronJob {
   const next = nextRun(c.schedule, new Date()); // validates too
   const info = getDb()
     .prepare(
-      `INSERT INTO crons (name, schedule, title, prompt, repo, model, priority, verify_cmd, next_run_at)
-       VALUES (@name, @schedule, @title, @prompt, @repo, @model, @priority, @verify_cmd, @next_run_at)`,
+      `INSERT INTO crons (name, schedule, title, prompt, repo, model, priority, verify_cmd, enabled, next_run_at)
+       VALUES (@name, @schedule, @title, @prompt, @repo, @model, @priority, @verify_cmd, @enabled, @next_run_at)`,
     )
     .run({
       name: c.name,
@@ -49,6 +50,7 @@ export function createCron(c: {
       model: c.model ?? null,
       priority: c.priority ?? 2,
       verify_cmd: c.verify_cmd ?? null,
+      enabled: c.enabled === false ? 0 : 1,
       next_run_at: next,
     });
   return getCron(Number(info.lastInsertRowid))!;
