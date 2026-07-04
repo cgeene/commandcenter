@@ -91,8 +91,11 @@ its own git worktree and tmux window, managed by a local daemon.
   start with `agp agent spawn --task N --fresh`.
 
 - **Web dashboard (Phase 3)** — React SPA served by the daemon at
-  `http://127.0.0.1:4711`: kanban board, agent grid, live terminal
-  (xterm.js ↔ WebSocket ↔ PTY ↔ tmux), transcript viewer, new-task form.
+  `http://127.0.0.1:4711`, tabbed (hash-routed: `#/board`, `#/tokens`; add
+  a tab = one entry in `TABS` + a render branch). **board**: kanban, agent
+  grid, live terminal (xterm.js ↔ WebSocket ↔ PTY ↔ tmux), transcript
+  viewer, new-task form. **tokens**: total/today/per-model stat cards and
+  a per-task usage table (click a row for the task panel).
   Each browser terminal gets its own *grouped* tmux session so viewers
   don't resize or steal focus from your desktop tmux client.
 - **Push (Phase 3)** — set `CC_NTFY_URL` (e.g. `https://ntfy.sh/<topic>`,

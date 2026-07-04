@@ -13,6 +13,18 @@ import type {
   TranscriptEntry,
 } from "./types";
 
+/** Dashboard tabs — add an entry here + a render branch in App to grow the dashboard. */
+const TABS = [
+  { id: "board", label: "board" },
+  { id: "tokens", label: "tokens" },
+] as const;
+type TabId = (typeof TABS)[number]["id"];
+
+function tabFromHash(): TabId {
+  const h = window.location.hash.replace(/^#\//, "");
+  return TABS.some((t) => t.id === h) ? (h as TabId) : "board";
+}
+
 const COLUMNS: { title: string; statuses: TaskStatus[] }[] = [
   { title: "Queued", statuses: ["queued", "claimed"] },
   { title: "In progress", statuses: ["in_progress"] },
@@ -76,7 +88,17 @@ export function App() {
   const [scheduler, setScheduler] = useState<SchedulerInfo | null>(null);
   const [stale, setStale] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [tab, setTabState] = useState<TabId>(tabFromHash);
   const keyboardStyle = useKeyboardAwareStyle();
+
+  const setTab = (t: TabId) => {
+    window.location.hash = `/${t}`; // hashchange listener updates state
+  };
+  useEffect(() => {
+    const onHash = () => setTabState(tabFromHash());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -134,6 +156,17 @@ export function App() {
       )}
       <header>
         <h1>commandcenter</h1>
+        <nav className="tabs">
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              className={tab === t.id ? "active" : ""}
+              onClick={() => setTab(t.id)}
+            >
+              {t.label}
+            </button>
+          ))}
+        </nav>
         <span className="muted">
           {tasks.filter((t) => t.status === "in_progress").length} running ·{" "}
           {tasks.filter((t) => ["queued", "claimed"].includes(t.status)).length}{" "}
@@ -175,6 +208,7 @@ export function App() {
         </div>
       )}
 
+      {tab === "board" && (
       <section className="agents">
         {agents.map((a) => (
           <div key={a.id} className="agent-card">
@@ -201,7 +235,11 @@ export function App() {
         ))}
         {agents.length === 0 && <span className="muted">no live agents</span>}
       </section>
+      )}
 
+      {tab === "tokens" && <TokensView tasks={tasks} onSelect={setSelTask} />}
+
+      {tab === "board" && (
       <main>
         <div className="board">
           {COLUMNS.map((col) => {
@@ -247,6 +285,7 @@ export function App() {
           ))}
         </aside>
       </main>
+      )}
 
       {selTask && (
         <TaskPanel
@@ -311,6 +350,104 @@ export function App() {
   );
 }
 
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
+  return String(n);
+}
+
+function TokensView({
+  tasks,
+  onSelect,
+}: {
+  tasks: Task[];
+  onSelect: (t: Task) => void;
+}) {
+  const tracked = tasks.filter((t) => (t.tokens_used ?? 0) > 0);
+  const total = tracked.reduce((s, t) => s + (t.tokens_used ?? 0), 0);
+  const today = new Date().toISOString().slice(0, 10);
+  const todayTotal = tracked
+    .filter((t) => t.updated_at.slice(0, 10) === today)
+    .reduce((s, t) => s + (t.tokens_used ?? 0), 0);
+
+  const byModel = new Map<string, number>();
+  for (const t of tracked) {
+    const key = t.model ?? "default";
+    byModel.set(key, (byModel.get(key) ?? 0) + (t.tokens_used ?? 0));
+  }
+  const rows = [...tracked].sort(
+    (a, b) => (b.tokens_used ?? 0) - (a.tokens_used ?? 0),
+  );
+
+  return (
+    <main>
+      <div className="tokens-view">
+        <div className="stat-cards">
+          <div className="stat-card">
+            <b>{fmtTokens(total)}</b>
+            <span className="muted">total tokens</span>
+          </div>
+          <div className="stat-card">
+            <b>{fmtTokens(todayTotal)}</b>
+            <span className="muted">tasks touched today</span>
+          </div>
+          <div className="stat-card">
+            <b>{tracked.length}</b>
+            <span className="muted">tasks tracked</span>
+          </div>
+          {[...byModel.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .map(([model, n]) => (
+              <div className="stat-card" key={model}>
+                <b>{fmtTokens(n)}</b>
+                <span className="muted">{model}</span>
+              </div>
+            ))}
+        </div>
+
+        {rows.length > 0 ? (
+          <table className="token-table">
+            <thead>
+              <tr>
+                <th>task</th>
+                <th>model</th>
+                <th>status</th>
+                <th className="num">tokens</th>
+                <th className="num">share</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((t) => (
+                <tr key={t.id} onClick={() => onSelect(t)}>
+                  <td>
+                    #{t.id} {t.title}
+                  </td>
+                  <td>{t.model ?? "—"}</td>
+                  <td>
+                    <span className={`chip ${t.status}`}>{t.status}</span>
+                  </td>
+                  <td className="num">{fmtTokens(t.tokens_used ?? 0)}</td>
+                  <td className="num muted">
+                    {total ? Math.round(((t.tokens_used ?? 0) / total) * 100) : 0}%
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <span className="muted">
+            no token data yet — usage is recorded each time a worker finishes a turn
+          </span>
+        )}
+        <p className="muted token-note">
+          input + output + cache tokens summed from session transcripts.
+          Approximate: a fresh (non-resumed) respawn resets a task's count.
+        </p>
+      </div>
+    </main>
+  );
+}
+
 function TaskPanel({
   task,
   onClose,
@@ -360,11 +497,7 @@ function TaskPanel({
           {task.tokens_used != null && task.tokens_used > 0 && (
             <>
               <dt>tokens</dt>
-              <dd>
-                {task.tokens_used >= 1_000_000
-                  ? `${(task.tokens_used / 1_000_000).toFixed(1)}M`
-                  : `${Math.round(task.tokens_used / 1000)}k`}
-              </dd>
+              <dd>{fmtTokens(task.tokens_used)}</dd>
             </>
           )}
           {task.pr_url && (
