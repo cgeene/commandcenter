@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { getAgent, listAgents } from "../db/agents.js";
+import { getAgent, listAgents, updateAgent } from "../db/agents.js";
 import { logEvent } from "../db/events.js";
 import { getTask, listTasks, updateTask, type Task } from "../db/tasks.js";
 import { notify } from "./notify.js";
@@ -162,6 +162,7 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
 
   if (workerAlive) {
     updateTask(taskId, { status: "in_progress", pr_feedback_at: mark });
+    updateAgent(worker.id, { state: "working" });
     await sendText(
       worker.tmux_target!,
       `New feedback on your PR (${task.pr_url}). Address every point, push to the same branch, then update your result_summary and stop.\n\n${feedback}`,

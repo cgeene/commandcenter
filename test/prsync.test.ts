@@ -1,8 +1,14 @@
-import { beforeEach, afterEach, describe, expect, it } from "vitest";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { PrState } from "../src/daemon/prsync.js";
+
+vi.mock("../src/daemon/tmux.js", () => ({
+  windowExists: () => true,
+  sendText: async () => {},
+  capturePane: () => "",
+}));
 
 let tmpDir: string;
 
@@ -107,6 +113,30 @@ describe("applyPrState", () => {
     );
     expect(getTask(task.id)?.status).toBe("review"); // untouched
     expect(listEvents(10).map((e) => e.kind)).not.toContain("pr.feedback");
+  });
+
+  it("delivering PR feedback moves a waiting_input worker back to working", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { task } = await setupPrTask();
+    const worker = createAgent({
+      kind: "worker",
+      state: "waiting_input",
+      task_id: task.id,
+      tmux_target: "cc:@7",
+    });
+    updateTask(task.id, { agent_id: worker.id });
+    await applyPrState(
+      task.id,
+      open({
+        comments: [
+          { author: "caleb", body: "fix this", created_at: "2026-07-04T02:00:00Z" },
+        ],
+      }),
+    );
+    expect(getTask(task.id)?.status).toBe("in_progress");
+    expect(getAgent(worker.id)?.state).toBe("working");
   });
 
   it("does nothing for tasks not in review", async () => {
