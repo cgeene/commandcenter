@@ -9,7 +9,8 @@ export type TaskStatus =
   | "blocked"
   | "review"
   | "done"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export type AgentState =
   | "spawning"
@@ -27,6 +28,7 @@ export const TASK_STATUSES: TaskStatus[] = [
   "review",
   "done",
   "failed",
+  "cancelled",
 ];
 
 const SCHEMA = `

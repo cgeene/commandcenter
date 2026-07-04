@@ -233,7 +233,8 @@ if (ROLE === "main") {
         id: z.number().int(),
         status: z
           .enum(["queued", "claimed", "in_progress", "blocked", "review", "done", "failed"])
-          .optional(),
+          .optional()
+          .describe("to close a task from any state, use cancel_task instead — it also kills live agents"),
         priority: z.number().int().min(0).max(4).optional(),
         model: z.string().optional(),
         prompt: z.string().optional(),
@@ -242,6 +243,23 @@ if (ROLE === "main") {
       },
     },
     async ({ id, ...fields }) => asText(await call("PATCH", `/api/tasks/${id}`, fields)),
+  );
+
+  server.registerTool(
+    "cancel_task",
+    {
+      description:
+        "Close a task from ANY state: kills its live worker/reviewer and marks it cancelled (terminal, idempotent). Returns any open tasks still blocked on it — those need re-pointing or cancelling too.",
+      inputSchema: {
+        task_id: z.number().int(),
+        rm_worktree: z
+          .boolean()
+          .optional()
+          .describe("also remove the task's worktree (uncommitted work is lost; the branch survives)"),
+      },
+    },
+    async ({ task_id, rm_worktree }) =>
+      asText(await call("POST", `/api/tasks/${task_id}/cancel`, { rm_worktree })),
   );
 
   server.registerTool(

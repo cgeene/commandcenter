@@ -18,7 +18,7 @@ const COLUMNS: { title: string; statuses: TaskStatus[] }[] = [
   { title: "In progress", statuses: ["in_progress"] },
   { title: "Blocked", statuses: ["blocked"] },
   { title: "Review", statuses: ["review"] },
-  { title: "Done", statuses: ["done", "failed"] },
+  { title: "Done", statuses: ["done", "failed", "cancelled"] },
 ];
 
 /**
@@ -211,6 +211,7 @@ export function App() {
                         <span className="chip agent-chip">a{t.agent_id}</span>
                       )}
                       {t.status === "failed" && <span className="chip bad">failed</span>}
+                      {t.status === "cancelled" && <span className="chip">cancelled</span>}
                     </div>
                   </div>
                 ))}
@@ -378,7 +379,7 @@ function TaskPanel({
               ✓ mark done
             </button>
           )}
-          {["blocked", "review", "failed"].includes(task.status) && (
+          {["blocked", "review", "failed", "cancelled"].includes(task.status) && (
             <button
               onClick={() =>
                 onAction(() =>
@@ -387,6 +388,17 @@ function TaskPanel({
               }
             >
               ↺ requeue
+            </button>
+          )}
+          {!["done", "cancelled"].includes(task.status) && (
+            <button
+              className="danger"
+              onClick={() => {
+                if (!confirm(`Cancel task #${task.id}? Live agents are killed; the branch survives.`)) return;
+                void onAction(() => api("POST", `/api/tasks/${task.id}/cancel`, {}));
+              }}
+            >
+              ✕ cancel task
             </button>
           )}
         </div>

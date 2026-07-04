@@ -37,6 +37,7 @@ button:hover { background: #30363d; }
 button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
 button.primary:hover { background: #388bfd; }
 button.primary:disabled { opacity: 0.5; cursor: default; }
+button.danger { color: #f85149; }
 button.danger:hover { background: #da3633; border-color: #da3633; color: #fff; }
 button.sched-on { background: #238636; border-color: #238636; color: #fff; }
 button.sched-on:hover { background: #da3633; border-color: #da3633; }
@@ -87,6 +88,7 @@ main { display: flex; flex: 1; overflow: hidden; }
 .chip.blocked { color: var(--red); }
 .chip.done { color: var(--green); }
 .chip.in_progress { color: var(--green); }
+.chip.cancelled { color: var(--muted, #8b949e); }
 
 .events {
   width: 280px; flex-shrink: 0; border-left: 1px solid var(--border);

@@ -27,7 +27,13 @@ import {
 } from "../db/tasks.js";
 import { handleHookEvent, type HookPayload } from "./hooks.js";
 import { handleVerdict, taskDiff } from "./review.js";
-import { killAgent, spawnMain, spawnReviewer, spawnWorker } from "./spawn.js";
+import {
+  cancelTask,
+  killAgent,
+  spawnMain,
+  spawnReviewer,
+  spawnWorker,
+} from "./spawn.js";
 import { capturePane, sendText, windowExists } from "./tmux.js";
 
 const newTaskSchema = z.object({
@@ -118,6 +124,14 @@ export function buildApp(): Hono {
       .parse(await c.req.json());
     const task = await handleVerdict(id, body.agent_id, body.verdict, body.notes);
     return c.json(task);
+  });
+
+  app.post("/api/tasks/:id/cancel", async (c) => {
+    const id = Number(c.req.param("id"));
+    const body = (await c.req.json().catch(() => ({}))) as {
+      rm_worktree?: boolean;
+    };
+    return c.json(cancelTask(id, { rmWorktree: body.rm_worktree }));
   });
 
   app.post("/api/tasks/:id/claim", (c) => {

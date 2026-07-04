@@ -75,7 +75,8 @@ export function listTasks(status?: TaskStatus): Task[] {
       `SELECT * FROM tasks
        ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'claimed' THEN 1
                             WHEN 'queued' THEN 2 WHEN 'blocked' THEN 3
-                            WHEN 'review' THEN 4 WHEN 'failed' THEN 5 ELSE 6 END,
+                            WHEN 'review' THEN 4 WHEN 'failed' THEN 5
+                            WHEN 'cancelled' THEN 6 ELSE 7 END,
                 priority ASC, id ASC`,
     )
     .all() as Task[];
@@ -91,6 +92,17 @@ export function readyTasks(): Task[] {
        ORDER BY t.priority ASC, t.id ASC`,
     )
     .all() as Task[];
+}
+
+/** Open tasks waiting on `taskId` via blocked_by. A cancelled blocker never
+ *  becomes 'done', so these stay stuck unless the human re-points them. */
+export function openDependents(taskId: number): Task[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM tasks WHERE blocked_by = ?
+       AND status NOT IN ('done','failed','cancelled') ORDER BY id ASC`,
+    )
+    .all(taskId) as Task[];
 }
 
 /**

@@ -5,7 +5,8 @@ export type TaskStatus =
   | "blocked"
   | "review"
   | "done"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export interface Task {
   id: number;

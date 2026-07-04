@@ -121,6 +121,27 @@ task
   });
 
 task
+  .command("cancel <id>")
+  .description("close a task from any state (kills its live worker/reviewer)")
+  .option("--rm-worktree", "also remove the worktree (uncommitted work is lost)")
+  .action(async (id: string, opts) => {
+    const r = await api<{
+      task: Task;
+      killed_agents: number[];
+      open_dependents: Task[];
+    }>("POST", `/api/tasks/${id}/cancel`, { rm_worktree: opts.rmWorktree });
+    const killed = r.killed_agents.length
+      ? ` (killed ${r.killed_agents.map((a) => `a${a}`).join(", ")})`
+      : "";
+    console.log(`task #${r.task.id} cancelled${killed}`);
+    for (const d of r.open_dependents) {
+      console.log(
+        `warning: task #${d.id} ("${d.title}") is blocked_by #${r.task.id} and will never become ready — re-point or cancel it`,
+      );
+    }
+  });
+
+task
   .command("diff <id>")
   .description("show the diff on a task's branch")
   .option("--stat", "stat + commits only")

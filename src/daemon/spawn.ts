@@ -11,7 +11,13 @@ import {
 } from "../db/agents.js";
 import { logEvent } from "../db/events.js";
 import { memorySectionFor } from "../db/memories.js";
-import { claimTask, getTask, updateTask, type Task } from "../db/tasks.js";
+import {
+  claimTask,
+  getTask,
+  openDependents,
+  updateTask,
+  type Task,
+} from "../db/tasks.js";
 import { ORCHESTRATOR_PROMPT } from "../prompts/orchestrator.js";
 import { buildReviewerPrompt } from "../prompts/reviewer.js";
 import { writeMcpConfigFile, writeSettingsFile } from "./genconfig.js";
@@ -259,6 +265,49 @@ export function spawnMain(model?: string): Agent {
     payload: { target, model: resolvedModel, kind: "main" },
   });
   return getAgent(agent.id)!;
+}
+
+/**
+ * Terminal cancel from ANY state: kill the task's live worker and reviewer
+ * (if any), then mark it cancelled. Idempotent. Returns the tasks still
+ * blocked on this one — a cancelled blocker never becomes 'done', so the
+ * caller should surface those to the human.
+ */
+export function cancelTask(
+  taskId: number,
+  opts?: { rmWorktree?: boolean },
+): { task: Task; killed_agents: number[]; open_dependents: Task[] } {
+  const task = getTask(taskId);
+  if (!task) throw new Error(`task ${taskId} not found`);
+
+  const killed: number[] = [];
+  if (task.status !== "cancelled") {
+    for (const a of listAgents({ live: true })) {
+      if (a.task_id !== taskId || a.kind === "main") continue;
+      // reviewer worktrees are throwaway — always reap them with the agent
+      killAgent(a.id, { rmWorktree: a.kind === "reviewer" || opts?.rmWorktree });
+      killed.push(a.id);
+    }
+    // killAgent(worker, rmWorktree) already cleared task.worktree; this
+    // covers a leftover worktree with no live agent attached.
+    if (opts?.rmWorktree) {
+      const fresh = getTask(taskId)!;
+      if (fresh.worktree) {
+        removeWorktree(fresh.repo, fresh.worktree);
+        updateTask(taskId, { worktree: null });
+      }
+    }
+    updateTask(taskId, { status: "cancelled" });
+    logEvent("task.cancelled", {
+      taskId,
+      payload: { from: task.status, killed_agents: killed },
+    });
+  }
+  return {
+    task: getTask(taskId)!,
+    killed_agents: killed,
+    open_dependents: openDependents(taskId),
+  };
 }
 
 export function killAgent(

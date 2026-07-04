@@ -147,6 +147,12 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
   }
 
   const result = await runVerify(task.verify_cmd, task.worktree);
+
+  // Verification can take minutes — if the task was cancelled (or otherwise
+  // moved on) while it ran, the stale result must not resurrect it.
+  const current = getTask(task.id);
+  if (!current || !["in_progress", "review"].includes(current.status)) return;
+
   if (result.ok) {
     updateTask(task.id, { status: "review" });
     logEvent("verify.passed", { taskId: task.id, agentId: agent.id });

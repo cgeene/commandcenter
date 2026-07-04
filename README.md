@@ -122,6 +122,7 @@ agp attach 1                            # interact; detach with C-b d
 agp task diff 1                         # what actually changed on the branch
 agp review 1                            # adversarial reviewer for a task in review
 agp task update 1 -s done               # after reviewing the branch
+agp task cancel 3 --rm-worktree         # close a task from ANY state (kills its agents)
 agp agent kill 1 --rm-worktree
 agp events
 
@@ -145,6 +146,12 @@ agp attach 2                            # talk to it: "work through the queue"
 ## Statuses
 
 Tasks: `queued → claimed → in_progress → blocked / review → done / failed`.
+`cancelled` is reachable from ANY state via `agp task cancel <id>` (or the
+main agent's `cancel_task`, or the dashboard's ✕): live worker + reviewer
+are killed, the branch survives (`--rm-worktree` to drop uncommitted work),
+and an in-flight verify result can't resurrect the task. Cancelled tasks can
+be requeued. A task `blocked_by` a cancelled one never becomes ready — the
+cancel reports these so you can re-point or cancel them.
 A reviewer rejection sends `review → in_progress` (live worker) or
 `review → queued` (worker gone, notes baked into the respawn prompt);
 `review_verdict`/`review_notes`/`review_cycles` on the task record who said
