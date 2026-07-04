@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { TASK_STATUSES, type TaskStatus } from "../db/db.js";
-import { getAgent, listAgents } from "../db/agents.js";
+import { getAgent, listAgents, updateAgent } from "../db/agents.js";
 import {
   createCron,
   deleteCron,
@@ -196,6 +196,14 @@ export function buildApp(): Hono {
     }
     const { text } = z.object({ text: z.string().min(1) }).parse(await c.req.json());
     await sendText(agent.tmux_target, text);
+    // No Claude Code hook fires when a resumed session picks work back up —
+    // Notification is the only thing that sets waiting_input, so nothing
+    // clears it until the agent's next Stop/Notification. Delivering input
+    // is the one place we know for certain the agent is unblocked, so flip
+    // it back to working here instead of leaving the dashboard stale.
+    if (agent.state === "waiting_input") {
+      updateAgent(agent.id, { state: "working" });
+    }
     logEvent("agent.sent", { agentId: agent.id, taskId: agent.task_id ?? undefined });
     return c.json({ ok: true });
   });
