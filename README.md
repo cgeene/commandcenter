@@ -65,6 +65,31 @@ its own git worktree and tmux window, managed by a local daemon.
   watchdog pages you anyway — once per wait, not once per minute. No live
   main agent = you're paged immediately, as before.
 
+- **PR lifecycle sync** — every 2 minutes the daemon polls GitHub (via `gh`)
+  for tasks in `review` with a `pr_url`. Merged → task `done`, agents
+  reaped, worktree removed, local branch pruned. Closed without merge →
+  `blocked`. New PR comments or a CHANGES_REQUESTED verdict → piped into
+  the live worker (or baked into the respawn prompt), task back to
+  `in_progress`. Review entirely in GitHub; the board follows.
+
+- **Stale-daemon detection + `agp upgrade`** — the daemon snapshots
+  `dist/`'s newest mtime at boot; if a rebuild lands while it runs, the
+  watchdog pushes a warning, the dashboard shows a banner, and
+  `GET /api/version` reports `stale: true`. `agp upgrade` = build →
+  respawn the `agentd` tmux window → health-check; `--main` also respawns
+  the main agent so it picks up new MCP tools.
+
+- **Token accounting** — on every worker `Stop` the daemon sums the
+  session transcript's per-turn usage into `tasks.tokens_used` (input +
+  output + cache; approximate, resets on a fresh —non-resumed— respawn).
+  Shown on the dashboard task panel and in `agp task show`.
+
+- **Session resume** — respawning a task whose previous session transcript
+  still exists uses `claude --resume`, so requeued/vanished/rejected work
+  continues with full context instead of starting over; outstanding
+  review/PR feedback rides along in the resume message. Force a clean
+  start with `agp agent spawn --task N --fresh`.
+
 - **Web dashboard (Phase 3)** — React SPA served by the daemon at
   `http://127.0.0.1:4711`: kanban board, agent grid, live terminal
   (xterm.js ↔ WebSocket ↔ PTY ↔ tmux), transcript viewer, new-task form.

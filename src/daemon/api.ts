@@ -61,12 +61,18 @@ const updateTaskSchema = z.object({
 const spawnSchema = z.object({
   task_id: z.number().int(),
   model: z.string().optional(),
+  fresh: z.boolean().optional(),
 });
 
 export function buildApp(): Hono {
   const app = new Hono();
 
   app.get("/healthz", (c) => c.json({ ok: true }));
+
+  app.get("/api/version", async (c) => {
+    const { versionInfo } = await import("./version.js");
+    return c.json(versionInfo());
+  });
 
   app.get("/api/tasks", (c) => {
     const status = c.req.query("status") as TaskStatus | undefined;
@@ -154,7 +160,7 @@ export function buildApp(): Hono {
 
   app.post("/api/agents", async (c) => {
     const body = spawnSchema.parse(await c.req.json());
-    const result = spawnWorker(body.task_id, body.model);
+    const result = spawnWorker(body.task_id, body.model, { fresh: body.fresh });
     return c.json(result, 201);
   });
 

@@ -17,6 +17,7 @@ import {
 import { notify } from "./notify.js";
 import { spawnWorker } from "./spawn.js";
 import { listWindowIds } from "./tmux.js";
+import { versionInfo } from "./version.js";
 
 export interface SchedulerDeps {
   spawn: (taskId: number) => void;
@@ -154,6 +155,8 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
   const windowIds = deps.windowIds();
   const nowMs = deps.now().getTime();
 
+  warnIfStale();
+
   for (const agent of listAgents({ live: true })) {
     // window gone -> agent is dead, whatever the DB thinks
     if (agent.tmux_target && !windowIds.includes(agent.tmux_target)) {
@@ -227,6 +230,22 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
       }
     }
   }
+}
+
+// Stale daemon = every feature since the last rebuild silently doesn't run.
+// Warn once per rebuild, not once per minute.
+let staleWarnedFor: string | null = null;
+
+function warnIfStale(): void {
+  const v = versionInfo();
+  if (!v.stale || v.dist_mtime === staleWarnedFor) return;
+  staleWarnedFor = v.dist_mtime;
+  logEvent("daemon.stale", { payload: v });
+  notify(
+    "agentd is running STALE code",
+    `dist/ was rebuilt at ${v.dist_mtime} but the daemon started ${v.started_at} — run: agp upgrade`,
+    { priority: "high", tags: "warning" },
+  );
 }
 
 function sendWindowReport(): void {

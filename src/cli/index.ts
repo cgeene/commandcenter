@@ -179,14 +179,15 @@ const agent = program.command("agent").description("manage worker agents");
 
 agent
   .command("spawn")
-  .description("spawn a Claude Code worker for a task")
+  .description("spawn a Claude Code worker for a task (resumes its previous session when one exists)")
   .requiredOption("-t, --task <id>", "task id")
   .option("-m, --model <model>", "override the task's model")
+  .option("--fresh", "force a fresh session instead of resuming")
   .action(async (opts) => {
     const { agent: a, task: t } = await api<{ agent: Agent; task: Task }>(
       "POST",
       "/api/agents",
-      { task_id: Number(opts.task), model: opts.model },
+      { task_id: Number(opts.task), model: opts.model, fresh: opts.fresh },
     );
     console.log(
       `agent a${a.id} spawned for task #${t.id} in ${a.tmux_target} (worktree: ${t.worktree})`,
@@ -529,6 +530,59 @@ scheduler
     }
     await api("PATCH", "/api/scheduler", patch);
     await printSchedulerStatus();
+  });
+
+// ---- upgrade ----
+
+program
+  .command("upgrade")
+  .description("rebuild and restart the daemon in place (fixes stale-daemon warnings)")
+  .option("--main", "also respawn the main agent so it picks up new MCP tools")
+  .action(async (opts) => {
+    console.log("building…");
+    const build = spawnSync("npm", ["run", "build:all"], {
+      cwd: pkgRoot(),
+      stdio: "inherit",
+    });
+    if (build.status !== 0) process.exit(build.status ?? 1);
+
+    const list = spawnSync(
+      "tmux",
+      ["list-windows", "-t", tmuxSession(), "-F", "#{window_name}\t#{session_name}:#{window_id}"],
+      { encoding: "utf8" },
+    );
+    const row = (list.stdout ?? "")
+      .split("\n")
+      .find((l) => l.startsWith("agentd\t"));
+    if (!row) {
+      console.log(
+        "no tmux window named 'agentd' found — restart the daemon however you run it, then check: agp scheduler status",
+      );
+      return;
+    }
+    const target = row.split("\t")[1];
+    console.log(`respawning daemon window ${target}…`);
+    spawnSync("tmux", ["respawn-window", "-k", "-t", target]);
+
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      try {
+        const v = await api<{ stale: boolean; started_at: string }>("GET", "/api/version");
+        console.log(`daemon back up (started ${v.started_at}, stale: ${v.stale})`);
+        if (opts.main) {
+          const agents = await api<Agent[]>("GET", "/api/agents?live=true");
+          const main = agents.find((a) => a.kind === "main");
+          if (main) await api("POST", `/api/agents/${main.id}/kill`, {});
+          const a = await api<Agent>("POST", "/api/main", {});
+          console.log(`main agent a${a.id} respawned in ${a.tmux_target}`);
+        }
+        return;
+      } catch {
+        /* daemon not up yet */
+      }
+    }
+    console.error("daemon did not come back within 15s — check the agentd window");
+    process.exit(1);
   });
 
 // ---- main agent ----

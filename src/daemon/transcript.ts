@@ -71,3 +71,39 @@ export function readTranscript(
   }
   return entries.slice(-limit);
 }
+
+export interface SessionTokens {
+  input: number;
+  output: number;
+  cache_read: number;
+  cache_creation: number;
+  total: number;
+}
+
+/** Sum the per-turn usage a session's transcript records for its assistant
+ *  messages. Approximate cost signal, not billing truth. */
+export function sessionTokens(sessionId: string): SessionTokens | undefined {
+  const file = findTranscript(sessionId);
+  if (!file) return undefined;
+
+  const t: SessionTokens = { input: 0, output: 0, cache_read: 0, cache_creation: 0, total: 0 };
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    if (!line.includes('"usage"')) continue;
+    let row: { type?: string; message?: { usage?: Record<string, unknown> } };
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (row.type !== "assistant") continue;
+    const u = row.message?.usage;
+    if (!u) continue;
+    const n = (k: string) => (typeof u[k] === "number" ? (u[k] as number) : 0);
+    t.input += n("input_tokens");
+    t.output += n("output_tokens");
+    t.cache_read += n("cache_read_input_tokens");
+    t.cache_creation += n("cache_creation_input_tokens");
+  }
+  t.total = t.input + t.output + t.cache_read + t.cache_creation;
+  return t;
+}

@@ -27,6 +27,8 @@ export interface Task {
   review_notes: string | null;
   review_cycles: number;
   pr_url: string | null;
+  pr_feedback_at: string | null;
+  tokens_used: number | null;
   created_at: string;
   updated_at: string;
 }

@@ -74,6 +74,7 @@ export function App() {
   const [showMemory, setShowMemory] = useState(false);
   const [showCrons, setShowCrons] = useState(false);
   const [scheduler, setScheduler] = useState<SchedulerInfo | null>(null);
+  const [stale, setStale] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const keyboardStyle = useKeyboardAwareStyle();
 
@@ -101,6 +102,16 @@ export function App() {
     return () => clearInterval(id);
   }, [refresh]);
 
+  useEffect(() => {
+    const check = () =>
+      api<{ stale: boolean }>("GET", "/api/version")
+        .then((v) => setStale(v.stale))
+        .catch(() => {});
+    check();
+    const id = setInterval(check, 60_000);
+    return () => clearInterval(id);
+  }, []);
+
   const act = async (fn: () => Promise<unknown>) => {
     try {
       setError(null);
@@ -116,6 +127,11 @@ export function App() {
 
   return (
     <div className="app">
+      {stale && (
+        <div className="error">
+          daemon is running stale code — run <code>agp upgrade</code>
+        </div>
+      )}
       <header>
         <h1>commandcenter</h1>
         <span className="muted">
@@ -339,6 +355,16 @@ function TaskPanel({
             <>
               <dt>verify</dt>
               <dd>{task.verify_cmd}</dd>
+            </>
+          )}
+          {task.tokens_used != null && task.tokens_used > 0 && (
+            <>
+              <dt>tokens</dt>
+              <dd>
+                {task.tokens_used >= 1_000_000
+                  ? `${(task.tokens_used / 1_000_000).toFixed(1)}M`
+                  : `${Math.round(task.tokens_used / 1000)}k`}
+              </dd>
             </>
           )}
           {task.pr_url && (

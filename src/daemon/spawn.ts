@@ -21,6 +21,7 @@ import {
 import { ORCHESTRATOR_PROMPT } from "../prompts/orchestrator.js";
 import { buildReviewerPrompt } from "../prompts/reviewer.js";
 import { writeMcpConfigFile, writeSettingsFile } from "./genconfig.js";
+import { findTranscript } from "./transcript.js";
 import { killWindow, newWindow, windowExists } from "./tmux.js";
 import {
   createReviewWorktree,
@@ -68,20 +69,44 @@ function buildWorkerPrompt(task: Task, branch: string): string {
   return lines.join("\n");
 }
 
-/** Test-only export: prompt construction is behavior worth pinning. */
+/** Short continuation message for `claude --resume` — the resumed session
+ *  already holds the full task context; don't repeat it, just re-anchor. */
+function buildResumePrompt(task: Task): string {
+  const lines = [
+    `You are being resumed on task #${task.id} ("${task.title}") — your previous session ended before the task was finished, or the task came back to you.`,
+    "Check where you left off (`git status` / `git log` in this worktree), then finish the task.",
+  ];
+  if (task.review_notes) {
+    lines.push(
+      "",
+      "## Outstanding feedback to address first",
+      task.review_notes,
+    );
+  }
+  lines.push(
+    "",
+    "Everything from your original instructions still applies: verify your work, push your branch and open/update the PR if you have commits, then set result_summary via update_my_task and stop.",
+  );
+  return lines.join("\n");
+}
+
+/** Test-only exports: prompt construction is behavior worth pinning. */
 export const _buildWorkerPromptForTest = buildWorkerPrompt;
+export const _buildResumePromptForTest = buildResumePrompt;
 
 function buildClaudeCmd(opts: {
   model?: string;
   settingsFile: string;
   mcpFile: string;
   promptFile: string;
+  resumeSession?: string;
 }): string {
   // The prompt positional MUST come before the flags: --mcp-config is
   // variadic (space-separated configs), so a trailing positional gets
   // swallowed as a "config file" and claude dies with ENAMETOOLONG.
   return [
     shellQuote(claudeBin()),
+    ...(opts.resumeSession ? ["--resume", shellQuote(opts.resumeSession)] : []),
     `"$(cat ${shellQuote(opts.promptFile)})"`,
     ...(opts.model ? ["--model", shellQuote(opts.model)] : []),
     "--permission-mode",
@@ -96,6 +121,7 @@ function buildClaudeCmd(opts: {
 export function spawnWorker(
   taskId: number,
   modelOverride?: string,
+  opts?: { fresh?: boolean },
 ): { agent: Agent; task: Task } {
   const task = getTask(taskId);
   if (!task) throw new Error(`task ${taskId} not found`);
@@ -144,14 +170,24 @@ export function spawnWorker(
     CC_TASK_ID: String(taskId),
   });
 
+  // A prior session with a surviving transcript means the worker can pick
+  // up exactly where it stopped instead of re-learning the task from zero.
+  const resumeSession =
+    !opts?.fresh && task.session_id && findTranscript(task.session_id)
+      ? task.session_id
+      : undefined;
+
   fs.mkdirSync(promptsDir(), { recursive: true });
   const promptFile = path.join(promptsDir(), `${tag}.md`);
-  fs.writeFileSync(promptFile, buildWorkerPrompt(task, branch));
+  fs.writeFileSync(
+    promptFile,
+    resumeSession ? buildResumePrompt(task) : buildWorkerPrompt(task, branch),
+  );
 
   const target = newWindow(
     `t${taskId}`,
     dir,
-    buildClaudeCmd({ model, settingsFile, mcpFile, promptFile }),
+    buildClaudeCmd({ model, settingsFile, mcpFile, promptFile, resumeSession }),
   );
   updateAgent(agent.id, { tmux_target: target, state: "working" });
   updateTask(taskId, {
@@ -164,7 +200,7 @@ export function spawnWorker(
   logEvent("agent.spawned", {
     agentId: agent.id,
     taskId,
-    payload: { target, model, worktree: dir },
+    payload: { target, model, worktree: dir, resumed: Boolean(resumeSession) },
   });
   return { agent: getAgent(agent.id)!, task: getTask(taskId)! };
 }

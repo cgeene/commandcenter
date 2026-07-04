@@ -6,6 +6,7 @@ import { getSchedulerConfig } from "../db/settings.js";
 import { notify } from "./notify.js";
 import { maybeAutoReview } from "./review.js";
 import { killAgent } from "./spawn.js";
+import { sessionTokens } from "./transcript.js";
 import { sendText, windowExists } from "./tmux.js";
 
 export interface HookPayload {
@@ -100,6 +101,7 @@ export async function handleHookEvent(
 
     case "Stop": {
       updateAgent(agentId, { state: "idle" });
+      recordTokens(agent, body.session_id);
       if (agent.kind === "reviewer") {
         reviewerStopped(agent);
         break;
@@ -113,6 +115,21 @@ export async function handleHookEvent(
       }
       break;
     }
+  }
+}
+
+/** Refresh the task's token tally from its worker's transcript. Worker
+ *  sessions only — a reviewer shares the task_id and would clobber the
+ *  worker's numbers with its own session total. */
+function recordTokens(agent: Agent, sessionId?: string): void {
+  if (agent.kind !== "worker" || !agent.task_id) return;
+  const sid = sessionId ?? agent.session_id;
+  if (!sid) return;
+  try {
+    const t = sessionTokens(sid);
+    if (t?.total) updateTask(agent.task_id, { tokens_used: t.total });
+  } catch {
+    /* transcript unreadable — not worth failing a hook over */
   }
 }
 

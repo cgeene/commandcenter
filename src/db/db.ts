@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   review_notes   TEXT,
   review_cycles  INTEGER NOT NULL DEFAULT 0,
   pr_url         TEXT,
+  pr_feedback_at TEXT,
   tokens_used    INTEGER,
   created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -143,6 +144,9 @@ function migrate(db: Database.Database): void {
   }
   if (!cols.includes("pr_url")) {
     db.exec("ALTER TABLE tasks ADD COLUMN pr_url TEXT");
+  }
+  if (!cols.includes("pr_feedback_at")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN pr_feedback_at TEXT");
   }
 }
 

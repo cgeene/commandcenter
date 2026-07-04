@@ -276,10 +276,11 @@ if (ROLE === "main") {
     "spawn_worker",
     {
       description:
-        "Spawn a Claude Code worker for a task in its own git worktree + tmux window. Model defaults to the task's model.",
+        "Spawn a Claude Code worker for a task in its own git worktree + tmux window. Model defaults to the task's model. If the task has a previous session, the worker RESUMES it with full context (pass fresh=true to force a clean start).",
       inputSchema: {
         task_id: z.number().int(),
         model: z.string().optional().describe("haiku | sonnet | opus | ..."),
+        fresh: z.boolean().optional().describe("force a fresh session instead of resuming"),
       },
     },
     async (args) => asText(await call("POST", "/api/agents", args)),

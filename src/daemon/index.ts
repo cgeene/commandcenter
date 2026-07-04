@@ -5,11 +5,14 @@ import { WebSocketServer } from "ws";
 import { dataDir, dbPath, port, webDistDir } from "../config.js";
 import { getDb } from "../db/db.js";
 import { buildApp } from "./api.js";
+import { startPrSync } from "./prsync.js";
 import { startScheduler } from "./scheduler.js";
 import { registerStatic } from "./static.js";
 import { attachTerminal } from "./termws.js";
+import { initVersion } from "./version.js";
 
 getDb(); // open + migrate up front so failures are loud at startup
+initVersion(); // snapshot dist/ mtime for stale-daemon detection
 
 const app = buildApp();
 registerStatic(app); // catch-all — must come after API routes
@@ -24,6 +27,7 @@ const server = serve(
 ) as Server;
 
 startScheduler();
+startPrSync();
 
 // Live terminal: /ws/term/<agentId> bridges xterm.js <-> tmux via a PTY.
 const wss = new WebSocketServer({ noServer: true });
