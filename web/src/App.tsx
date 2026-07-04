@@ -341,6 +341,16 @@ function TaskPanel({
               <dd>{task.verify_cmd}</dd>
             </>
           )}
+          {task.pr_url && (
+            <>
+              <dt>PR</dt>
+              <dd>
+                <a href={task.pr_url} target="_blank" rel="noreferrer">
+                  {task.pr_url}
+                </a>
+              </dd>
+            </>
+          )}
           {task.result_summary && (
             <>
               <dt>result</dt>

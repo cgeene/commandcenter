@@ -97,26 +97,35 @@ describe("handleVerdict", () => {
 });
 
 describe("maybeAutoReview", () => {
-  it("skips manually-created tasks", async () => {
+  it("attempts a reviewer for ANY task reaching review, manual included", async () => {
     const { maybeAutoReview } = await import("../src/daemon/review.js");
     const { listEvents } = await import("../src/db/events.js");
-    const { task } = await setupReviewTask();
-    maybeAutoReview(task.id);
-    const kinds = listEvents(10).map((e) => e.kind);
-    expect(kinds).not.toContain("reviewer.spawned");
-    expect(kinds).not.toContain("reviewer.spawn_error");
-  });
-
-  it("attempts a reviewer for scheduler-spawned tasks", async () => {
-    const { maybeAutoReview } = await import("../src/daemon/review.js");
-    const { logEvent, listEvents } = await import("../src/db/events.js");
-    const { task } = await setupReviewTask();
-    logEvent("scheduler.spawned", { taskId: task.id });
+    const { task } = await setupReviewTask(); // manually created, never scheduler-spawned
     maybeAutoReview(task.id);
     // No real repo/tmux in tests — the attempt surfaces as spawn_error,
     // which proves the gate opened.
     const kinds = listEvents(10).map((e) => e.kind);
     expect(kinds).toContain("reviewer.spawn_error");
+  });
+
+  it("skips branches with no commits (report-only tasks)", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const repo = path.join(tmpDir, "repo");
+    fs.mkdirSync(repo);
+    const g = (...a: string[]) => execFileSync("git", ["-C", repo, ...a]);
+    g("init", "-q");
+    g("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init");
+    g("branch", "agent/task-x"); // branch at HEAD, zero commits ahead
+
+    const { maybeAutoReview } = await import("../src/daemon/review.js");
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const task = createTask({ title: "t", prompt: "x", repo });
+    updateTask(task.id, { status: "review", branch: "agent/task-x" });
+    maybeAutoReview(task.id);
+    const kinds = listEvents(10).map((e) => e.kind);
+    expect(kinds).not.toContain("reviewer.spawned");
+    expect(kinds).not.toContain("reviewer.spawn_error");
   });
 
   it("respects the auto_review kill switch", async () => {

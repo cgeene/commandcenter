@@ -48,6 +48,21 @@ export function countAgentEvents(agentId: number, kinds: string[]): number {
   return row.n;
 }
 
+/** Timestamp of the agent's most recent event of any of `kinds`. */
+export function latestAgentEventTs(
+  agentId: number,
+  kinds: string[],
+): string | undefined {
+  const marks = kinds.map(() => "?").join(",");
+  const row = getDb()
+    .prepare(
+      `SELECT ts FROM events WHERE agent_id = ? AND kind IN (${marks})
+       ORDER BY id DESC LIMIT 1`,
+    )
+    .get(agentId, ...kinds) as { ts: string } | undefined;
+  return row?.ts;
+}
+
 /** Events of `kind` since UTC midnight — used for the daily spawn budget. */
 export function countEventsToday(kind: string): number {
   const row = getDb()

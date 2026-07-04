@@ -28,11 +28,12 @@ its own git worktree and tmux window, managed by a local daemon.
   agent at a time.
 
 - **Adversarial review (Phase 5)** — an independent reviewer agent proofs
-  work before the human sees it. When a task hits `review`, `agp review <id>`
-  (or the main agent's `spawn_reviewer`, or automatically for
-  scheduler-spawned tasks — toggle `agp scheduler set --auto-review on|off`)
-  spawns a fresh Claude session in its own detached worktree at the task's
-  branch, with file-editing tools denied. It gets the same *inputs* as the
+  work before the human sees it. Every task that reaches `review` with
+  commits on its branch is auto-reviewed (toggle `agp scheduler set
+  --auto-review on|off`; report-only tasks like the dreamer are skipped);
+  `agp review <id>` and the main agent's `spawn_reviewer` trigger one
+  manually. The reviewer is a fresh Claude session in its own detached
+  worktree at the task's branch, with file-editing tools denied. It gets the same *inputs* as the
   worker (task prompt, branch, claimed summary) but none of its conversation
   — independence is the point — and is prompted to find reasons to REJECT:
   unmet requirements, weakened tests, summary/diff mismatches. It submits
@@ -45,6 +46,24 @@ its own git worktree and tmux window, managed by a local daemon.
   proof workers with evidence instead of terminal peeks, and the `Stop` hook
   now re-verifies tasks a worker moved to `review` itself, so `verify_cmd`
   can't be bypassed.
+
+- **Worker PRs** — review happens in GitHub, not transcripts. Workers with
+  commits push their own `agent/task-N` branch and open a PR (`git push` on
+  their branch + `gh pr create` are pre-allowed in their generated settings,
+  so no permission stall), record it via `update_my_task(pr_url)`, and the
+  PR link rides along on review pushes, the task record, and the dashboard.
+  Merging, force-pushes, and any other branch remain the human's.
+
+- **Main-agent triage of stuck workers** — when a worker hits
+  `waiting_input`, the daemon first hands it to a live main agent (a
+  "[commandcenter] aN is waiting for input" message lands in its session):
+  it peeks, answers questions or approves safe/expected permission prompts
+  itself (e.g. a worker pushing its own branch), and pages you via its
+  `escalate` tool only for what's genuinely yours — credentials, judgment
+  calls, destructive actions. If nothing resolves the wait within
+  `escalate_minutes` (default 5, `agp scheduler set --escalate <m>`), the
+  watchdog pages you anyway — once per wait, not once per minute. No live
+  main agent = you're paged immediately, as before.
 
 - **Web dashboard (Phase 3)** — React SPA served by the daemon at
   `http://127.0.0.1:4711`: kanban board, agent grid, live terminal

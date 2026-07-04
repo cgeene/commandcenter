@@ -175,10 +175,11 @@ if (ROLE === "worker") {
     "update_my_task",
     {
       description:
-        "Update your own task: set result_summary when done, or move status to blocked/review.",
+        "Update your own task: set result_summary when done, pr_url after opening a PR, or move status to blocked/review.",
       inputSchema: {
         status: z.enum(["blocked", "review"]).optional(),
         result_summary: z.string().optional(),
+        pr_url: z.string().url().optional().describe("the PR you opened for this task"),
       },
     },
     async (args) => asText(await call("PATCH", `/api/tasks/${MY_TASK_ID}`, args)),
@@ -378,6 +379,21 @@ if (ROLE === "main") {
       inputSchema: { id: z.number().int() },
     },
     async ({ id }) => asText(await call("DELETE", `/api/memories/${id}`)),
+  );
+
+  server.registerTool(
+    "escalate",
+    {
+      description:
+        "Page the human immediately (high-priority push). Use when a worker's block genuinely needs them — credentials, a judgment call that's theirs, destructive approval — or when something is wrong you cannot fix. Be specific: say which task/agent and exactly what you need from them.",
+      inputSchema: {
+        title: z.string().max(120),
+        message: z.string().max(2000),
+        task_id: z.number().int().optional(),
+        agent_id: z.number().int().optional(),
+      },
+    },
+    async (args) => asText(await call("POST", "/api/escalate", args)),
   );
 
   server.registerTool(

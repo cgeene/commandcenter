@@ -1,6 +1,11 @@
 import { listAgents, updateAgent } from "../db/agents.js";
 import { dueCrons, nextRun, openTasksFor, updateCron } from "../db/crons.js";
-import { countEventsToday, countTaskEvents, logEvent } from "../db/events.js";
+import {
+  countEventsToday,
+  countTaskEvents,
+  latestAgentEventTs,
+  logEvent,
+} from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import {
   createTask,
@@ -179,6 +184,30 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
         }
       }
       continue;
+    }
+
+    // waiting_input was delegated to the main agent (hooks.ts); if nobody
+    // rescued the worker within escalate_minutes, page the human — once per
+    // wait episode (a fresh Notification starts a new episode).
+    if (agent.kind !== "main" && agent.state === "waiting_input") {
+      const waitStart = latestAgentEventTs(agent.id, ["hook.notification"]);
+      if (
+        waitStart &&
+        nowMs - Date.parse(waitStart) > cfg.escalate_minutes * 60_000
+      ) {
+        const escalated = latestAgentEventTs(agent.id, ["waiting.escalated"]);
+        if (!escalated || escalated < waitStart) {
+          logEvent("waiting.escalated", {
+            agentId: agent.id,
+            taskId: agent.task_id ?? undefined,
+          });
+          notify(
+            `a${agent.id}${agent.task_id ? ` (task #${agent.task_id})` : ""} still needs input`,
+            `waiting ${cfg.escalate_minutes}m+ and the main agent didn't resolve it — peek or attach`,
+            { priority: "high", tags: "warning" },
+          );
+        }
+      }
     }
 
     // silent too long while supposedly working -> stalled

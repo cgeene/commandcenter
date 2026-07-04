@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
-import { getAgent, updateAgent, type Agent } from "../db/agents.js";
+import { getAgent, listAgents, updateAgent, type Agent } from "../db/agents.js";
 import { countAgentEvents, countTaskEvents, logEvent } from "../db/events.js";
 import { getTask, updateTask, type Task } from "../db/tasks.js";
+import { getSchedulerConfig } from "../db/settings.js";
 import { notify } from "./notify.js";
 import { maybeAutoReview } from "./review.js";
 import { killAgent } from "./spawn.js";
@@ -19,6 +20,10 @@ const MAX_VERIFY_NUDGES = 2;
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function getEscalateMinutes(): number {
+  return getSchedulerConfig().escalate_minutes;
 }
 
 /**
@@ -53,14 +58,45 @@ export async function handleHookEvent(
       }
       break;
 
-    case "Notification":
+    case "Notification": {
+      const wasAlreadyWaiting = agent.state === "waiting_input";
       updateAgent(agentId, { state: "waiting_input" });
-      notify(
-        `a${agentId}${agent.task_id ? ` (task #${agent.task_id})` : ""} needs input`,
-        body.message ?? "waiting for input",
-        { priority: "high", tags: "warning" },
+      const msg = body.message ?? "waiting for input";
+      const who = `a${agentId}${agent.task_id ? ` (task #${agent.task_id})` : ""}`;
+
+      // The main agent asking for input IS the escalation — page the human.
+      if (agent.kind === "main") {
+        notify(`${who} needs input`, msg, { priority: "high", tags: "warning" });
+        break;
+      }
+      // Repeat notification for the same wait: already delegated or paged.
+      if (wasAlreadyWaiting) break;
+
+      // First try the main agent. Only a main that is working/idle — text
+      // injected into a main sitting on its own permission menu would be
+      // interpreted as an answer to that menu.
+      const main = listAgents({ live: true }).find(
+        (a) =>
+          a.kind === "main" &&
+          ["working", "idle"].includes(a.state) &&
+          a.tmux_target !== null &&
+          windowExists(a.tmux_target),
       );
+      if (main) {
+        logEvent("waiting.delegated", {
+          agentId,
+          taskId: agent.task_id ?? undefined,
+          payload: { to: main.id, message: msg },
+        });
+        await sendText(
+          main.tmux_target!,
+          `[commandcenter] ${agent.kind} ${who} is waiting for input: "${msg}". peek_worker(${agentId}) to see exactly what it's asking, then try to unblock it yourself via send_to_worker (for a numbered menu send just the digit). Escalate to the human ONLY if it genuinely needs them: credentials, a judgment call that's theirs, or approval for something destructive/outside the worktree. If unresolved after ${getEscalateMinutes()}m the human is paged automatically.`,
+        );
+      } else {
+        notify(`${who} needs input`, msg, { priority: "high", tags: "warning" });
+      }
       break;
+    }
 
     case "Stop": {
       updateAgent(agentId, { state: "idle" });
@@ -123,7 +159,11 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     if (fresh?.result_summary) {
       updateTask(task.id, { status: "review" });
       logEvent("task.review", { taskId: task.id, agentId: agent.id });
-      notify(`task #${task.id} ready for review`, task.title, { tags: "eyes" });
+      notify(
+        `task #${task.id} ready for review`,
+        fresh.pr_url ? `${task.title}\n${fresh.pr_url}` : task.title,
+        { tags: "eyes" },
+      );
       maybeAutoReview(task.id);
     } else {
       const prior = countTaskEvents(task.id, "task.stopped_incomplete");
@@ -156,9 +196,11 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
   if (result.ok) {
     updateTask(task.id, { status: "review" });
     logEvent("verify.passed", { taskId: task.id, agentId: agent.id });
-    notify(`task #${task.id} ready for review`, `${task.title} — verify passed`, {
-      tags: "eyes,white_check_mark",
-    });
+    notify(
+      `task #${task.id} ready for review`,
+      `${task.title} — verify passed${current.pr_url ? `\n${current.pr_url}` : ""}`,
+      { tags: "eyes,white_check_mark" },
+    );
     maybeAutoReview(task.id);
     return;
   }

@@ -18,6 +18,7 @@ export interface Task {
   review_verdict: string | null;
   review_notes: string | null;
   review_cycles: number;
+  pr_url: string | null;
   tokens_used: number | null;
   cron_id: number | null;
   created_at: string;
@@ -139,6 +140,7 @@ const UPDATABLE = new Set([
   "review_verdict",
   "review_notes",
   "review_cycles",
+  "pr_url",
   "tokens_used",
 ]);
 

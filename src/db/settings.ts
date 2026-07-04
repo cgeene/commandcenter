@@ -11,8 +11,10 @@ export interface SchedulerConfig {
   stall_minutes: number;
   /** Only auto-spawn inside this window (hours, local time); null = always. start > end wraps overnight (e.g. 22 -> 6). */
   active_hours: { start: number; end: number } | null;
-  /** Auto-spawn an adversarial reviewer when a SCHEDULER-spawned task reaches review. Manual tasks are never auto-reviewed. */
+  /** Auto-spawn an adversarial reviewer when a task reaches review. */
   auto_review: boolean;
+  /** Minutes a worker may sit in waiting_input (after the main agent was asked to unblock it) before the human is paged. */
+  escalate_minutes: number;
 }
 
 export const SCHEDULER_DEFAULTS: SchedulerConfig = {
@@ -22,6 +24,7 @@ export const SCHEDULER_DEFAULTS: SchedulerConfig = {
   stall_minutes: 15,
   active_hours: null,
   auto_review: true,
+  escalate_minutes: 5,
 };
 
 function getSetting(key: string): string | undefined {

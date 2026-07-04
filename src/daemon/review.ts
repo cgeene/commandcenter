@@ -1,5 +1,5 @@
 import { getAgent, updateAgent } from "../db/agents.js";
-import { countEventsToday, countTaskEvents, logEvent } from "../db/events.js";
+import { countEventsToday, logEvent } from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { getTask, updateTask, type Task } from "../db/tasks.js";
 import { notify } from "./notify.js";
@@ -41,23 +41,39 @@ export function taskDiff(task: Task): TaskDiff {
 }
 
 /**
- * Auto-spawn an adversarial reviewer when an AUTONOMOUS (scheduler-spawned)
- * task reaches review. Manual tasks are reviewed on demand only. Auto
- * reviews draw from the same daily budget as autonomous worker spawns.
+ * Auto-spawn an adversarial reviewer when a task reaches review — every
+ * task, manual or scheduler-spawned (toggle: auto_review). Skipped when the
+ * branch has no commits (report-only tasks like the dreamer have nothing to
+ * review). Auto reviews draw from the same daily budget as autonomous
+ * worker spawns; a budget skip is pushed so reviews never silently
+ * not-happen.
  */
 export function maybeAutoReview(taskId: number): void {
   const cfg = getSchedulerConfig();
   if (!cfg.auto_review) return;
   const task = getTask(taskId);
   if (!task || task.status !== "review" || !task.branch) return;
-  if (countTaskEvents(taskId, "scheduler.spawned") === 0) return; // manual task
   if (task.review_verdict === "approve") return; // already approved
   if (task.review_cycles >= MAX_REVIEW_CYCLES) return;
+
+  try {
+    const base = git(task.repo, "merge-base", "HEAD", task.branch).trim();
+    if (!git(task.repo, "log", "--oneline", `${base}..${task.branch}`).trim()) {
+      return; // no commits — nothing to review
+    }
+  } catch {
+    // odd repo/branch state: fall through and let spawnReviewer surface it
+  }
 
   const spent =
     countEventsToday("scheduler.spawned") + countEventsToday("reviewer.auto_spawned");
   if (spent >= cfg.daily_spawn_limit) {
     logEvent("reviewer.budget_skipped", { taskId });
+    notify(
+      `task #${taskId} NOT auto-reviewed`,
+      `${task.title} — daily spawn budget exhausted; review manually or agp review ${taskId}`,
+      { priority: "high", tags: "moneybag" },
+    );
     return;
   }
   try {
@@ -99,7 +115,7 @@ export async function handleVerdict(
     updateTask(taskId, { review_verdict: "approve", review_notes: notes });
     notify(
       `task #${taskId} approved by reviewer`,
-      `${task.title} — ready for your final review/merge`,
+      `${task.title} — ready for your final review/merge${task.pr_url ? `\n${task.pr_url}` : ""}`,
       { tags: "white_check_mark" },
     );
     return getTask(taskId)!;

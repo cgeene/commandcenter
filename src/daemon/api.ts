@@ -55,6 +55,7 @@ const updateTaskSchema = z.object({
   blocked_by: z.number().int().nullable().optional(),
   verify_cmd: z.string().nullable().optional(),
   result_summary: z.string().nullable().optional(),
+  pr_url: z.string().url().nullable().optional(),
 });
 
 const spawnSchema = z.object({
@@ -209,6 +210,26 @@ export function buildApp(): Hono {
     return c.json(spawnMain(body.model), 201);
   });
 
+  // Main agent's line to the human: an immediate high-priority push.
+  app.post("/api/escalate", async (c) => {
+    const body = z
+      .object({
+        title: z.string().min(1).max(120),
+        message: z.string().min(1).max(2000),
+        task_id: z.number().int().optional(),
+        agent_id: z.number().int().optional(),
+      })
+      .parse(await c.req.json());
+    logEvent("main.escalated", {
+      taskId: body.task_id,
+      agentId: body.agent_id,
+      payload: { title: body.title },
+    });
+    const { notify } = await import("./notify.js");
+    notify(body.title, body.message, { priority: "high", tags: "sos" });
+    return c.json({ ok: true });
+  });
+
   // Claude Code hooks POST their stdin JSON here (see genconfig.ts).
   // Respond immediately — verification can take minutes and the hook's curl
   // has a 5s timeout; the transition runs in the background.
@@ -351,6 +372,7 @@ export function buildApp(): Hono {
       .nullable()
       .optional(),
     auto_review: z.boolean().optional(),
+    escalate_minutes: z.number().int().min(1).max(120).optional(),
   });
 
   app.get("/api/scheduler", (c) => {
