@@ -76,7 +76,7 @@ server.registerTool(
   "remember",
   {
     description:
-      "Store a durable lesson in platform memory (repo quirks, build gotchas, workflow insights). One fact per call. Relevant memories are auto-injected into future workers' prompts, so write them to be useful standalone.",
+      "Store a durable lesson in platform memory (repo quirks, build gotchas, workflow insights). One fact per call. Relevant memories are auto-injected into future workers' prompts, so write them to be useful standalone. The result includes `similar` — existing memories that overlap heavily; if one already covers your lesson, mention the redundancy in your result_summary so it can be merged (only the main agent / human can delete).",
     inputSchema: {
       text: z.string().max(2000).describe("the lesson, standalone and specific"),
       tags: z.string().optional().describe("comma-separated, e.g. 'repo:functions,build'"),
@@ -107,7 +107,7 @@ server.registerTool(
     asText(
       await call(
         "GET",
-        `/api/memories?q=${encodeURIComponent(query)}&limit=${limit ?? 10}`,
+        `/api/memories?q=${encodeURIComponent(query)}&limit=${limit ?? 10}&track=1`,
       ),
     ),
 );

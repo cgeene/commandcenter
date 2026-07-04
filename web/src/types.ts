@@ -65,6 +65,8 @@ export interface Memory {
   tags: string | null;
   task_id: number | null;
   agent_id: number | null;
+  use_count: number;
+  last_used_at: string | null;
   created_at: string;
 }
 

@@ -84,17 +84,22 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 CREATE TABLE IF NOT EXISTS memories (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  text       TEXT NOT NULL,
-  tags       TEXT,
-  task_id    INTEGER,
-  agent_id   INTEGER,
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  text         TEXT NOT NULL,
+  tags         TEXT,
+  task_id      INTEGER,
+  agent_id     INTEGER,
+  use_count    INTEGER NOT NULL DEFAULT 0,
+  last_used_at TEXT,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   text, tags, content='memories', content_rowid='id'
 );
+
+-- corpus term statistics for IDF-aware query construction
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_vocab USING fts5vocab('memories_fts', 'row');
 
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
   INSERT INTO memories_fts(rowid, text, tags) VALUES (new.id, new.text, new.tags);
@@ -147,6 +152,13 @@ function migrate(db: Database.Database): void {
   }
   if (!cols.includes("pr_feedback_at")) {
     db.exec("ALTER TABLE tasks ADD COLUMN pr_feedback_at TEXT");
+  }
+  const memCols = (db.prepare("PRAGMA table_info(memories)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!memCols.includes("use_count")) {
+    db.exec("ALTER TABLE memories ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0");
+    db.exec("ALTER TABLE memories ADD COLUMN last_used_at TEXT");
   }
 }
 

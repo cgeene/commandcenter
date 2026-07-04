@@ -14,7 +14,9 @@ import {
   addMemory,
   deleteMemory,
   listMemories,
+  markRecalled,
   searchMemories,
+  similarMemories,
 } from "../db/memories.js";
 import { getSchedulerConfig, setSchedulerConfig } from "../db/settings.js";
 import {
@@ -337,7 +339,14 @@ export function buildApp(): Hono {
   app.get("/api/memories", (c) => {
     const q = c.req.query("q");
     const limit = Number(c.req.query("limit") ?? 20);
-    return c.json(q ? searchMemories(q, limit) : listMemories(limit));
+    const hits = q ? searchMemories(q, limit) : listMemories(limit);
+    // track=1 (agent recall) feeds the usage boost + the dreamer's pruning
+    // data; human browsing from the dashboard/CLI must not pollute it.
+    if (q && c.req.query("track") === "1" && hits.length > 0) {
+      markRecalled(hits.map((m) => m.id));
+      logEvent("memory.recalled", { payload: { ids: hits.map((m) => m.id), q } });
+    }
+    return c.json(hits);
   });
 
   app.post("/api/memories", async (c) => {
@@ -355,7 +364,13 @@ export function buildApp(): Hono {
       agentId: body.agent_id,
       payload: { id: memory.id },
     });
-    return c.json(memory, 201);
+    // near-duplicates ride along so the caller can merge instead of pile up
+    const similar = similarMemories(body.text, memory.id).map((m) => ({
+      id: m.id,
+      text: m.text,
+      tags: m.tags,
+    }));
+    return c.json({ ...memory, similar }, 201);
   });
 
   app.delete("/api/memories/:id", (c) => {

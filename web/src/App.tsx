@@ -701,6 +701,7 @@ function MemoryDrawer({ onClose }: { onClose: () => void }) {
                 #{m.id} · {m.created_at.slice(0, 10)}
                 {m.tags ? ` · ${m.tags}` : ""}
                 {m.task_id ? ` · task #${m.task_id}` : ""}
+                {m.use_count > 0 ? ` · recalled ${m.use_count}×` : ""}
               </span>
               <button
                 className="danger"

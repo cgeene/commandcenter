@@ -64,7 +64,10 @@ function buildWorkerPrompt(task: Task, branch: string): string {
     `When done and you have commits: push your branch (\`git push -u origin ${branch}\`) and open a PR with \`gh pr create\` against the repo's default branch — title in conventional-commit style, body covering what/why/how you verified, ending with "commandcenter task #${task.id}". The human reviews PRs in GitHub, not transcripts. Never push any other branch, never merge, never touch an existing PR that isn't yours. If the repo has no GitHub remote, the push fails, or you made no commits, skip the PR and say so in result_summary.`,
     "When done: set result_summary via update_my_task with a short summary of what you did and how you verified it (include pr_url if you opened a PR), then stop.",
   );
-  const memories = memorySectionFor(`${task.title} ${task.prompt} ${task.repo}`);
+  const memories = memorySectionFor(`${task.title} ${task.prompt}`, 5, {
+    taskId: task.id,
+    repo: task.repo,
+  });
   if (memories) lines.push(memories);
   return lines.join("\n");
 }
