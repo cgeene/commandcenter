@@ -37,6 +37,7 @@ button:hover { background: #30363d; }
 button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
 button.primary:hover { background: #388bfd; }
 button.primary:disabled { opacity: 0.5; cursor: default; }
+button.danger { color: #f85149; }
 button.danger:hover { background: #da3633; border-color: #da3633; color: #fff; }
 button.sched-on { background: #238636; border-color: #238636; color: #fff; }
 button.sched-on:hover { background: #da3633; border-color: #da3633; }
@@ -87,6 +88,7 @@ main { display: flex; flex: 1; overflow: hidden; }
 .chip.blocked { color: var(--red); }
 .chip.done { color: var(--green); }
 .chip.in_progress { color: var(--green); }
+.chip.cancelled { color: var(--muted, #8b949e); }
 
 .events {
   width: 280px; flex-shrink: 0; border-left: 1px solid var(--border);
@@ -172,3 +174,34 @@ dd { word-break: break-all; }
   .events { display: none; }
   .column { width: 170px; min-width: 170px; }
 }
+
+/* ---- dashboard tabs ---- */
+.tabs { display: flex; gap: 4px; }
+.tabs button {
+  background: transparent; border: 1px solid transparent; color: var(--muted);
+}
+.tabs button:hover { background: #21262d; color: var(--fg); }
+.tabs button.active {
+  background: #21262d; border-color: var(--border); color: var(--fg);
+}
+
+/* ---- tokens view ---- */
+.tokens-view {
+  flex: 1; overflow-y: auto; padding: 16px;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.stat-cards { display: flex; flex-wrap: wrap; gap: 10px; }
+.stat-card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 16px; display: flex; flex-direction: column; min-width: 110px;
+}
+.stat-card b { font-size: 20px; }
+.token-table { border-collapse: collapse; width: 100%; }
+.token-table th, .token-table td {
+  text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border);
+}
+.token-table th { color: var(--muted); font-size: 12px; font-weight: 500; }
+.token-table td.num, .token-table th.num { text-align: right; }
+.token-table tbody tr { cursor: pointer; }
+.token-table tbody tr:hover { background: var(--panel); }
+.token-note { font-size: 11px; }

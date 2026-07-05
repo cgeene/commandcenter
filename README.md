@@ -27,9 +27,75 @@ its own git worktree and tmux window, managed by a local daemon.
   queue, picks models, spawns/monitors/reviews workers. One live main
   agent at a time.
 
+- **Adversarial review (Phase 5)** — an independent reviewer agent proofs
+  work before the human sees it. Every task that reaches `review` with
+  commits on its branch is auto-reviewed (toggle `agp scheduler set
+  --auto-review on|off`; report-only tasks like the dreamer are skipped);
+  `agp review <id>` and the main agent's `spawn_reviewer` trigger one
+  manually. The reviewer is a fresh Claude session in its own detached
+  worktree at the task's branch, with file-editing tools denied. It gets the same *inputs* as the
+  worker (task prompt, branch, claimed summary) but none of its conversation
+  — independence is the point — and is prompted to find reasons to REJECT:
+  unmet requirements, weakened tests, summary/diff mismatches. It submits
+  `submit_review(approve|reject, notes)`. Rejection notes go straight back
+  into the worker's session (or into the respawn prompt if it's gone) and the
+  task returns to `in_progress`; after 2 rejected cycles the task is blocked
+  and escalated to you with both sides' notes. Approval pings you — the merge
+  is still yours. Auto-reviews draw from the scheduler's daily spawn budget.
+  The main agent also gets `get_task_diff` and `read_worker_transcript` to
+  proof workers with evidence instead of terminal peeks, and the `Stop` hook
+  now re-verifies tasks a worker moved to `review` itself, so `verify_cmd`
+  can't be bypassed.
+
+- **Worker PRs** — review happens in GitHub, not transcripts. Workers with
+  commits push their own `agent/task-N` branch and open a PR (`git push` on
+  their branch + `gh pr create` are pre-allowed in their generated settings,
+  so no permission stall), record it via `update_my_task(pr_url)`, and the
+  PR link rides along on review pushes, the task record, and the dashboard.
+  Merging, force-pushes, and any other branch remain the human's.
+
+- **Main-agent triage of stuck workers** — when a worker hits
+  `waiting_input`, the daemon first hands it to a live main agent (a
+  "[commandcenter] aN is waiting for input" message lands in its session):
+  it peeks, answers questions or approves safe/expected permission prompts
+  itself (e.g. a worker pushing its own branch), and pages you via its
+  `escalate` tool only for what's genuinely yours — credentials, judgment
+  calls, destructive actions. If nothing resolves the wait within
+  `escalate_minutes` (default 5, `agp scheduler set --escalate <m>`), the
+  watchdog pages you anyway — once per wait, not once per minute. No live
+  main agent = you're paged immediately, as before.
+
+- **PR lifecycle sync** — every 2 minutes the daemon polls GitHub (via `gh`)
+  for tasks in `review` with a `pr_url`. Merged → task `done`, agents
+  reaped, worktree removed, local branch pruned. Closed without merge →
+  `blocked`. New PR comments or a CHANGES_REQUESTED verdict → piped into
+  the live worker (or baked into the respawn prompt), task back to
+  `in_progress`. Review entirely in GitHub; the board follows.
+
+- **Stale-daemon detection + `agp upgrade`** — the daemon snapshots
+  `dist/`'s newest mtime at boot; if a rebuild lands while it runs, the
+  watchdog pushes a warning, the dashboard shows a banner, and
+  `GET /api/version` reports `stale: true`. `agp upgrade` = build →
+  respawn the `agentd` tmux window → health-check; `--main` also respawns
+  the main agent so it picks up new MCP tools.
+
+- **Token accounting** — on every worker `Stop` the daemon sums the
+  session transcript's per-turn usage into `tasks.tokens_used` (input +
+  output + cache; approximate, resets on a fresh —non-resumed— respawn).
+  Shown on the dashboard task panel and in `agp task show`.
+
+- **Session resume** — respawning a task whose previous session transcript
+  still exists uses `claude --resume`, so requeued/vanished/rejected work
+  continues with full context instead of starting over; outstanding
+  review/PR feedback rides along in the resume message. Force a clean
+  start with `agp agent spawn --task N --fresh`.
+
 - **Web dashboard (Phase 3)** — React SPA served by the daemon at
-  `http://127.0.0.1:4711`: kanban board, agent grid, live terminal
-  (xterm.js ↔ WebSocket ↔ PTY ↔ tmux), transcript viewer, new-task form.
+  `http://127.0.0.1:4711`, tabbed (hash-routed: `#/board`, `#/tokens`; add
+  a tab = one entry in `TABS` + a render branch). **board**: kanban, agent
+  grid, live terminal (xterm.js ↔ WebSocket ↔ PTY ↔ tmux), transcript
+  viewer, new-task form. **tokens**: total/today/per-model stat cards and
+  a per-task usage table (click a row for the task panel).
   Each browser terminal gets its own *grouped* tmux session so viewers
   don't resize or steal focus from your desktop tmux client.
 - **Push (Phase 3)** — set `CC_NTFY_URL` (e.g. `https://ntfy.sh/<topic>`,
@@ -100,7 +166,10 @@ agp agent ls
 agp agent peek 1                        # see its terminal without attaching
 agp agent send 1 "also update the docs" # message a running worker
 agp attach 1                            # interact; detach with C-b d
+agp task diff 1                         # what actually changed on the branch
+agp review 1                            # adversarial reviewer for a task in review
 agp task update 1 -s done               # after reviewing the branch
+agp task cancel 3 --rm-worktree         # close a task from ANY state (kills its agents)
 agp agent kill 1 --rm-worktree
 agp events
 
@@ -124,6 +193,17 @@ agp attach 2                            # talk to it: "work through the queue"
 ## Statuses
 
 Tasks: `queued → claimed → in_progress → blocked / review → done / failed`.
-Agents: `spawning → working → idle / waiting_input / stalled → dead`.
+`cancelled` is reachable from ANY state via `agp task cancel <id>` (or the
+main agent's `cancel_task`, or the dashboard's ✕): live worker + reviewer
+are killed, the branch survives (`--rm-worktree` to drop uncommitted work),
+and an in-flight verify result can't resurrect the task. Cancelled tasks can
+be requeued. A task `blocked_by` a cancelled one never becomes ready — the
+cancel reports these so you can re-point or cancel them.
+A reviewer rejection sends `review → in_progress` (live worker) or
+`review → queued` (worker gone, notes baked into the respawn prompt);
+`review_verdict`/`review_notes`/`review_cycles` on the task record who said
+what.
+Agents: `spawning → working → idle / waiting_input / stalled → dead`
+(kinds: `main`, `worker`, `reviewer`).
 Claiming is a single SQLite UPDATE — atomic; two agents can never take the
 same task.

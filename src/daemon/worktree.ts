@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { worktreesDir } from "../config.js";
 
-function git(repo: string, ...args: string[]): string {
+export function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
 }
 
@@ -37,6 +37,31 @@ export function createWorktree(
     git(repo, "worktree", "add", dir, "-b", branch);
   }
   return { dir, branch };
+}
+
+export function reviewWorktreeDir(repo: string, taskId: number): string {
+  return path.join(worktreesDir(), `${path.basename(repo)}-task-${taskId}-review`);
+}
+
+/**
+ * Create (or refresh) a reviewer's worktree for a task branch. Detached HEAD
+ * at the branch tip: git refuses to check out a branch already checked out in
+ * the worker's worktree, and the reviewer must not commit anyway. On reuse
+ * (second review cycle) re-detach so the reviewer sees the latest commits.
+ */
+export function createReviewWorktree(
+  repo: string,
+  taskId: number,
+  branch: string,
+): string {
+  const dir = reviewWorktreeDir(repo, taskId);
+  if (fs.existsSync(dir)) {
+    git(dir, "checkout", "--detach", branch);
+    return dir;
+  }
+  fs.mkdirSync(worktreesDir(), { recursive: true });
+  git(repo, "worktree", "add", "--detach", dir, branch);
+  return dir;
 }
 
 export function removeWorktree(repo: string, dir: string): void {

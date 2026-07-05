@@ -9,7 +9,8 @@ export type TaskStatus =
   | "blocked"
   | "review"
   | "done"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export type AgentState =
   | "spawning"
@@ -27,6 +28,7 @@ export const TASK_STATUSES: TaskStatus[] = [
   "review",
   "done",
   "failed",
+  "cancelled",
 ];
 
 const SCHEMA = `
@@ -45,6 +47,11 @@ CREATE TABLE IF NOT EXISTS tasks (
   session_id     TEXT,
   verify_cmd     TEXT,
   result_summary TEXT,
+  review_verdict TEXT,
+  review_notes   TEXT,
+  review_cycles  INTEGER NOT NULL DEFAULT 0,
+  pr_url         TEXT,
+  pr_feedback_at TEXT,
   tokens_used    INTEGER,
   created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -77,17 +84,22 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 CREATE TABLE IF NOT EXISTS memories (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  text       TEXT NOT NULL,
-  tags       TEXT,
-  task_id    INTEGER,
-  agent_id   INTEGER,
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  text         TEXT NOT NULL,
+  tags         TEXT,
+  task_id      INTEGER,
+  agent_id     INTEGER,
+  use_count    INTEGER NOT NULL DEFAULT 0,
+  last_used_at TEXT,
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   text, tags, content='memories', content_rowid='id'
 );
+
+-- corpus term statistics for IDF-aware query construction
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_vocab USING fts5vocab('memories_fts', 'row');
 
 CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
   INSERT INTO memories_fts(rowid, text, tags) VALUES (new.id, new.text, new.tags);
@@ -129,6 +141,24 @@ function migrate(db: Database.Database): void {
   );
   if (!cols.includes("cron_id")) {
     db.exec("ALTER TABLE tasks ADD COLUMN cron_id INTEGER");
+  }
+  if (!cols.includes("review_verdict")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN review_verdict TEXT");
+    db.exec("ALTER TABLE tasks ADD COLUMN review_notes TEXT");
+    db.exec("ALTER TABLE tasks ADD COLUMN review_cycles INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!cols.includes("pr_url")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN pr_url TEXT");
+  }
+  if (!cols.includes("pr_feedback_at")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN pr_feedback_at TEXT");
+  }
+  const memCols = (db.prepare("PRAGMA table_info(memories)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!memCols.includes("use_count")) {
+    db.exec("ALTER TABLE memories ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0");
+    db.exec("ALTER TABLE memories ADD COLUMN last_used_at TEXT");
   }
 }
 

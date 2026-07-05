@@ -70,4 +70,56 @@ describe("memories", () => {
     addMemory({ text: "always run go vet", tags: "repo:uas,linting" });
     expect(searchMemories("linting uas").length).toBe(1);
   });
+
+  it("IDF selection keeps a rare term that appears late in a long query", async () => {
+    const { addMemory, searchMemories } = await import("../src/db/memories.js");
+    for (let i = 0; i < 9; i++) {
+      addMemory({ text: `platform task worker system filler lesson number${i}` });
+    }
+    addMemory({ text: "grafana iap binding lives in the gma-mt-stg terraform stack" });
+    // >12 distinct words; "grafana" past the old first-12 cutoff
+    const hits = searchMemories(
+      "platform task worker system needs several common filler distinct words alpha beta gamma delta epsilon zeta before grafana appears",
+    );
+    expect(hits[0].text).toContain("grafana");
+  });
+
+  it("injection floor: one shared term is not enough", async () => {
+    const { addMemory, memorySectionFor } = await import("../src/db/memories.js");
+    addMemory({ text: "alpha lesson about something unrelated entirely" });
+    expect(memorySectionFor("alpha completely different topic query")).toBe("");
+  });
+
+  it("repo mention rescues a weak match for injection", async () => {
+    const { addMemory, memorySectionFor } = await import("../src/db/memories.js");
+    addMemory({ text: "use make generate first", tags: "repo:functions,build" });
+    const section = memorySectionFor("deploy service quickly", 5, {
+      repo: "/Users/x/projects/functions",
+    });
+    expect(section).toContain("make generate");
+  });
+
+  it("recalled memories outrank equally-matching unrecalled ones", async () => {
+    const { addMemory, markRecalled, searchMemories } = await import(
+      "../src/db/memories.js"
+    );
+    addMemory({ text: "spanner emulator quirk variant one" });
+    const favored = addMemory({ text: "spanner emulator quirk variant two" });
+    for (let i = 0; i < 5; i++) markRecalled([favored.id]);
+    const hits = searchMemories("spanner emulator quirk");
+    expect(hits[0].id).toBe(favored.id);
+    expect(hits[0].use_count).toBe(5);
+  });
+
+  it("similarMemories flags near-duplicates but not unrelated text", async () => {
+    const { addMemory, similarMemories } = await import("../src/db/memories.js");
+    const orig = addMemory({
+      text: "workers must push their agent task branch before opening a PR",
+    });
+    const dupes = similarMemories(
+      "push the agent task branch before you open the PR",
+    );
+    expect(dupes.map((m) => m.id)).toContain(orig.id);
+    expect(similarMemories("totally unrelated cooking recipe").length).toBe(0);
+  });
 });

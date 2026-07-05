@@ -2,7 +2,7 @@ import { getDb, type AgentState } from "./db.js";
 
 export interface Agent {
   id: number;
-  kind: "main" | "worker";
+  kind: "main" | "worker" | "reviewer";
   model: string | null;
   state: AgentState;
   task_id: number | null;
@@ -13,7 +13,7 @@ export interface Agent {
 }
 
 export function createAgent(a: {
-  kind?: "main" | "worker";
+  kind?: "main" | "worker" | "reviewer";
   model?: string;
   state?: AgentState;
   task_id?: number;

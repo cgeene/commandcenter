@@ -120,20 +120,74 @@ task
     console.log(`task #${t.id} claimed`);
   });
 
+task
+  .command("cancel <id>")
+  .description("close a task from any state (kills its live worker/reviewer)")
+  .option("--rm-worktree", "also remove the worktree (uncommitted work is lost)")
+  .action(async (id: string, opts) => {
+    const r = await api<{
+      task: Task;
+      killed_agents: number[];
+      open_dependents: Task[];
+    }>("POST", `/api/tasks/${id}/cancel`, { rm_worktree: opts.rmWorktree });
+    const killed = r.killed_agents.length
+      ? ` (killed ${r.killed_agents.map((a) => `a${a}`).join(", ")})`
+      : "";
+    console.log(`task #${r.task.id} cancelled${killed}`);
+    for (const d of r.open_dependents) {
+      console.log(
+        `warning: task #${d.id} ("${d.title}") is blocked_by #${r.task.id} and will never become ready — re-point or cancel it`,
+      );
+    }
+  });
+
+task
+  .command("diff <id>")
+  .description("show the diff on a task's branch")
+  .option("--stat", "stat + commits only")
+  .action(async (id: string, opts) => {
+    const d = await api<{ commits: string; stat: string; diff: string; truncated: boolean }>(
+      "GET",
+      `/api/tasks/${id}/diff`,
+    );
+    console.log(d.commits ? `${d.commits}\n\n${d.stat}` : "(no commits on branch)");
+    if (!opts.stat && d.diff) {
+      console.log(`\n${d.diff}`);
+      if (d.truncated) console.log("[diff truncated]");
+    }
+  });
+
+// ---- review ----
+
+program
+  .command("review <taskId>")
+  .description("spawn an independent adversarial reviewer for a task in review")
+  .option("-m, --model <model>", "reviewer model (default: the task's model)")
+  .action(async (taskId: string, opts) => {
+    const { agent: a } = await api<{ agent: Agent }>(
+      "POST",
+      `/api/tasks/${taskId}/reviewer`,
+      { model: opts.model },
+    );
+    console.log(`reviewer a${a.id} spawned in ${a.tmux_target}${a.model ? ` (${a.model})` : ""}`);
+    console.log(`watch with: agp agent peek ${a.id}`);
+  });
+
 // ---- agent commands ----
 
 const agent = program.command("agent").description("manage worker agents");
 
 agent
   .command("spawn")
-  .description("spawn a Claude Code worker for a task")
+  .description("spawn a Claude Code worker for a task (resumes its previous session when one exists)")
   .requiredOption("-t, --task <id>", "task id")
   .option("-m, --model <model>", "override the task's model")
+  .option("--fresh", "force a fresh session instead of resuming")
   .action(async (opts) => {
     const { agent: a, task: t } = await api<{ agent: Agent; task: Task }>(
       "POST",
       "/api/agents",
-      { task_id: Number(opts.task), model: opts.model },
+      { task_id: Number(opts.task), model: opts.model, fresh: opts.fresh },
     );
     console.log(
       `agent a${a.id} spawned for task #${t.id} in ${a.tmux_target} (worktree: ${t.worktree})`,
@@ -408,6 +462,8 @@ interface SchedulerInfo {
     daily_spawn_limit: number;
     stall_minutes: number;
     active_hours: { start: number; end: number } | null;
+    auto_review: boolean;
+    escalate_minutes: number;
   };
   status: { live_workers: number; spawns_today: number };
 }
@@ -422,7 +478,7 @@ async function printSchedulerStatus(): Promise<void> {
     ? `${config.active_hours.start}:00-${config.active_hours.end}:00`
     : "always";
   console.log(
-    `scheduler: ${config.enabled ? "ON" : "OFF"} · workers ${status.live_workers}/${config.max_concurrent} · spawns today ${status.spawns_today}/${config.daily_spawn_limit} · window ${hours} · stall ${config.stall_minutes}m`,
+    `scheduler: ${config.enabled ? "ON" : "OFF"} · workers ${status.live_workers}/${config.max_concurrent} · spawns today ${status.spawns_today}/${config.daily_spawn_limit} · window ${hours} · stall ${config.stall_minutes}m · auto-review ${config.auto_review ? "on" : "off"} · escalate ${config.escalate_minutes}m`,
   );
 }
 
@@ -454,9 +510,13 @@ scheduler
   .option("--limit <n>", "daily autonomous spawn budget")
   .option("--stall <minutes>", "stall detection threshold")
   .option("--hours <range>", '"22-6" for overnight, or "always"')
+  .option("--auto-review <on|off>", "auto-review tasks when they reach review")
+  .option("--escalate <minutes>", "minutes a waiting worker gets before the human is paged")
   .action(async (opts) => {
     const patch: Record<string, unknown> = {};
     if (opts.max) patch.max_concurrent = Number(opts.max);
+    if (opts.autoReview) patch.auto_review = opts.autoReview === "on";
+    if (opts.escalate) patch.escalate_minutes = Number(opts.escalate);
     if (opts.limit) patch.daily_spawn_limit = Number(opts.limit);
     if (opts.stall) patch.stall_minutes = Number(opts.stall);
     if (opts.hours === "always") patch.active_hours = null;
@@ -470,6 +530,59 @@ scheduler
     }
     await api("PATCH", "/api/scheduler", patch);
     await printSchedulerStatus();
+  });
+
+// ---- upgrade ----
+
+program
+  .command("upgrade")
+  .description("rebuild and restart the daemon in place (fixes stale-daemon warnings)")
+  .option("--main", "also respawn the main agent so it picks up new MCP tools")
+  .action(async (opts) => {
+    console.log("building…");
+    const build = spawnSync("npm", ["run", "build:all"], {
+      cwd: pkgRoot(),
+      stdio: "inherit",
+    });
+    if (build.status !== 0) process.exit(build.status ?? 1);
+
+    const list = spawnSync(
+      "tmux",
+      ["list-windows", "-t", tmuxSession(), "-F", "#{window_name}\t#{session_name}:#{window_id}"],
+      { encoding: "utf8" },
+    );
+    const row = (list.stdout ?? "")
+      .split("\n")
+      .find((l) => l.startsWith("agentd\t"));
+    if (!row) {
+      console.log(
+        "no tmux window named 'agentd' found — restart the daemon however you run it, then check: agp scheduler status",
+      );
+      return;
+    }
+    const target = row.split("\t")[1];
+    console.log(`respawning daemon window ${target}…`);
+    spawnSync("tmux", ["respawn-window", "-k", "-t", target]);
+
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      try {
+        const v = await api<{ stale: boolean; started_at: string }>("GET", "/api/version");
+        console.log(`daemon back up (started ${v.started_at}, stale: ${v.stale})`);
+        if (opts.main) {
+          const agents = await api<Agent[]>("GET", "/api/agents?live=true");
+          const main = agents.find((a) => a.kind === "main");
+          if (main) await api("POST", `/api/agents/${main.id}/kill`, {});
+          const a = await api<Agent>("POST", "/api/main", {});
+          console.log(`main agent a${a.id} respawned in ${a.tmux_target}`);
+        }
+        return;
+      } catch {
+        /* daemon not up yet */
+      }
+    }
+    console.error("daemon did not come back within 15s — check the agentd window");
+    process.exit(1);
   });
 
 // ---- main agent ----

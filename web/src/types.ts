@@ -5,7 +5,8 @@ export type TaskStatus =
   | "blocked"
   | "review"
   | "done"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export interface Task {
   id: number;
@@ -22,13 +23,19 @@ export interface Task {
   session_id: string | null;
   verify_cmd: string | null;
   result_summary: string | null;
+  review_verdict: string | null;
+  review_notes: string | null;
+  review_cycles: number;
+  pr_url: string | null;
+  pr_feedback_at: string | null;
+  tokens_used: number | null;
   created_at: string;
   updated_at: string;
 }
 
 export interface Agent {
   id: number;
-  kind: "main" | "worker";
+  kind: "main" | "worker" | "reviewer";
   model: string | null;
   state: string;
   task_id: number | null;
@@ -58,6 +65,8 @@ export interface Memory {
   tags: string | null;
   task_id: number | null;
   agent_id: number | null;
+  use_count: number;
+  last_used_at: string | null;
   created_at: string;
 }
 

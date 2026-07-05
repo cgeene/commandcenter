@@ -14,7 +14,9 @@ import {
   addMemory,
   deleteMemory,
   listMemories,
+  markRecalled,
   searchMemories,
+  similarMemories,
 } from "../db/memories.js";
 import { getSchedulerConfig, setSchedulerConfig } from "../db/settings.js";
 import {
@@ -26,8 +28,16 @@ import {
   updateTask,
 } from "../db/tasks.js";
 import { handleHookEvent, type HookPayload } from "./hooks.js";
-import { killAgent, spawnMain, spawnWorker } from "./spawn.js";
-import { capturePane, sendText, windowExists } from "./tmux.js";
+import { handleVerdict, taskDiff } from "./review.js";
+import {
+  cancelTask,
+  killAgent,
+  spawnMain,
+  spawnReviewer,
+  spawnWorker,
+} from "./spawn.js";
+import { resumeAgent } from "./resume.js";
+import { capturePane, windowExists } from "./tmux.js";
 
 const newTaskSchema = z.object({
   title: z.string().min(1),
@@ -48,17 +58,24 @@ const updateTaskSchema = z.object({
   blocked_by: z.number().int().nullable().optional(),
   verify_cmd: z.string().nullable().optional(),
   result_summary: z.string().nullable().optional(),
+  pr_url: z.string().url().nullable().optional(),
 });
 
 const spawnSchema = z.object({
   task_id: z.number().int(),
   model: z.string().optional(),
+  fresh: z.boolean().optional(),
 });
 
 export function buildApp(): Hono {
   const app = new Hono();
 
   app.get("/healthz", (c) => c.json({ ok: true }));
+
+  app.get("/api/version", async (c) => {
+    const { versionInfo } = await import("./version.js");
+    return c.json(versionInfo());
+  });
 
   app.get("/api/tasks", (c) => {
     const status = c.req.query("status") as TaskStatus | undefined;
@@ -93,6 +110,40 @@ export function buildApp(): Hono {
     return c.json(task);
   });
 
+  app.get("/api/tasks/:id/diff", (c) => {
+    const task = getTask(Number(c.req.param("id")));
+    if (!task) return c.json({ error: "not found" }, 404);
+    if (!task.branch) return c.json({ error: "task has no branch" }, 409);
+    return c.json(taskDiff(task));
+  });
+
+  app.post("/api/tasks/:id/reviewer", async (c) => {
+    const id = Number(c.req.param("id"));
+    const body = (await c.req.json().catch(() => ({}))) as { model?: string };
+    return c.json(spawnReviewer(id, body.model), 201);
+  });
+
+  app.post("/api/tasks/:id/verdict", async (c) => {
+    const id = Number(c.req.param("id"));
+    const body = z
+      .object({
+        agent_id: z.number().int(),
+        verdict: z.enum(["approve", "reject"]),
+        notes: z.string().min(1),
+      })
+      .parse(await c.req.json());
+    const task = await handleVerdict(id, body.agent_id, body.verdict, body.notes);
+    return c.json(task);
+  });
+
+  app.post("/api/tasks/:id/cancel", async (c) => {
+    const id = Number(c.req.param("id"));
+    const body = (await c.req.json().catch(() => ({}))) as {
+      rm_worktree?: boolean;
+    };
+    return c.json(cancelTask(id, { rmWorktree: body.rm_worktree }));
+  });
+
   app.post("/api/tasks/:id/claim", (c) => {
     const id = Number(c.req.param("id"));
     const task = claimTask(id);
@@ -112,7 +163,7 @@ export function buildApp(): Hono {
 
   app.post("/api/agents", async (c) => {
     const body = spawnSchema.parse(await c.req.json());
-    const result = spawnWorker(body.task_id, body.model);
+    const result = spawnWorker(body.task_id, body.model, { fresh: body.fresh });
     return c.json(result, 201);
   });
 
@@ -141,18 +192,50 @@ export function buildApp(): Hono {
   app.post("/api/agents/:id/send", async (c) => {
     const agent = getAgent(Number(c.req.param("id")));
     if (!agent) return c.json({ error: "not found" }, 404);
-    if (!agent.tmux_target || !windowExists(agent.tmux_target)) {
-      return c.json({ error: "no live tmux window" }, 409);
-    }
     const { text } = z.object({ text: z.string().min(1) }).parse(await c.req.json());
-    await sendText(agent.tmux_target, text);
+    // interrupt: a send to a waiting agent IS the answer to its question
+    const outcome = await resumeAgent(agent.id, text, { interrupt: true });
+    if (outcome !== "sent") return c.json({ error: "no live tmux window" }, 409);
     logEvent("agent.sent", { agentId: agent.id, taskId: agent.task_id ?? undefined });
     return c.json({ ok: true });
+  });
+
+  app.get("/api/agents/:id/transcript", async (c) => {
+    const agent = getAgent(Number(c.req.param("id")));
+    if (!agent) return c.json({ error: "not found" }, 404);
+    if (!agent.session_id) {
+      return c.json({ error: "agent has no recorded session yet" }, 409);
+    }
+    const limit = Number(c.req.query("limit") ?? 200);
+    const { readTranscript } = await import("./transcript.js");
+    const entries = readTranscript(agent.session_id, limit);
+    if (!entries) return c.json({ error: "transcript not found" }, 404);
+    return c.json({ agent_id: agent.id, session_id: agent.session_id, entries });
   });
 
   app.post("/api/main", async (c) => {
     const body = (await c.req.json().catch(() => ({}))) as { model?: string };
     return c.json(spawnMain(body.model), 201);
+  });
+
+  // Main agent's line to the human: an immediate high-priority push.
+  app.post("/api/escalate", async (c) => {
+    const body = z
+      .object({
+        title: z.string().min(1).max(120),
+        message: z.string().min(1).max(2000),
+        task_id: z.number().int().optional(),
+        agent_id: z.number().int().optional(),
+      })
+      .parse(await c.req.json());
+    logEvent("main.escalated", {
+      taskId: body.task_id,
+      agentId: body.agent_id,
+      payload: { title: body.title },
+    });
+    const { notify } = await import("./notify.js");
+    notify(body.title, body.message, { priority: "high", tags: "sos" });
+    return c.json({ ok: true });
   });
 
   // Claude Code hooks POST their stdin JSON here (see genconfig.ts).
@@ -256,7 +339,14 @@ export function buildApp(): Hono {
   app.get("/api/memories", (c) => {
     const q = c.req.query("q");
     const limit = Number(c.req.query("limit") ?? 20);
-    return c.json(q ? searchMemories(q, limit) : listMemories(limit));
+    const hits = q ? searchMemories(q, limit) : listMemories(limit);
+    // track=1 (agent recall) feeds the usage boost + the dreamer's pruning
+    // data; human browsing from the dashboard/CLI must not pollute it.
+    if (q && c.req.query("track") === "1" && hits.length > 0) {
+      markRecalled(hits.map((m) => m.id));
+      logEvent("memory.recalled", { payload: { ids: hits.map((m) => m.id), q } });
+    }
+    return c.json(hits);
   });
 
   app.post("/api/memories", async (c) => {
@@ -274,7 +364,13 @@ export function buildApp(): Hono {
       agentId: body.agent_id,
       payload: { id: memory.id },
     });
-    return c.json(memory, 201);
+    // near-duplicates ride along so the caller can merge instead of pile up
+    const similar = similarMemories(body.text, memory.id).map((m) => ({
+      id: m.id,
+      text: m.text,
+      tags: m.tags,
+    }));
+    return c.json({ ...memory, similar }, 201);
   });
 
   app.delete("/api/memories/:id", (c) => {
@@ -296,6 +392,8 @@ export function buildApp(): Hono {
       })
       .nullable()
       .optional(),
+    auto_review: z.boolean().optional(),
+    escalate_minutes: z.number().int().min(1).max(120).optional(),
   });
 
   app.get("/api/scheduler", (c) => {
@@ -306,7 +404,9 @@ export function buildApp(): Hono {
       config: getSchedulerConfig(),
       status: {
         live_workers: liveWorkers,
-        spawns_today: countEventsToday("scheduler.spawned"),
+        spawns_today:
+          countEventsToday("scheduler.spawned") +
+          countEventsToday("reviewer.auto_spawned"),
       },
     });
   });

@@ -5,13 +5,17 @@
  * so SQLite keeps a single writer.
  *
  * Roles (CC_ROLE env): "main" gets the full orchestration toolset,
- * "worker" gets a restricted subset scoped to its own task (CC_TASK_ID).
+ * "worker" gets a restricted subset scoped to its own task (CC_TASK_ID),
+ * "reviewer" gets read-only task access plus submit_review.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const ROLE = process.env.CC_ROLE === "main" ? "main" : "worker";
+const ROLE =
+  process.env.CC_ROLE === "main" || process.env.CC_ROLE === "reviewer"
+    ? process.env.CC_ROLE
+    : "worker";
 const BASE_URL = process.env.CC_URL ?? "http://127.0.0.1:4711";
 const MY_TASK_ID = process.env.CC_TASK_ID
   ? Number(process.env.CC_TASK_ID)
@@ -72,7 +76,7 @@ server.registerTool(
   "remember",
   {
     description:
-      "Store a durable lesson in platform memory (repo quirks, build gotchas, workflow insights). One fact per call. Relevant memories are auto-injected into future workers' prompts, so write them to be useful standalone.",
+      "Store a durable lesson in platform memory (repo quirks, build gotchas, workflow insights). One fact per call. Relevant memories are auto-injected into future workers' prompts, so write them to be useful standalone. The result includes `similar` — existing memories that overlap heavily; if one already covers your lesson, mention the redundancy in your result_summary so it can be merged (only the main agent / human can delete).",
     inputSchema: {
       text: z.string().max(2000).describe("the lesson, standalone and specific"),
       tags: z.string().optional().describe("comma-separated, e.g. 'repo:functions,build'"),
@@ -103,7 +107,7 @@ server.registerTool(
     asText(
       await call(
         "GET",
-        `/api/memories?q=${encodeURIComponent(query)}&limit=${limit ?? 10}`,
+        `/api/memories?q=${encodeURIComponent(query)}&limit=${limit ?? 10}&track=1`,
       ),
     ),
 );
@@ -120,23 +124,62 @@ server.registerTool(
   async ({ hours }) => asText(await call("GET", `/api/summary?hours=${hours ?? 24}`)),
 );
 
-// ---- worker tools ----
+// ---- worker + reviewer tools ----
 
-if (ROLE === "worker") {
+if (ROLE === "worker" || ROLE === "reviewer") {
   server.registerTool(
     "get_my_task",
     { description: "Fetch your own task record (status, prompt, verify command, branch).", inputSchema: {} },
     async () => asText(await call("GET", `/api/tasks/${MY_TASK_ID}`)),
   );
+}
 
+// ---- reviewer tools ----
+
+if (ROLE === "reviewer") {
+  server.registerTool(
+    "get_task_diff",
+    {
+      description:
+        "Full diff of the task's branch against its merge-base (commits, stat, patch). This is the work you are reviewing.",
+      inputSchema: {},
+    },
+    async () => asText(await call("GET", `/api/tasks/${MY_TASK_ID}/diff`)),
+  );
+
+  server.registerTool(
+    "submit_review",
+    {
+      description:
+        "Submit your review verdict — call exactly once, then stop. reject requires specific, actionable notes (they are sent verbatim to the worker as its fix list); approve requires a justification citing the evidence you checked.",
+      inputSchema: {
+        verdict: z.enum(["approve", "reject"]),
+        notes: z.string().min(1).max(4000),
+      },
+    },
+    async ({ verdict, notes }) =>
+      asText(
+        await call("POST", `/api/tasks/${MY_TASK_ID}/verdict`, {
+          agent_id: process.env.CC_AGENT_ID ? Number(process.env.CC_AGENT_ID) : undefined,
+          verdict,
+          notes,
+        }),
+      ),
+  );
+}
+
+// ---- worker tools ----
+
+if (ROLE === "worker") {
   server.registerTool(
     "update_my_task",
     {
       description:
-        "Update your own task: set result_summary when done, or move status to blocked/review.",
+        "Update your own task: set result_summary when done, pr_url after opening a PR, or move status to blocked/review.",
       inputSchema: {
         status: z.enum(["blocked", "review"]).optional(),
         result_summary: z.string().optional(),
+        pr_url: z.string().url().optional().describe("the PR you opened for this task"),
       },
     },
     async (args) => asText(await call("PATCH", `/api/tasks/${MY_TASK_ID}`, args)),
@@ -191,7 +234,8 @@ if (ROLE === "main") {
         id: z.number().int(),
         status: z
           .enum(["queued", "claimed", "in_progress", "blocked", "review", "done", "failed"])
-          .optional(),
+          .optional()
+          .describe("to close a task from any state, use cancel_task instead — it also kills live agents"),
         priority: z.number().int().min(0).max(4).optional(),
         model: z.string().optional(),
         prompt: z.string().optional(),
@@ -200,6 +244,23 @@ if (ROLE === "main") {
       },
     },
     async ({ id, ...fields }) => asText(await call("PATCH", `/api/tasks/${id}`, fields)),
+  );
+
+  server.registerTool(
+    "cancel_task",
+    {
+      description:
+        "Close a task from ANY state: kills its live worker/reviewer and marks it cancelled (terminal, idempotent). Returns any open tasks still blocked on it — those need re-pointing or cancelling too.",
+      inputSchema: {
+        task_id: z.number().int(),
+        rm_worktree: z
+          .boolean()
+          .optional()
+          .describe("also remove the task's worktree (uncommitted work is lost; the branch survives)"),
+      },
+    },
+    async ({ task_id, rm_worktree }) =>
+      asText(await call("POST", `/api/tasks/${task_id}/cancel`, { rm_worktree })),
   );
 
   server.registerTool(
@@ -215,10 +276,11 @@ if (ROLE === "main") {
     "spawn_worker",
     {
       description:
-        "Spawn a Claude Code worker for a task in its own git worktree + tmux window. Model defaults to the task's model.",
+        "Spawn a Claude Code worker for a task in its own git worktree + tmux window. Model defaults to the task's model. If the task has a previous session, the worker RESUMES it with full context (pass fresh=true to force a clean start).",
       inputSchema: {
         task_id: z.number().int(),
         model: z.string().optional().describe("haiku | sonnet | opus | ..."),
+        fresh: z.boolean().optional().describe("force a fresh session instead of resuming"),
       },
     },
     async (args) => asText(await call("POST", "/api/agents", args)),
@@ -272,12 +334,67 @@ if (ROLE === "main") {
   );
 
   server.registerTool(
+    "get_task_diff",
+    {
+      description:
+        "Diff of a task's branch against its merge-base (commits, stat, patch). Use this to proof a worker's actual changes — never trust its self-report alone.",
+      inputSchema: { task_id: z.number().int() },
+    },
+    async ({ task_id }) => asText(await call("GET", `/api/tasks/${task_id}/diff`)),
+  );
+
+  server.registerTool(
+    "read_worker_transcript",
+    {
+      description:
+        "Read an agent's session transcript (simplified chat view, last `limit` entries). Use to audit what a worker actually did versus what it claims.",
+      inputSchema: {
+        agent_id: z.number().int(),
+        limit: z.number().int().min(1).max(500).optional(),
+      },
+    },
+    async ({ agent_id, limit }) =>
+      asText(
+        await call("GET", `/api/agents/${agent_id}/transcript?limit=${limit ?? 200}`),
+      ),
+  );
+
+  server.registerTool(
+    "spawn_reviewer",
+    {
+      description:
+        "Spawn an independent adversarial reviewer for a task in review. It gets the task prompt + diff in a fresh context (never the worker's conversation), tries to reject the work, and submits approve/reject with notes. Rejection feedback flows back to the worker automatically; 2 rejected cycles block the task for the human.",
+      inputSchema: {
+        task_id: z.number().int(),
+        model: z.string().optional(),
+      },
+    },
+    async ({ task_id, model }) =>
+      asText(await call("POST", `/api/tasks/${task_id}/reviewer`, { model })),
+  );
+
+  server.registerTool(
     "forget",
     {
       description: "Delete a memory by id (wrong, stale, or superseded).",
       inputSchema: { id: z.number().int() },
     },
     async ({ id }) => asText(await call("DELETE", `/api/memories/${id}`)),
+  );
+
+  server.registerTool(
+    "escalate",
+    {
+      description:
+        "Page the human immediately (high-priority push). Use when a worker's block genuinely needs them — credentials, a judgment call that's theirs, destructive approval — or when something is wrong you cannot fix. Be specific: say which task/agent and exactly what you need from them.",
+      inputSchema: {
+        title: z.string().max(120),
+        message: z.string().max(2000),
+        task_id: z.number().int().optional(),
+        agent_id: z.number().int().optional(),
+      },
+    },
+    async (args) => asText(await call("POST", "/api/escalate", args)),
   );
 
   server.registerTool(

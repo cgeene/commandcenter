@@ -15,6 +15,11 @@ export interface Task {
   session_id: string | null;
   verify_cmd: string | null;
   result_summary: string | null;
+  review_verdict: string | null;
+  review_notes: string | null;
+  review_cycles: number;
+  pr_url: string | null;
+  pr_feedback_at: string | null;
   tokens_used: number | null;
   cron_id: number | null;
   created_at: string;
@@ -72,7 +77,8 @@ export function listTasks(status?: TaskStatus): Task[] {
       `SELECT * FROM tasks
        ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'claimed' THEN 1
                             WHEN 'queued' THEN 2 WHEN 'blocked' THEN 3
-                            WHEN 'review' THEN 4 WHEN 'failed' THEN 5 ELSE 6 END,
+                            WHEN 'review' THEN 4 WHEN 'failed' THEN 5
+                            WHEN 'cancelled' THEN 6 ELSE 7 END,
                 priority ASC, id ASC`,
     )
     .all() as Task[];
@@ -88,6 +94,17 @@ export function readyTasks(): Task[] {
        ORDER BY t.priority ASC, t.id ASC`,
     )
     .all() as Task[];
+}
+
+/** Open tasks waiting on `taskId` via blocked_by. A cancelled blocker never
+ *  becomes 'done', so these stay stuck unless the human re-points them. */
+export function openDependents(taskId: number): Task[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM tasks WHERE blocked_by = ?
+       AND status NOT IN ('done','failed','cancelled') ORDER BY id ASC`,
+    )
+    .all(taskId) as Task[];
 }
 
 /**
@@ -121,6 +138,11 @@ const UPDATABLE = new Set([
   "session_id",
   "verify_cmd",
   "result_summary",
+  "review_verdict",
+  "review_notes",
+  "review_cycles",
+  "pr_url",
+  "pr_feedback_at",
   "tokens_used",
 ]);
 

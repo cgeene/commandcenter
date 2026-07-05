@@ -1,6 +1,11 @@
 import { listAgents, updateAgent } from "../db/agents.js";
 import { dueCrons, nextRun, openTasksFor, updateCron } from "../db/crons.js";
-import { countEventsToday, countTaskEvents, logEvent } from "../db/events.js";
+import {
+  countEventsToday,
+  countTaskEvents,
+  latestAgentEventTs,
+  logEvent,
+} from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import {
   createTask,
@@ -12,6 +17,7 @@ import {
 import { notify } from "./notify.js";
 import { spawnWorker } from "./spawn.js";
 import { listWindowIds } from "./tmux.js";
+import { versionInfo } from "./version.js";
 
 export interface SchedulerDeps {
   spawn: (taskId: number) => void;
@@ -97,7 +103,10 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
   let capacity = cfg.max_concurrent - liveWorkers.length;
   if (capacity <= 0) return;
 
-  let spawnsToday = countEventsToday("scheduler.spawned");
+  // auto-spawned reviewers draw from the same daily budget as worker spawns
+  let spawnsToday =
+    countEventsToday("scheduler.spawned") +
+    countEventsToday("reviewer.auto_spawned");
 
   for (const task of readyTasks()) {
     if (capacity <= 0) break;
@@ -146,6 +155,8 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
   const windowIds = deps.windowIds();
   const nowMs = deps.now().getTime();
 
+  warnIfStale();
+
   for (const agent of listAgents({ live: true })) {
     // window gone -> agent is dead, whatever the DB thinks
     if (agent.tmux_target && !windowIds.includes(agent.tmux_target)) {
@@ -178,12 +189,40 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
       continue;
     }
 
-    // silent too long while supposedly working -> stalled
+    // waiting_input was delegated to the main agent (hooks.ts); if nobody
+    // rescued the worker within escalate_minutes, page the human — once per
+    // wait episode (a fresh Notification starts a new episode).
+    if (agent.kind !== "main" && agent.state === "waiting_input") {
+      const waitStart = latestAgentEventTs(agent.id, ["hook.notification"]);
+      if (
+        waitStart &&
+        nowMs - Date.parse(waitStart) > cfg.escalate_minutes * 60_000
+      ) {
+        const escalated = latestAgentEventTs(agent.id, ["waiting.escalated"]);
+        if (!escalated || escalated < waitStart) {
+          logEvent("waiting.escalated", {
+            agentId: agent.id,
+            taskId: agent.task_id ?? undefined,
+          });
+          notify(
+            `a${agent.id}${agent.task_id ? ` (task #${agent.task_id})` : ""} still needs input`,
+            `waiting ${cfg.escalate_minutes}m+ and the main agent didn't resolve it — peek or attach`,
+            { priority: "high", tags: "warning" },
+          );
+        }
+      }
+    }
+
+    // silent too long while supposedly working -> stalled. "review" is
+    // included because resumed workers (PR feedback answered mid-review,
+    // input delivered via /send) can be working while the task shows
+    // review — without it, a resume that failed to unblock the agent
+    // would never be surfaced to anyone.
     if (agent.kind === "worker" && agent.state === "working") {
       const last = Date.parse(agent.last_event_at ?? agent.spawned_at);
       if (nowMs - last > cfg.stall_minutes * 60_000) {
         const task = agent.task_id ? getTask(agent.task_id) : undefined;
-        if (task?.status === "in_progress") {
+        if (task && ["in_progress", "review"].includes(task.status)) {
           updateAgent(agent.id, { state: "stalled" });
           logEvent("agent.stalled", { agentId: agent.id, taskId: task.id });
           notify(
@@ -195,6 +234,22 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
       }
     }
   }
+}
+
+// Stale daemon = every feature since the last rebuild silently doesn't run.
+// Warn once per rebuild, not once per minute.
+let staleWarnedFor: string | null = null;
+
+function warnIfStale(): void {
+  const v = versionInfo();
+  if (!v.stale || v.dist_mtime === staleWarnedFor) return;
+  staleWarnedFor = v.dist_mtime;
+  logEvent("daemon.stale", { payload: v });
+  notify(
+    "agentd is running STALE code",
+    `dist/ was rebuilt at ${v.dist_mtime} but the daemon started ${v.started_at} — run: agp upgrade`,
+    { priority: "high", tags: "warning" },
+  );
 }
 
 function sendWindowReport(): void {
