@@ -69,4 +69,25 @@ describe("POST /api/agents/:id/send", () => {
 
     expect(getAgent(agent.id)?.state).toBe("working");
   });
+
+  it("moves an idle agent to working — a follow-up instruction starts a turn", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const agent = createAgent({
+      kind: "worker",
+      state: "idle",
+      tmux_target: "cc:@3",
+    });
+
+    const app = buildApp();
+    await app.request(`/api/agents/${agent.id}/send`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "also update the docs" }),
+    });
+
+    const a = getAgent(agent.id)!;
+    expect(a.state).toBe("working");
+    expect(a.last_event_at).not.toBeNull(); // stall clock restarts at the resume
+  });
 });

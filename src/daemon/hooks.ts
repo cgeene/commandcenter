@@ -1,13 +1,19 @@
 import { execFile } from "node:child_process";
 import { getAgent, listAgents, updateAgent, type Agent } from "../db/agents.js";
-import { countAgentEvents, countTaskEvents, logEvent } from "../db/events.js";
+import {
+  countAgentEvents,
+  countTaskEvents,
+  latestTaskEventId,
+  logEvent,
+} from "../db/events.js";
 import { getTask, updateTask, type Task } from "../db/tasks.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { notify } from "./notify.js";
+import { resumeAgent } from "./resume.js";
 import { maybeAutoReview } from "./review.js";
 import { killAgent } from "./spawn.js";
 import { sessionTokens } from "./transcript.js";
-import { sendText, windowExists } from "./tmux.js";
+import { windowExists } from "./tmux.js";
 
 export interface HookPayload {
   hook_event_name?: string;
@@ -54,7 +60,10 @@ export async function handleHookEvent(
   switch (event) {
     case "SessionStart":
       if (agent.state === "spawning") updateAgent(agentId, { state: "working" });
-      if (agent.task_id && body.session_id) {
+      // Worker sessions only — a reviewer shares the task_id, and recording
+      // its session here would make the next respawn `--resume` the
+      // adversarial reviewer's conversation instead of the worker's.
+      if (agent.kind === "worker" && agent.task_id && body.session_id) {
         updateTask(agent.task_id, { session_id: body.session_id });
       }
       break;
@@ -83,16 +92,18 @@ export async function handleHookEvent(
           a.tmux_target !== null &&
           windowExists(a.tmux_target),
       );
-      if (main) {
+      const delegated =
+        main &&
+        (await resumeAgent(
+          main.id,
+          `[commandcenter] ${agent.kind} ${who} is waiting for input: "${msg}". peek_worker(${agentId}) to see exactly what it's asking, then try to unblock it yourself via send_to_worker (for a numbered menu send just the digit). Escalate to the human ONLY if it genuinely needs them: credentials, a judgment call that's theirs, or approval for something destructive/outside the worktree. If unresolved after ${getEscalateMinutes()}m the human is paged automatically.`,
+        )) === "sent";
+      if (delegated) {
         logEvent("waiting.delegated", {
           agentId,
           taskId: agent.task_id ?? undefined,
-          payload: { to: main.id, message: msg },
+          payload: { to: main!.id, message: msg },
         });
-        await sendText(
-          main.tmux_target!,
-          `[commandcenter] ${agent.kind} ${who} is waiting for input: "${msg}". peek_worker(${agentId}) to see exactly what it's asking, then try to unblock it yourself via send_to_worker (for a numbered menu send just the digit). Escalate to the human ONLY if it genuinely needs them: credentials, a judgment call that's theirs, or approval for something destructive/outside the worktree. If unresolved after ${getEscalateMinutes()}m the human is paged automatically.`,
-        );
       } else {
         notify(`${who} needs input`, msg, { priority: "high", tags: "warning" });
       }
@@ -196,11 +207,20 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     return;
   }
 
-  // Already in review AND already verified this cycle (each rejection cycle
-  // demands one fresh verify.passed) — an extra Stop, e.g. after the human
-  // messaged the idle worker. Nothing to re-run.
-  if (wasReview && countTaskEvents(task.id, "verify.passed") > task.review_cycles) {
-    return;
+  // Already in review AND already verified since work last resumed — an
+  // extra Stop, e.g. after the human messaged the idle worker. Nothing to
+  // re-run. Every review -> work transition logs a resume marker
+  // (task.reopened / task.requeued / agent.spawned), so a pass that predates
+  // the latest one never suppresses a re-verify of the new work. Event ids
+  // order reliably where same-second timestamps cannot.
+  if (wasReview) {
+    const pass = latestTaskEventId(task.id, ["verify.passed"]);
+    const resumed = latestTaskEventId(task.id, [
+      "task.reopened",
+      "task.requeued",
+      "agent.spawned",
+    ]);
+    if (pass && (!resumed || pass > resumed)) return;
   }
 
   const result = await runVerify(task.verify_cmd, task.worktree);
@@ -229,18 +249,21 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     payload: { output: result.output.slice(-2000) },
   });
 
-  const canNudge =
+  const nudged =
     priorFails < MAX_VERIFY_NUDGES &&
-    agent.tmux_target !== null &&
-    windowExists(agent.tmux_target);
-
-  if (canNudge) {
-    if (wasReview) updateTask(task.id, { status: "in_progress" });
-    updateAgent(agent.id, { state: "working" });
-    await sendText(
-      agent.tmux_target!,
+    (await resumeAgent(
+      agent.id,
       `Verification failed (\`${task.verify_cmd}\`). Fix the issues and finish the task. Output tail:\n${result.output.slice(-1500)}`,
-    );
+    )) === "sent";
+
+  if (nudged) {
+    if (wasReview) {
+      updateTask(task.id, { status: "in_progress" });
+      logEvent("task.reopened", {
+        taskId: task.id,
+        payload: { reason: "verify failed" },
+      });
+    }
   } else {
     updateTask(task.id, { status: "blocked" });
     logEvent("task.blocked", {

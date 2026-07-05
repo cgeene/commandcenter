@@ -74,14 +74,19 @@ describe("sessionTokens", () => {
 });
 
 describe("resume prompt", () => {
-  it("re-anchors without repeating the task and carries outstanding feedback", async () => {
+  it("restates the current task prompt and carries outstanding feedback", async () => {
     const { _buildResumePromptForTest } = await import("../src/daemon/spawn.js");
     const { createTask, updateTask, getTask } = await import("../src/db/tasks.js");
     const task = createTask({ title: "fix retry", prompt: "the full original prompt", repo: "/r" });
-    updateTask(task.id, { review_notes: "handle the empty-input case" });
+    // the orchestrator's recovery flow rewrites the prompt between sessions —
+    // the resume must deliver the CURRENT text, not rely on stale context
+    updateTask(task.id, {
+      prompt: "the revised prompt",
+      review_notes: "handle the empty-input case",
+    });
     const p = _buildResumePromptForTest(getTask(task.id)!);
     expect(p).toContain("resumed");
     expect(p).toContain("empty-input case");
-    expect(p).not.toContain("the full original prompt"); // resume keeps context; no repeat
+    expect(p).toContain("the revised prompt");
   });
 });

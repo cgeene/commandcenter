@@ -63,6 +63,22 @@ export function latestAgentEventTs(
   return row?.ts;
 }
 
+/** Id of the task's most recent event of any of `kinds`. Ids order events
+ *  reliably where same-second timestamps cannot. */
+export function latestTaskEventId(
+  taskId: number,
+  kinds: string[],
+): number | undefined {
+  const marks = kinds.map(() => "?").join(",");
+  const row = getDb()
+    .prepare(
+      `SELECT id FROM events WHERE task_id = ? AND kind IN (${marks})
+       ORDER BY id DESC LIMIT 1`,
+    )
+    .get(taskId, ...kinds) as { id: number } | undefined;
+  return row?.id;
+}
+
 /** Events of `kind` since UTC midnight — used for the daily spawn budget. */
 export function countEventsToday(kind: string): number {
   const row = getDb()

@@ -213,12 +213,16 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
       }
     }
 
-    // silent too long while supposedly working -> stalled
+    // silent too long while supposedly working -> stalled. "review" is
+    // included because resumed workers (PR feedback answered mid-review,
+    // input delivered via /send) can be working while the task shows
+    // review — without it, a resume that failed to unblock the agent
+    // would never be surfaced to anyone.
     if (agent.kind === "worker" && agent.state === "working") {
       const last = Date.parse(agent.last_event_at ?? agent.spawned_at);
       if (nowMs - last > cfg.stall_minutes * 60_000) {
         const task = agent.task_id ? getTask(agent.task_id) : undefined;
-        if (task?.status === "in_progress") {
+        if (task && ["in_progress", "review"].includes(task.status)) {
           updateAgent(agent.id, { state: "stalled" });
           logEvent("agent.stalled", { agentId: agent.id, taskId: task.id });
           notify(

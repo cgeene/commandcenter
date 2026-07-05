@@ -72,12 +72,17 @@ function buildWorkerPrompt(task: Task, branch: string): string {
   return lines.join("\n");
 }
 
-/** Short continuation message for `claude --resume` — the resumed session
- *  already holds the full task context; don't repeat it, just re-anchor. */
+/** Continuation message for `claude --resume` — the resumed session holds
+ *  the conversation, but the task prompt is restated: the orchestrator's
+ *  "requeue with a better prompt" flow edits task.prompt between sessions,
+ *  and a resume that omits it would silently redo the wrong work. */
 function buildResumePrompt(task: Task): string {
   const lines = [
     `You are being resumed on task #${task.id} ("${task.title}") — your previous session ended before the task was finished, or the task came back to you.`,
     "Check where you left off (`git status` / `git log` in this worktree), then finish the task.",
+    "",
+    "## The task (re-read it — it may have been revised since your last session)",
+    task.prompt,
   ];
   if (task.review_notes) {
     lines.push(
@@ -158,11 +163,14 @@ export function spawnWorker(
 
   const tag = `task-${taskId}`;
   // Workers may publish their own branch + PR without a permission stall —
-  // but only their own branch; anything else still prompts.
+  // but only their own branch; anything else still prompts. Exact commands,
+  // no trailing glob: `${branch}*` would also match a refspec push onto the
+  // remote's main (`git push origin ${branch}:main`) and sibling branches
+  // by prefix (task-1* matches task-10..task-19).
   const settingsFile = writeSettingsFile(tag, agent.id, {
     allow: [
-      `Bash(git push -u origin ${branch}*)`,
-      `Bash(git push origin ${branch}*)`,
+      `Bash(git push -u origin ${branch})`,
+      `Bash(git push origin ${branch})`,
       "Bash(gh pr create*)",
       "Bash(gh pr view*)",
     ],

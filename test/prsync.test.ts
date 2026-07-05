@@ -69,14 +69,17 @@ describe("applyPrState", () => {
     expect(listEvents(10).map((e) => e.kind)).toContain("pr.merged");
   });
 
-  it("closed-unmerged PR blocks the task", async () => {
+  it("closed-unmerged PR blocks the task and reaps its worker", async () => {
     const { applyPrState } = await import("../src/daemon/prsync.js");
     const { getTask } = await import("../src/db/tasks.js");
-    const { task } = await setupPrTask();
+    const { getAgent } = await import("../src/db/agents.js");
+    const { task, worker } = await setupPrTask();
     await applyPrState(task.id, open({ state: "CLOSED" }));
     const t = getTask(task.id)!;
     expect(t.status).toBe("blocked");
     expect(t.review_notes).toContain("closed without merging");
+    // an idle worker on a blocked task would occupy scheduler capacity forever
+    expect(getAgent(worker.id)?.state).toBe("dead");
   });
 
   it("new comments requeue a dead worker's task with the feedback as notes", async () => {
@@ -115,14 +118,14 @@ describe("applyPrState", () => {
     expect(listEvents(10).map((e) => e.kind)).not.toContain("pr.feedback");
   });
 
-  it("delivering PR feedback moves a waiting_input worker back to working", async () => {
+  it("delivering PR feedback moves a live worker back to working", async () => {
     const { applyPrState } = await import("../src/daemon/prsync.js");
     const { getTask, updateTask } = await import("../src/db/tasks.js");
     const { createAgent, getAgent } = await import("../src/db/agents.js");
     const { task } = await setupPrTask();
     const worker = createAgent({
       kind: "worker",
-      state: "waiting_input",
+      state: "idle",
       task_id: task.id,
       tmux_target: "cc:@7",
     });
@@ -136,7 +139,55 @@ describe("applyPrState", () => {
       }),
     );
     expect(getTask(task.id)?.status).toBe("in_progress");
-    expect(getAgent(worker.id)?.state).toBe("working");
+    const w = getAgent(worker.id)!;
+    expect(w.state).toBe("working");
+    // resumed workers must not trip the stall watchdog on pre-resume silence
+    expect(w.last_event_at).not.toBeNull();
+  });
+
+  it("defers feedback while the worker sits on a permission prompt", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { task } = await setupPrTask();
+    const worker = createAgent({
+      kind: "worker",
+      state: "waiting_input", // injected text would answer its pending menu
+      task_id: task.id,
+      tmux_target: "cc:@7",
+    });
+    updateTask(task.id, { agent_id: worker.id });
+    await applyPrState(
+      task.id,
+      open({
+        comments: [
+          { author: "caleb", body: "fix this", created_at: "2026-07-04T02:00:00Z" },
+        ],
+      }),
+    );
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("review"); // untouched
+    expect(t.pr_feedback_at).toBeNull(); // watermark NOT advanced — retried next pass
+    expect(getAgent(worker.id)?.state).toBe("waiting_input");
+  });
+
+  it("defers feedback while an adversarial reviewer is live", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { task } = await setupPrTask();
+    createAgent({ kind: "reviewer", state: "working", task_id: task.id });
+    await applyPrState(
+      task.id,
+      open({
+        comments: [
+          { author: "caleb", body: "fix this", created_at: "2026-07-04T02:00:00Z" },
+        ],
+      }),
+    );
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("review"); // the reviewer's submit_review stays valid
+    expect(t.pr_feedback_at).toBeNull();
   });
 
   it("does nothing for tasks not in review", async () => {

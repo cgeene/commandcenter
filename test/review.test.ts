@@ -195,6 +195,21 @@ describe("verify bypass fix", () => {
     await handleHookEvent(agent.id, { hook_event_name: "Stop" });
     expect(countTaskEvents(task.id, "verify.passed")).toBe(1); // unchanged
   });
+
+  it("re-verifies when work resumed after the last pass (PR feedback cycle)", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { logEvent, countTaskEvents } = await import("../src/db/events.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r", verify_cmd: "true" });
+    const agent = createAgent({ kind: "worker", state: "idle", task_id: task.id });
+    updateTask(task.id, { status: "review", agent_id: agent.id, worktree: tmpDir });
+    logEvent("verify.passed", { taskId: task.id, agentId: agent.id });
+    // PR feedback (or a rejection) resumed the worker — the old pass is stale
+    logEvent("task.reopened", { taskId: task.id });
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    expect(countTaskEvents(task.id, "verify.passed")).toBe(2); // ran again
+  });
 });
 
 describe("reviewer stop handling", () => {

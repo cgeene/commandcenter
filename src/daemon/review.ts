@@ -1,10 +1,9 @@
-import { getAgent, updateAgent } from "../db/agents.js";
 import { countEventsToday, logEvent } from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { getTask, updateTask, type Task } from "../db/tasks.js";
 import { notify } from "./notify.js";
-import { spawnReviewer } from "./spawn.js";
-import { sendText, windowExists } from "./tmux.js";
+import { resumeAgent } from "./resume.js";
+import { killAgent, spawnReviewer } from "./spawn.js";
 import { git } from "./worktree.js";
 
 /** Rejection cycles before the reviewer/worker loop escalates to the human. */
@@ -122,12 +121,6 @@ export async function handleVerdict(
   }
 
   const cycles = task.review_cycles + 1;
-  const worker = task.agent_id ? getAgent(task.agent_id) : undefined;
-  const workerAlive =
-    worker &&
-    worker.state !== "dead" &&
-    worker.tmux_target !== null &&
-    windowExists(worker.tmux_target);
 
   if (cycles >= MAX_REVIEW_CYCLES) {
     updateTask(taskId, {
@@ -142,7 +135,17 @@ export async function handleVerdict(
       `${task.title} — last reviewer notes: ${notes.slice(0, 200)}`,
       { priority: "high", tags: "rotating_light" },
     );
-  } else if (workerAlive) {
+    return getTask(taskId)!;
+  }
+
+  const outcome = task.agent_id
+    ? await resumeAgent(
+        task.agent_id,
+        `An independent reviewer REJECTED your work on this task. Address every point below, re-verify, update your result_summary, then stop.\n\n${notes}`,
+      )
+    : "not_live";
+
+  if (outcome === "sent") {
     // verdict cleared so the next pass through review gets a fresh reviewer
     updateTask(taskId, {
       status: "in_progress",
@@ -150,12 +153,12 @@ export async function handleVerdict(
       review_notes: notes,
       review_cycles: cycles,
     });
-    updateAgent(worker.id, { state: "working" });
-    await sendText(
-      worker.tmux_target!,
-      `An independent reviewer REJECTED your work on this task. Address every point below, re-verify, update your result_summary, then stop.\n\n${notes}`,
-    );
+    logEvent("task.reopened", { taskId, payload: { reason: "review rejected" } });
   } else {
+    // A worker parked on a permission prompt can't take the notes, and the
+    // prompt it's waiting on belongs to work that was just rejected — kill
+    // it; the respawn resumes its session with the notes in the prompt.
+    if (outcome === "waiting_input") killAgent(task.agent_id!);
     updateTask(taskId, {
       status: "queued",
       agent_id: null,

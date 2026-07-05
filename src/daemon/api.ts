@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { TASK_STATUSES, type TaskStatus } from "../db/db.js";
-import { getAgent, listAgents, updateAgent } from "../db/agents.js";
+import { getAgent, listAgents } from "../db/agents.js";
 import {
   createCron,
   deleteCron,
@@ -36,7 +36,8 @@ import {
   spawnReviewer,
   spawnWorker,
 } from "./spawn.js";
-import { capturePane, sendText, windowExists } from "./tmux.js";
+import { resumeAgent } from "./resume.js";
+import { capturePane, windowExists } from "./tmux.js";
 
 const newTaskSchema = z.object({
   title: z.string().min(1),
@@ -191,19 +192,10 @@ export function buildApp(): Hono {
   app.post("/api/agents/:id/send", async (c) => {
     const agent = getAgent(Number(c.req.param("id")));
     if (!agent) return c.json({ error: "not found" }, 404);
-    if (!agent.tmux_target || !windowExists(agent.tmux_target)) {
-      return c.json({ error: "no live tmux window" }, 409);
-    }
     const { text } = z.object({ text: z.string().min(1) }).parse(await c.req.json());
-    await sendText(agent.tmux_target, text);
-    // No Claude Code hook fires when a resumed session picks work back up —
-    // Notification is the only thing that sets waiting_input, so nothing
-    // clears it until the agent's next Stop/Notification. Delivering input
-    // is the one place we know for certain the agent is unblocked, so flip
-    // it back to working here instead of leaving the dashboard stale.
-    if (agent.state === "waiting_input") {
-      updateAgent(agent.id, { state: "working" });
-    }
+    // interrupt: a send to a waiting agent IS the answer to its question
+    const outcome = await resumeAgent(agent.id, text, { interrupt: true });
+    if (outcome !== "sent") return c.json({ error: "no live tmux window" }, 409);
     logEvent("agent.sent", { agentId: agent.id, taskId: agent.task_id ?? undefined });
     return c.json({ ok: true });
   });

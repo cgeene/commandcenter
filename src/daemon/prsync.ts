@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
-import { getAgent, listAgents, updateAgent } from "../db/agents.js";
+import { listAgents } from "../db/agents.js";
 import { logEvent } from "../db/events.js";
 import { getTask, listTasks, updateTask, type Task } from "../db/tasks.js";
 import { notify } from "./notify.js";
+import { resumeAgent } from "./resume.js";
 import { killAgent } from "./spawn.js";
-import { sendText, windowExists } from "./tmux.js";
 import { git, removeWorktree } from "./worktree.js";
 
 /**
@@ -75,15 +75,22 @@ export async function fetchPrState(prUrl: string): Promise<PrState> {
         body: r.body ?? "",
         created_at: r.submittedAt ?? "",
       })),
-  ].filter((c) => c.body.trim() && c.created_at);
+  ]
+    .filter((c) => c.body.trim() && c.created_at)
+    // CI chatter (codecov[bot], github-actions[bot], ...) is not review
+    // feedback — forwarding it would yank the task out of review for nothing.
+    .filter((c) => !c.author.endsWith("[bot]"));
   comments.sort((a, b) => a.created_at.localeCompare(b.created_at));
   return { state: v.state, reviewDecision: v.reviewDecision, comments };
 }
 
-function reapTaskAgents(task: Task): void {
+function reapTaskAgents(task: Task, opts?: { rmWorktree?: boolean }): void {
   for (const a of listAgents({ live: true })) {
     if (a.task_id === task.id && a.kind !== "main") {
-      killAgent(a.id, { rmWorktree: true });
+      // reviewer worktrees are throwaway — always reap them with the agent
+      killAgent(a.id, {
+        rmWorktree: a.kind === "reviewer" || (opts?.rmWorktree ?? false),
+      });
     }
   }
 }
@@ -94,7 +101,7 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
   if (!task || task.status !== "review") return;
 
   if (pr.state === "MERGED") {
-    reapTaskAgents(task);
+    reapTaskAgents(task, { rmWorktree: true });
     const fresh = getTask(taskId)!;
     if (fresh.worktree) {
       try {
@@ -118,6 +125,10 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
   }
 
   if (pr.state === "CLOSED") {
+    // Reap the agents — a blocked task's idle worker would otherwise sit in
+    // scheduler capacity forever (nothing else cleans up blocked tasks).
+    // The worktree and branch stay for the human to inspect or salvage.
+    reapTaskAgents(task);
     updateTask(taskId, {
       status: "blocked",
       review_notes: `PR closed without merging: ${task.pr_url}`,
@@ -138,6 +149,14 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
   if (fresh.length === 0 && !changesRequested) return;
   if (fresh.length === 0 && changesRequested && task.pr_feedback_at) return; // already forwarded
 
+  // A live adversarial reviewer is judging this exact state — moving the
+  // task out of review now would void its verdict mid-flight. The feedback
+  // keeps: nothing below is persisted, so the next pass retries.
+  const reviewing = listAgents({ live: true }).some(
+    (a) => a.kind === "reviewer" && a.task_id === taskId,
+  );
+  if (reviewing) return;
+
   const feedback = [
     changesRequested ? "The PR review verdict is CHANGES REQUESTED." : "",
     ...fresh.map((c) => `${c.author}: ${c.body}`),
@@ -148,35 +167,41 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
     ? fresh[fresh.length - 1].created_at
     : new Date().toISOString();
 
+  // Deliver BEFORE persisting: once pr_feedback_at advances these comments
+  // are never looked at again, so a failed send must leave it untouched.
+  if (task.agent_id) {
+    const outcome = await resumeAgent(
+      task.agent_id,
+      `New feedback on your PR (${task.pr_url}). Address every point, push to the same branch, then update your result_summary and stop.\n\n${feedback}`,
+    );
+    // Worker is parked on a permission prompt — injected text would answer
+    // the menu, not reach the conversation. The wait is already being
+    // escalated; retry on a later pass once it's unblocked.
+    if (outcome === "waiting_input") return;
+    if (outcome === "sent") {
+      updateTask(taskId, { status: "in_progress", pr_feedback_at: mark });
+      logEvent("pr.feedback", {
+        taskId,
+        payload: { comments: fresh.length, changes_requested: changesRequested },
+      });
+      logEvent("task.reopened", { taskId, payload: { reason: "pr feedback" } });
+      return;
+    }
+    // not_live: fall through to requeue
+  }
+
+  // notes flow into the respawn prompt, same as a reviewer rejection
+  updateTask(taskId, {
+    status: "queued",
+    agent_id: null,
+    pr_feedback_at: mark,
+    review_notes: `PR feedback (${task.pr_url}) — address every point and push to the same branch:\n${feedback}`,
+  });
   logEvent("pr.feedback", {
     taskId,
     payload: { comments: fresh.length, changes_requested: changesRequested },
   });
-
-  const worker = task.agent_id ? getAgent(task.agent_id) : undefined;
-  const workerAlive =
-    worker &&
-    worker.state !== "dead" &&
-    worker.tmux_target !== null &&
-    windowExists(worker.tmux_target);
-
-  if (workerAlive) {
-    updateTask(taskId, { status: "in_progress", pr_feedback_at: mark });
-    updateAgent(worker.id, { state: "working" });
-    await sendText(
-      worker.tmux_target!,
-      `New feedback on your PR (${task.pr_url}). Address every point, push to the same branch, then update your result_summary and stop.\n\n${feedback}`,
-    );
-  } else {
-    // notes flow into the respawn prompt, same as a reviewer rejection
-    updateTask(taskId, {
-      status: "queued",
-      agent_id: null,
-      pr_feedback_at: mark,
-      review_notes: `PR feedback (${task.pr_url}) — address every point and push to the same branch:\n${feedback}`,
-    });
-    logEvent("task.requeued", { taskId, payload: { reason: "pr feedback" } });
-  }
+  logEvent("task.requeued", { taskId, payload: { reason: "pr feedback" } });
 }
 
 const failing = new Set<number>();
