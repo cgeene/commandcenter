@@ -60,10 +60,17 @@ function buildWorkerPrompt(task: Task, branch: string): string {
       `Before finishing, verify with: \`${task.verify_cmd}\` and make it pass. The platform re-runs this after you stop.`,
     );
   }
-  lines.push(
-    `When done and you have commits: push your branch (\`git push -u origin ${branch}\`) and open a PR with \`gh pr create\` against the repo's default branch — title in conventional-commit style, body covering what/why/how you verified, ending with "commandcenter task #${task.id}". The human reviews PRs in GitHub, not transcripts. Never push any other branch, never merge, never touch an existing PR that isn't yours. If the repo has no GitHub remote, the push fails, or you made no commits, skip the PR and say so in result_summary.`,
-    "When done: set result_summary via update_my_task with a short summary of what you did and how you verified it (include pr_url if you opened a PR), then stop.",
-  );
+  if (task.open_pr === 0) {
+    lines.push(
+      `When done and you have commits: commit to your branch and push it (\`git push -u origin ${branch}\`). Do NOT open a PR — the branch itself is the deliverable for this task. Note the branch name and head commit (\`git rev-parse HEAD\`) in your result_summary.`,
+      "When done: set result_summary via update_my_task with a short summary of what you did and how you verified it, then stop.",
+    );
+  } else {
+    lines.push(
+      `When done and you have commits: push your branch (\`git push -u origin ${branch}\`) and open a PR with \`gh pr create\` against the repo's default branch — title in conventional-commit style, body covering what/why/how you verified, ending with "commandcenter task #${task.id}". The human reviews PRs in GitHub, not transcripts. Never push any other branch, never merge, never touch an existing PR that isn't yours. If the repo has no GitHub remote, the push fails, or you made no commits, skip the PR and say so in result_summary.`,
+      "When done: set result_summary via update_my_task with a short summary of what you did and how you verified it (include pr_url if you opened a PR), then stop.",
+    );
+  }
   const memories = memorySectionFor(`${task.title} ${task.prompt}`, 5, {
     taskId: task.id,
     repo: task.repo,
@@ -93,7 +100,9 @@ function buildResumePrompt(task: Task): string {
   }
   lines.push(
     "",
-    "Everything from your original instructions still applies: verify your work, push your branch and open/update the PR if you have commits, then set result_summary via update_my_task and stop.",
+    task.open_pr === 0
+      ? "Everything from your original instructions still applies: verify your work, commit and push your branch — Do NOT open a PR, the branch itself is the deliverable — then set result_summary via update_my_task and stop."
+      : "Everything from your original instructions still applies: verify your work, push your branch and open/update the PR if you have commits, then set result_summary via update_my_task and stop.",
   );
   return lines.join("\n");
 }

@@ -57,6 +57,18 @@ describe("task queue", () => {
       updateTask(t.id, { status: "bogus" as never }),
     ).toThrow(/invalid status/);
   });
+
+  it("defaults open_pr to true", async () => {
+    const { createTask } = await import("../src/db/tasks.js");
+    const t = createTask({ title: "t", prompt: "x", repo: "/r" });
+    expect(t.open_pr).toBe(1);
+  });
+
+  it("createTask respects open_pr: false", async () => {
+    const { createTask } = await import("../src/db/tasks.js");
+    const t = createTask({ title: "t", prompt: "x", repo: "/r", open_pr: false });
+    expect(t.open_pr).toBe(0);
+  });
 });
 
 describe("api", () => {
@@ -91,5 +103,54 @@ describe("api", () => {
       body: JSON.stringify({ title: "" }),
     });
     expect(res.status).toBe(400);
+  });
+
+  it("creates a branch-only task via open_pr: false", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const app = buildApp();
+    const create = await app.request("/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "t", prompt: "x", repo: "/r", open_pr: false }),
+    });
+    const task = (await create.json()) as { open_pr: number };
+    expect(task.open_pr).toBe(0);
+  });
+
+  it("PATCH flips open_pr to false and back without erroring", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const app = buildApp();
+    const create = await app.request("/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "t", prompt: "x", repo: "/r" }),
+    });
+    const task = (await create.json()) as { id: number };
+
+    const off = await app.request(`/api/tasks/${task.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ open_pr: false }),
+    });
+    expect(off.status).toBe(200);
+    expect(((await off.json()) as { open_pr: number }).open_pr).toBe(0);
+
+    // a PATCH that omits open_pr must not touch it (regression guard: binding
+    // an explicit `undefined` for a NOT NULL column throws, per the
+    // crons.enabled bug of the same shape)
+    const untouched = await app.request(`/api/tasks/${task.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ priority: 1 }),
+    });
+    expect(untouched.status).toBe(200);
+    expect(((await untouched.json()) as { open_pr: number }).open_pr).toBe(0);
+
+    const on = await app.request(`/api/tasks/${task.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ open_pr: true }),
+    });
+    expect(((await on.json()) as { open_pr: number }).open_pr).toBe(1);
   });
 });

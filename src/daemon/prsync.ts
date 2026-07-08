@@ -207,7 +207,10 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
 const failing = new Set<number>();
 
 export async function prSyncPass(): Promise<void> {
-  const candidates = listTasks("review").filter((t) => t.pr_url);
+  // open_pr=false tasks are branch-only by design and should never carry a
+  // pr_url, but skip explicitly rather than let a stale one trigger a sync
+  // error against a PR this task was never supposed to have.
+  const candidates = listTasks("review").filter((t) => t.pr_url && t.open_pr !== 0);
   for (const task of candidates) {
     try {
       const pr = await fetchPrState(task.pr_url!);

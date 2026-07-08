@@ -212,6 +212,51 @@ describe("verify bypass fix", () => {
   });
 });
 
+describe("open_pr prompt wiring", () => {
+  it("worker prompt tells a branch-only task not to open a PR", async () => {
+    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r", open_pr: false });
+    const prompt = _buildWorkerPromptForTest(task, "agent/task-1");
+    expect(prompt).toContain("Do NOT open a PR");
+    expect(prompt).not.toContain("gh pr create");
+  });
+
+  it("worker prompt tells a normal task to open a PR", async () => {
+    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const prompt = _buildWorkerPromptForTest(task, "agent/task-1");
+    expect(prompt).toContain("gh pr create");
+    expect(prompt).not.toContain("Do NOT open a PR");
+  });
+
+  it("resume prompt carries the branch-only instruction too", async () => {
+    const { _buildResumePromptForTest } = await import("../src/daemon/spawn.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r", open_pr: false });
+    const prompt = _buildResumePromptForTest(task);
+    expect(prompt).toContain("Do NOT open a PR");
+  });
+
+  it("reviewer prompt states a missing PR is not a defect for branch-only tasks", async () => {
+    const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r", open_pr: false });
+    const prompt = buildReviewerPrompt(task);
+    expect(prompt).toContain("BRANCH-ONLY");
+    expect(prompt).toContain("A missing PR is NOT a defect");
+  });
+
+  it("reviewer prompt states a PR is expected for normal tasks", async () => {
+    const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const prompt = buildReviewerPrompt(task);
+    expect(prompt).toContain("This task expects a PR");
+  });
+});
+
 describe("reviewer stop handling", () => {
   it("flags a reviewer that stopped without submitting a verdict", async () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");

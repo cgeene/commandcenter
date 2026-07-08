@@ -59,6 +59,12 @@ server.registerTool(
       priority: z.number().int().min(0).max(4).optional(),
       blocked_by: z.number().int().optional(),
       verify_cmd: z.string().optional(),
+      open_pr: z
+        .boolean()
+        .optional()
+        .describe(
+          "false = branch-only: the worker commits and pushes but must NOT open a PR (default true)",
+        ),
     },
   },
   async (args) => {
@@ -241,6 +247,12 @@ if (ROLE === "main") {
         prompt: z.string().optional(),
         verify_cmd: z.string().optional(),
         result_summary: z.string().optional(),
+        open_pr: z
+          .boolean()
+          .optional()
+          .describe(
+            "false = branch-only: the worker commits and pushes but must NOT open a PR",
+          ),
       },
     },
     async ({ id, ...fields }) => asText(await call("PATCH", `/api/tasks/${id}`, fields)),
