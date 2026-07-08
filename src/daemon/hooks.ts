@@ -12,8 +12,9 @@ import { notify } from "./notify.js";
 import { resumeAgent } from "./resume.js";
 import { maybeAutoReview } from "./review.js";
 import { killAgent } from "./spawn.js";
+import { detectTransientApiError } from "./stall.js";
 import { sessionTokens } from "./transcript.js";
-import { windowExists } from "./tmux.js";
+import { capturePane, windowExists } from "./tmux.js";
 
 export interface HookPayload {
   hook_event_name?: string;
@@ -24,6 +25,64 @@ export interface HookPayload {
 
 const VERIFY_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_VERIFY_NUDGES = 2;
+const MAX_AUTO_NUDGES = 2;
+const PANE_TAIL_LINES = 60;
+
+/** Consecutive transient-API-error nudges sent per agent, in-memory only —
+ *  losing this on daemon restart just means one extra escalation, which is
+ *  the safe direction to fail in. */
+const autoNudgeCounts = new Map<number, number>();
+
+/** A human or the orchestrator delivered real input — whatever stall streak
+ *  was in progress is over. */
+export function resetAutoNudgeCount(agentId: number): void {
+  autoNudgeCounts.delete(agentId);
+}
+
+/** Test-only: agent ids reset to 1 on every fresh in-memory test db, but
+ *  this map does not — clear it between tests to avoid cross-test bleed. */
+export function __clearAutoNudgeCountsForTests(): void {
+  autoNudgeCounts.clear();
+}
+
+interface StallCheck {
+  nudged: boolean;
+  error: string | null;
+}
+
+/**
+ * Capture the agent's pane and, if it ends on the harness's own transient
+ * API-error line, send a silent "please continue" through the same delivery
+ * path send_to_worker uses instead of surfacing this as waiting_input. Caps
+ * at MAX_AUTO_NUDGES consecutive attempts per agent — beyond that the caller
+ * falls through to its normal escalation path, with `error` available to
+ * fold into that notification's text.
+ */
+async function tryAutoNudge(agent: Agent): Promise<StallCheck> {
+  if (agent.kind === "main" || !agent.tmux_target || !windowExists(agent.tmux_target)) {
+    return { nudged: false, error: null };
+  }
+
+  const error = detectTransientApiError(capturePane(agent.tmux_target, PANE_TAIL_LINES));
+  if (!error) {
+    resetAutoNudgeCount(agent.id);
+    return { nudged: false, error: null };
+  }
+
+  const count = autoNudgeCounts.get(agent.id) ?? 0;
+  if (count >= MAX_AUTO_NUDGES) return { nudged: false, error };
+
+  const outcome = await resumeAgent(agent.id, "please continue");
+  if (outcome !== "sent") return { nudged: false, error };
+
+  autoNudgeCounts.set(agent.id, count + 1);
+  logEvent("agent.auto_nudged", {
+    agentId: agent.id,
+    taskId: agent.task_id ?? undefined,
+    payload: { error, attempt: count + 1 },
+  });
+  return { nudged: true, error };
+}
 
 function now(): string {
   return new Date().toISOString();
@@ -69,18 +128,33 @@ export async function handleHookEvent(
       break;
 
     case "Notification": {
-      const wasAlreadyWaiting = agent.state === "waiting_input";
-      updateAgent(agentId, { state: "waiting_input" });
       const msg = body.message ?? "waiting for input";
       const who = `a${agentId}${agent.task_id ? ` (task #${agent.task_id})` : ""}`;
 
       // The main agent asking for input IS the escalation — page the human.
       if (agent.kind === "main") {
+        updateAgent(agentId, { state: "waiting_input" });
         notify(`${who} needs input`, msg, { priority: "high", tags: "warning" });
         break;
       }
+
+      const wasAlreadyWaiting = agent.state === "waiting_input";
+      let stallError: string | null = null;
+      if (!wasAlreadyWaiting) {
+        const stall = await tryAutoNudge(agent);
+        // Recovered on its own — never mark waiting_input or start the
+        // escalation timer for this occurrence.
+        if (stall.nudged) break;
+        stallError = stall.error;
+      }
+
+      updateAgent(agentId, { state: "waiting_input" });
       // Repeat notification for the same wait: already delegated or paged.
       if (wasAlreadyWaiting) break;
+
+      const fullMsg = stallError
+        ? `${msg}\n\n(auto-recovery gave up after ${MAX_AUTO_NUDGES} attempts — last seen: ${stallError})`
+        : msg;
 
       // First try the main agent. Only a main that is working/idle — text
       // injected into a main sitting on its own permission menu would be
@@ -96,16 +170,16 @@ export async function handleHookEvent(
         main &&
         (await resumeAgent(
           main.id,
-          `[commandcenter] ${agent.kind} ${who} is waiting for input: "${msg}". peek_worker(${agentId}) to see exactly what it's asking, then try to unblock it yourself via send_to_worker (for a numbered menu send just the digit). Escalate to the human ONLY if it genuinely needs them: credentials, a judgment call that's theirs, or approval for something destructive/outside the worktree. If unresolved after ${getEscalateMinutes()}m the human is paged automatically.`,
+          `[commandcenter] ${agent.kind} ${who} is waiting for input: "${fullMsg}". peek_worker(${agentId}) to see exactly what it's asking, then try to unblock it yourself via send_to_worker (for a numbered menu send just the digit). Escalate to the human ONLY if it genuinely needs them: credentials, a judgment call that's theirs, or approval for something destructive/outside the worktree. If unresolved after ${getEscalateMinutes()}m the human is paged automatically.`,
         )) === "sent";
       if (delegated) {
         logEvent("waiting.delegated", {
           agentId,
           taskId: agent.task_id ?? undefined,
-          payload: { to: main!.id, message: msg },
+          payload: { to: main!.id, message: fullMsg },
         });
       } else {
-        notify(`${who} needs input`, msg, { priority: "high", tags: "warning" });
+        notify(`${who} needs input`, fullMsg, { priority: "high", tags: "warning" });
       }
       break;
     }
@@ -114,7 +188,7 @@ export async function handleHookEvent(
       updateAgent(agentId, { state: "idle" });
       recordTokens(agent, body.session_id);
       if (agent.kind === "reviewer") {
-        reviewerStopped(agent);
+        await reviewerStopped(agent);
         break;
       }
       if (agent.kind !== "worker" || !agent.task_id) break;
@@ -145,15 +219,20 @@ function recordTokens(agent: Agent, sessionId?: string): void {
 }
 
 /** A reviewer's turn ended. If it submitted a verdict its job is done —
- *  reap the window and its throwaway worktree. If not, it lost the thread:
- *  flag it for the human instead of leaving a zombie reviewer around. */
-function reviewerStopped(agent: Agent): void {
+ *  reap the window and its throwaway worktree. If not, check whether a
+ *  transient API error stalled it before flagging it for the human — a
+ *  zombie reviewer left waiting on an empty prompt otherwise pages someone
+ *  for pure Anthropic-side flakiness. */
+async function reviewerStopped(agent: Agent): Promise<void> {
   const submitted =
     countAgentEvents(agent.id, ["review.approved", "review.rejected"]) > 0;
   if (submitted) {
     killAgent(agent.id, { rmWorktree: true });
     return;
   }
+  const stall = await tryAutoNudge(agent);
+  if (stall.nudged) return;
+
   const prior = countAgentEvents(agent.id, ["reviewer.stopped_incomplete"]);
   logEvent("reviewer.stopped_incomplete", {
     agentId: agent.id,
@@ -162,7 +241,9 @@ function reviewerStopped(agent: Agent): void {
   if (prior === 0) {
     notify(
       `reviewer a${agent.id} stopped without a verdict`,
-      `task #${agent.task_id} — peek to see why, or kill it and re-spawn a reviewer`,
+      stall.error
+        ? `task #${agent.task_id} — auto-recovery gave up after ${MAX_AUTO_NUDGES} attempts (last seen: ${stall.error}); peek to see why, or kill it and re-spawn a reviewer`
+        : `task #${agent.task_id} — peek to see why, or kill it and re-spawn a reviewer`,
       { priority: "high", tags: "warning" },
     );
   }
@@ -185,6 +266,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     // pings the human about work that doesn't exist yet.
     const fresh = getTask(task.id);
     if (fresh?.result_summary) {
+      resetAutoNudgeCount(agent.id);
       updateTask(task.id, { status: "review" });
       logEvent("task.review", { taskId: task.id, agentId: agent.id });
       notify(
@@ -194,12 +276,17 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
       );
       maybeAutoReview(task.id);
     } else {
+      const stall = await tryAutoNudge(agent);
+      if (stall.nudged) return;
+
       const prior = countTaskEvents(task.id, "task.stopped_incomplete");
       logEvent("task.stopped_incomplete", { taskId: task.id, agentId: agent.id });
       if (prior === 0) {
         notify(
           `a${agent.id} stopped without completing #${task.id}`,
-          `${task.title} — no result set; peek, steer, or requeue`,
+          stall.error
+            ? `${task.title} — no result set; auto-recovery gave up after ${MAX_AUTO_NUDGES} attempts (last seen: ${stall.error}); peek, steer, or requeue`
+            : `${task.title} — no result set; peek, steer, or requeue`,
           { priority: "high", tags: "warning" },
         );
       }
@@ -231,6 +318,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
   if (!current || !["in_progress", "review"].includes(current.status)) return;
 
   if (result.ok) {
+    resetAutoNudgeCount(agent.id);
     updateTask(task.id, { status: "review" });
     logEvent("verify.passed", { taskId: task.id, agentId: agent.id });
     notify(
