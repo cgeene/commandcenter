@@ -182,6 +182,33 @@ describe("createReviewWorktree", () => {
     expect(git(repoA, "rev-parse", taskBranch)).toBe(commitX);
   });
 
+  it("falls back to the local branch (loudly) when the repo has no origin remote", async () => {
+    const repo = path.join(tmpDir, "no-remote");
+    fs.mkdirSync(repo);
+    git(repo, "init", "-b", "main");
+    const taskBranch = "agent/task-20";
+    git(repo, "checkout", "-b", taskBranch);
+    writeFile(repo, "work.txt", "local only\n");
+    commit(repo, "feat: local only work");
+    const localTip = git(repo, "rev-parse", taskBranch);
+
+    const { createReviewWorktree, git: worktreeGit } = await import(
+      "../src/daemon/worktree.js"
+    );
+    const { listEvents } = await import("../src/db/events.js");
+    const dir = createReviewWorktree(repo, 20, taskBranch);
+
+    expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
+    const events = listEvents(20).filter(
+      (e) => e.kind === "worktree.review_fallback_local_branch",
+    );
+    expect(events).toHaveLength(1);
+    expect(JSON.parse(events[0].payload!)).toMatchObject({
+      branch: taskBranch,
+      reason: "no-origin-remote",
+    });
+  });
+
   it("falls back to the local branch when it was never pushed", async () => {
     const { remoteDir } = setupRemote();
     const repoA = cloneRepo(remoteDir, "repo-a");

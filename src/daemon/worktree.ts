@@ -137,7 +137,13 @@ export function reviewWorktreeDir(repo: string, taskId: number): string {
  * fails — logged loudly rather than silently.
  */
 function resolveReviewTarget(repo: string, branch: string, taskId: number): string {
-  if (!hasOriginRemote(repo)) return branch;
+  if (!hasOriginRemote(repo)) {
+    logEvent("worktree.review_fallback_local_branch", {
+      taskId,
+      payload: { branch, reason: "no-origin-remote" },
+    });
+    return branch;
+  }
   try {
     fetchQuiet(repo, branch);
     return `origin/${branch}`;
