@@ -253,6 +253,20 @@ async function reviewerStopped(agent: Agent): Promise<void> {
  *  review — or push the failure back into the worker's session. */
 async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
   const wasReview = task.status === "review";
+  const fresh = wasReview ? task : getTask(task.id);
+  const hasResult = Boolean(fresh?.result_summary);
+
+  // A Stop with no result_summary is a worker giving up mid-turn — exactly
+  // the empty-prompt stall this module exists to tell apart from a
+  // transient Anthropic-side error. Check BEFORE running verify_cmd (if any)
+  // at all: a trivial verify_cmd can pass on an untouched worktree and
+  // falsely mark a stalled turn "done", and a failing one would otherwise
+  // burn the separate MAX_VERIFY_NUDGES budget re-sending the wrong message.
+  let stall: StallCheck = { nudged: false, error: null };
+  if (!wasReview && !hasResult) {
+    stall = await tryAutoNudge(agent);
+    if (stall.nudged) return;
+  }
 
   if (!task.verify_cmd || !task.worktree) {
     if (wasReview) {
@@ -264,21 +278,17 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     // done when it set result_summary (or moved the status itself). A Stop
     // without one is a worker pausing/asking — flagging that as "review"
     // pings the human about work that doesn't exist yet.
-    const fresh = getTask(task.id);
-    if (fresh?.result_summary) {
+    if (hasResult) {
       resetAutoNudgeCount(agent.id);
       updateTask(task.id, { status: "review" });
       logEvent("task.review", { taskId: task.id, agentId: agent.id });
       notify(
         `task #${task.id} ready for review`,
-        fresh.pr_url ? `${task.title}\n${fresh.pr_url}` : task.title,
+        fresh!.pr_url ? `${task.title}\n${fresh!.pr_url}` : task.title,
         { tags: "eyes" },
       );
       maybeAutoReview(task.id);
     } else {
-      const stall = await tryAutoNudge(agent);
-      if (stall.nudged) return;
-
       const prior = countTaskEvents(task.id, "task.stopped_incomplete");
       logEvent("task.stopped_incomplete", { taskId: task.id, agentId: agent.id });
       if (prior === 0) {
@@ -337,11 +347,15 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     payload: { output: result.output.slice(-2000) },
   });
 
+  const stallNote = stall.error
+    ? `\n\n(this turn followed ${MAX_AUTO_NUDGES} auto-recovery attempts for a transient error: ${stall.error})`
+    : "";
+
   const nudged =
     priorFails < MAX_VERIFY_NUDGES &&
     (await resumeAgent(
       agent.id,
-      `Verification failed (\`${task.verify_cmd}\`). Fix the issues and finish the task. Output tail:\n${result.output.slice(-1500)}`,
+      `Verification failed (\`${task.verify_cmd}\`). Fix the issues and finish the task. Output tail:\n${result.output.slice(-1500)}${stallNote}`,
     )) === "sent";
 
   if (nudged) {
@@ -361,7 +375,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     });
     notify(
       `task #${task.id} blocked`,
-      `${task.title} — verification failed repeatedly`,
+      `${task.title} — verification failed repeatedly${stallNote}`,
       { priority: "high", tags: "rotating_light" },
     );
   }

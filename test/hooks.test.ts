@@ -172,6 +172,50 @@ describe("transient API error auto-nudge", () => {
     expect(kinds).not.toContain("task.stopped_incomplete");
   });
 
+  it("a task WITH a verify_cmd still auto-nudges on a stalled Stop instead of trivially verifying", async () => {
+    // A trivially-passing verify_cmd must not be run at all for a stalled
+    // turn — running it would falsely mark an untouched turn "done".
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, agent } = await setup({ verify_cmd: "true", tmux_target: "cc:@1" });
+    paneContent = OVERLOAD_ERROR_PANE;
+
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+
+    expect(sendText).toHaveBeenCalledOnce();
+    expect(sendText).toHaveBeenCalledWith("cc:@1", "please continue");
+    expect(getTask(task.id)?.status).toBe("in_progress"); // NOT review
+    const kinds = listEvents(10).map((e) => e.kind);
+    expect(kinds).toContain("agent.auto_nudged");
+    expect(kinds).not.toContain("verify.passed");
+  });
+
+  it("a verify_cmd task caps at 2 auto-nudges, then falls through to the normal verify-failure path with the stall folded in", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, agent } = await setup({ verify_cmd: "false", tmux_target: "cc:@1" });
+    paneContent = OVERLOAD_ERROR_PANE;
+
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // auto-nudge 1
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // auto-nudge 2
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // cap hit: falls through to verify
+
+    expect(sendText).toHaveBeenCalledTimes(3);
+    expect(sendText.mock.calls[0][1]).toBe("please continue");
+    expect(sendText.mock.calls[1][1]).toBe("please continue");
+    // The 3rd call is the pre-existing verify-failure nudge, with the
+    // transient-error context folded in rather than silently dropped.
+    expect(sendText.mock.calls[2][1]).toMatch(/Verification failed/);
+    expect(sendText.mock.calls[2][1]).toMatch(/auto-recovery attempts for a transient error/);
+
+    const events = listEvents(20);
+    expect(events.filter((e) => e.kind === "agent.auto_nudged").length).toBe(2);
+    expect(events.filter((e) => e.kind === "verify.failed").length).toBe(1);
+    expect(getTask(task.id)?.status).toBe("in_progress"); // reopened via the verify nudge, not blocked yet
+  });
+
   it("does not auto-nudge when the worker merely quoted an API error in prose", async () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");
     const { listEvents } = await import("../src/db/events.js");
