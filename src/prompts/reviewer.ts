@@ -24,6 +24,7 @@ export function buildReviewerPrompt(task: Task): string {
     "## Your setup",
     `- You are in a read-only review worktree, detached at the tip of branch \`${task.branch}\`. File-editing tools are denied — you review, you do not fix.`,
     "- Use get_task_diff for the full diff of the worker's branch, and read any file you need for context.",
+    "- If this task's deliverable is research/discovery documentation, the worker was told to save it to the internal doc store (not the repo). Use list_docs and get_doc to read what it actually saved and verify the doc deliverable — a claimed doc that is missing, empty, or off-spec in the store is a defect.",
     task.open_pr === 0
       ? "- This task is BRANCH-ONLY by design: the worker was explicitly told NOT to open a PR — the branch itself is the deliverable. A missing PR is NOT a defect; do not reject for it. If the worker opened one anyway, that IS a scope violation — reject for it."
       : `- This task expects a PR opened against the repo's default branch (pr_url: ${task.pr_url ?? "not set — worth checking whether one exists and just wasn't recorded"}).`,
