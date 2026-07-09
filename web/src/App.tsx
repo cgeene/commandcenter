@@ -4,6 +4,7 @@ import { api } from "./api";
 import { Terminal } from "./Terminal";
 import type {
   Agent,
+  AttentionItem,
   CronJob,
   Event,
   Memory,
@@ -79,6 +80,7 @@ export function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
+  const [attention, setAttention] = useState<AttentionItem[]>([]);
   const [selTask, setSelTask] = useState<Task | null>(null);
   const [termAgent, setTermAgent] = useState<number | null>(null);
   const [transcript, setTranscript] = useState<TranscriptEntry[] | null>(null);
@@ -102,16 +104,18 @@ export function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [t, a, e, s] = await Promise.all([
+      const [t, a, e, s, at] = await Promise.all([
         api<Task[]>("GET", "/api/tasks"),
         api<Agent[]>("GET", "/api/agents?live=true"),
         api<Event[]>("GET", "/api/events?limit=25"),
         api<SchedulerInfo>("GET", "/api/scheduler"),
+        api<AttentionItem[]>("GET", "/api/attention"),
       ]);
       setTasks(t);
       setAgents(a);
       setEvents(e);
       setScheduler(s);
+      setAttention(at);
       setSelTask((cur) => (cur ? (t.find((x) => x.id === cur.id) ?? null) : null));
     } catch {
       /* daemon briefly unreachable — keep last state */
@@ -164,6 +168,9 @@ export function App() {
               onClick={() => setTab(t.id)}
             >
               {t.label}
+              {t.id === "board" && attention.length > 0 && (
+                <span className="tab-badge">{attention.length}</span>
+              )}
             </button>
           ))}
         </nav>
@@ -206,6 +213,19 @@ export function App() {
         <div className="error" onClick={() => setError(null)}>
           {error}
         </div>
+      )}
+
+      {tab === "board" && (
+        <AttentionPanel
+          items={attention}
+          onDismiss={(key) =>
+            act(() => api("POST", `/api/attention/${encodeURIComponent(key)}/dismiss`, {}))
+          }
+          onOpenTask={(taskId) => {
+            const t = tasks.find((x) => x.id === taskId);
+            if (t) setSelTask(t);
+          }}
+        />
       )}
 
       {tab === "board" && (
@@ -347,6 +367,90 @@ export function App() {
         />
       )}
     </div>
+  );
+}
+
+function fmtAge(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  return `${Math.floor(h / 24)}d`;
+}
+
+const KIND_ICON: Record<AttentionItem["kind"], string> = {
+  merge_pr: "⇧",
+  merge_and_apply: "⚡",
+  decision: "⚖",
+  escalation: "⛔",
+  stale_waiting: "⏳",
+};
+
+/**
+ * The pinned "Needs You" queue. Always shown on the board: a severity-colored
+ * row per action when non-empty, collapsed to a single reassuring line when
+ * there's nothing to do.
+ */
+function AttentionPanel({
+  items,
+  onDismiss,
+  onOpenTask,
+}: {
+  items: AttentionItem[];
+  onDismiss: (key: string) => void;
+  onOpenTask: (taskId: number) => void;
+}) {
+  if (items.length === 0) {
+    return (
+      <section className="attention empty">
+        <span className="muted">✓ nothing needs you</span>
+      </section>
+    );
+  }
+  return (
+    <section className="attention">
+      <h2>
+        Needs you <span className="muted">{items.length}</span>
+      </h2>
+      {items.map((it) => (
+        <div key={it.id} className={`attention-row sev-${it.severity}`}>
+          <span className="att-icon" title={it.kind}>
+            {KIND_ICON[it.kind]}
+          </span>
+          <div className="att-main">
+            <div className="att-title">
+              {it.title}
+              {it.urgent && <span className="att-urgent">urgent</span>}
+            </div>
+            {it.context && <div className="att-context muted">{it.context}</div>}
+          </div>
+          <span className="att-age muted" title={it.created_at}>
+            {fmtAge(it.age_ms)}
+          </span>
+          {it.pr_url ? (
+            <a
+              className="att-open"
+              href={it.pr_url}
+              target="_blank"
+              rel="noreferrer"
+            >
+              open
+            </a>
+          ) : it.task_id != null ? (
+            <button className="att-open" onClick={() => onOpenTask(it.task_id!)}>
+              open
+            </button>
+          ) : (
+            <span className="att-open" />
+          )}
+          <button className="att-dismiss" onClick={() => onDismiss(it.id)}>
+            dismiss
+          </button>
+        </div>
+      ))}
+    </section>
   );
 }
 

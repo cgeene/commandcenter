@@ -58,6 +58,51 @@ button.sched-on:hover { background: #da3633; border-color: #da3633; }
 }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 
+/* "Needs You" pinned action queue */
+.attention {
+  padding: 10px 16px; border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+.attention.empty { padding: 8px 16px; }
+.attention.empty .muted { color: var(--green); }
+.attention h2 {
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--muted); margin-bottom: 8px;
+}
+.attention-row {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  border-left-width: 3px; padding: 7px 12px; margin-bottom: 6px; font-size: 13px;
+}
+.attention-row.sev-red { border-left-color: var(--red); }
+.attention-row.sev-orange { border-left-color: #db6d28; }
+.attention-row.sev-yellow { border-left-color: var(--yellow); }
+.att-icon { font-size: 15px; width: 18px; text-align: center; flex-shrink: 0; }
+.att-main { flex: 1; min-width: 0; }
+.att-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.att-urgent {
+  margin-left: 8px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: #fff; background: var(--red); border-radius: 8px; padding: 1px 6px; font-weight: 700;
+}
+.att-context {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px;
+}
+.att-age { flex-shrink: 0; font-size: 12px; white-space: nowrap; }
+.att-open, .att-dismiss {
+  flex-shrink: 0; font-size: 12px; padding: 3px 10px; text-decoration: none;
+  display: inline-block; min-width: 54px; text-align: center;
+}
+a.att-open {
+  background: #21262d; color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; line-height: 1.6;
+}
+a.att-open:hover { border-color: var(--accent); }
+span.att-open { min-width: 54px; }
+.tab-badge {
+  margin-left: 6px; font-size: 10px; font-weight: 700; color: #fff;
+  background: var(--red); border-radius: 8px; padding: 0 6px; line-height: 1.5;
+}
+
 main { display: flex; flex: 1; overflow: hidden; }
 
 .board {

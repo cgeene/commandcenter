@@ -63,6 +63,21 @@ export function latestAgentEventTs(
   return row?.ts;
 }
 
+/** The agent's most recent event of any of `kinds` (id + ts). The id gives a
+ *  stable, monotonic discriminator where same-second timestamps cannot. */
+export function latestAgentEvent(
+  agentId: number,
+  kinds: string[],
+): { id: number; ts: string } | undefined {
+  const marks = kinds.map(() => "?").join(",");
+  return getDb()
+    .prepare(
+      `SELECT id, ts FROM events WHERE agent_id = ? AND kind IN (${marks})
+       ORDER BY id DESC LIMIT 1`,
+    )
+    .get(agentId, ...kinds) as { id: number; ts: string } | undefined;
+}
+
 /** Id of the task's most recent event of any of `kinds`. Ids order events
  *  reliably where same-second timestamps cannot. */
 export function latestTaskEventId(
