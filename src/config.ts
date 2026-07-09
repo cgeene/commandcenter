@@ -20,6 +20,12 @@ export function promptsDir(): string {
   return path.join(dataDir(), "prompts");
 }
 
+/** Root of the internal long-term doc store — plain markdown + sidecar files
+ *  under <root>/<project>/<slug>.md so they can be read/grepped directly. */
+export function docsDir(): string {
+  return process.env.CC_DOCS_DIR ?? path.join(dataDir(), "docs");
+}
+
 export function port(): number {
   return Number(process.env.CC_PORT ?? 4711);
 }
