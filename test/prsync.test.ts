@@ -199,3 +199,17 @@ describe("applyPrState", () => {
     expect(getTask(task.id)?.status).toBe("done");
   });
 });
+
+describe("prSyncPass", () => {
+  it("skips a branch-only (open_pr=false) task even if it has a stale pr_url", async () => {
+    const { prSyncPass } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task } = await setupPrTask();
+    updateTask(task.id, { open_pr: 0 });
+    await prSyncPass();
+    // no gh call attempted -> no sync error, task left untouched
+    expect(listEvents(10).map((e) => e.kind)).not.toContain("pr.sync_error");
+    expect(getTask(task.id)?.status).toBe("review");
+  });
+});

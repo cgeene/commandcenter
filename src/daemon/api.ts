@@ -47,6 +47,7 @@ const newTaskSchema = z.object({
   model: z.string().optional(),
   blocked_by: z.number().int().optional(),
   verify_cmd: z.string().optional(),
+  open_pr: z.boolean().optional(),
 });
 
 const updateTaskSchema = z.object({
@@ -59,6 +60,7 @@ const updateTaskSchema = z.object({
   verify_cmd: z.string().nullable().optional(),
   result_summary: z.string().nullable().optional(),
   pr_url: z.string().url().nullable().optional(),
+  open_pr: z.boolean().optional(),
 });
 
 const spawnSchema = z.object({
@@ -100,7 +102,12 @@ export function buildApp(): Hono {
     if (!getTask(id)) return c.json({ error: "not found" }, 404);
     const body = updateTaskSchema.parse(await c.req.json());
     const before = getTask(id)!;
-    const task = updateTask(id, body as Parameters<typeof updateTask>[1]);
+    // body.open_pr is a boolean (or absent); only present when the caller
+    // sent it, so an explicit `undefined` never gets bound as a SQL param
+    // (that binds NULL against a NOT NULL column — see the crons.enabled bug).
+    const patch: Record<string, unknown> = { ...body };
+    if (body.open_pr !== undefined) patch.open_pr = body.open_pr ? 1 : 0;
+    const task = updateTask(id, patch as Parameters<typeof updateTask>[1]);
     if (body.status && body.status !== before.status) {
       logEvent("task.status", {
         taskId: id,

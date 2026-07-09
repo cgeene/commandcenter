@@ -20,6 +20,7 @@ export interface Task {
   review_cycles: number;
   pr_url: string | null;
   pr_feedback_at: string | null;
+  open_pr: number; // sqlite boolean, default 1
   tokens_used: number | null;
   cron_id: number | null;
   created_at: string;
@@ -35,14 +36,15 @@ export interface NewTask {
   blocked_by?: number;
   verify_cmd?: string;
   cron_id?: number;
+  open_pr?: boolean;
 }
 
 export function createTask(t: NewTask): Task {
   const db = getDb();
   const info = db
     .prepare(
-      `INSERT INTO tasks (title, prompt, repo, priority, model, blocked_by, verify_cmd, cron_id)
-       VALUES (@title, @prompt, @repo, @priority, @model, @blocked_by, @verify_cmd, @cron_id)`,
+      `INSERT INTO tasks (title, prompt, repo, priority, model, blocked_by, verify_cmd, cron_id, open_pr)
+       VALUES (@title, @prompt, @repo, @priority, @model, @blocked_by, @verify_cmd, @cron_id, @open_pr)`,
     )
     .run({
       title: t.title,
@@ -53,6 +55,7 @@ export function createTask(t: NewTask): Task {
       blocked_by: t.blocked_by ?? null,
       verify_cmd: t.verify_cmd ?? null,
       cron_id: t.cron_id ?? null,
+      open_pr: t.open_pr === false ? 0 : 1,
     });
   return getTask(Number(info.lastInsertRowid))!;
 }
@@ -143,6 +146,7 @@ const UPDATABLE = new Set([
   "review_cycles",
   "pr_url",
   "pr_feedback_at",
+  "open_pr",
   "tokens_used",
 ]);
 
