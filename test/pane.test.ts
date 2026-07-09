@@ -78,6 +78,67 @@ describe("parsePane", () => {
     );
   });
 
+  it("returns unsubmitted text verbatim even when it wraps across pane width", () => {
+    const raw = [
+      "CORNER_TL DASHES CORNER_TR",
+      "PIPE CURSOR this is a very long line of typed but unsubmitted PIPE",
+      "PIPE   text that keeps going onto a second physical line PIPE",
+      "CORNER_BL DASHES CORNER_BR",
+    ].join("\n");
+
+    const parsed = parsePane(fixture(raw));
+
+    expect(parsed.unsubmitted_input).toBe(
+      "this is a very long line of typed but unsubmitted " +
+        "text that keeps going onto a second physical line",
+    );
+  });
+
+  it("joins a permission question that itself wraps across pane width", () => {
+    const raw = [
+      "CORNER_TL DASHES CORNER_TR",
+      "PIPE Do you want to proceed with this PIPE",
+      "PIPE potentially destructive operation? PIPE",
+      "PIPE CURSOR 1. Yes PIPE",
+      "PIPE   2. No PIPE",
+      "CORNER_BL DASHES CORNER_BR",
+    ].join("\n");
+
+    const parsed = parsePane(fixture(raw));
+
+    expect(parsed.pending_permission?.question).toBe(
+      "Do you want to proceed with this potentially destructive operation?",
+    );
+  });
+
+  /**
+   * The bug this guards against: a worker can have BOTH stale unsubmitted
+   * text sitting in its input line AND assistant text above the box that
+   * reads as a plain question (the backend only nulls unsubmitted_input /
+   * pending_question against pending_permission, never against each other).
+   * The frontend must never let an operator type a fresh reply on top of
+   * unsubmitted_input — the two would concatenate and submit as one
+   * garbled message. This test documents that the parser legitimately
+   * returns both fields set at once, which is exactly the state the
+   * frontend's reply box must special-case (see AgentPane in App.tsx).
+   */
+  it("can report pending_question and unsubmitted_input at the same time", () => {
+    const raw = [
+      "BULLET Should I also back up the table before running this?",
+      "",
+      "CORNER_TL DASHES CORNER_TR",
+      "PIPE CURSOR wait don't run it yet PIPE",
+      "CORNER_BL DASHES CORNER_BR",
+    ].join("\n");
+
+    const parsed = parsePane(fixture(raw));
+
+    expect(parsed.pending_question).toBe(
+      "Should I also back up the table before running this?",
+    );
+    expect(parsed.unsubmitted_input).toBe("wait don't run it yet");
+  });
+
   it("returns all-null fields for an empty prompt", () => {
     const raw = [
       "CORNER_TL DASHES CORNER_TR",

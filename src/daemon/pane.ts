@@ -71,16 +71,15 @@ function parsePermission(lines: string[]): PendingPermission | null {
   );
   if (optStart === -1) return null;
 
-  // Question: the nearest non-blank bordered line above the option block.
-  let question = "";
+  // Question: all contiguous non-blank bordered lines directly above the
+  // option block, in original order — it can wrap across pane width too.
+  const questionLines: string[] = [];
   for (let i = optStart - 1; i >= 0; i--) {
     const u = unwrapped[i];
-    if (!u.bordered) break;
-    if (u.content) {
-      question = u.content;
-      break;
-    }
+    if (!u.bordered || u.content === "") break;
+    questionLines.unshift(u.content);
   }
+  const question = questionLines.join(" ");
 
   const options: PaneOption[] = [];
   for (let i = optStart; i < unwrapped.length; i++) {
@@ -100,18 +99,34 @@ function parsePermission(lines: string[]): PendingPermission | null {
   return options.length > 0 ? { question, options } : null;
 }
 
-/** Text sitting after the input marker that hasn't been sent yet. */
+/** Text sitting after the input marker that hasn't been sent yet — may wrap
+ *  across multiple physical lines within the input box at pane width. */
 function parseUnsubmittedInput(lines: string[]): string | null {
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const u = unwrap(lines[i]);
+  const unwrapped = lines.map(unwrap);
+  let start = -1;
+  let firstText = "";
+  for (let i = unwrapped.length - 1; i >= 0; i--) {
+    const u = unwrapped[i];
     if (!u.bordered) continue;
     const m = INPUT_LINE_RE.exec(u.content);
     if (!m) continue;
     // A menu cursor ("❯ 1. Yes") is not the free-text input line.
     if (/^\d{1,2}[.)]\s/.test(m[1])) continue;
-    return m[1].length > 0 ? m[1] : null;
+    start = i;
+    firstText = m[1];
+    break;
   }
-  return null;
+  if (start === -1) return null;
+
+  const parts = firstText.length > 0 ? [firstText] : [];
+  for (let i = start + 1; i < unwrapped.length; i++) {
+    const u = unwrapped[i];
+    // A wrapped continuation is bordered, non-blank, and not itself a new
+    // prompt/menu row.
+    if (!u.bordered || u.content === "" || u.content.startsWith("❯")) break;
+    parts.push(u.content);
+  }
+  return parts.length > 0 ? parts.join(" ") : null;
 }
 
 /** The agent's last assistant text before the (empty or not) input box. */

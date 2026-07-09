@@ -556,19 +556,28 @@ function AgentPane({
       {!pane?.pending_permission && pane?.pending_question && (
         <div className="pane-block">
           <div className="pane-question">{pane.pending_question}</div>
-          <div className="pane-reply">
-            <input
-              placeholder="reply…"
-              value={reply}
-              onChange={(e) => setReply(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") submitReply();
-              }}
-            />
-            <button className="primary" disabled={!reply.trim()} onClick={submitReply}>
-              send
-            </button>
-          </div>
+          {pane.unsubmitted_input ? (
+            // Sending now would type the reply directly after whatever's
+            // already sitting unsubmitted in the prompt, garbling both into
+            // one message — resolve the banner above first.
+            <span className="muted">
+              resolve the unsubmitted text above before replying
+            </span>
+          ) : (
+            <div className="pane-reply">
+              <input
+                placeholder="reply…"
+                value={reply}
+                onChange={(e) => setReply(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") submitReply();
+                }}
+              />
+              <button className="primary" disabled={!reply.trim()} onClick={submitReply}>
+                send
+              </button>
+            </div>
+          )}
         </div>
       )}
 
