@@ -404,6 +404,7 @@ export function buildApp(): Hono {
       .optional(),
     auto_review: z.boolean().optional(),
     escalate_minutes: z.number().int().min(1).max(120).optional(),
+    read_only_extra_allow: z.array(z.string()).optional(),
   });
 
   app.get("/api/scheduler", (c) => {

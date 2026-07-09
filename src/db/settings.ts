@@ -15,6 +15,11 @@ export interface SchedulerConfig {
   auto_review: boolean;
   /** Minutes a worker may sit in waiting_input (after the main agent was asked to unblock it) before the human is paged. */
   escalate_minutes: number;
+  /** Extra read-only permission patterns appended to the baked-in READ_ONLY_PROFILE
+   *  (src/daemon/permissions.ts) for worker/reviewer settings.json — lets new
+   *  read-only MCP tools/commands get allowlisted without a code change. Never
+   *  put state-changing patterns here; this list is applied unconditionally. */
+  read_only_extra_allow: string[];
 }
 
 export const SCHEDULER_DEFAULTS: SchedulerConfig = {
@@ -25,6 +30,7 @@ export const SCHEDULER_DEFAULTS: SchedulerConfig = {
   active_hours: null,
   auto_review: true,
   escalate_minutes: 5,
+  read_only_extra_allow: [],
 };
 
 function getSetting(key: string): string | undefined {

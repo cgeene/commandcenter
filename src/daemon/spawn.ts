@@ -21,6 +21,7 @@ import {
 import { ORCHESTRATOR_PROMPT } from "../prompts/orchestrator.js";
 import { buildReviewerPrompt } from "../prompts/reviewer.js";
 import { writeMcpConfigFile, writeSettingsFile } from "./genconfig.js";
+import { readOnlyProfileAllow } from "./permissions.js";
 import { findTranscript } from "./transcript.js";
 import { killWindow, newWindow, windowExists } from "./tmux.js";
 import {
@@ -107,9 +108,40 @@ function buildResumePrompt(task: Task): string {
   return lines.join("\n");
 }
 
+/** Workers may publish their own branch + PR without a permission stall —
+ *  but only their own branch; anything else still prompts. Exact commands,
+ *  no trailing glob: `${branch}*` would also match a refspec push onto the
+ *  remote's main (`git push origin ${branch}:main`) and sibling branches
+ *  by prefix (task-1* matches task-10..task-19). The read-only profile is
+ *  a base layer underneath — anything outside it still prompts normally. */
+function buildWorkerAllow(branch: string): string[] {
+  return [
+    ...readOnlyProfileAllow(),
+    `Bash(git push -u origin ${branch})`,
+    `Bash(git push origin ${branch})`,
+    "Bash(gh pr create*)",
+    "Bash(gh pr view*)",
+  ];
+}
+
+/** Reviewers are read-only by design (Edit/Write/commit/push are denied
+ *  below), so the shared read-only profile applies unconditionally. */
+function buildReviewerAllow(task: Task): string[] {
+  return [
+    "Read",
+    "Grep",
+    "Glob",
+    ...readOnlyProfileAllow(),
+    "Bash(git status*)",
+    ...(task.verify_cmd ? [`Bash(${task.verify_cmd})`] : []),
+  ];
+}
+
 /** Test-only exports: prompt construction is behavior worth pinning. */
 export const _buildWorkerPromptForTest = buildWorkerPrompt;
 export const _buildResumePromptForTest = buildResumePrompt;
+export const _buildWorkerAllowForTest = buildWorkerAllow;
+export const _buildReviewerAllowForTest = buildReviewerAllow;
 
 function buildClaudeCmd(opts: {
   model?: string;
@@ -171,18 +203,8 @@ export function spawnWorker(
   });
 
   const tag = `task-${taskId}`;
-  // Workers may publish their own branch + PR without a permission stall —
-  // but only their own branch; anything else still prompts. Exact commands,
-  // no trailing glob: `${branch}*` would also match a refspec push onto the
-  // remote's main (`git push origin ${branch}:main`) and sibling branches
-  // by prefix (task-1* matches task-10..task-19).
   const settingsFile = writeSettingsFile(tag, agent.id, {
-    allow: [
-      `Bash(git push -u origin ${branch})`,
-      `Bash(git push origin ${branch})`,
-      "Bash(gh pr create*)",
-      "Bash(gh pr view*)",
-    ],
+    allow: buildWorkerAllow(branch),
   });
   const mcpFile = writeMcpConfigFile(tag, {
     CC_ROLE: "worker",
@@ -259,16 +281,7 @@ export function spawnReviewer(
 
   const tag = `task-${taskId}-review`;
   const settingsFile = writeSettingsFile(tag, agent.id, {
-    allow: [
-      "Read",
-      "Grep",
-      "Glob",
-      "Bash(git diff*)",
-      "Bash(git log*)",
-      "Bash(git show*)",
-      "Bash(git status*)",
-      ...(task.verify_cmd ? [`Bash(${task.verify_cmd})`] : []),
-    ],
+    allow: buildReviewerAllow(task),
     deny: ["Edit", "Write", "NotebookEdit", "Bash(git commit*)", "Bash(git push*)"],
   });
   const mcpFile = writeMcpConfigFile(tag, {
