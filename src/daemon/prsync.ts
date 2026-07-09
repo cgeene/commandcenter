@@ -20,13 +20,22 @@ export interface PrComment {
   created_at: string;
 }
 
+/** CI check rollup for a PR — how the dashboard badges its health. */
+export type CheckRollup = "pass" | "fail" | "pending" | "none";
+
 export interface PrState {
   state: "OPEN" | "MERGED" | "CLOSED";
   reviewDecision: string | null;
   comments: PrComment[];
+  /** Rolled-up CI status; absent when not fetched (older callers/tests). */
+  checks?: CheckRollup;
 }
 
 const POLL_MS = 120_000;
+
+/** Consecutive prsync failures for one PR before we escalate loudly instead
+ *  of logging the same error silently forever (see unicorn-k8s PR #2199). */
+export const SYNC_FAIL_THRESHOLD = 3;
 
 export function parsePrUrl(
   url: string,
@@ -43,11 +52,45 @@ function gh(args: string[]): Promise<string> {
   });
 }
 
+/** Individual entries in gh's statusCheckRollup — either GitHub Checks
+ *  (status/conclusion) or legacy commit statuses (state). */
+interface RollupEntry {
+  status?: string; // QUEUED | IN_PROGRESS | COMPLETED (CheckRun)
+  conclusion?: string; // SUCCESS | FAILURE | ... (CheckRun, once COMPLETED)
+  state?: string; // SUCCESS | PENDING | FAILURE | ERROR (StatusContext)
+}
+
+/** Collapse a PR's individual checks into one health verdict. Any failure
+ *  wins; else any not-yet-complete check makes it pending; else all pass. */
+export function computeCheckRollup(entries: RollupEntry[]): CheckRollup {
+  if (!entries || entries.length === 0) return "none";
+  let pending = false;
+  for (const e of entries) {
+    const concl = (e.conclusion ?? "").toUpperCase();
+    const status = (e.status ?? "").toUpperCase();
+    const legacy = (e.state ?? "").toUpperCase();
+    if (
+      concl === "FAILURE" ||
+      concl === "TIMED_OUT" ||
+      concl === "CANCELLED" ||
+      concl === "ACTION_REQUIRED" ||
+      concl === "STARTUP_FAILURE" ||
+      legacy === "FAILURE" ||
+      legacy === "ERROR"
+    ) {
+      return "fail";
+    }
+    // a CheckRun that hasn't reached COMPLETED, or a pending legacy status
+    if ((status && status !== "COMPLETED") || legacy === "PENDING") pending = true;
+  }
+  return pending ? "pending" : "pass";
+}
+
 export async function fetchPrState(prUrl: string): Promise<PrState> {
   const ref = parsePrUrl(prUrl);
   if (!ref) throw new Error(`not a GitHub PR url: ${prUrl}`);
   const [view, issueComments, reviewComments] = await Promise.all([
-    gh(["pr", "view", prUrl, "--json", "state,reviewDecision,reviews"]),
+    gh(["pr", "view", prUrl, "--json", "state,reviewDecision,reviews,statusCheckRollup"]),
     gh(["api", `repos/${ref.owner}/${ref.repo}/issues/${ref.number}/comments`]),
     gh(["api", `repos/${ref.owner}/${ref.repo}/pulls/${ref.number}/comments`]),
   ]);
@@ -55,6 +98,7 @@ export async function fetchPrState(prUrl: string): Promise<PrState> {
     state: PrState["state"];
     reviewDecision: string | null;
     reviews?: { author?: { login?: string }; body?: string; submittedAt?: string }[];
+    statusCheckRollup?: RollupEntry[];
   };
   type RawComment = { user?: { login?: string }; body?: string; created_at?: string };
   const comments: PrComment[] = [
@@ -81,7 +125,12 @@ export async function fetchPrState(prUrl: string): Promise<PrState> {
     // feedback — forwarding it would yank the task out of review for nothing.
     .filter((c) => !c.author.endsWith("[bot]"));
   comments.sort((a, b) => a.created_at.localeCompare(b.created_at));
-  return { state: v.state, reviewDecision: v.reviewDecision, comments };
+  return {
+    state: v.state,
+    reviewDecision: v.reviewDecision,
+    comments,
+    checks: computeCheckRollup(v.statusCheckRollup ?? []),
+  };
 }
 
 function reapTaskAgents(task: Task, opts?: { rmWorktree?: boolean }): void {
@@ -204,7 +253,46 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
   logEvent("task.requeued", { taskId, payload: { reason: "pr feedback" } });
 }
 
-const failing = new Set<number>();
+/**
+ * Persist a successful sync: cache the PR lifecycle + CI rollup on the task
+ * and clear the consecutive-failure streak. The dashboard's PR board reads
+ * these columns instead of shelling out to gh on every render.
+ */
+export function recordSyncSuccess(taskId: number, pr: PrState): void {
+  updateTask(taskId, {
+    pr_state: pr.state.toLowerCase(),
+    pr_checks: pr.checks ?? null,
+    pr_synced_at: new Date().toISOString(),
+    pr_sync_fails: 0,
+  });
+}
+
+/**
+ * Record a failed sync. The failure count is persisted so the streak survives
+ * daemon restarts. We log the error once at the start of a streak (not every
+ * 2min), then escalate loudly exactly once when it reaches the threshold —
+ * that's the alarm that was missing when unicorn-k8s PR #2199 failed 4x
+ * silently.
+ */
+export function recordSyncFailure(taskId: number, error: string): void {
+  const task = getTask(taskId);
+  if (!task) return;
+  const fails = (task.pr_sync_fails ?? 0) + 1;
+  updateTask(taskId, { pr_sync_fails: fails });
+  if (fails === 1) {
+    logEvent("pr.sync_error", { taskId, payload: { error, fails } });
+  } else if (fails === SYNC_FAIL_THRESHOLD) {
+    logEvent("pr.sync_broken", {
+      taskId,
+      payload: { error, fails, pr_url: task.pr_url },
+    });
+    notify(
+      `PR sync broken — task #${taskId}`,
+      `${task.title} — ${fails} consecutive sync failures: ${error}`,
+      { priority: "high", tags: "warning" },
+    );
+  }
+}
 
 export async function prSyncPass(): Promise<void> {
   // open_pr=false tasks are branch-only by design and should never carry a
@@ -214,16 +302,10 @@ export async function prSyncPass(): Promise<void> {
   for (const task of candidates) {
     try {
       const pr = await fetchPrState(task.pr_url!);
-      failing.delete(task.id);
+      recordSyncSuccess(task.id, pr);
       await applyPrState(task.id, pr);
     } catch (err) {
-      if (!failing.has(task.id)) {
-        failing.add(task.id); // log once per failure streak, not every 2min
-        logEvent("pr.sync_error", {
-          taskId: task.id,
-          payload: { error: err instanceof Error ? err.message : String(err) },
-        });
-      }
+      recordSyncFailure(task.id, err instanceof Error ? err.message : String(err));
     }
   }
 }

@@ -213,3 +213,103 @@ describe("prSyncPass", () => {
     expect(getTask(task.id)?.status).toBe("review");
   });
 });
+
+describe("computeCheckRollup", () => {
+  it("empty rollup -> none", async () => {
+    const { computeCheckRollup } = await import("../src/daemon/prsync.js");
+    expect(computeCheckRollup([])).toBe("none");
+  });
+
+  it("all successful checks -> pass", async () => {
+    const { computeCheckRollup } = await import("../src/daemon/prsync.js");
+    expect(
+      computeCheckRollup([
+        { status: "COMPLETED", conclusion: "SUCCESS" },
+        { state: "SUCCESS" },
+      ]),
+    ).toBe("pass");
+  });
+
+  it("any failure wins over pending/success", async () => {
+    const { computeCheckRollup } = await import("../src/daemon/prsync.js");
+    expect(
+      computeCheckRollup([
+        { status: "COMPLETED", conclusion: "SUCCESS" },
+        { status: "IN_PROGRESS" },
+        { status: "COMPLETED", conclusion: "FAILURE" },
+      ]),
+    ).toBe("fail");
+    expect(computeCheckRollup([{ state: "ERROR" }])).toBe("fail");
+  });
+
+  it("an incomplete check with no failures -> pending", async () => {
+    const { computeCheckRollup } = await import("../src/daemon/prsync.js");
+    expect(
+      computeCheckRollup([
+        { status: "COMPLETED", conclusion: "SUCCESS" },
+        { status: "QUEUED" },
+      ]),
+    ).toBe("pending");
+    expect(computeCheckRollup([{ state: "PENDING" }])).toBe("pending");
+  });
+});
+
+describe("recordSyncSuccess", () => {
+  it("persists the PR lifecycle + CI rollup and clears the failure streak", async () => {
+    const { recordSyncSuccess, recordSyncFailure } = await import(
+      "../src/daemon/prsync.js"
+    );
+    const { getTask } = await import("../src/db/tasks.js");
+    const { task } = await setupPrTask();
+    recordSyncFailure(task.id, "boom"); // seed a streak
+    recordSyncSuccess(task.id, open({ state: "OPEN", checks: "pass" }));
+    const t = getTask(task.id)!;
+    expect(t.pr_state).toBe("open");
+    expect(t.pr_checks).toBe("pass");
+    expect(t.pr_synced_at).not.toBeNull();
+    expect(t.pr_sync_fails).toBe(0);
+  });
+});
+
+describe("recordSyncFailure escalation", () => {
+  it("logs sync_error once, then escalates to sync_broken at the threshold", async () => {
+    const { recordSyncFailure, SYNC_FAIL_THRESHOLD } = await import(
+      "../src/daemon/prsync.js"
+    );
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task } = await setupPrTask();
+
+    // fail #1: log once
+    recordSyncFailure(task.id, "gh timeout");
+    expect(getTask(task.id)?.pr_sync_fails).toBe(1);
+    // fail #2: silent (no repeated logging every pass)
+    recordSyncFailure(task.id, "gh timeout");
+    expect(getTask(task.id)?.pr_sync_fails).toBe(2);
+    // fail #3 (== threshold): escalate loudly, exactly once
+    recordSyncFailure(task.id, "gh timeout");
+    expect(getTask(task.id)?.pr_sync_fails).toBe(SYNC_FAIL_THRESHOLD);
+    // fail #4: no further events — it's already surfaced
+    recordSyncFailure(task.id, "gh timeout");
+    expect(getTask(task.id)?.pr_sync_fails).toBe(4);
+
+    const kinds = listEvents(20).map((e) => e.kind);
+    expect(kinds.filter((k) => k === "pr.sync_error")).toHaveLength(1);
+    expect(kinds.filter((k) => k === "pr.sync_broken")).toHaveLength(1);
+  });
+
+  it("a success between failures resets the streak so it never escalates", async () => {
+    const { recordSyncFailure, recordSyncSuccess } = await import(
+      "../src/daemon/prsync.js"
+    );
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task } = await setupPrTask();
+    recordSyncFailure(task.id, "flaky");
+    recordSyncFailure(task.id, "flaky");
+    recordSyncSuccess(task.id, open()); // recovered
+    recordSyncFailure(task.id, "flaky again");
+    expect(getTask(task.id)?.pr_sync_fails).toBe(1);
+    expect(listEvents(20).map((e) => e.kind)).not.toContain("pr.sync_broken");
+  });
+});

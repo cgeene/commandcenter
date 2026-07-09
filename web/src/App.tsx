@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { CSSProperties } from "react";
 import { api } from "./api";
+import { blockedByChain, groupByProject } from "../../src/lib/board";
 import { Terminal } from "./Terminal";
 import type {
   Agent,
@@ -11,29 +12,31 @@ import type {
   ParsedPane,
   SchedulerInfo,
   Task,
-  TaskStatus,
   TranscriptEntry,
 } from "./types";
 
 /** Dashboard tabs — add an entry here + a render branch in App to grow the dashboard. */
 const TABS = [
   { id: "board", label: "board" },
+  { id: "prs", label: "PRs" },
   { id: "tokens", label: "tokens" },
 ] as const;
 type TabId = (typeof TABS)[number]["id"];
+
+/** A task-linked PR still awaiting action — merged/closed ones auto-clear. */
+function isOpenPr(t: Task): boolean {
+  return (
+    !!t.pr_url &&
+    t.open_pr !== 0 &&
+    t.pr_state !== "merged" &&
+    t.pr_state !== "closed"
+  );
+}
 
 function tabFromHash(): TabId {
   const h = window.location.hash.replace(/^#\//, "");
   return TABS.some((t) => t.id === h) ? (h as TabId) : "board";
 }
-
-const COLUMNS: { title: string; statuses: TaskStatus[] }[] = [
-  { title: "Queued", statuses: ["queued", "claimed"] },
-  { title: "In progress", statuses: ["in_progress"] },
-  { title: "Blocked", statuses: ["blocked"] },
-  { title: "Review", statuses: ["review"] },
-  { title: "Done", statuses: ["done", "failed", "cancelled"] },
-];
 
 /**
  * On phones the virtual keyboard overlays the page without resizing it
@@ -109,7 +112,7 @@ export function App() {
       const [t, a, e, s, at] = await Promise.all([
         api<Task[]>("GET", "/api/tasks"),
         api<Agent[]>("GET", "/api/agents?live=true"),
-        api<Event[]>("GET", "/api/events?limit=25"),
+        api<Event[]>("GET", "/api/events?narrated=true&limit=30"),
         api<SchedulerInfo>("GET", "/api/scheduler"),
         api<AttentionItem[]>("GET", "/api/attention"),
       ]);
@@ -167,7 +170,15 @@ export function App() {
   };
 
   const liveMain = agents.find((a) => a.kind === "main" && a.state !== "dead");
-  const agentFor = (t: Task) => agents.find((a) => a.id === t.agent_id);
+  // Nav badge: open PRs the reviewer has approved and are now waiting on a
+  // human merge — the one state that most wants Caleb's attention.
+  const prsAwaitingMerge = tasks.filter(
+    (t) => isOpenPr(t) && t.review_verdict === "approve",
+  ).length;
+  const tabBadge: Partial<Record<TabId, number>> = {
+    board: attention.length,
+    prs: prsAwaitingMerge,
+  };
 
   return (
     <div className="app">
@@ -186,8 +197,8 @@ export function App() {
               onClick={() => setTab(t.id)}
             >
               {t.label}
-              {t.id === "board" && attention.length > 0 && (
-                <span className="tab-badge">{attention.length}</span>
+              {(tabBadge[t.id] ?? 0) > 0 && (
+                <span className="tab-badge">{tabBadge[t.id]}</span>
               )}
             </button>
           ))}
@@ -290,50 +301,43 @@ export function App() {
 
       {tab === "tokens" && <TokensView tasks={tasks} onSelect={setSelTask} />}
 
+      {tab === "prs" && <PrsView tasks={tasks} onSelect={setSelTask} />}
+
       {tab === "board" && (
       <main>
         <div className="board">
-          {COLUMNS.map((col) => {
-            const colTasks = tasks.filter((t) => col.statuses.includes(t.status));
-            return (
-              <div key={col.title} className="column">
+          {(() => {
+            // Blocker may live in another project group, so resolve chains
+            // against all tasks, not just the current group's.
+            const byId = new Map(tasks.map((t) => [t.id, t] as const));
+            return groupByProject(tasks).map((g) => (
+              <div key={g.project} className="column">
                 <h2>
-                  {col.title} <span className="muted">{colTasks.length}</span>
+                  {g.project} <span className="muted">{g.done}/{g.total}</span>
                 </h2>
-                {colTasks.map((t) => (
-                  <div
+                {g.tasks.map((t) => (
+                  <TaskCard
                     key={t.id}
-                    className={`card ${t.status}`}
-                    onClick={() => setSelTask(t)}
-                  >
-                    <div className="card-title">
-                      #{t.id} {t.title}
-                    </div>
-                    <div className="chips">
-                      {t.model && <span className="chip">{t.model}</span>}
-                      <span className="chip">p{t.priority}</span>
-                      {t.agent_id && agentFor(t) && (
-                        <span className="chip agent-chip">a{t.agent_id}</span>
-                      )}
-                      {t.status === "failed" && <span className="chip bad">failed</span>}
-                      {t.status === "cancelled" && <span className="chip">cancelled</span>}
-                    </div>
-                  </div>
+                    task={t}
+                    byId={byId}
+                    onSelect={setSelTask}
+                  />
                 ))}
               </div>
-            );
-          })}
+            ));
+          })()}
+          {tasks.length === 0 && <span className="muted">no tasks yet</span>}
         </div>
 
         <aside className="events">
-          <h2>Events</h2>
+          <h2>Activity</h2>
           {events.map((e) => (
             <div key={e.id} className="event">
-              <span className="muted">{e.ts.slice(11, 19)}</span> {e.kind}
-              {e.task_id ? ` #${e.task_id}` : ""}
-              {e.agent_id ? ` a${e.agent_id}` : ""}
+              <span className="muted">{e.ts.slice(11, 19)}</span>{" "}
+              {e.narrative ?? e.kind}
             </div>
           ))}
+          {events.length === 0 && <span className="muted">no activity yet</span>}
         </aside>
       </main>
       )}
@@ -409,6 +413,152 @@ function fmtAge(ms: number): string {
   const h = Math.floor(m / 60);
   if (h < 24) return `${h}h`;
   return `${Math.floor(h / 24)}d`;
+}
+
+/** First non-empty line of a summary, clipped for a card. */
+function firstLine(s: string | null, n = 140): string {
+  if (!s) return "";
+  const line = (s.split("\n").find((l) => l.trim()) ?? "").trim();
+  return line.length > n ? line.slice(0, n) + "…" : line;
+}
+
+/**
+ * Outcome-first task card for the board: status + reviewer-verdict chips, the
+ * first line of the result, a one-level blocked_by chain, and a PR link — so
+ * the card answers "how did this land?" without opening the detail drawer.
+ */
+function TaskCard({
+  task,
+  byId,
+  onSelect,
+}: {
+  task: Task;
+  byId: Map<number, Task>;
+  onSelect: (t: Task) => void;
+}) {
+  const chain = blockedByChain(task, byId);
+  const summary = firstLine(task.result_summary);
+  return (
+    <div className={`card ${task.status}`} onClick={() => onSelect(task)}>
+      <div className="card-title">
+        #{task.id} {task.title}
+      </div>
+      <div className="chips">
+        <span className={`chip ${task.status}`}>{task.status}</span>
+        {task.review_verdict === "approve" && (
+          <span className="chip approved">✓ approved</span>
+        )}
+        {task.review_verdict === "reject" && (
+          <span className="chip bad">✗ changes</span>
+        )}
+        {task.model && <span className="chip">{task.model}</span>}
+        {task.agent_id && <span className="chip agent-chip">a{task.agent_id}</span>}
+      </div>
+      {summary && <div className="card-summary">{summary}</div>}
+      {chain && (
+        <div className="card-blocked muted">
+          ⇠ #{chain.id} ({chain.status})
+        </div>
+      )}
+      {task.pr_url && (
+        <a
+          className="card-pr"
+          href={task.pr_url}
+          target="_blank"
+          rel="noreferrer"
+          onClick={(e) => e.stopPropagation()}
+        >
+          PR ↗
+        </a>
+      )}
+    </div>
+  );
+}
+
+const CI_BADGE: Record<string, { label: string; cls: string }> = {
+  pass: { label: "✓ CI", cls: "ci-pass" },
+  fail: { label: "✗ CI", cls: "ci-fail" },
+  pending: { label: "● CI", cls: "ci-pending" },
+  none: { label: "– CI", cls: "ci-none" },
+};
+
+function CiBadge({ checks }: { checks: string | null }) {
+  const b = CI_BADGE[checks ?? "none"] ?? CI_BADGE.none;
+  return <span className={`pr-ci ${b.cls}`}>{b.label}</span>;
+}
+
+/** The reviewer verdict — "reviewer approved — awaiting merge" is the state
+ *  the whole board is built to surface. */
+function VerdictBadge({ task }: { task: Task }) {
+  if (task.review_verdict === "approve") {
+    return <span className="pr-verdict approved">✓ reviewer approved — awaiting merge</span>;
+  }
+  if (task.review_verdict === "reject") {
+    return <span className="pr-verdict bad">✗ changes requested</span>;
+  }
+  return <span className="pr-verdict muted">in review</span>;
+}
+
+function prNumber(url: string | null): string {
+  return url?.match(/\/pull\/(\d+)/)?.[1] ?? "?";
+}
+
+function PrRow({ task, onSelect }: { task: Task; onSelect: (t: Task) => void }) {
+  const broken = (task.pr_sync_fails ?? 0) >= 3;
+  return (
+    <div className="pr-row">
+      <a className="pr-link" href={task.pr_url!} target="_blank" rel="noreferrer">
+        #{prNumber(task.pr_url)} {task.title}
+      </a>
+      <button className="pr-task" onClick={() => onSelect(task)}>
+        #{task.id}
+      </button>
+      <CiBadge checks={task.pr_checks} />
+      <VerdictBadge task={task} />
+      {broken && (
+        <span className="chip bad" title="prsync has failed 3+ times in a row">
+          ⚠ sync broken
+        </span>
+      )}
+      <span className="pr-age muted" title={task.pr_synced_at ?? task.updated_at}>
+        {fmtAge(Date.now() - Date.parse(task.updated_at))}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * The PR board: every task-linked PR grouped by repo/project, merged & closed
+ * ones auto-cleared. Leads with the reviewer verdict so approved-awaiting-merge
+ * work is unmissable.
+ */
+function PrsView({
+  tasks,
+  onSelect,
+}: {
+  tasks: Task[];
+  onSelect: (t: Task) => void;
+}) {
+  const groups = groupByProject(tasks.filter(isOpenPr));
+  return (
+    <main>
+      <div className="prs-view">
+        {groups.length === 0 && (
+          <span className="muted">no open PRs — everything's merged or in flight</span>
+        )}
+        {groups.map((g) => (
+          <div key={g.project} className="pr-group">
+            <h2>
+              {g.project} <span className="muted">{g.total}</span>
+            </h2>
+            {g.tasks.map((t) => (
+              <PrRow key={t.id} task={t} onSelect={onSelect} />
+            ))}
+          </div>
+        ))}
+      </div>
+    </main>
+  );
 }
 
 const KIND_ICON: Record<AttentionItem["kind"], string> = {

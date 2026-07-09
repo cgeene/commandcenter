@@ -28,6 +28,10 @@ export interface Task {
   review_cycles: number;
   pr_url: string | null;
   pr_feedback_at: string | null;
+  pr_state: string | null; // open | merged | closed
+  pr_checks: string | null; // pass | fail | pending | none
+  pr_synced_at: string | null;
+  pr_sync_fails: number;
   open_pr: number;
   tokens_used: number | null;
   created_at: string;
@@ -53,6 +57,8 @@ export interface Event {
   task_id: number | null;
   kind: string;
   payload: string | null;
+  /** Present when fetched with ?narrated=true — a human-readable one-liner. */
+  narrative?: string;
 }
 
 export interface TranscriptEntry {

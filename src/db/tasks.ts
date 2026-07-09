@@ -20,6 +20,10 @@ export interface Task {
   review_cycles: number;
   pr_url: string | null;
   pr_feedback_at: string | null;
+  pr_state: string | null; // open | merged | closed (lowercased gh state)
+  pr_checks: string | null; // CI rollup: pass | fail | pending | none
+  pr_synced_at: string | null; // last successful prsync
+  pr_sync_fails: number; // consecutive prsync failures; escalates at 3
   open_pr: number; // sqlite boolean, default 1
   tokens_used: number | null;
   cron_id: number | null;
@@ -146,6 +150,10 @@ const UPDATABLE = new Set([
   "review_cycles",
   "pr_url",
   "pr_feedback_at",
+  "pr_state",
+  "pr_checks",
+  "pr_synced_at",
+  "pr_sync_fails",
   "open_pr",
   "tokens_used",
 ]);
