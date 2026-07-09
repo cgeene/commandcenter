@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   review_cycles  INTEGER NOT NULL DEFAULT 0,
   pr_url         TEXT,
   pr_feedback_at TEXT,
+  pr_state       TEXT,
+  pr_checks      TEXT,
+  pr_synced_at   TEXT,
+  pr_sync_fails  INTEGER NOT NULL DEFAULT 0,
   open_pr        INTEGER NOT NULL DEFAULT 1,
   tokens_used    INTEGER,
   created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -193,6 +197,12 @@ function migrate(db: Database.Database): void {
   }
   if (!cols.includes("open_pr")) {
     db.exec("ALTER TABLE tasks ADD COLUMN open_pr INTEGER NOT NULL DEFAULT 1");
+  }
+  if (!cols.includes("pr_state")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN pr_state TEXT");
+    db.exec("ALTER TABLE tasks ADD COLUMN pr_checks TEXT");
+    db.exec("ALTER TABLE tasks ADD COLUMN pr_synced_at TEXT");
+    db.exec("ALTER TABLE tasks ADD COLUMN pr_sync_fails INTEGER NOT NULL DEFAULT 0");
   }
   const memCols = (db.prepare("PRAGMA table_info(memories)").all() as { name: string }[]).map(
     (c) => c.name,
