@@ -48,15 +48,43 @@ button.sched-on:hover { background: #da3633; border-color: #da3633; }
 }
 
 .agents {
-  display: flex; gap: 8px; padding: 10px 16px; overflow-x: auto;
-  border-bottom: 1px solid var(--border); min-height: 52px; align-items: center;
+  display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 16px;
+  border-bottom: 1px solid var(--border); min-height: 52px; align-items: flex-start;
 }
 .agent-card {
   display: flex; align-items: center; gap: 8px; white-space: nowrap;
   background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
   padding: 6px 10px; font-size: 12px;
 }
+/* A waiting_input card breaks out to full width so its pane content has
+   room to breathe instead of being crammed into a horizontal-scroll chip. */
+.agent-card.waiting {
+  flex-basis: 100%; flex-direction: column; align-items: stretch; white-space: normal;
+  border-color: var(--yellow);
+}
+.agent-card-row { display: flex; align-items: center; gap: 8px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+.agent-pane { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.pane-banner {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: #d299221a; border: 1px solid var(--yellow); border-radius: 6px;
+  padding: 6px 10px; font-size: 12px;
+}
+.pane-banner span { flex: 1; min-width: 200px; }
+.pane-banner-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.pane-block { display: flex; flex-direction: column; gap: 6px; }
+.pane-question {
+  font-size: 13px; white-space: pre-wrap; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px;
+}
+.pane-options { display: flex; flex-wrap: wrap; gap: 6px; }
+.pane-reply { display: flex; gap: 6px; }
+.pane-reply input {
+  flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 7px 9px; font-size: 13px; font-family: inherit;
+}
+.pane-terminal-link { align-self: flex-start; }
 
 /* "Needs You" pinned action queue */
 .attention {

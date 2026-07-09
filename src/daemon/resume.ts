@@ -1,6 +1,6 @@
 import { getAgent, updateAgent } from "../db/agents.js";
 import { logEvent } from "../db/events.js";
-import { sendText, windowExists } from "./tmux.js";
+import { sendEnter, sendText, windowExists } from "./tmux.js";
 
 export type ResumeOutcome = "sent" | "not_live" | "waiting_input";
 
@@ -58,6 +58,43 @@ export async function resumeAgent(
   if (fresh.state === "waiting_input" && agent.state !== "waiting_input") {
     return "sent";
   }
+  updateAgent(agentId, {
+    state: "working",
+    last_event_at: new Date().toISOString(),
+  });
+  return "sent";
+}
+
+/**
+ * Submit whatever text is already sitting in the agent's input line, without
+ * retyping it — the "submit it" action on an unsubmitted-input banner. Just
+ * presses Enter; sendText's literal-text + Enter dance would duplicate the
+ * text that's already there.
+ */
+export async function submitPending(agentId: number): Promise<ResumeOutcome> {
+  const agent = getAgent(agentId);
+  if (
+    !agent ||
+    agent.state === "dead" ||
+    !agent.tmux_target ||
+    !windowExists(agent.tmux_target)
+  ) {
+    return "not_live";
+  }
+
+  try {
+    sendEnter(agent.tmux_target);
+  } catch (err) {
+    logEvent("agent.send_failed", {
+      agentId,
+      taskId: agent.task_id ?? undefined,
+      payload: { error: err instanceof Error ? err.message : String(err) },
+    });
+    return "not_live";
+  }
+
+  const fresh = getAgent(agentId);
+  if (!fresh || fresh.state === "dead") return "sent";
   updateAgent(agentId, {
     state: "working",
     last_event_at: new Date().toISOString(),

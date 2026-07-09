@@ -43,8 +43,9 @@ import {
   spawnReviewer,
   spawnWorker,
 } from "./spawn.js";
-import { resumeAgent } from "./resume.js";
-import { capturePane, windowExists } from "./tmux.js";
+import { resumeAgent, submitPending } from "./resume.js";
+import { capturePane, clearInputLine, windowExists } from "./tmux.js";
+import { parsePane } from "./pane.js";
 
 const newTaskSchema = z.object({
   title: z.string().min(1),
@@ -203,6 +204,21 @@ export function buildApp(): Hono {
     return c.json({ target: agent.tmux_target, content: capturePane(agent.tmux_target, lines) });
   });
 
+  // Structured read of what a waiting_input agent's pane is showing — lets
+  // the dashboard answer it without opening the terminal.
+  app.get("/api/agents/:id/pane", (c) => {
+    const agent = getAgent(Number(c.req.param("id")));
+    if (!agent) return c.json({ error: "not found" }, 404);
+    if (!agent.tmux_target || !windowExists(agent.tmux_target)) {
+      return c.json({ error: "no live tmux window" }, 409);
+    }
+    const lines = Number(c.req.query("lines") ?? 60);
+    return c.json({
+      target: agent.tmux_target,
+      ...parsePane(capturePane(agent.tmux_target, lines)),
+    });
+  });
+
   app.post("/api/agents/:id/send", async (c) => {
     const agent = getAgent(Number(c.req.param("id")));
     if (!agent) return c.json({ error: "not found" }, 404);
@@ -214,6 +230,30 @@ export function buildApp(): Hono {
     // stall streak this agent was on is over.
     resetAutoNudgeCount(agent.id);
     logEvent("agent.sent", { agentId: agent.id, taskId: agent.task_id ?? undefined });
+    return c.json({ ok: true });
+  });
+
+  // "submit it" on an unsubmitted-input banner: press Enter on whatever's
+  // already typed, without retyping it (that would duplicate the text).
+  app.post("/api/agents/:id/submit-input", async (c) => {
+    const agent = getAgent(Number(c.req.param("id")));
+    if (!agent) return c.json({ error: "not found" }, 404);
+    const outcome = await submitPending(agent.id);
+    if (outcome !== "sent") return c.json({ error: "no live tmux window" }, 409);
+    resetAutoNudgeCount(agent.id);
+    logEvent("agent.input_submitted", { agentId: agent.id, taskId: agent.task_id ?? undefined });
+    return c.json({ ok: true });
+  });
+
+  // "clear it" on an unsubmitted-input banner: Ctrl-U, never a silent submit.
+  app.post("/api/agents/:id/clear-input", (c) => {
+    const agent = getAgent(Number(c.req.param("id")));
+    if (!agent) return c.json({ error: "not found" }, 404);
+    if (!agent.tmux_target || !windowExists(agent.tmux_target)) {
+      return c.json({ error: "no live tmux window" }, 409);
+    }
+    clearInputLine(agent.tmux_target);
+    logEvent("agent.input_cleared", { agentId: agent.id, taskId: agent.task_id ?? undefined });
     return c.json({ ok: true });
   });
 

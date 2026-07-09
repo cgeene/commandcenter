@@ -8,6 +8,7 @@ import type {
   CronJob,
   Event,
   Memory,
+  ParsedPane,
   SchedulerInfo,
   Task,
   TaskStatus,
@@ -79,6 +80,7 @@ const STATE_COLORS: Record<string, string> = {
 export function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [panes, setPanes] = useState<Record<number, ParsedPane>>({});
   const [events, setEvents] = useState<Event[]>([]);
   const [attention, setAttention] = useState<AttentionItem[]>([]);
   const [selTask, setSelTask] = useState<Task | null>(null);
@@ -117,6 +119,22 @@ export function App() {
       setScheduler(s);
       setAttention(at);
       setSelTask((cur) => (cur ? (t.find((x) => x.id === cur.id) ?? null) : null));
+
+      // Waiting agents need their pane parsed so the card can show what
+      // they're asking without opening the terminal.
+      const waiting = a.filter((x) => x.state === "waiting_input");
+      const paneEntries = await Promise.all(
+        waiting.map(async (x): Promise<[number, ParsedPane] | null> => {
+          try {
+            return [x.id, await api<ParsedPane>("GET", `/api/agents/${x.id}/pane`)];
+          } catch {
+            return null;
+          }
+        }),
+      );
+      setPanes(
+        Object.fromEntries(paneEntries.filter((e): e is [number, ParsedPane] => e !== null)),
+      );
     } catch {
       /* daemon briefly unreachable — keep last state */
     }
@@ -231,26 +249,39 @@ export function App() {
       {tab === "board" && (
       <section className="agents">
         {agents.map((a) => (
-          <div key={a.id} className="agent-card">
-            <span
-              className="dot"
-              style={{ background: STATE_COLORS[a.state] ?? "#8b949e" }}
-            />
-            <b>
-              a{a.id} {a.kind === "main" ? "· main" : a.task_id ? `· #${a.task_id}` : ""}
-            </b>
-            <span className="muted">
-              {a.state} · {a.model ?? "?"}
-            </span>
-            <button onClick={() => setTermAgent(a.id)}>terminal</button>
-            <button
-              className="danger"
-              onClick={() =>
-                act(() => api("POST", `/api/agents/${a.id}/kill`, { requeue: a.kind === "worker" }))
-              }
-            >
-              kill
-            </button>
+          <div
+            key={a.id}
+            className={`agent-card ${a.state === "waiting_input" ? "waiting" : ""}`}
+          >
+            <div className="agent-card-row">
+              <span
+                className="dot"
+                style={{ background: STATE_COLORS[a.state] ?? "#8b949e" }}
+              />
+              <b>
+                a{a.id} {a.kind === "main" ? "· main" : a.task_id ? `· #${a.task_id}` : ""}
+              </b>
+              <span className="muted">
+                {a.state} · {a.model ?? "?"}
+              </span>
+              <button onClick={() => setTermAgent(a.id)}>terminal</button>
+              <button
+                className="danger"
+                onClick={() =>
+                  act(() => api("POST", `/api/agents/${a.id}/kill`, { requeue: a.kind === "worker" }))
+                }
+              >
+                kill
+              </button>
+            </div>
+            {a.state === "waiting_input" && (
+              <AgentPane
+                agentId={a.id}
+                pane={panes[a.id]}
+                onAction={act}
+                onOpenTerminal={() => setTermAgent(a.id)}
+              />
+            )}
           </div>
         ))}
         {agents.length === 0 && <span className="muted">no live agents</span>}
@@ -451,6 +482,100 @@ function AttentionPanel({
         </div>
       ))}
     </section>
+  );
+}
+
+/**
+ * Inline "what is this agent asking?" panel for a waiting_input card — the
+ * whole point being that Caleb (or the orchestrator) can answer it right
+ * here instead of opening the terminal to find out. Every action is an
+ * explicit click; nothing here is ever auto-sent.
+ */
+function AgentPane({
+  agentId,
+  pane,
+  onAction,
+  onOpenTerminal,
+}: {
+  agentId: number;
+  pane: ParsedPane | undefined;
+  onAction: (fn: () => Promise<unknown>) => Promise<void>;
+  onOpenTerminal: () => void;
+}) {
+  const [reply, setReply] = useState("");
+  const send = (text: string) =>
+    onAction(() => api("POST", `/api/agents/${agentId}/send`, { text }));
+
+  const submitReply = () => {
+    if (!reply.trim()) return;
+    void send(reply.trim());
+    setReply("");
+  };
+
+  return (
+    <div className="agent-pane">
+      {pane?.unsubmitted_input && (
+        <div className="pane-banner">
+          <span>
+            unsubmitted text in prompt: "{pane.unsubmitted_input}"
+          </span>
+          <div className="pane-banner-actions">
+            <button
+              className="primary"
+              onClick={() =>
+                onAction(() => api("POST", `/api/agents/${agentId}/submit-input`, {}))
+              }
+            >
+              submit it
+            </button>
+            <button
+              className="danger"
+              onClick={() =>
+                onAction(() => api("POST", `/api/agents/${agentId}/clear-input`, {}))
+              }
+            >
+              clear it
+            </button>
+          </div>
+        </div>
+      )}
+
+      {pane?.pending_permission && (
+        <div className="pane-block">
+          <div className="pane-question">{pane.pending_permission.question}</div>
+          <div className="pane-options">
+            {pane.pending_permission.options.map((o) => (
+              <button key={o.n} onClick={() => send(String(o.n))}>
+                {o.n}. {o.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!pane?.pending_permission && pane?.pending_question && (
+        <div className="pane-block">
+          <div className="pane-question">{pane.pending_question}</div>
+          <div className="pane-reply">
+            <input
+              placeholder="reply…"
+              value={reply}
+              onChange={(e) => setReply(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") submitReply();
+              }}
+            />
+            <button className="primary" disabled={!reply.trim()} onClick={submitReply}>
+              send
+            </button>
+          </div>
+        </div>
+      )}
+
+      <button className="pane-terminal-link" onClick={onOpenTerminal}>
+        open terminal
+      </button>
+    </div>
   );
 }
 
