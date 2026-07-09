@@ -1,209 +1,421 @@
 # commandcenter
 
-Personal agent platform: an editable task queue + Claude Code workers, each in
-its own git worktree and tmux window, managed by a local daemon.
+**A local-first orchestration platform for fleets of Claude Code agents.**
 
-## Architecture (Phase 1)
+![Node >= 22](https://img.shields.io/badge/node-%3E%3D22-informational)
+![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)
+![Local-first](https://img.shields.io/badge/local--first-no%20telemetry-success)
 
-- **`agentd`** — daemon owning the SQLite queue (`~/.commandcenter/state.db`),
-  a localhost REST API (`127.0.0.1:4711`), and the tmux/worktree lifecycle.
-- **`agp`** — CLI client for the daemon.
-- **Workers** — interactive `claude` sessions launched into tmux windows
-  (session `cc`), one git worktree + branch (`agent/task-N`) per task,
-  `--permission-mode acceptEdits`.
-- **Hooks (Phase 2)** — each agent gets a generated settings file
-  (`~/.commandcenter/settings/`) whose `SessionStart`/`Stop`/`Notification`
-  hooks POST back to the daemon. `Stop` on an in-progress task runs the
-  task's `verify_cmd` in the worktree: pass → `review`; fail → the failure
-  output is sent back into the worker's session (max 2 nudges, then
-  `blocked`). We never touch `~/.claude/settings.json`.
-- **MCP server (Phase 2)** — `cc-mcp` (stdio) exposes the platform to agents
-  via a generated `--mcp-config`. Workers get a scoped toolset
-  (`get_my_task`, `update_my_task`, `report_blocked`, `add_task`); the main
-  agent gets the full orchestration set (spawn/kill/peek/send workers,
-  full queue CRUD, events).
-- **Main agent (Phase 2)** — `agp main` spawns the orchestrator (default
-  model `opus`, override with `-m` or `CC_MAIN_MODEL`): it triages the
-  queue, picks models, spawns/monitors/reviews workers. One live main
-  agent at a time.
+commandcenter turns a queue of tasks into work done by autonomous [Claude Code](https://claude.com/claude-code)
+agents. A long-running daemon owns a SQLite task queue and spawns each task into
+its **own git worktree and tmux window**, so agents run in parallel without
+stepping on each other. Finished work is proofed by an **independent adversarial
+reviewer** before you ever see it, pushed as a normal GitHub PR, and surfaced on
+a **live web dashboard** with a "Needs You" panel that tells you the one thing
+only a human can do next. Agents share a **platform memory** of hard-won lessons
+and an **internal doc store** for research. Everything runs on your machine —
+no hosted control plane, no telemetry.
 
-- **Adversarial review (Phase 5)** — an independent reviewer agent proofs
-  work before the human sees it. Every task that reaches `review` with
-  commits on its branch is auto-reviewed (toggle `agp scheduler set
-  --auto-review on|off`; report-only tasks like the dreamer are skipped);
-  `agp review <id>` and the main agent's `spawn_reviewer` trigger one
-  manually. The reviewer is a fresh Claude session in its own detached
-  worktree at the task's branch, with file-editing tools denied. It gets the same *inputs* as the
-  worker (task prompt, branch, claimed summary) but none of its conversation
-  — independence is the point — and is prompted to find reasons to REJECT:
-  unmet requirements, weakened tests, summary/diff mismatches. It submits
-  `submit_review(approve|reject, notes)`. Rejection notes go straight back
-  into the worker's session (or into the respawn prompt if it's gone) and the
-  task returns to `in_progress`; after 2 rejected cycles the task is blocked
-  and escalated to you with both sides' notes. Approval pings you — the merge
-  is still yours. Auto-reviews draw from the scheduler's daily spawn budget.
-  The main agent also gets `get_task_diff` and `read_worker_transcript` to
-  proof workers with evidence instead of terminal peeks, and the `Stop` hook
-  now re-verifies tasks a worker moved to `review` itself, so `verify_cmd`
-  can't be bypassed.
+<!-- TODO(screenshot): dashboard board view — kanban + agent grid + live terminal -->
 
-- **Worker PRs** — review happens in GitHub, not transcripts. Workers with
-  commits push their own `agent/task-N` branch and open a PR (`git push` on
-  their branch + `gh pr create` are pre-allowed in their generated settings,
-  so no permission stall), record it via `update_my_task(pr_url)`, and the
-  PR link rides along on review pushes, the task record, and the dashboard.
-  Merging, force-pushes, and any other branch remain the human's.
+---
 
-- **Main-agent triage of stuck workers** — when a worker hits
-  `waiting_input`, the daemon first hands it to a live main agent (a
-  "[commandcenter] aN is waiting for input" message lands in its session):
-  it peeks, answers questions or approves safe/expected permission prompts
-  itself (e.g. a worker pushing its own branch), and pages you via its
-  `escalate` tool only for what's genuinely yours — credentials, judgment
-  calls, destructive actions. If nothing resolves the wait within
-  `escalate_minutes` (default 5, `agp scheduler set --escalate <m>`), the
-  watchdog pages you anyway — once per wait, not once per minute. No live
-  main agent = you're paged immediately, as before.
+## Contents
 
-- **PR lifecycle sync** — every 2 minutes the daemon polls GitHub (via `gh`)
-  for tasks in `review` with a `pr_url`. Merged → task `done`, agents
-  reaped, worktree removed, local branch pruned. Closed without merge →
-  `blocked`. New PR comments or a CHANGES_REQUESTED verdict → piped into
-  the live worker (or baked into the respawn prompt), task back to
-  `in_progress`. Review entirely in GitHub; the board follows.
+- [What it is](#what-it-is)
+- [Architecture](#architecture)
+- [Quickstart](#quickstart)
+- [Core concepts](#core-concepts)
+- [Configuration](#configuration)
+- [Security & trust](#security--trust)
+- [Contributing](#contributing)
+- [License](#license)
 
-- **Stale-daemon detection + `agp upgrade`** — the daemon snapshots
-  `dist/`'s newest mtime at boot; if a rebuild lands while it runs, the
-  watchdog pushes a warning, the dashboard shows a banner, and
-  `GET /api/version` reports `stale: true`. `agp upgrade` = build →
-  respawn the `agentd` tmux window → health-check; `--main` also respawns
-  the main agent so it picks up new MCP tools.
+---
 
-- **Token accounting** — on every worker `Stop` the daemon sums the
-  session transcript's per-turn usage into `tasks.tokens_used` (input +
-  output + cache; approximate, resets on a fresh —non-resumed— respawn).
-  Shown on the dashboard task panel and in `agp task show`.
+## What it is
 
-- **Session resume** — respawning a task whose previous session transcript
-  still exists uses `claude --resume`, so requeued/vanished/rejected work
-  continues with full context instead of starting over; outstanding
-  review/PR feedback rides along in the resume message. Force a clean
-  start with `agp agent spawn --task N --fresh`.
+You file tasks (a title, a prompt, a target repo, optionally a `verify_cmd`).
+The daemon claims a ready task, cuts a fresh branch and git worktree from the
+repo's origin default branch, opens a tmux window, and launches an interactive
+`claude` session scoped to that worktree with a generated settings file and an
+MCP toolset. The worker does the work, commits, pushes its branch, and opens a
+PR. A separate reviewer agent — a fresh session with **no** access to the
+worker's conversation and with file-editing tools denied — tries to *reject* the
+work; two rejections block the task for your arbitration. Approved work lands in
+`review` and waits for **you** to merge. A scheduler can run this whole loop
+autonomously within budgets you set, but nothing ever merges itself.
 
-- **Web dashboard (Phase 3)** — React SPA served by the daemon at
-  `http://127.0.0.1:4711`, tabbed (hash-routed: `#/board`, `#/tokens`; add
-  a tab = one entry in `TABS` + a render branch). **board**: kanban, agent
-  grid, live terminal (xterm.js ↔ WebSocket ↔ PTY ↔ tmux), transcript
-  viewer, new-task form. **tokens**: total/today/per-model stat cards and
-  a per-task usage table (click a row for the task panel).
-  Each browser terminal gets its own *grouped* tmux session so viewers
-  don't resize or steal focus from your desktop tmux client.
-- **Push (Phase 3)** — set `CC_NTFY_URL` (e.g. `https://ntfy.sh/<topic>`,
-  ideally self-hosted or token-protected via `CC_NTFY_TOKEN`) to get pushes
-  when an agent needs input, a task hits review, or a task gets blocked.
+The primitives:
 
-- **Memory** — a local lessons store (SQLite FTS5, no external services).
-  All agents get `remember(text, tags)` / `recall(query)` MCP tools (main
-  also gets `forget`); the daemon auto-injects the top 5 relevant memories
-  into every worker's prompt at spawn, so repo quirks and build gotchas get
-  learned once and applied forever. Human access: `agp memory
-  ls|search|add|rm` and the dashboard's memory drawer.
-- **Dreaming run** — a nightly reflection agent (created disabled by
-  `agp dream setup`; enable with `agp cron enable dreaming`). It reads the
-  day's activity via `activity_summary`, stores durable lessons into memory
-  (max 5/night), files improvement tasks for recurring friction (max
-  3/night, duplicate-checked against the open queue), and leaves a morning
-  report in its task's result summary — which lands in `review`, so the
-  report ping is your normal review push. Guardrails: it's an ordinary
-  worker with the narrow worker toolset — no code changes, no spawning, no
-  merging; everything it produces is human-reviewed.
-- **Scheduler (Phase 4)** — off by default; toggle via `agp scheduler on|off`
-  or the dashboard's auto button (green = on, click = kill switch). Every
-  30s it claims ready tasks up to `max_concurrent` (default 3), bounded by a
-  `daily_spawn_limit` budget (default 20 autonomous spawns/day) and an
-  optional `active_hours` window (`agp scheduler set --hours 22-6` for
-  overnight runs; a summary push is sent when the window closes). The
-  watchdog runs every 60s regardless: a worker whose tmux window vanished is
-  reaped (its task requeued once, failed on the second vanish), and a worker
-  silent for `stall_minutes` (default 15) is flagged stalled + pushed to
-  your phone. Autonomous work still lands in `review` — nothing merges
-  itself.
+| Piece | What it is |
+|---|---|
+| **`agentd`** | The daemon. Owns the SQLite queue, a localhost REST API + WebSocket, the tmux/worktree lifecycle, the scheduler, PR sync, and serves the dashboard. |
+| **`agp`** | CLI client for the daemon (`agp task add`, `agp agent spawn`, …). |
+| **`cc-mcp`** | MCP server exposing the platform to agents (scoped per role). |
+| **Workers** | `claude` sessions, one per task, each in `agent/task-N` worktree + branch. |
+| **Reviewers** | Independent read-only `claude` sessions that adversarially proof a branch. |
+| **Main agent** | An orchestrator `claude` session that triages the queue and manages workers. |
+| **Dashboard** | React SPA served by the daemon: board, PRs, tokens, live terminals. |
 
-## Setup
+---
+
+## Architecture
+
+```
+                                  ┌──────────────────────────────┐
+   you ──▶ agp CLI ──────────────▶│           agentd             │
+   you ──▶ browser (dashboard) ──▶│  (launchd / npm run dev)     │
+                                  │                              │
+                                  │  • REST API + WebSocket      │
+                                  │    127.0.0.1:4711            │
+                                  │  • scheduler (30s)           │
+                                  │  • watchdog (60s)            │
+                                  │  • PR sync (2m, via gh)      │
+                                  │  • serves web/dist           │
+                                  └───────┬───────────┬──────────┘
+                                          │           │
+                        owns / reads      │           │  spawns / reaps
+                                          ▼           ▼
+                            ┌───────────────────┐   ┌──────────────────────────┐
+                            │   SQLite state.db │   │  tmux session "cc"        │
+                            │  tasks · agents   │   │  ┌─────────────────────┐  │
+                            │  events · memories│   │  │ worker  → worktree A │  │
+                            │  docs · crons     │   │  │ worker  → worktree B │  │
+                            │  settings         │   │  │ reviewer→ worktree A'│  │
+                            └───────────────────┘   │  │ main    → orchestr.  │  │
+                                     ▲              │  └─────────────────────┘  │
+                                     │              └────────────┬─────────────┘
+                                     │ MCP tools                 │ hooks (curl → API)
+                                     │ (get_my_task, update_my_  │ SessionStart / Stop /
+                                     │  task, spawn_worker, …)   │ Notification
+                                     └───────────────┬───────────┘
+                                                     │
+                                          ┌──────────┴──────────┐
+                                          │  cc-mcp (stdio)     │
+                                          │  scoped per role:   │
+                                          │  worker / reviewer /│
+                                          │  main               │
+                                          └─────────────────────┘
+
+   Each task ── git worktree ($CC_DATA_DIR/worktrees) on branch agent/task-N
+             └─ pushed to origin ─▶ GitHub PR ─▶ (PR sync) ─▶ task follows the PR
+```
+
+**Data flow, end to end:** the scheduler (or you) claims a `queued` task with an
+atomic SQLite `UPDATE` → `spawn` creates the worktree + tmux window + generated
+`--settings`/`--mcp-config` and launches `claude` → the worker does the work and
+talks back through **MCP tools** (state changes) and **hooks** (lifecycle
+events `curl`ed to the API) → on `Stop` the daemon runs `verify_cmd` in the
+worktree → pass sends the task to `review`, where the reviewer proofs it → the
+worker pushes its branch and opens a PR → **PR sync** polls GitHub and moves the
+task as the PR is merged / closed / commented → the dashboard reflects all of
+this live over WebSocket, and the **attention panel** surfaces whatever needs
+you.
+
+For a deeper walk-through see [`docs/architecture.md`](docs/architecture.md).
+
+---
+
+## Quickstart
+
+### Prerequisites
+
+- **Node.js ≥ 22** (`node --version`)
+- **tmux** (`tmux -V`) — workers run inside a tmux session
+- **git** with a configured `origin` remote on repos you point tasks at
+- **[GitHub CLI](https://cli.github.com/) (`gh`)**, authenticated (`gh auth login`) — used for PR create/sync
+- **[Claude Code](https://claude.com/claude-code)** installed and authenticated — the `claude` binary must be on your `PATH` (override with `CC_CLAUDE_BIN`)
+
+macOS is the primary target (launchd, tmux); Linux works via `npm run dev:daemon`.
+
+### Install & build
+
+```sh
+git clone https://github.com/cgeene/commandcenter.git
+cd commandcenter
+npm install
+npm run build:all   # backend → dist/, dashboard → web/dist/
+npm link            # puts `agentd`, `agp`, `cc-mcp` on your PATH
+```
+
+> The MCP server is loaded from `dist/mcp/index.js`, so agents need a build.
+> Re-run `npm run build:all` (or `agp upgrade`) after changing source.
+
+### Start the daemon
+
+**macOS (launchd, recommended)** — runs at login and restarts on crash. Create a
+`launchd` agent that runs `agentd`; a ready-to-edit plist template and install
+steps are in [`docs/deployment.md`](docs/deployment.md).
+
+**Any platform (foreground)**:
+
+```sh
+agentd                 # if you ran `npm link`
+# or, from a clone without linking:
+npm run dev:daemon     # tsx src/daemon/index.ts
+```
+
+You should see:
+
+```
+agentd listening on http://127.0.0.1:4711
+data dir: /Users/you/.commandcenter (db: /Users/you/.commandcenter/state.db)
+```
+
+### Open the dashboard
+
+Visit **http://127.0.0.1:4711**. Tabs: **board** (kanban + agent grid + live
+terminal + new-task form), **PRs** (project-grouped PR board), **tokens** (usage).
+To reach it from your phone, see the Tailscale notes in
+[`docs/deployment.md`](docs/deployment.md) — never expose the daemon publicly; it
+has no auth of its own.
+
+### File your first task and watch it run
+
+```sh
+# 1. file a task
+agp task add "Fix the flaky retry test" \
+  --repo ~/projects/foo -m sonnet -v "npm test" \
+  -p "tests/retry.test.ts is flaky because of a real timer. Fix it properly."
+
+agp task ls                       # queue overview
+
+# 2. spawn a worker for it (worktree + tmux window + claude)
+agp agent spawn --task 1
+agp agent ls
+agp agent peek 1                  # see its terminal without attaching
+agp attach 1                      # interact; detach with Ctrl-b d
+
+# 3. when it reaches review, proof it and follow the PR
+agp review 1                      # spawn an adversarial reviewer
+agp task diff 1                   # what actually changed on the branch
+```
+
+On the dashboard, the worker appears in the agent grid with a live terminal; when
+it needs you (a permission prompt, a question) or finishes, it shows up in the
+**Needs You** panel and (once its PR is open) on the **PRs** board. Merge the PR
+in GitHub — PR sync marks the task `done`, reaps the agent, and cleans up the
+worktree.
+
+Prefer autonomy? Spawn the orchestrator and turn on the scheduler:
+
+```sh
+agp main                          # spawn the orchestrator agent
+agp attach 2                      # "work through the queue"
+agp scheduler on                  # claim & spawn ready tasks automatically
+```
+
+Full CLI reference: [`docs/cli.md`](docs/cli.md).
+
+---
+
+## Core concepts
+
+### Tasks & the queue
+
+A task carries a `title`, `prompt`, `repo`, `priority` (lower runs first;
+default `2`), an optional `verify_cmd`, and an optional `blocked_by` (another
+task id — it won't become ready until its blocker is `done`). `open_pr` (default
+on) controls whether a worker opens a PR or leaves the branch as the deliverable.
+Statuses:
+
+```
+queued → claimed → in_progress → blocked / review → done / failed
+```
+
+`cancelled` is reachable from **any** state (`agp task cancel <id>`): live worker
+and reviewer are killed, the branch survives (`--rm-worktree` drops uncommitted
+work), and an in-flight verify can't resurrect the task. Claiming is a single
+atomic SQLite `UPDATE`, so two agents can never take the same task. `open_pr`,
+`pr_url`, `review_verdict`, `review_notes`, `review_cycles`, and `tokens_used`
+all live on the task record.
+
+### Workers, reviewers & the adversarial review loop
+
+A **worker** is an interactive `claude` session for one task, launched with
+`--permission-mode acceptEdits` into a dedicated worktree. When a worker moves a
+task to `review` with commits on its branch, an independent **reviewer** proofs
+it. The reviewer is a *fresh* session in its own detached worktree at the task's
+branch with **Edit/Write/commit/push denied** — it gets the same inputs as the
+worker (prompt, branch, claimed summary) but **none of its conversation**, and is
+prompted to find reasons to **reject**: unmet requirements, weakened tests,
+summary/diff mismatches. It calls `submit_review(approve|reject, notes)`.
+
+- **Reject** → notes go straight back into the worker's session (or into the
+  respawn prompt if it's gone), task returns to `in_progress`.
+- After **2 rejected cycles** (`MAX_REVIEW_CYCLES`) the task is **blocked** and
+  escalated to you with both sides' notes.
+- **Approve** → pings you; the merge is still yours.
+
+The `Stop` hook re-verifies any task a worker moved to `review` itself, so
+`verify_cmd` can't be bypassed. Auto-review is on by default
+(`agp scheduler set --auto-review off` to disable).
+
+### Worktree isolation & branch hygiene
+
+Every task gets its own git worktree under `$CC_DATA_DIR/worktrees` on branch
+`agent/task-N`, cut from the repo's **origin default branch** (fetched fresh),
+not your local `HEAD` — so branches start clean by construction and your main
+checkout is never touched. Workers may push **only** their own branch and open a
+PR (`git push … agent/task-N`, `gh pr create` are pre-allowed); merges,
+force-pushes, and every other branch stay yours. Reviewers work in a throwaway
+detached worktree that's reaped with the agent.
+
+### Platform memory
+
+A local lessons store (SQLite FTS5, no external services). Every agent gets
+`remember(text, tags)` / `recall(query)` MCP tools; the daemon auto-injects the
+top relevant memories into a worker's prompt at spawn, so a repo quirk or build
+gotcha is learned once and applied by every future worker. Human access:
+`agp memory ls|search|add|rm` and the dashboard's memory drawer.
+
+### Internal doc store
+
+A local markdown doc store (`$CC_DOCS_DIR`, default `$CC_DATA_DIR/docs`) with
+`save_doc` / `get_doc` / `search_docs` / `list_docs` MCP tools. Research,
+investigation, and analysis findings live here — plain `<project>/<slug>.md`
+files you can grep directly, FTS5-indexed and versioned on update — instead of
+polluting a code repo with non-code artifacts.
+
+### Attention panel ("Needs You")
+
+An ordered, self-healing action queue derived live from tasks/agents/events —
+the only thing persisted is your dismissals. Item kinds: `merge_pr` /
+`merge_and_apply` (approved work awaiting your merge), `decision` (a task blocked
+after the review loop gave up), `escalation` (a live worker still waiting after
+you were paged), and `stale_waiting` (an agent parked in `waiting_input` past
+`attention_stale_minutes`). A situation that re-triggers gets a new key, so it
+resurfaces even if you dismissed the earlier instance.
+
+### Crons & the scheduler
+
+- **Scheduler** — off by default (`agp scheduler on|off`, or the dashboard kill
+  switch). Every 30s it claims ready tasks up to `max_concurrent`, bounded by a
+  `daily_spawn_limit` and an optional `active_hours` window. A watchdog runs
+  every 60s: a worker whose tmux window vanished is reaped (task requeued once,
+  failed on the second vanish); a worker silent past `stall_minutes` is flagged
+  and pushed to your phone. Autonomous work still lands in `review`.
+- **Crons** — recurring task templates (`agp cron add|ls|enable|disable|run`)
+  that file a fresh task on a schedule.
+- **Dreaming run** — an optional nightly reflection agent (`agp dream setup`,
+  then `agp cron enable dreaming`). It reads the day's activity, stores durable
+  lessons into memory, files improvement tasks for recurring friction, and leaves
+  a morning report — all with the narrow worker toolset (no code changes, no
+  spawning, no merging), everything human-reviewed.
+
+### Permission profiles
+
+Each agent gets a **generated** `--settings` file — commandcenter never touches
+your `~/.claude/settings.json`. Workers layer their branch push/PR allowances on
+top of a baked-in **read-only profile** (safe read commands + read-only MCP
+tools). Reviewers get the read-only profile with editing/commit/push explicitly
+denied. New read-only tools can be allowlisted via `read_only_extra_allow` in
+scheduler config without a code change (never put state-changing patterns there).
+
+---
+
+## Configuration
+
+All config is either an environment variable read at call time or a value in the
+`settings` table (via `agp scheduler set …`). See
+[`docs/configuration.md`](docs/configuration.md) for the complete reference.
+
+### Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CC_DATA_DIR` | `~/.commandcenter` | DB, worktrees, prompts, generated settings/mcp files |
+| `CC_DOCS_DIR` | `$CC_DATA_DIR/docs` | Internal doc store root |
+| `CC_PORT` | `4711` | Daemon port (localhost only) |
+| `CC_URL` | `http://127.0.0.1:$CC_PORT` | Base URL agents/hooks use to reach the daemon |
+| `CC_CLAUDE_BIN` | `claude` | Worker/reviewer/main binary (override for testing) |
+| `CC_TMUX_SESSION` | `cc` | tmux session name |
+| `CC_MAIN_MODEL` | `opus` | Default model for `agp main` |
+| `CC_NTFY_URL` | unset | ntfy topic URL for push notifications (disabled if unset) |
+| `CC_NTFY_TOKEN` | unset | ntfy auth token (self-hosted / protected topics) |
+| `CC_CLAUDE_PROJECTS` | `~/.claude/projects` | Where Claude Code transcripts live (for token accounting & resume) |
+
+### Scheduler config (`agp scheduler set …`)
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Master switch (the dashboard kill switch flips this) |
+| `max_concurrent` | `3` | Max live workers the scheduler maintains |
+| `daily_spawn_limit` | `20` | Autonomous spawns allowed per UTC day |
+| `stall_minutes` | `15` | Silence before a working agent is marked stalled |
+| `active_hours` | `null` | Only auto-spawn in this hour window (e.g. `22-6` wraps overnight) |
+| `auto_review` | `true` | Auto-spawn a reviewer when a task reaches `review` |
+| `escalate_minutes` | `5` | Minutes in `waiting_input` (after the main agent was asked) before paging you |
+| `attention_stale_minutes` | `10` | Minutes in `waiting_input` before the Needs-You panel flags it stale |
+| `read_only_extra_allow` | `[]` | Extra **read-only** permission patterns appended to the baked-in profile |
+
+---
+
+## Security & trust
+
+commandcenter is built to run agents you don't fully trust on code you care
+about, on your own machine.
+
+- **Everything is local.** The daemon binds to `127.0.0.1` only. State is a local
+  SQLite file; the doc store and memory are local markdown/SQLite. There is **no
+  telemetry**, no hosted control plane, and no outbound calls except the ones the
+  tools you configure make (`gh` to your GitHub, `claude` to Anthropic, an
+  optional ntfy push).
+- **Workers are sandboxed to a worktree.** Each runs in its own `agent/task-N`
+  worktree; your main checkout and every other branch are untouched. A worker
+  that discovers its work belongs in a different repo is instructed to *report
+  blocked*, not to edit it.
+- **Least-privilege permissions.** Agents run against a **generated** settings
+  file, never your `~/.claude/settings.json`. Workers may push only their own
+  branch and open a PR; everything else falls to a normal permission prompt.
+  Reviewers additionally deny Edit/Write/commit/push. The read-only allowlist is
+  an explicit, auditable list in [`src/daemon/permissions.ts`](src/daemon/permissions.ts).
+- **Humans hold the merge.** Nothing merges itself — not the scheduler, not the
+  main agent, not an approved reviewer. Merges, force-pushes, and secrets are
+  yours.
+- **Don't expose it.** The daemon has no auth. If you need remote access, front
+  it with Tailscale (`tailscale serve`, tailnet-only) — never `tailscale funnel`
+  or a public tunnel. See [`docs/deployment.md`](docs/deployment.md).
+
+---
+
+## Contributing
+
+Contributions welcome. The platform dogfoods itself — tasks that modify
+commandcenter are dispatched *through* commandcenter, run in an isolated
+worktree, and go through the same adversarial review + PR flow as any other task.
+
+### Dev setup
 
 ```sh
 npm install
-npm run build:all   # backend (dist/) + dashboard (web/dist/)
-npm link            # puts `agentd`, `agp`, `cc-mcp` on PATH
+npm run dev:daemon      # daemon with tsx (no build step)
+npm run build:all       # backend + dashboard when you need dist/
 ```
 
-## Remote access (Tailscale)
-
-The daemon binds to 127.0.0.1 only. To reach the dashboard from your phone,
-install Tailscale on the Mac + phone, then:
+### Checks (run before opening a PR)
 
 ```sh
-tailscale serve --bg --https=443 http://127.0.0.1:4711
+npm run typecheck       # tsc --noEmit (strict)
+npm test                # vitest (unit + worktree integration)
 ```
 
-This gives `https://<mac-name>.<tailnet>.ts.net` with automatic TLS,
-reachable only from your tailnet (WebSockets included). Do NOT use
-`tailscale funnel` — that would expose the daemon to the public internet
-with no auth.
+The web bundle and daemon are two separate TypeScript builds; shared,
+dependency-free logic lives under `src/lib/` so it can be both unit-tested in
+Node and imported by the Vite bundle.
 
-## Usage
+### PR conventions
 
-```sh
-agentd                                  # or: npm run dev:daemon
+- Branch from `main`; **never push directly to `main`**.
+- Conventional commits (`feat:`, `fix:`, `chore:`, `docs:`, …).
+- Open PRs with `gh pr create`; describe what changed, why, and how you verified.
+- Keep functions small and match existing patterns in the file you're editing.
 
-agp task add "Fix the flaky retry test" \
-  --repo ~/projects/foo -m sonnet -v "make test" \
-  -p "tests/retry_test.go is flaky because ... fix it properly"
+---
 
-agp task ls                             # queue overview
-agp agent spawn --task 1                # worktree + tmux window + claude
-agp agent ls
-agp agent peek 1                        # see its terminal without attaching
-agp agent send 1 "also update the docs" # message a running worker
-agp attach 1                            # interact; detach with C-b d
-agp task diff 1                         # what actually changed on the branch
-agp review 1                            # adversarial reviewer for a task in review
-agp task update 1 -s done               # after reviewing the branch
-agp task cancel 3 --rm-worktree         # close a task from ANY state (kills its agents)
-agp agent kill 1 --rm-worktree
-agp events
+## License
 
-agp main                                # spawn the orchestrator agent
-agp attach 2                            # talk to it: "work through the queue"
-```
-
-## Environment
-
-| var | default | purpose |
-|---|---|---|
-| `CC_DATA_DIR` | `~/.commandcenter` | DB, worktrees, prompt/settings files |
-| `CC_PORT` | `4711` | daemon port (localhost only) |
-| `CC_CLAUDE_BIN` | `claude` | worker binary (override for testing) |
-| `CC_TMUX_SESSION` | `cc` | tmux session name |
-| `CC_MAIN_MODEL` | `opus` | default model for `agp main` |
-| `CC_NTFY_URL` | unset | ntfy topic URL for push notifications |
-| `CC_NTFY_TOKEN` | unset | ntfy auth token (self-hosted/protected topics) |
-| `CC_CLAUDE_PROJECTS` | `~/.claude/projects` | transcript location |
-
-## Statuses
-
-Tasks: `queued → claimed → in_progress → blocked / review → done / failed`.
-`cancelled` is reachable from ANY state via `agp task cancel <id>` (or the
-main agent's `cancel_task`, or the dashboard's ✕): live worker + reviewer
-are killed, the branch survives (`--rm-worktree` to drop uncommitted work),
-and an in-flight verify result can't resurrect the task. Cancelled tasks can
-be requeued. A task `blocked_by` a cancelled one never becomes ready — the
-cancel reports these so you can re-point or cancel them.
-A reviewer rejection sends `review → in_progress` (live worker) or
-`review → queued` (worker gone, notes baked into the respawn prompt);
-`review_verdict`/`review_notes`/`review_cycles` on the task record who said
-what.
-Agents: `spawning → working → idle / waiting_input / stalled → dead`
-(kinds: `main`, `worker`, `reviewer`).
-Claiming is a single SQLite UPDATE — atomic; two agents can never take the
-same task.
+**No license file is present in this repository yet.** Until a `LICENSE` is
+added, default copyright applies — the code is source-available but not licensed
+for reuse. Choose and add a license before publicizing the project.
