@@ -25,6 +25,7 @@ import {
   searchDocs,
 } from "../db/docs.js";
 import { getSchedulerConfig, setSchedulerConfig } from "../db/settings.js";
+import { dismissAttention } from "../db/attention.js";
 import {
   claimTask,
   createTask,
@@ -270,6 +271,21 @@ export function buildApp(): Hono {
     c.json(listEvents(Number(c.req.query("limit") ?? 50))),
   );
 
+  // The pinned "Needs You" action queue — an ordered list of items only the
+  // human can act on, derived live from tasks/agents/events.
+  app.get("/api/attention", async (c) => {
+    const { computeAttention } = await import("./attention.js");
+    return c.json(await computeAttention());
+  });
+
+  app.post("/api/attention/:key/dismiss", (c) => {
+    const key = c.req.param("key");
+    if (!key) return c.json({ error: "missing key" }, 400);
+    dismissAttention(key);
+    logEvent("attention.dismissed", { payload: { key } });
+    return c.json({ ok: true });
+  });
+
   const newCronSchema = z.object({
     name: z.string().min(1).regex(/^[a-z0-9-_]+$/i, "name must be alphanumeric/dash"),
     schedule: z.string().min(1),
@@ -455,6 +471,7 @@ export function buildApp(): Hono {
     auto_review: z.boolean().optional(),
     escalate_minutes: z.number().int().min(1).max(120).optional(),
     read_only_extra_allow: z.array(z.string()).optional(),
+    attention_stale_minutes: z.number().int().min(1).max(240).optional(),
   });
 
   app.get("/api/scheduler", (c) => {

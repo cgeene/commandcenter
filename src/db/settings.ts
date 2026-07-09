@@ -20,6 +20,8 @@ export interface SchedulerConfig {
    *  read-only MCP tools/commands get allowlisted without a code change. Never
    *  put state-changing patterns here; this list is applied unconditionally. */
   read_only_extra_allow: string[];
+  /** Minutes an agent may sit in waiting_input before the "Needs You" panel flags it as stale. */
+  attention_stale_minutes: number;
 }
 
 export const SCHEDULER_DEFAULTS: SchedulerConfig = {
@@ -31,6 +33,7 @@ export const SCHEDULER_DEFAULTS: SchedulerConfig = {
   auto_review: true,
   escalate_minutes: 5,
   read_only_extra_allow: [],
+  attention_stale_minutes: 10,
 };
 
 function getSetting(key: string): string | undefined {

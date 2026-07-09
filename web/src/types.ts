@@ -86,6 +86,27 @@ export interface CronJob {
   next_run_at: string | null;
 }
 
+export type AttentionKind =
+  | "merge_pr"
+  | "merge_and_apply"
+  | "decision"
+  | "escalation"
+  | "stale_waiting";
+
+export interface AttentionItem {
+  id: string;
+  kind: AttentionKind;
+  title: string;
+  context: string;
+  severity: "red" | "orange" | "yellow";
+  urgent: boolean;
+  task_id: number | null;
+  agent_id: number | null;
+  pr_url: string | null;
+  created_at: string;
+  age_ms: number;
+}
+
 export interface SchedulerInfo {
   config: {
     enabled: boolean;

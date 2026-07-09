@@ -160,6 +160,14 @@ CREATE TABLE IF NOT EXISTS crons (
   created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- Human-action items the "Needs You" panel surfaces are derived on the fly;
+-- this only records which ones the human has dismissed. A re-triggering
+-- situation gets a fresh item_key (see attention.ts) so it reappears.
+CREATE TABLE IF NOT EXISTS attention_dismissed (
+  item_key     TEXT PRIMARY KEY,
+  dismissed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
 `;
