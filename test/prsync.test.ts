@@ -214,6 +214,68 @@ describe("prSyncPass", () => {
   });
 });
 
+describe("tasksNeedingPrSync (candidate selection + backfill)", () => {
+  async function mkTask(over: Record<string, unknown> = {}) {
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    updateTask(task.id, over);
+    return task.id;
+  }
+
+  it("includes done/cancelled tasks whose pr_state was never synced (backfill)", async () => {
+    const { tasksNeedingPrSync } = await import("../src/db/tasks.js");
+    const done = await mkTask({
+      status: "done",
+      pr_url: "https://github.com/x/y/pull/1",
+    });
+    const cancelled = await mkTask({
+      status: "cancelled",
+      pr_url: "https://github.com/x/y/pull/2",
+    });
+    const ids = tasksNeedingPrSync().map((t) => t.id);
+    // NULL pr_state must be picked up even though the task is terminal-status —
+    // this is the pre-existing-row catch-up that PR #9 never ran.
+    expect(ids).toContain(done);
+    expect(ids).toContain(cancelled);
+  });
+
+  it("keeps syncing an OPEN PR but never re-polls a terminal (merged/closed) one", async () => {
+    const { tasksNeedingPrSync } = await import("../src/db/tasks.js");
+    const open = await mkTask({
+      status: "review",
+      pr_url: "https://github.com/x/y/pull/3",
+      pr_state: "open",
+    });
+    const merged = await mkTask({
+      status: "done",
+      pr_url: "https://github.com/x/y/pull/4",
+      pr_state: "merged",
+    });
+    const closed = await mkTask({
+      status: "blocked",
+      pr_url: "https://github.com/x/y/pull/5",
+      pr_state: "closed",
+    });
+    const ids = tasksNeedingPrSync().map((t) => t.id);
+    expect(ids).toContain(open);
+    expect(ids).not.toContain(merged); // terminal — polling it again wastes gh quota
+    expect(ids).not.toContain(closed);
+  });
+
+  it("ignores tasks without a pr_url and branch-only (open_pr=0) tasks", async () => {
+    const { tasksNeedingPrSync } = await import("../src/db/tasks.js");
+    const noPr = await mkTask({ status: "review" });
+    const branchOnly = await mkTask({
+      status: "review",
+      pr_url: "https://github.com/x/y/pull/6",
+      open_pr: 0,
+    });
+    const ids = tasksNeedingPrSync().map((t) => t.id);
+    expect(ids).not.toContain(noPr);
+    expect(ids).not.toContain(branchOnly);
+  });
+});
+
 describe("computeCheckRollup", () => {
   it("empty rollup -> none", async () => {
     const { computeCheckRollup } = await import("../src/daemon/prsync.js");

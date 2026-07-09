@@ -224,6 +224,33 @@ export function getDoc(
   return { ...row, content };
 }
 
+export interface AttachmentFile {
+  filename: string;
+  content: Buffer;
+}
+
+/**
+ * Read one of a doc's sidecar attachments by filename. The lookup is scoped to
+ * the doc's own recorded attachment list and the name is reduced to a basename
+ * first, so a caller can never use this to read an arbitrary file off disk.
+ * Returns undefined if the doc, the attachment record, or the file is missing.
+ */
+export function getDocAttachment(
+  key: number | string,
+  name: string,
+  project?: string,
+): AttachmentFile | undefined {
+  const doc = getDoc(key, project);
+  if (!doc) return undefined;
+  const base = path.basename(name); // traversal guard
+  const rels: string[] = doc.attachments ? JSON.parse(doc.attachments) : [];
+  const rel = rels.find((r) => path.basename(r) === base);
+  if (!rel) return undefined;
+  const abs = absPath(rel);
+  if (!fs.existsSync(abs)) return undefined;
+  return { filename: base, content: fs.readFileSync(abs) };
+}
+
 export function listDocs(opts?: { project?: string; tag?: string }): Doc[] {
   const clauses: string[] = [];
   const params: unknown[] = [];

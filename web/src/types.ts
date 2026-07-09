@@ -77,6 +77,27 @@ export interface Memory {
   created_at: string;
 }
 
+export interface Doc {
+  id: number;
+  slug: string;
+  project: string;
+  title: string;
+  tags: string | null;
+  task_id: number | null;
+  agent_id: number | null;
+  summary: string | null;
+  file_path: string;
+  /** JSON array of sidecar file paths (relative to the docs root), or null. */
+  attachments: string | null;
+  version: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DocWithContent extends Doc {
+  content: string;
+}
+
 export interface CronJob {
   id: number;
   name: string;

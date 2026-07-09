@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { listAgents } from "../db/agents.js";
 import { logEvent } from "../db/events.js";
-import { getTask, listTasks, updateTask, type Task } from "../db/tasks.js";
+import { getTask, tasksNeedingPrSync, updateTask, type Task } from "../db/tasks.js";
 import { notify } from "./notify.js";
 import { resumeAgent } from "./resume.js";
 import { killAgent } from "./spawn.js";
@@ -295,10 +295,14 @@ export function recordSyncFailure(taskId: number, error: string): void {
 }
 
 export async function prSyncPass(): Promise<void> {
-  // open_pr=false tasks are branch-only by design and should never carry a
-  // pr_url, but skip explicitly rather than let a stale one trigger a sync
-  // error against a PR this task was never supposed to have.
-  const candidates = listTasks("review").filter((t) => t.pr_url && t.open_pr !== 0);
+  // Every task with a live (non-terminal) PR, regardless of task status. This
+  // deliberately includes done/cancelled tasks: their PR badge must track the
+  // real GitHub state, and a task can be marked done while its PR is still
+  // open. recordSyncSuccess caches the state for the dashboard; applyPrState
+  // only drives lifecycle transitions for review-status tasks (it no-ops for
+  // everything else), so polling a done task's PR is safe. Merged/closed PRs
+  // are already filtered out by the query — we never re-poll a terminal PR.
+  const candidates = tasksNeedingPrSync();
   for (const task of candidates) {
     try {
       const pr = await fetchPrState(task.pr_url!);
@@ -311,6 +315,12 @@ export async function prSyncPass(): Promise<void> {
 }
 
 export function startPrSync(): void {
+  // One-time catch-up: pre-existing rows with a pr_url and NULL/OPEN pr_state
+  // (e.g. done/cancelled tasks whose PRs predate the pr_state columns) get
+  // synced immediately rather than waiting out the first poll interval. Once
+  // each PR reaches a terminal state it drops out of the candidate set, so
+  // this never repeatedly re-polls merged/closed PRs.
+  prSyncPass().catch((err) => console.error("pr sync (startup catch-up) failed:", err));
   setInterval(() => {
     prSyncPass().catch((err) => console.error("pr sync failed:", err));
   }, POLL_MS);

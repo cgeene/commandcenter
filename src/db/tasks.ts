@@ -103,6 +103,27 @@ export function readyTasks(): Task[] {
     .all() as Task[];
 }
 
+/**
+ * Tasks whose PR still needs polling: it has a pr_url, PR-opening is enabled
+ * (open_pr != 0), and the cached pr_state is not yet terminal. A PR is terminal
+ * once it is merged or closed — we never poll it again (that would burn gh
+ * quota for a state that can't change). Crucially this is NOT scoped to
+ * review-status tasks: a task can be done/cancelled while its PR is still open
+ * (or was never synced), and its PR badge must still reflect reality. The
+ * NULL check is explicit because `NULL NOT IN (...)` is NULL, not true, so a
+ * never-synced row would otherwise be skipped.
+ */
+export function tasksNeedingPrSync(): Task[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM tasks
+       WHERE pr_url IS NOT NULL AND open_pr != 0
+         AND (pr_state IS NULL OR pr_state NOT IN ('merged', 'closed'))
+       ORDER BY id ASC`,
+    )
+    .all() as Task[];
+}
+
 /** Open tasks waiting on `taskId` via blocked_by. A cancelled blocker never
  *  becomes 'done', so these stay stuck unless the human re-points them. */
 export function openDependents(taskId: number): Task[] {

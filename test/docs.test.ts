@@ -79,6 +79,34 @@ describe("docs store (db + filesystem)", () => {
     expect(fs.readFileSync(path.join(docsDir(), rels[0]), "utf8")).toBe("a,b\n1,2\n");
   });
 
+  it("reads an attachment back by filename, scoped to the doc", async () => {
+    const { saveDoc, getDocAttachment } = await import("../src/db/docs.js");
+    const { doc } = saveDoc({
+      project: "cogs",
+      title: "Workload Map",
+      content: "see the csv",
+      attachments: [{ filename: "workload-map.csv", content: "a,b\n1,2\n" }],
+    });
+    const att = getDocAttachment(doc.id, "workload-map.csv");
+    expect(att?.filename).toBe("workload-map.csv");
+    expect(att?.content.toString("utf8")).toBe("a,b\n1,2\n");
+    // a filename not in the doc's attachment list is not served
+    expect(getDocAttachment(doc.id, "other.csv")).toBeUndefined();
+  });
+
+  it("refuses to serve a file outside the doc's recorded attachments (traversal)", async () => {
+    const { saveDoc, getDocAttachment } = await import("../src/db/docs.js");
+    const { doc } = saveDoc({
+      project: "cogs",
+      title: "Workload Map",
+      content: "x",
+      attachments: [{ filename: "workload-map.csv", content: "safe\n" }],
+    });
+    // even a basename that matches nothing, or a traversal attempt, returns undefined
+    expect(getDocAttachment(doc.id, "../../../etc/passwd")).toBeUndefined();
+    expect(getDocAttachment(doc.id, "workload-map.csv")?.content.toString()).toBe("safe\n");
+  });
+
   it("slugifies project and slug so paths cannot traverse out of docsDir", async () => {
     const { saveDoc } = await import("../src/db/docs.js");
     const { doc } = saveDoc({
@@ -215,6 +243,26 @@ describe("docs HTTP API", () => {
     expect(bySlug.content).toContain("costs-reporting");
 
     expect((await a.request("/api/docs/does-not-exist")).status).toBe(404);
+  });
+
+  it("GET serves a doc's attachment as a download and 404s unknown names", async () => {
+    const a = await app();
+    await a.request("/api/docs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project: "cogs",
+        title: "Workload Map",
+        content: "see the csv",
+        attachments: [{ filename: "workload-map.csv", content: "a,b\n1,2\n" }],
+      }),
+    });
+    const ok = await a.request("/api/docs/1/attachments/workload-map.csv");
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("content-disposition")).toContain("workload-map.csv");
+    expect(await ok.text()).toBe("a,b\n1,2\n");
+
+    expect((await a.request("/api/docs/1/attachments/missing.csv")).status).toBe(404);
   });
 
   it("logs a doc.saved event", async () => {
