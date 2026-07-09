@@ -18,6 +18,12 @@ import {
   searchMemories,
   similarMemories,
 } from "../db/memories.js";
+import {
+  getDoc,
+  listDocs,
+  saveDoc,
+  searchDocs,
+} from "../db/docs.js";
 import { getSchedulerConfig, setSchedulerConfig } from "../db/settings.js";
 import {
   claimTask,
@@ -388,6 +394,50 @@ export function buildApp(): Hono {
     if (!deleteMemory(id)) return c.json({ error: "not found" }, 404);
     logEvent("memory.deleted", { payload: { id } });
     return c.json({ ok: true });
+  });
+
+  // ---- internal doc store ----
+
+  const newDocSchema = z.object({
+    project: z.string().min(1),
+    title: z.string().min(1),
+    content: z.string().min(1),
+    tags: z.string().optional(),
+    summary: z.string().optional(),
+    task_id: z.number().int().optional(),
+    agent_id: z.number().int().optional(),
+    attachments: z
+      .array(z.object({ filename: z.string().min(1), content: z.string() }))
+      .optional(),
+  });
+
+  // List or (with ?q=) search docs. Metadata only — no bodies.
+  app.get("/api/docs", (c) => {
+    const q = c.req.query("q");
+    const project = c.req.query("project") || undefined;
+    const tag = c.req.query("tag") || undefined;
+    const limit = Number(c.req.query("limit") ?? 20);
+    if (q) return c.json(searchDocs(q, limit, project));
+    return c.json(listDocs({ project, tag }));
+  });
+
+  // Fetch one doc (with its body) by numeric id or by slug (+ ?project=).
+  app.get("/api/docs/:key", (c) => {
+    const key = c.req.param("key");
+    const project = c.req.query("project") || undefined;
+    const doc = getDoc(/^\d+$/.test(key) ? Number(key) : key, project);
+    return doc ? c.json(doc) : c.json({ error: "not found" }, 404);
+  });
+
+  app.post("/api/docs", async (c) => {
+    const body = newDocSchema.parse(await c.req.json());
+    const { doc, created } = saveDoc(body);
+    logEvent("doc.saved", {
+      taskId: body.task_id,
+      agentId: body.agent_id,
+      payload: { id: doc.id, project: doc.project, slug: doc.slug, created, version: doc.version },
+    });
+    return c.json(doc, created ? 201 : 200);
   });
 
   const schedulerPatchSchema = z.object({
