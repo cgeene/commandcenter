@@ -1,0 +1,145 @@
+import type { Event } from "../db/events.js";
+
+/**
+ * Turn a raw platform event into a one-line human sentence for the dashboard's
+ * narrated feed. Pure over the event (id/kind/task_id/agent_id + JSON payload)
+ * so it's trivially testable and needs no DB lookups. Unknown kinds fall back
+ * to "<kind> #<task> a<agent> <raw payload>" so nothing is ever swallowed.
+ */
+
+type Payload = Record<string, unknown>;
+
+function payloadOf(e: Event): Payload {
+  if (!e.payload) return {};
+  try {
+    const v = JSON.parse(e.payload);
+    return v && typeof v === "object" ? (v as Payload) : {};
+  } catch {
+    return {};
+  }
+}
+
+function str(v: unknown): string {
+  return v == null ? "" : String(v);
+}
+
+/** Trim to n chars with an ellipsis, collapsing whitespace first. */
+function clip(v: unknown, n: number): string {
+  const s = str(v).replace(/\s+/g, " ").trim();
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+const taskRef = (e: Event) => (e.task_id != null ? `#${e.task_id}` : "the task");
+const worker = (e: Event) => (e.agent_id != null ? `worker ${e.agent_id}` : "a worker");
+const agentRef = (e: Event) => (e.agent_id != null ? `agent ${e.agent_id}` : "an agent");
+
+type Template = (e: Event, p: Payload) => string;
+
+const TEMPLATES: Record<string, Template> = {
+  // --- tasks ---
+  "task.created": (e) => `New task ${taskRef(e)} queued`,
+  "task.status": (e, p) =>
+    `${taskRef(e)} moved ${str(p.from) || "?"} → ${str(p.to) || "?"}`,
+  "task.claimed": (e) => `${taskRef(e)} claimed`,
+  "task.review": (e) => `${taskRef(e)} is ready for review`,
+  "task.blocked": (e, p) =>
+    `${taskRef(e)} blocked${p.reason ? `: ${clip(p.reason, 80)}` : ""}`,
+  "task.failed": (e) => `${taskRef(e)} failed`,
+  "task.cancelled": (e) => `${taskRef(e)} cancelled`,
+  "task.reopened": (e, p) =>
+    `Reopened ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
+  "task.requeued": (e, p) =>
+    `Requeued ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
+
+  // --- review ---
+  "review.approved": (e, p) =>
+    `Reviewer approved ${taskRef(e)}${p.notes ? `: ${clip(p.notes, 80)}` : ""}`,
+  "review.rejected": (e, p) =>
+    `Reviewer rejected ${taskRef(e)}${p.notes ? `: ${clip(p.notes, 80)}` : ""}`,
+  "review.escalated": (e) =>
+    `${taskRef(e)} escalated — too many rejected reviews`,
+  "reviewer.auto_spawned": (e) => `Auto-spawned a reviewer for ${taskRef(e)}`,
+  "reviewer.spawned": (e) => `Spawned a reviewer for ${taskRef(e)}`,
+  "reviewer.budget_skipped": (e) =>
+    `Skipped auto-review of ${taskRef(e)} — daily spawn budget spent`,
+
+  // --- verify ---
+  "verify.passed": (e) => `${taskRef(e)} passed verification`,
+  "verify.failed": (e) => `${taskRef(e)} failed verification`,
+
+  // --- PRs ---
+  "pr.merged": (e) => `PR merged — ${taskRef(e)} done`,
+  "pr.closed": (e) => `PR closed without merge — ${taskRef(e)} blocked`,
+  "pr.feedback": (e, p) => {
+    const n = Number(p.comments) || 0;
+    const cr = p.changes_requested ? ", changes requested" : "";
+    return `New PR feedback on ${taskRef(e)} (${n} comment${n === 1 ? "" : "s"}${cr})`;
+  },
+  "pr.sync_error": (e, p) =>
+    `PR sync failed for ${taskRef(e)}: ${clip(p.error, 80)}`,
+  "pr.sync_broken": (e, p) =>
+    `PR sync broken for ${taskRef(e)} after ${str(p.fails) || "several"} tries: ${clip(p.error, 80)}`,
+
+  // --- agents ---
+  "agent.spawned": (e) => `Spawned ${agentRef(e)}${e.task_id != null ? ` on ${taskRef(e)}` : ""}`,
+  "agent.killed": (e) => `Killed ${agentRef(e)}`,
+  "agent.stalled": (e) => `${worker(e)} stalled on ${taskRef(e)}`,
+  "agent.vanished": (e) => `${worker(e)} vanished`,
+  "agent.sent": (e) => `Sent input to ${worker(e)}`,
+  "agent.send_failed": (e) => `Failed to send input to ${worker(e)}`,
+  "agent.input_submitted": (e) => `Submitted ${worker(e)}'s pending input`,
+  "agent.input_cleared": (e) => `Cleared ${worker(e)}'s input`,
+  "agent.auto_nudged": (e, p) => {
+    const attempt = Number(p.attempt) || 0;
+    return `Auto-nudged ${worker(e)} (transient API stall${attempt > 1 ? `, attempt ${attempt}` : ""})`;
+  },
+
+  // --- waiting / delegation ---
+  "waiting.escalated": (e) => `Escalated ${worker(e)} — still waiting for input`,
+  "waiting.delegated": (e) => `Delegated ${worker(e)}'s question to the main agent`,
+
+  // --- scheduler / crons ---
+  "scheduler.spawned": (e) => `Scheduler spawned a worker for ${taskRef(e)}`,
+  "scheduler.spawn_error": (e, p) =>
+    `Scheduler failed to spawn for ${taskRef(e)}: ${clip(p.error, 80)}`,
+  "scheduler.budget_reached": () => `Daily spawn budget reached`,
+  "cron.fired": (e, p) =>
+    `Ran cron ${str(p.name) || `#${str(p.cron_id)}`} → ${taskRef(e)}`,
+  "cron.skipped": (e, p) =>
+    `Skipped ${str(p.name) || "a cron"}: ${clip(p.reason, 80) || "previous run still open"}`,
+  "cron.created": (_e, p) => `Created cron ${str(p.name) || `#${str(p.cron_id)}`}`,
+  "cron.updated": (_e, p) => `Updated cron #${str(p.cron_id)}`,
+  "cron.deleted": (_e, p) => `Deleted cron #${str(p.cron_id)}`,
+
+  // --- memory / docs ---
+  "memory.added": () => `Stored a memory`,
+  "memory.deleted": () => `Forgot a memory`,
+  "memory.recalled": (_e, p) => {
+    const n = Array.isArray(p.ids) ? p.ids.length : 0;
+    return `Recalled ${n} ${n === 1 ? "memory" : "memories"}`;
+  },
+  "memory.injected": (e) => `Injected a memory into ${worker(e)}`,
+  "doc.saved": (_e, p) =>
+    `Saved doc ${str(p.project)}/${str(p.slug)}${p.created ? "" : " (updated)"}`,
+
+  // --- misc ---
+  "main.escalated": (_e, p) => `Main agent escalated: ${clip(p.title, 80)}`,
+  "attention.dismissed": () => `Dismissed a "needs you" item`,
+  "scheduler.config": () => `Scheduler settings changed`,
+  "daemon.stale": () => `Daemon is running stale code`,
+};
+
+export function humanizeEvent(e: Event): string {
+  const p = payloadOf(e);
+  const tmpl = TEMPLATES[e.kind];
+  if (tmpl) return tmpl(e, p);
+  // Unknown kind — never swallow it: show kind + refs + raw payload.
+  const refs = [
+    e.task_id != null ? `#${e.task_id}` : "",
+    e.agent_id != null ? `a${e.agent_id}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const raw = e.payload ? ` ${clip(e.payload, 120)}` : "";
+  return `${e.kind}${refs ? ` ${refs}` : ""}${raw}`;
+}

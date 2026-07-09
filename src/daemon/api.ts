@@ -10,6 +10,7 @@ import {
   updateCron,
 } from "../db/crons.js";
 import { countEventsToday, listEvents, logEvent } from "../db/events.js";
+import { humanizeEvent } from "./humanize.js";
 import {
   addMemory,
   deleteMemory,
@@ -307,9 +308,15 @@ export function buildApp(): Hono {
     return c.json({ ok: true });
   });
 
-  app.get("/api/events", (c) =>
-    c.json(listEvents(Number(c.req.query("limit") ?? 50))),
-  );
+  app.get("/api/events", (c) => {
+    const events = listEvents(Number(c.req.query("limit") ?? 50));
+    // ?narrated=true adds a human-readable one-liner per event for the
+    // dashboard's narrated feed; raw callers get the events untouched.
+    if (c.req.query("narrated") === "true") {
+      return c.json(events.map((e) => ({ ...e, narrative: humanizeEvent(e) })));
+    }
+    return c.json(events);
+  });
 
   // The pinned "Needs You" action queue — an ordered list of items only the
   // human can act on, derived live from tasks/agents/events.
