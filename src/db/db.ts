@@ -115,6 +115,35 @@ CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
   INSERT INTO memories_fts(rowid, text, tags) VALUES (new.id, new.text, new.tags);
 END;
 
+-- Internal long-term doc store index. The document bodies live as plain
+-- markdown files on disk (docsDir()/<project>/<slug>.md); this table indexes
+-- them for listing/search. (project, slug) is the stable identity — save_doc
+-- on an existing slug updates in place and bumps version.
+CREATE TABLE IF NOT EXISTS docs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  slug        TEXT NOT NULL,
+  project     TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  tags        TEXT,
+  task_id     INTEGER,
+  agent_id    INTEGER,
+  summary     TEXT,
+  file_path   TEXT NOT NULL,
+  attachments TEXT,
+  version     INTEGER NOT NULL DEFAULT 1,
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  UNIQUE(project, slug)
+);
+
+-- Full-text search over doc metadata + body. The body is not a column on the
+-- docs table (it lives on disk), so this is a standalone FTS5 table whose
+-- rowid is kept equal to docs.id and maintained by hand in save_doc/delete
+-- (rather than content-table triggers like memories_fts uses).
+CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
+  title, tags, summary, body
+);
+
 CREATE TABLE IF NOT EXISTS crons (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   name        TEXT NOT NULL UNIQUE,

@@ -130,6 +130,98 @@ server.registerTool(
   async ({ hours }) => asText(await call("GET", `/api/summary?hours=${hours ?? 24}`)),
 );
 
+// ---- internal doc store (all roles) ----
+// Long-term storage for research/discovery/investigation findings. These live
+// on the local filesystem + a searchable index — NOT in a git repo or a PR.
+
+server.registerTool(
+  "save_doc",
+  {
+    description:
+      "Persist a research/discovery/investigation document to the internal doc store (local filesystem, NOT a git repo or PR). Use this for findings deliverables instead of committing markdown into a repo. Saving with a title that resolves to an existing slug (in the same project) updates it in place, bumps the version, and keeps the prior body as <slug>.v<N>.md. `attachments` are sidecar data files (e.g. a CSV) written next to the doc.",
+    inputSchema: {
+      project: z
+        .string()
+        .describe("stable topic/initiative name grouping related docs, e.g. 'cogs'"),
+      title: z.string(),
+      content: z.string().describe("the markdown body"),
+      tags: z.string().optional().describe("comma-separated"),
+      summary: z.string().optional().describe("one-line summary for listings/search"),
+      attachments: z
+        .array(z.object({ filename: z.string(), content: z.string() }))
+        .optional()
+        .describe("sidecar data files (e.g. CSV) stored alongside the doc"),
+    },
+  },
+  async (args) =>
+    asText(
+      await call("POST", "/api/docs", {
+        ...args,
+        task_id: MY_TASK_ID,
+        agent_id: process.env.CC_AGENT_ID ? Number(process.env.CC_AGENT_ID) : undefined,
+      }),
+    ),
+);
+
+server.registerTool(
+  "get_doc",
+  {
+    description:
+      "Fetch a stored doc (with its full body) by numeric id or by slug. Pass project when using a slug to disambiguate.",
+    inputSchema: {
+      key: z.string().describe("numeric doc id or slug"),
+      project: z.string().optional(),
+    },
+  },
+  async ({ key, project }) =>
+    asText(
+      await call(
+        "GET",
+        `/api/docs/${encodeURIComponent(key)}${project ? `?project=${encodeURIComponent(project)}` : ""}`,
+      ),
+    ),
+);
+
+server.registerTool(
+  "list_docs",
+  {
+    description:
+      "List stored docs (metadata only, no bodies), optionally filtered by project and/or tag.",
+    inputSchema: {
+      project: z.string().optional(),
+      tag: z.string().optional(),
+      limit: z.number().int().min(1).max(200).optional(),
+    },
+  },
+  async ({ project, tag, limit }) => {
+    const qs = new URLSearchParams();
+    if (project) qs.set("project", project);
+    if (tag) qs.set("tag", tag);
+    if (limit) qs.set("limit", String(limit));
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return asText(await call("GET", `/api/docs${suffix}`));
+  },
+);
+
+server.registerTool(
+  "search_docs",
+  {
+    description:
+      "Full-text search the internal doc store (title, tags, summary, and body). Optionally scope to a project.",
+    inputSchema: {
+      query: z.string(),
+      project: z.string().optional(),
+      limit: z.number().int().min(1).max(50).optional(),
+    },
+  },
+  async ({ query, project, limit }) => {
+    const qs = new URLSearchParams({ q: query });
+    if (project) qs.set("project", project);
+    if (limit) qs.set("limit", String(limit));
+    return asText(await call("GET", `/api/docs?${qs.toString()}`));
+  },
+);
+
 // ---- worker + reviewer tools ----
 
 if (ROLE === "worker" || ROLE === "reviewer") {
