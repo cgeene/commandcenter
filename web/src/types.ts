@@ -107,6 +107,24 @@ export interface AttentionItem {
   age_ms: number;
 }
 
+export interface PaneOption {
+  n: number;
+  label: string;
+}
+
+export interface PendingPermission {
+  question: string;
+  options: PaneOption[];
+}
+
+export interface ParsedPane {
+  target: string;
+  pending_permission: PendingPermission | null;
+  pending_question: string | null;
+  unsubmitted_input: string | null;
+  raw: string;
+}
+
 export interface SchedulerInfo {
   config: {
     enabled: boolean;

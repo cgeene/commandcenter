@@ -80,3 +80,14 @@ export function capturePane(target: string, lines = 50): string {
   const out = tmux("capture-pane", "-p", "-t", target, "-S", `-${lines}`);
   return out.replace(/\n+$/, "");
 }
+
+/** Press Enter without typing anything — submits whatever's already sitting
+ *  in the input line, instead of retyping it. */
+export function sendEnter(target: string): void {
+  tmux("send-keys", "-t", target, "Enter");
+}
+
+/** Ctrl-U: clear the input line back to the prompt without submitting it. */
+export function clearInputLine(target: string): void {
+  tmux("send-keys", "-t", target, "C-u");
+}
