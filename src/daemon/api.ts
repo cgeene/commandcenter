@@ -27,7 +27,7 @@ import {
   readyTasks,
   updateTask,
 } from "../db/tasks.js";
-import { handleHookEvent, type HookPayload } from "./hooks.js";
+import { handleHookEvent, resetAutoNudgeCount, type HookPayload } from "./hooks.js";
 import { handleVerdict, taskDiff } from "./review.js";
 import {
   cancelTask,
@@ -203,6 +203,9 @@ export function buildApp(): Hono {
     // interrupt: a send to a waiting agent IS the answer to its question
     const outcome = await resumeAgent(agent.id, text, { interrupt: true });
     if (outcome !== "sent") return c.json({ error: "no live tmux window" }, 409);
+    // A human or the orchestrator delivered real input — any transient-error
+    // stall streak this agent was on is over.
+    resetAutoNudgeCount(agent.id);
     logEvent("agent.sent", { agentId: agent.id, taskId: agent.task_id ?? undefined });
     return c.json({ ok: true });
   });
