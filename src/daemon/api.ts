@@ -21,6 +21,7 @@ import {
 } from "../db/memories.js";
 import {
   getDoc,
+  getDocAttachment,
   listDocs,
   saveDoc,
   searchDocs,
@@ -490,6 +491,20 @@ export function buildApp(): Hono {
     const project = c.req.query("project") || undefined;
     const doc = getDoc(/^\d+$/.test(key) ? Number(key) : key, project);
     return doc ? c.json(doc) : c.json({ error: "not found" }, 404);
+  });
+
+  // Download a doc's sidecar attachment (CSV etc.) as a raw file. Served as an
+  // attachment so the browser downloads it rather than trying to render it.
+  app.get("/api/docs/:key/attachments/:name", (c) => {
+    const key = c.req.param("key");
+    const name = c.req.param("name");
+    const project = c.req.query("project") || undefined;
+    const att = getDocAttachment(/^\d+$/.test(key) ? Number(key) : key, name, project);
+    if (!att) return c.json({ error: "not found" }, 404);
+    return c.body(new Uint8Array(att.content), 200, {
+      "content-type": "application/octet-stream",
+      "content-disposition": `attachment; filename="${att.filename.replace(/"/g, "")}"`,
+    });
   });
 
   app.post("/api/docs", async (c) => {

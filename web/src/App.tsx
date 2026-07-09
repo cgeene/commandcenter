@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useState } from "react";
 import type { CSSProperties } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeSanitize from "rehype-sanitize";
 import { api } from "./api";
-import { blockedByChain, groupByProject } from "../../src/lib/board";
+import { blockedByChain, groupByProject, isActive, isArchived, projectOf } from "../../src/lib/board";
 import { Terminal } from "./Terminal";
 import type {
   Agent,
   AttentionItem,
   CronJob,
+  Doc,
+  DocWithContent,
   Event,
   Memory,
   ParsedPane,
@@ -19,7 +24,9 @@ import type {
 const TABS = [
   { id: "board", label: "board" },
   { id: "prs", label: "PRs" },
+  { id: "docs", label: "docs" },
   { id: "tokens", label: "tokens" },
+  { id: "archive", label: "archive" },
 ] as const;
 type TabId = (typeof TABS)[number]["id"];
 
@@ -303,6 +310,10 @@ export function App() {
 
       {tab === "prs" && <PrsView tasks={tasks} onSelect={setSelTask} />}
 
+      {tab === "docs" && <DocsView />}
+
+      {tab === "archive" && <ArchiveView tasks={tasks} onSelect={setSelTask} />}
+
       {tab === "board" && (
       <main>
         <div className="board">
@@ -310,7 +321,9 @@ export function App() {
             // Blocker may live in another project group, so resolve chains
             // against all tasks, not just the current group's.
             const byId = new Map(tasks.map((t) => [t.id, t] as const));
-            return groupByProject(tasks).map((g) => (
+            // Only active cards on the board; done/cancelled live under Archive.
+            // Headers still count archived tasks (rollup is over all tasks).
+            return groupByProject(tasks, { visible: (t) => isActive(t.status) }).map((g) => (
               <div key={g.project} className="column">
                 <h2>
                   {g.project} <span className="muted">{g.done}/{g.total}</span>
@@ -326,7 +339,11 @@ export function App() {
               </div>
             ));
           })()}
-          {tasks.length === 0 && <span className="muted">no tasks yet</span>}
+          {tasks.filter((t) => isActive(t.status)).length === 0 && (
+            <span className="muted">
+              {tasks.length === 0 ? "no tasks yet" : "no active tasks — see Archive"}
+            </span>
+          )}
         </div>
 
         <aside className="events">
@@ -556,6 +573,198 @@ function PrsView({
             ))}
           </div>
         ))}
+      </div>
+    </main>
+  );
+}
+
+/**
+ * The Archive tab: done + cancelled tasks, same project-grouped layout as the
+ * board, so finished work stays browsable without cluttering the active board.
+ * A single text box filters by project name or task title.
+ */
+function ArchiveView({
+  tasks,
+  onSelect,
+}: {
+  tasks: Task[];
+  onSelect: (t: Task) => void;
+}) {
+  const [filter, setFilter] = useState("");
+  const byId = new Map(tasks.map((t) => [t.id, t] as const));
+  const q = filter.trim().toLowerCase();
+  const groups = groupByProject(tasks, {
+    visible: (t) =>
+      isArchived(t.status) &&
+      (q === "" ||
+        projectOf(t.repo).toLowerCase().includes(q) ||
+        t.title.toLowerCase().includes(q)),
+  });
+  const archivedCount = tasks.filter((t) => isArchived(t.status)).length;
+
+  return (
+    <main>
+      <div className="archive-view">
+        <input
+          className="archive-filter"
+          placeholder="filter archive by project or title…"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        />
+        <div className="board">
+          {groups.map((g) => (
+            <div key={g.project} className="column">
+              <h2>
+                {g.project} <span className="muted">{g.done}/{g.total}</span>
+              </h2>
+              {g.tasks.map((t) => (
+                <TaskCard key={t.id} task={t} byId={byId} onSelect={onSelect} />
+              ))}
+            </div>
+          ))}
+          {groups.length === 0 && (
+            <span className="muted">
+              {archivedCount === 0
+                ? "nothing archived yet"
+                : "no archived tasks match your filter"}
+            </span>
+          )}
+        </div>
+      </div>
+    </main>
+  );
+}
+
+/**
+ * Render agent-authored markdown safely. react-markdown never passes raw HTML
+ * through to the DOM (no dangerouslySetInnerHTML), so embedded <script>/<img
+ * onerror> in a doc is shown as inert text; rehype-sanitize is layered on as
+ * defense-in-depth. remark-gfm adds tables, task lists, and fenced code.
+ */
+function Markdown({ content }: { content: string }) {
+  return (
+    <div className="markdown">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeSanitize]}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function basename(p: string): string {
+  return p.split(/[/\\]/).pop() ?? p;
+}
+
+/**
+ * The Docs tab: a read-only viewer for the internal doc store. Docs are listed
+ * grouped by project on the left; selecting one fetches its body and renders it
+ * as sanitized markdown. Attachments (CSV etc.) are offered as download links.
+ */
+function DocsView() {
+  const [docs, setDocs] = useState<Doc[]>([]);
+  const [selected, setSelected] = useState<DocWithContent | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    api<Doc[]>("GET", "/api/docs")
+      .then(setDocs)
+      .catch((e) => setError(String(e instanceof Error ? e.message : e)));
+  }, []);
+
+  const open = async (id: number) => {
+    setLoading(true);
+    setError(null);
+    try {
+      setSelected(await api<DocWithContent>("GET", `/api/docs/${id}`));
+    } catch (e) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Group by project, preserving the API's updated_at-desc order.
+  const order: string[] = [];
+  const byProject = new Map<string, Doc[]>();
+  for (const d of docs) {
+    let bucket = byProject.get(d.project);
+    if (!bucket) {
+      bucket = [];
+      byProject.set(d.project, bucket);
+      order.push(d.project);
+    }
+    bucket.push(d);
+  }
+
+  const attachments: string[] = selected?.attachments
+    ? (JSON.parse(selected.attachments) as string[])
+    : [];
+
+  return (
+    <main>
+      <div className="docs-view">
+        <aside className="docs-list">
+          {order.map((project) => (
+            <div key={project} className="docs-group">
+              <h3>{project}</h3>
+              {byProject.get(project)!.map((d) => (
+                <button
+                  key={d.id}
+                  className={`docs-item ${selected?.id === d.id ? "active" : ""}`}
+                  onClick={() => open(d.id)}
+                >
+                  <span className="docs-item-title">{d.title}</span>
+                  {d.summary && (
+                    <span className="docs-item-summary muted">{d.summary}</span>
+                  )}
+                </button>
+              ))}
+            </div>
+          ))}
+          {docs.length === 0 && !error && (
+            <span className="muted">no docs yet</span>
+          )}
+        </aside>
+        <section className="docs-body">
+          {error && <div className="error">{error}</div>}
+          {loading && <span className="muted">loading…</span>}
+          {!loading && !selected && !error && (
+            <span className="muted">select a doc to read it</span>
+          )}
+          {selected && (
+            <>
+              <div className="docs-head">
+                <h2>{selected.title}</h2>
+                <span className="muted">
+                  {selected.project} · v{selected.version} · updated{" "}
+                  {selected.updated_at.slice(0, 10)}
+                </span>
+              </div>
+              {attachments.length > 0 && (
+                <div className="docs-attachments">
+                  <b className="muted">attachments</b>
+                  {attachments.map((rel) => {
+                    const name = basename(rel);
+                    return (
+                      <a
+                        key={rel}
+                        className="docs-attachment"
+                        href={`/api/docs/${selected.id}/attachments/${encodeURIComponent(name)}`}
+                      >
+                        ⬇ {name}
+                      </a>
+                    );
+                  })}
+                </div>
+              )}
+              <Markdown content={selected.content} />
+            </>
+          )}
+        </section>
       </div>
     </main>
   );
