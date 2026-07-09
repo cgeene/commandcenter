@@ -5,6 +5,7 @@
 ![Node >= 22](https://img.shields.io/badge/node-%3E%3D22-informational)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)
 ![Local-first](https://img.shields.io/badge/local--first-no%20telemetry-success)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
 commandcenter turns a queue of tasks into work done by autonomous [Claude Code](https://claude.com/claude-code)
 agents. A long-running daemon owns a SQLite task queue and spawns each task into
@@ -416,6 +417,4 @@ Node and imported by the Vite bundle.
 
 ## License
 
-**No license file is present in this repository yet.** Until a `LICENSE` is
-added, default copyright applies — the code is source-available but not licensed
-for reuse. Choose and add a license before publicizing the project.
+[MIT](LICENSE) © 2026 Caleb Geene.
