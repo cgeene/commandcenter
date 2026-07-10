@@ -175,14 +175,14 @@ describe("createReviewWorktree", () => {
     const { createReviewWorktree, git: worktreeGit } = await import(
       "../src/daemon/worktree.js"
     );
-    const dir = createReviewWorktree(repoA, 9, taskBranch);
+    const dir = createReviewWorktree(repoA, 9, taskBranch, true);
 
     expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(commitY);
     // The local branch ref in repoA itself must stay untouched.
     expect(git(repoA, "rev-parse", taskBranch)).toBe(commitX);
   });
 
-  it("falls back to the local branch (loudly) when the repo has no origin remote", async () => {
+  it("logs an expected (calm) fallback when the repo has no origin remote", async () => {
     const repo = path.join(tmpDir, "no-remote");
     fs.mkdirSync(repo);
     git(repo, "init", "-b", "main");
@@ -196,11 +196,16 @@ describe("createReviewWorktree", () => {
       "../src/daemon/worktree.js"
     );
     const { listEvents } = await import("../src/db/events.js");
-    const dir = createReviewWorktree(repo, 20, taskBranch);
+    const dir = createReviewWorktree(repo, 20, taskBranch, true);
 
     expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
+    // No origin at all: local is the only copy, so this is expected operation
+    // and must NOT trip the alarm kind, whatever the task's open_pr flag.
+    expect(
+      listEvents(20).some((e) => e.kind === "worktree.review_fallback_local_branch"),
+    ).toBe(false);
     const events = listEvents(20).filter(
-      (e) => e.kind === "worktree.review_fallback_local_branch",
+      (e) => e.kind === "worktree.review_local_branch_expected",
     );
     expect(events).toHaveLength(1);
     expect(JSON.parse(events[0].payload!)).toMatchObject({
@@ -209,7 +214,7 @@ describe("createReviewWorktree", () => {
     });
   });
 
-  it("falls back to the local branch (reason: branch-not-on-origin) when it was never pushed", async () => {
+  it("logs an expected (calm) fallback when the branch was never pushed", async () => {
     const { remoteDir } = setupRemote();
     const repoA = cloneRepo(remoteDir, "repo-a");
     const taskBranch = "agent/task-10";
@@ -222,22 +227,25 @@ describe("createReviewWorktree", () => {
       "../src/daemon/worktree.js"
     );
     const { listEvents } = await import("../src/db/events.js");
-    const dir = createReviewWorktree(repoA, 10, taskBranch);
+    const dir = createReviewWorktree(repoA, 10, taskBranch, true);
 
     expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
+    // The benign not-yet-pushed case: origin genuinely lacks the branch, so
+    // reviewing local is correct — the calm kind, never the alarm kind.
+    expect(
+      listEvents(20).some((e) => e.kind === "worktree.review_fallback_local_branch"),
+    ).toBe(false);
     const events = listEvents(20).filter(
-      (e) => e.kind === "worktree.review_fallback_local_branch",
+      (e) => e.kind === "worktree.review_local_branch_expected",
     );
     expect(events).toHaveLength(1);
-    // The benign not-yet-pushed case: origin genuinely lacks the branch, so
-    // reviewing local is correct — must NOT be conflated with a fetch failure.
     expect(JSON.parse(events[0].payload!)).toMatchObject({
       branch: taskBranch,
       reason: "branch-not-on-origin",
     });
   });
 
-  it("falls back to the local branch (reason: fetch-failed) when the fetch itself fails", async () => {
+  it("logs the ALARM fallback when the fetch fails on a PR task (open_pr)", async () => {
     const { remoteDir } = setupRemote();
     const repoA = cloneRepo(remoteDir, "repo-a");
     const taskBranch = "agent/task-12";
@@ -253,18 +261,53 @@ describe("createReviewWorktree", () => {
       "../src/daemon/worktree.js"
     );
     const { listEvents } = await import("../src/db/events.js");
-    const dir = createReviewWorktree(repoA, 12, taskBranch);
+    const dir = createReviewWorktree(repoA, 12, taskBranch, true);
 
     expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
     const events = listEvents(20).filter(
       (e) => e.kind === "worktree.review_fallback_local_branch",
     );
     expect(events).toHaveLength(1);
-    // A genuine fetch failure: origin may hold newer commits than local, so
-    // this fallback risks a stale review and is the case worth alarming on.
+    // A genuine fetch failure on a task that pushes to origin: origin may hold
+    // newer commits than local, so this fallback risks a stale review and is
+    // the one case worth alarming on.
     expect(JSON.parse(events[0].payload!)).toMatchObject({
       branch: taskBranch,
       reason: "fetch-failed",
+      open_pr: true,
+    });
+  });
+
+  it("downgrades a fetch-failed fallback to the calm kind for a no-PR task (open_pr=false)", async () => {
+    const { remoteDir } = setupRemote();
+    const repoA = cloneRepo(remoteDir, "repo-a");
+    const taskBranch = "agent/task-13";
+    git(repoA, "checkout", "-b", taskBranch);
+    writeFile(repoA, "work.txt", "local only\n");
+    commit(repoA, "feat: local only work");
+    const localTip = git(repoA, "rev-parse", taskBranch);
+    git(repoA, "remote", "set-url", "origin", path.join(tmpDir, "does-not-exist.git"));
+
+    const { createReviewWorktree, git: worktreeGit } = await import(
+      "../src/daemon/worktree.js"
+    );
+    const { listEvents } = await import("../src/db/events.js");
+    const dir = createReviewWorktree(repoA, 13, taskBranch, false);
+
+    expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
+    // A no-PR / doc-store task never pushes, so origin can't hold a newer copy
+    // than local — even a fetch error carries no stale-review risk here.
+    expect(
+      listEvents(20).some((e) => e.kind === "worktree.review_fallback_local_branch"),
+    ).toBe(false);
+    const events = listEvents(20).filter(
+      (e) => e.kind === "worktree.review_local_branch_expected",
+    );
+    expect(events).toHaveLength(1);
+    expect(JSON.parse(events[0].payload!)).toMatchObject({
+      branch: taskBranch,
+      reason: "fetch-failed",
+      open_pr: false,
     });
   });
 
@@ -280,7 +323,7 @@ describe("createReviewWorktree", () => {
     const { createReviewWorktree, git: worktreeGit } = await import(
       "../src/daemon/worktree.js"
     );
-    const firstDir = createReviewWorktree(repoA, 11, taskBranch);
+    const firstDir = createReviewWorktree(repoA, 11, taskBranch, true);
     const firstTip = worktreeGit(firstDir, "rev-parse", "HEAD");
 
     // Second review cycle: worker pushed more commits from elsewhere.
@@ -290,7 +333,7 @@ describe("createReviewWorktree", () => {
     commit(repoB, "feat: v2");
     git(repoB, "push", "origin", taskBranch);
 
-    const secondDir = createReviewWorktree(repoA, 11, taskBranch);
+    const secondDir = createReviewWorktree(repoA, 11, taskBranch, true);
     expect(secondDir).toBe(firstDir);
     const secondTip = worktreeGit(secondDir, "rev-parse", "HEAD");
     expect(secondTip).not.toBe(firstTip);

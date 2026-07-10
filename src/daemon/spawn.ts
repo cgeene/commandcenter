@@ -272,7 +272,7 @@ export function spawnReviewer(
   }
 
   const model = modelOverride ?? task.model ?? undefined;
-  const dir = createReviewWorktree(task.repo, taskId, task.branch);
+  const dir = createReviewWorktree(task.repo, taskId, task.branch, task.open_pr !== 0);
   const agent = createAgent({
     kind: "reviewer",
     model,
