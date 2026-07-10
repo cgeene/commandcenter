@@ -122,6 +122,14 @@ const TEMPLATES: Record<string, Template> = {
   "doc.saved": (_e, p) =>
     `Saved doc ${str(p.project)}/${str(p.slug)}${p.created ? "" : " (updated)"}`,
 
+  // --- worktrees ---
+  "worktree.fallback_local_head": (e, p) =>
+    `Cut ${taskRef(e)}'s worktree from local HEAD (${str(p.reason) || "no origin"}) — origin start-point unavailable`,
+  "worktree.review_fallback_local_branch": (e, p) =>
+    `Reviewing ${taskRef(e)} from a stale local branch — fetch failed (${clip(p.detail, 80) || "unknown error"})`,
+  "worktree.review_local_branch_expected": (e, p) =>
+    `Reviewing ${taskRef(e)} from the local branch (${str(p.reason) || "not on origin"}) — expected, origin has no newer copy`,
+
   // --- misc ---
   "main.escalated": (_e, p) => `Main agent escalated: ${clip(p.title, 80)}`,
   "attention.dismissed": () => `Dismissed a "needs you" item`,

@@ -136,24 +136,48 @@ export function reviewWorktreeDir(repo: string, taskId: number): string {
  * behavior) if there's no remote, the branch was never pushed, or the fetch
  * fails — logged loudly rather than silently.
  *
- * The fallback event's `reason` distinguishes the two error shapes because
- * they have very different implications for review correctness:
- *   - `branch-not-on-origin` — git reported "couldn't find remote ref": origin
- *     genuinely lacks the branch. This is BENIGN and expected: reviews are
- *     triggered on the worker's Stop hook, which usually fires before the
- *     worker pushes (or never, for no-PR / doc-store tasks). Local is then the
- *     only and freshest copy of the work, so reviewing it is correct.
- *   - `fetch-failed` — the fetch itself failed (offline, auth, timeout). Here
- *     origin *might* hold commits newer than the local ref, so falling back to
- *     local risks reviewing stale state. This is the case worth alarming on.
+ * The fallback is logged under one of two event kinds, split by whether it
+ * carries any real risk of reviewing STALE state, so the raw per-kind counters
+ * that drive watch-items (summary.ts `event_counts`, the nightly dream
+ * reflection) only ever see the noteworthy case under the alarming name:
+ *   - `worktree.review_fallback_local_branch` — the ALARM kind. Emitted only
+ *     when the fetch itself failed (offline, auth, timeout) AND the task pushes
+ *     to origin (`open_pr`). Origin might then hold commits newer than the
+ *     local ref, so falling back to local risks a stale review.
+ *   - `worktree.review_local_branch_expected` — the CALM kind, still recorded
+ *     for auditability but not worth alarming on. Covers every expected shape:
+ *       * origin genuinely lacks the branch (`branch-not-on-origin`) — reviews
+ *         trigger on the worker's Stop hook, which usually fires before the
+ *         worker pushes; local is then the only, freshest copy.
+ *       * no origin remote at all (`no-origin-remote`).
+ *       * ANY fallback on a no-PR / doc-store task (`open_pr = 0`): its worker
+ *         never pushes, so origin never holds the branch and local is always
+ *         the intended review target regardless of why the fetch failed.
+ * The `payload.reason` and `payload.open_pr` are kept on both kinds so a
+ * consumer can still tell the shapes apart.
  */
-function resolveReviewTarget(repo: string, branch: string, taskId: number): string {
-  if (!hasOriginRemote(repo)) {
-    logEvent("worktree.review_fallback_local_branch", {
-      taskId,
-      payload: { branch, reason: "no-origin-remote" },
-    });
+function resolveReviewTarget(
+  repo: string,
+  branch: string,
+  taskId: number,
+  openPr: boolean,
+): string {
+  const fallback = (reason: string, extra?: Record<string, unknown>): string => {
+    // A stale review is only possible when the fetch failed (origin may be
+    // ahead of local) AND the task pushes to origin at all. Everything else
+    // means local is the only/freshest copy — the correct thing to review.
+    const noteworthy = reason === "fetch-failed" && openPr;
+    logEvent(
+      noteworthy
+        ? "worktree.review_fallback_local_branch"
+        : "worktree.review_local_branch_expected",
+      { taskId, payload: { branch, reason, open_pr: openPr, ...extra } },
+    );
     return branch;
+  };
+
+  if (!hasOriginRemote(repo)) {
+    return fallback("no-origin-remote");
   }
   try {
     fetchQuiet(repo, branch);
@@ -165,11 +189,7 @@ function resolveReviewTarget(repo: string, branch: string, taskId: number): stri
     const reason = /couldn't find remote ref/i.test(detail)
       ? "branch-not-on-origin"
       : "fetch-failed";
-    logEvent("worktree.review_fallback_local_branch", {
-      taskId,
-      payload: { branch, reason, detail },
-    });
-    return branch;
+    return fallback(reason, { detail });
   }
 }
 
@@ -178,14 +198,18 @@ function resolveReviewTarget(repo: string, branch: string, taskId: number): stri
  * at the branch tip: git refuses to check out a branch already checked out in
  * the worker's worktree, and the reviewer must not commit anyway. On reuse
  * (second review cycle) re-detach so the reviewer sees the latest commits.
+ *
+ * `openPr` (the task's PR flag) only tunes how a fallback to the local branch
+ * is logged — see resolveReviewTarget — and never changes which ref is used.
  */
 export function createReviewWorktree(
   repo: string,
   taskId: number,
   branch: string,
+  openPr: boolean,
 ): string {
   const dir = reviewWorktreeDir(repo, taskId);
-  const target = resolveReviewTarget(repo, branch, taskId);
+  const target = resolveReviewTarget(repo, branch, taskId, openPr);
   if (fs.existsSync(dir)) {
     git(dir, "checkout", "--detach", target);
     return dir;

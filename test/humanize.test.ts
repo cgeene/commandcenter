@@ -68,6 +68,32 @@ describe("humanizeEvent", () => {
     ).toBe("New PR feedback on #5 (2 comments, changes requested)");
   });
 
+  it("review_local_branch_expected reads as expected operation, not an alarm", () => {
+    const s = humanizeEvent(
+      ev({
+        kind: "worktree.review_local_branch_expected",
+        task_id: 32,
+        payload: JSON.stringify({ branch: "agent/task-32", reason: "branch-not-on-origin", open_pr: false }),
+      }),
+    );
+    expect(s).toBe(
+      "Reviewing #32 from the local branch (branch-not-on-origin) — expected, origin has no newer copy",
+    );
+  });
+
+  it("review_fallback_local_branch surfaces the fetch error as a stale-review risk", () => {
+    const s = humanizeEvent(
+      ev({
+        kind: "worktree.review_fallback_local_branch",
+        task_id: 12,
+        payload: JSON.stringify({ branch: "agent/task-12", reason: "fetch-failed", open_pr: true, detail: "fatal: unable to access remote" }),
+      }),
+    );
+    expect(s).toBe(
+      "Reviewing #12 from a stale local branch — fetch failed (fatal: unable to access remote)",
+    );
+  });
+
   it("unknown kinds fall back to kind + refs + raw payload", () => {
     const s = humanizeEvent(
       ev({ kind: "some.new_kind", task_id: 9, agent_id: 4, payload: JSON.stringify({ a: 1 }) }),
