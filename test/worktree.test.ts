@@ -209,7 +209,7 @@ describe("createReviewWorktree", () => {
     });
   });
 
-  it("falls back to the local branch when it was never pushed", async () => {
+  it("falls back to the local branch (reason: branch-not-on-origin) when it was never pushed", async () => {
     const { remoteDir } = setupRemote();
     const repoA = cloneRepo(remoteDir, "repo-a");
     const taskBranch = "agent/task-10";
@@ -225,9 +225,47 @@ describe("createReviewWorktree", () => {
     const dir = createReviewWorktree(repoA, 10, taskBranch);
 
     expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
-    expect(listEvents(20).map((e) => e.kind)).toContain(
-      "worktree.review_fallback_local_branch",
+    const events = listEvents(20).filter(
+      (e) => e.kind === "worktree.review_fallback_local_branch",
     );
+    expect(events).toHaveLength(1);
+    // The benign not-yet-pushed case: origin genuinely lacks the branch, so
+    // reviewing local is correct — must NOT be conflated with a fetch failure.
+    expect(JSON.parse(events[0].payload!)).toMatchObject({
+      branch: taskBranch,
+      reason: "branch-not-on-origin",
+    });
+  });
+
+  it("falls back to the local branch (reason: fetch-failed) when the fetch itself fails", async () => {
+    const { remoteDir } = setupRemote();
+    const repoA = cloneRepo(remoteDir, "repo-a");
+    const taskBranch = "agent/task-12";
+    git(repoA, "checkout", "-b", taskBranch);
+    writeFile(repoA, "work.txt", "local only\n");
+    commit(repoA, "feat: local only work");
+    const localTip = git(repoA, "rev-parse", taskBranch);
+    // Point origin at a path that no longer exists so the fetch errors out
+    // (offline/auth-style failure) rather than reporting a missing ref.
+    git(repoA, "remote", "set-url", "origin", path.join(tmpDir, "does-not-exist.git"));
+
+    const { createReviewWorktree, git: worktreeGit } = await import(
+      "../src/daemon/worktree.js"
+    );
+    const { listEvents } = await import("../src/db/events.js");
+    const dir = createReviewWorktree(repoA, 12, taskBranch);
+
+    expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
+    const events = listEvents(20).filter(
+      (e) => e.kind === "worktree.review_fallback_local_branch",
+    );
+    expect(events).toHaveLength(1);
+    // A genuine fetch failure: origin may hold newer commits than local, so
+    // this fallback risks a stale review and is the case worth alarming on.
+    expect(JSON.parse(events[0].payload!)).toMatchObject({
+      branch: taskBranch,
+      reason: "fetch-failed",
+    });
   });
 
   it("re-detaches to pick up new commits on reuse (second review cycle)", async () => {

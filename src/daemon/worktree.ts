@@ -135,6 +135,17 @@ export function reviewWorktreeDir(repo: string, taskId: number): string {
  * the worker's latest push. Falls back to the plain local branch name (prior
  * behavior) if there's no remote, the branch was never pushed, or the fetch
  * fails — logged loudly rather than silently.
+ *
+ * The fallback event's `reason` distinguishes the two error shapes because
+ * they have very different implications for review correctness:
+ *   - `branch-not-on-origin` — git reported "couldn't find remote ref": origin
+ *     genuinely lacks the branch. This is BENIGN and expected: reviews are
+ *     triggered on the worker's Stop hook, which usually fires before the
+ *     worker pushes (or never, for no-PR / doc-store tasks). Local is then the
+ *     only and freshest copy of the work, so reviewing it is correct.
+ *   - `fetch-failed` — the fetch itself failed (offline, auth, timeout). Here
+ *     origin *might* hold commits newer than the local ref, so falling back to
+ *     local risks reviewing stale state. This is the case worth alarming on.
  */
 function resolveReviewTarget(repo: string, branch: string, taskId: number): string {
   if (!hasOriginRemote(repo)) {
@@ -148,9 +159,15 @@ function resolveReviewTarget(repo: string, branch: string, taskId: number): stri
     fetchQuiet(repo, branch);
     return `origin/${branch}`;
   } catch (err) {
+    const detail = String(err);
+    // git prints "couldn't find remote ref <branch>" when the branch simply
+    // isn't on origin yet — a benign not-yet-pushed case, not a fetch failure.
+    const reason = /couldn't find remote ref/i.test(detail)
+      ? "branch-not-on-origin"
+      : "fetch-failed";
     logEvent("worktree.review_fallback_local_branch", {
       taskId,
-      payload: { branch, reason: String(err) },
+      payload: { branch, reason, detail },
     });
     return branch;
   }
