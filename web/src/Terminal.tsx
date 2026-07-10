@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
+import { shiftEnterNewline } from "../../src/lib/terminal-keys";
 
 const BAR_KEYS: { label: string; seq: string }[] = [
   { label: "esc", seq: "\x1b" },
@@ -59,6 +60,20 @@ export function Terminal({ agentId }: { agentId: number }) {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ t: "i", d }));
       }
+    });
+
+    // Shift+Enter inserts a newline instead of submitting: intercept it before
+    // xterm turns it into a plain CR. We send the newline sequence ourselves and
+    // return false so xterm does NOT also emit "\r" (which Claude Code reads as
+    // submit). Every other key (including plain Enter) returns true and is
+    // handled by xterm as usual.
+    term.attachCustomKeyEventHandler((e) => {
+      const seq = shiftEnterNewline(e);
+      if (seq === null) return true;
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ t: "i", d: seq }));
+      }
+      return false;
     });
 
     const resizeObserver = new ResizeObserver(() => {

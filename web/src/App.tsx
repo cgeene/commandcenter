@@ -5,6 +5,7 @@ import remarkGfm from "remark-gfm";
 import rehypeSanitize from "rehype-sanitize";
 import { api } from "./api";
 import { blockedByChain, groupByProject, isActive, isArchived, projectOf } from "../../src/lib/board";
+import { openPanel, type Panel } from "../../src/lib/panel";
 import { Terminal } from "./Terminal";
 import type {
   Agent,
@@ -93,8 +94,11 @@ export function App() {
   const [panes, setPanes] = useState<Record<number, ParsedPane>>({});
   const [events, setEvents] = useState<Event[]>([]);
   const [attention, setAttention] = useState<AttentionItem[]>([]);
-  const [selTask, setSelTask] = useState<Task | null>(null);
-  const [termAgent, setTermAgent] = useState<number | null>(null);
+  // One side panel at a time: task detail, terminal, or transcript. A single
+  // union means any panel-opening click replaces whatever's open, so panels
+  // can never stack. The heavier transcript payload lives in `transcript`,
+  // keyed off the active panel's sessionId.
+  const [panel, setPanel] = useState<Panel>(null);
   const [transcript, setTranscript] = useState<TranscriptEntry[] | null>(null);
   const [showNewTask, setShowNewTask] = useState(false);
   const [showMemory, setShowMemory] = useState(false);
@@ -114,6 +118,19 @@ export function App() {
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
+  // Every panel-opening control routes through openPanel: opening one closes
+  // whatever was open (last click wins), and re-clicking the same control
+  // toggles it closed.
+  const openTask = (id: number) => setPanel((cur) => openPanel(cur, { kind: "task", id }));
+  const openTerminal = (agentId: number) =>
+    setPanel((cur) => openPanel(cur, { kind: "terminal", agentId }));
+  const openTranscript = async (sessionId: string) => {
+    const r = await api<{ entries: TranscriptEntry[] }>("GET", `/api/transcript/${sessionId}`);
+    setTranscript(r.entries);
+    setPanel((cur) => openPanel(cur, { kind: "transcript", sessionId }));
+  };
+  const closePanel = () => setPanel(null);
+
   const refresh = useCallback(async () => {
     try {
       const [t, a, e, s, at] = await Promise.all([
@@ -128,7 +145,6 @@ export function App() {
       setEvents(e);
       setScheduler(s);
       setAttention(at);
-      setSelTask((cur) => (cur ? (t.find((x) => x.id === cur.id) ?? null) : null));
 
       // Waiting agents need their pane parsed so the card can show what
       // they're asking without opening the terminal.
@@ -175,6 +191,11 @@ export function App() {
       setError(String(e instanceof Error ? e.message : e));
     }
   };
+
+  // The task drawer reads from the live `tasks` list by id, so it always
+  // reflects the latest poll (no stale copy to re-sync); if the task vanishes
+  // the drawer simply closes.
+  const selTask = panel?.kind === "task" ? (tasks.find((t) => t.id === panel.id) ?? null) : null;
 
   const liveMain = agents.find((a) => a.kind === "main" && a.state !== "dead");
   // Nav badge: open PRs the reviewer has approved and are now waiting on a
@@ -257,10 +278,7 @@ export function App() {
           onDismiss={(key) =>
             act(() => api("POST", `/api/attention/${encodeURIComponent(key)}/dismiss`, {}))
           }
-          onOpenTask={(taskId) => {
-            const t = tasks.find((x) => x.id === taskId);
-            if (t) setSelTask(t);
-          }}
+          onOpenTask={openTask}
         />
       )}
 
@@ -282,7 +300,7 @@ export function App() {
               <span className="muted">
                 {a.state} · {a.model ?? "?"}
               </span>
-              <button onClick={() => setTermAgent(a.id)}>terminal</button>
+              <button onClick={() => openTerminal(a.id)}>terminal</button>
               <button
                 className="danger"
                 onClick={() =>
@@ -297,7 +315,7 @@ export function App() {
                 agentId={a.id}
                 pane={panes[a.id]}
                 onAction={act}
-                onOpenTerminal={() => setTermAgent(a.id)}
+                onOpenTerminal={() => openTerminal(a.id)}
               />
             )}
           </div>
@@ -306,13 +324,13 @@ export function App() {
       </section>
       )}
 
-      {tab === "tokens" && <TokensView tasks={tasks} onSelect={setSelTask} />}
+      {tab === "tokens" && <TokensView tasks={tasks} onSelect={(t) => openTask(t.id)} />}
 
-      {tab === "prs" && <PrsView tasks={tasks} onSelect={setSelTask} />}
+      {tab === "prs" && <PrsView tasks={tasks} onSelect={(t) => openTask(t.id)} />}
 
       {tab === "docs" && <DocsView />}
 
-      {tab === "archive" && <ArchiveView tasks={tasks} onSelect={setSelTask} />}
+      {tab === "archive" && <ArchiveView tasks={tasks} onSelect={(t) => openTask(t.id)} />}
 
       {tab === "board" && (
       <main>
@@ -333,7 +351,7 @@ export function App() {
                     key={t.id}
                     task={t}
                     byId={byId}
-                    onSelect={setSelTask}
+                    onSelect={(sel) => openTask(sel.id)}
                   />
                 ))}
               </div>
@@ -362,36 +380,30 @@ export function App() {
       {selTask && (
         <TaskPanel
           task={selTask}
-          onClose={() => setSelTask(null)}
+          onClose={closePanel}
           onAction={act}
-          onTerminal={(agentId) => setTermAgent(agentId)}
-          onTranscript={async (sid) => {
-            const r = await api<{ entries: TranscriptEntry[] }>(
-              "GET",
-              `/api/transcript/${sid}`,
-            );
-            setTranscript(r.entries);
-          }}
+          onTerminal={openTerminal}
+          onTranscript={openTranscript}
         />
       )}
 
-      {termAgent !== null && (
+      {panel?.kind === "terminal" && (
         <div className="drawer terminal-drawer" style={keyboardStyle}>
           <div className="drawer-head">
-            <b>terminal — a{termAgent}</b>
+            <b>terminal — a{panel.agentId}</b>
             <div className="spacer" />
-            <button onClick={() => setTermAgent(null)}>close</button>
+            <button onClick={closePanel}>close</button>
           </div>
-          <Terminal agentId={termAgent} />
+          <Terminal agentId={panel.agentId} />
         </div>
       )}
 
-      {transcript && (
+      {panel?.kind === "transcript" && transcript && (
         <div className="drawer">
           <div className="drawer-head">
             <b>transcript</b>
             <div className="spacer" />
-            <button onClick={() => setTranscript(null)}>close</button>
+            <button onClick={closePanel}>close</button>
           </div>
           <div className="transcript">
             {transcript.map((e, i) => (
