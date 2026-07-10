@@ -3,11 +3,14 @@ import crypto from "node:crypto";
 import pty from "node-pty";
 import type { WebSocket } from "ws";
 import { getAgent } from "../db/agents.js";
+import { localeEnv } from "./locale.js";
 import { windowExists } from "./tmux.js";
 
 function tmux(...args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
-    execFile("tmux", args, (err) => (err ? reject(err) : resolve()));
+    execFile("tmux", args, { env: localeEnv() }, (err) =>
+      err ? reject(err) : resolve(),
+    );
   });
 }
 
@@ -65,11 +68,13 @@ export async function attachTerminal(
   try {
     // Start the PTY at the browser's real dimensions so the first paint is
     // already correct — a wrong initial size leaves redraw artifacts.
-    term = pty.spawn("tmux", ["attach", "-t", viewer], {
+    // `-u` + a UTF-8 locale keep tmux from downgrading ⏺ ❯ ✻ to `_` when the
+    // daemon's own environment lacks LANG/LC_* (e.g. under launchd).
+    term = pty.spawn("tmux", ["-u", "attach", "-t", viewer], {
       name: "xterm-256color",
       cols: size?.cols ?? 120,
       rows: size?.rows ?? 32,
-      env: process.env as Record<string, string>,
+      env: localeEnv(),
     });
   } catch (err) {
     // e.g. node-pty spawn-helper missing exec bit — never crash the daemon

@@ -31,7 +31,10 @@ export function Terminal({ agentId }: { agentId: number }) {
 
     const term = new Xterm({
       fontSize: 12,
-      fontFamily: "SF Mono, Menlo, monospace",
+      // Multiple monospace fallbacks so glyphs like ⏺ ❯ ✻ resolve to a font
+      // that carries them even if the first choice doesn't. (The primary
+      // unicode fix is server-side — see src/daemon/locale.ts.)
+      fontFamily: "'SF Mono', Menlo, Monaco, 'Courier New', monospace",
       theme: { background: "#0d1117", foreground: "#c9d1d9" },
       cursorBlink: true,
       scrollback: 5000,
