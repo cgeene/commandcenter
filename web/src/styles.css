@@ -18,12 +18,18 @@ body {
   font: 14px/1.45 -apple-system, "SF Pro Text", Segoe UI, sans-serif;
 }
 
-.app { display: flex; flex-direction: column; height: 100vh; }
+/* Single-document flow: the page (body) is the one scroll container. The app
+   is at least a viewport tall so short content still fills the screen, but it
+   grows past 100vh and the whole page scrolls as one — no inner overflow traps
+   tied to mouse position. Overlays (drawers/modals) keep their own scroll. */
+.app { display: flex; flex-direction: column; min-height: 100vh; }
 
 header {
   display: flex; align-items: center; gap: 12px;
   padding: 10px 16px; border-bottom: 1px solid var(--border);
   background: var(--panel);
+  /* Stay reachable while the page scrolls — sticky doesn't trap the wheel. */
+  position: sticky; top: 0; z-index: 5;
 }
 header h1 { font-size: 16px; font-weight: 600; }
 .spacer { flex: 1; }
@@ -131,10 +137,15 @@ span.att-open { min-width: 54px; }
   background: var(--red); border-radius: 8px; padding: 0 6px; line-height: 1.5;
 }
 
-main { display: flex; flex: 1; overflow: hidden; }
+main { display: flex; }
 
+/* Columns wrap instead of scrolling horizontally: the board grows downward
+   with the page rather than trapping the wheel in an inner scroll region.
+   (overflow-x:auto would force overflow-y to compute to auto — a vertical
+   trap whenever a column is tall — so we wrap instead.) */
 .board {
-  display: flex; gap: 12px; padding: 14px 16px; flex: 1; overflow-x: auto;
+  display: flex; flex-wrap: wrap; align-content: flex-start;
+  gap: 12px; padding: 14px 16px; flex: 1; min-width: 0;
 }
 .column { min-width: 200px; width: 220px; flex-shrink: 0; }
 .column h2 {
@@ -177,7 +188,7 @@ main { display: flex; flex: 1; overflow: hidden; }
 
 .events {
   width: 280px; flex-shrink: 0; border-left: 1px solid var(--border);
-  padding: 14px; overflow-y: auto; font-size: 12px;
+  padding: 14px; font-size: 12px;
 }
 .events h2 { font-size: 12px; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; }
 .event { padding: 3px 0; border-bottom: 1px solid #21262d; }
@@ -272,7 +283,7 @@ dd { word-break: break-all; }
 
 /* ---- PR board ---- */
 .prs-view {
-  flex: 1; overflow-y: auto; padding: 16px;
+  flex: 1; padding: 16px;
   display: flex; flex-direction: column; gap: 20px;
 }
 .pr-group h2 {
@@ -304,7 +315,7 @@ dd { word-break: break-all; }
 
 /* ---- tokens view ---- */
 .tokens-view {
-  flex: 1; overflow-y: auto; padding: 16px;
+  flex: 1; padding: 16px;
   display: flex; flex-direction: column; gap: 16px;
 }
 .stat-cards { display: flex; flex-wrap: wrap; gap: 10px; }
@@ -323,7 +334,7 @@ dd { word-break: break-all; }
 .token-table tbody tr:hover { background: var(--panel); }
 
 /* ---- archive view ---- */
-.archive-view { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.archive-view { flex: 1; display: flex; flex-direction: column; }
 .archive-filter {
   margin: 12px 16px 0; padding: 6px 10px; background: var(--panel);
   border: 1px solid var(--border); border-radius: 8px; color: var(--fg);
@@ -332,9 +343,9 @@ dd { word-break: break-all; }
 .archive-view .board { padding-top: 10px; }
 
 /* ---- docs view ---- */
-.docs-view { flex: 1; display: flex; overflow: hidden; }
+.docs-view { flex: 1; display: flex; }
 .docs-list {
-  width: 280px; flex-shrink: 0; overflow-y: auto; padding: 14px;
+  width: 280px; flex-shrink: 0; padding: 14px;
   border-right: 1px solid var(--border);
   display: flex; flex-direction: column; gap: 14px;
 }
@@ -353,7 +364,7 @@ dd { word-break: break-all; }
 .docs-item-summary {
   font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.docs-body { flex: 1; overflow-y: auto; padding: 20px 28px; }
+.docs-body { flex: 1; min-width: 0; padding: 20px 28px; }
 .docs-head { margin-bottom: 12px; display: flex; flex-direction: column; gap: 4px; }
 .docs-head h2 { margin: 0; }
 .docs-attachments {
