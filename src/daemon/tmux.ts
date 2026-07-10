@@ -1,8 +1,11 @@
 import { execFileSync } from "node:child_process";
 import { tmuxSession } from "../config.js";
+import { localeEnv } from "./locale.js";
 
 function tmux(...args: string[]): string {
-  return execFileSync("tmux", args, { encoding: "utf8" });
+  // Run with a UTF-8 locale so the tmux server (and worker processes it
+  // spawns) start under UTF-8 rather than the daemon's bare C locale.
+  return execFileSync("tmux", args, { encoding: "utf8", env: localeEnv() });
 }
 
 export function ensureSession(): void {
