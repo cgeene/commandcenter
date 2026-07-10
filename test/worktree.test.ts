@@ -278,7 +278,7 @@ describe("createReviewWorktree", () => {
     });
   });
 
-  it("downgrades a fetch-failed fallback to the calm kind for a no-PR task (open_pr=false)", async () => {
+  it("still ALARMs on a fetch-failed fallback for a no-PR task (open_pr=false)", async () => {
     const { remoteDir } = setupRemote();
     const repoA = cloneRepo(remoteDir, "repo-a");
     const taskBranch = "agent/task-13";
@@ -295,13 +295,14 @@ describe("createReviewWorktree", () => {
     const dir = createReviewWorktree(repoA, 13, taskBranch, false);
 
     expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
-    // A no-PR / doc-store task never pushes, so origin can't hold a newer copy
-    // than local — even a fetch error carries no stale-review risk here.
+    // A no-PR / doc-store task still PUSHES its branch (the branch is the
+    // deliverable), so origin can hold commits the stale local ref lacks — a
+    // genuine fetch failure is a stale-review risk regardless of open_pr.
     expect(
-      listEvents(20).some((e) => e.kind === "worktree.review_fallback_local_branch"),
+      listEvents(20).some((e) => e.kind === "worktree.review_local_branch_expected"),
     ).toBe(false);
     const events = listEvents(20).filter(
-      (e) => e.kind === "worktree.review_local_branch_expected",
+      (e) => e.kind === "worktree.review_fallback_local_branch",
     );
     expect(events).toHaveLength(1);
     expect(JSON.parse(events[0].payload!)).toMatchObject({

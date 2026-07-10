@@ -140,21 +140,23 @@ export function reviewWorktreeDir(repo: string, taskId: number): string {
  * carries any real risk of reviewing STALE state, so the raw per-kind counters
  * that drive watch-items (summary.ts `event_counts`, the nightly dream
  * reflection) only ever see the noteworthy case under the alarming name:
- *   - `worktree.review_fallback_local_branch` — the ALARM kind. Emitted only
- *     when the fetch itself failed (offline, auth, timeout) AND the task pushes
- *     to origin (`open_pr`). Origin might then hold commits newer than the
- *     local ref, so falling back to local risks a stale review.
+ *   - `worktree.review_fallback_local_branch` — the ALARM kind. Emitted whenever
+ *     the fetch itself failed (offline, auth, timeout). Origin might then hold
+ *     commits newer than the local ref, so falling back to local risks a stale
+ *     review. This holds for no-PR / doc-store tasks too: `open_pr = 0` workers
+ *     still push their branch (it IS the deliverable — see spawn.ts) and skip
+ *     only the PR, so origin can be ahead of a re-cut/lost local worktree just
+ *     the same. open_pr does NOT downgrade a genuine fetch failure.
  *   - `worktree.review_local_branch_expected` — the CALM kind, still recorded
- *     for auditability but not worth alarming on. Covers every expected shape:
+ *     for auditability but not worth alarming on. Covers the two shapes where a
+ *     missing origin branch is fully expected and local is by definition the
+ *     freshest copy:
  *       * origin genuinely lacks the branch (`branch-not-on-origin`) — reviews
  *         trigger on the worker's Stop hook, which usually fires before the
  *         worker pushes; local is then the only, freshest copy.
  *       * no origin remote at all (`no-origin-remote`).
- *       * ANY fallback on a no-PR / doc-store task (`open_pr = 0`): its worker
- *         never pushes, so origin never holds the branch and local is always
- *         the intended review target regardless of why the fetch failed.
  * The `payload.reason` and `payload.open_pr` are kept on both kinds so a
- * consumer can still tell the shapes apart.
+ * consumer can still see the shape and whether it was a PR task.
  */
 function resolveReviewTarget(
   repo: string,
@@ -163,10 +165,12 @@ function resolveReviewTarget(
   openPr: boolean,
 ): string {
   const fallback = (reason: string, extra?: Record<string, unknown>): string => {
-    // A stale review is only possible when the fetch failed (origin may be
-    // ahead of local) AND the task pushes to origin at all. Everything else
-    // means local is the only/freshest copy — the correct thing to review.
-    const noteworthy = reason === "fetch-failed" && openPr;
+    // A stale review is only possible when the fetch itself failed — origin may
+    // then be ahead of the local ref. This does not depend on open_pr: no-PR
+    // tasks push their branch too (it's the deliverable), so their origin copy
+    // can also lead local. The other reasons mean origin has no copy at all, so
+    // local is by definition freshest and reviewing it is correct.
+    const noteworthy = reason === "fetch-failed";
     logEvent(
       noteworthy
         ? "worktree.review_fallback_local_branch"
