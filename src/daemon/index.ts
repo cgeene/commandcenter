@@ -4,6 +4,7 @@ import type { Server } from "node:http";
 import { WebSocketServer } from "ws";
 import { dataDir, dbPath, port, webDistDir } from "../config.js";
 import { getDb } from "../db/db.js";
+import { migrateDocsToFrontmatter } from "../db/docs.js";
 import { buildApp } from "./api.js";
 import { startPrSync } from "./prsync.js";
 import { startScheduler } from "./scheduler.js";
@@ -12,6 +13,18 @@ import { attachTerminal } from "./termws.js";
 import { initVersion } from "./version.js";
 
 getDb(); // open + migrate up front so failures are loud at startup
+// Bring the on-disk doc store up to the current layout (frontmatter + version
+// sidecars + per-project index). Idempotent; never blocks boot on failure.
+try {
+  const m = migrateDocsToFrontmatter();
+  if (m.updated || m.relocated) {
+    console.log(
+      `doc store: ${m.updated} file(s) got frontmatter, ${m.relocated} sidecar(s) relocated`,
+    );
+  }
+} catch (err) {
+  console.error("doc frontmatter migration failed (continuing):", err);
+}
 initVersion(); // snapshot dist/ mtime for stale-daemon detection
 
 const app = buildApp();

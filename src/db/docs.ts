@@ -1,6 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { docsDir } from "../config.js";
+import {
+  emitFrontmatter,
+  stripFrontmatter,
+  type FrontmatterValue,
+} from "../lib/frontmatter.js";
 import { getDb } from "./db.js";
 
 export interface Doc {
@@ -117,11 +122,84 @@ function writeAttachments(project: string, attachments?: Attachment[]): string[]
   return rels;
 }
 
+/** Split a stored comma-separated tag string into a trimmed, non-empty list. */
+function tagList(tags: string | null): string[] {
+  return tags
+    ? tags.split(",").map((t) => t.trim()).filter(Boolean)
+    : [];
+}
+
+/**
+ * Render the YAML frontmatter for a doc from its (authoritative) DB row. The
+ * file is self-describing: the whole index could be rebuilt from disk. The FTS
+ * body deliberately excludes this — the metadata fields have their own FTS
+ * columns (see reindex()), so on-disk content and the search body never diverge.
+ */
+function frontmatterFor(row: Doc): string {
+  const entries: Array<[string, FrontmatterValue]> = [
+    ["title", row.title],
+    ["project", row.project],
+    ["slug", row.slug],
+    ["tags", tagList(row.tags)],
+    ["summary", row.summary],
+    ["task_id", row.task_id],
+    ["agent_id", row.agent_id],
+    ["version", row.version],
+    ["created_at", row.created_at],
+    ["updated_at", row.updated_at],
+  ];
+  return emitFrontmatter(entries);
+}
+
+/** Write a doc's file as `<frontmatter><body>` (no extra separator, so the
+ *  body round-trips exactly through stripFrontmatter). */
+function writeDocFile(row: Doc, content: string): void {
+  fs.writeFileSync(absPath(row.file_path), frontmatterFor(row) + content);
+}
+
+/** Relative path of a doc's version sidecars, kept out of the main folder. */
+function versionRel(project: string, slug: string, version: number): string {
+  return `${project}/_versions/${slug}.v${version}.md`;
+}
+
+/**
+ * Regenerate a project's `_index.md` map-of-content: one linked, summarized
+ * line per current doc, newest first. This is the entry point for a human
+ * browsing the folder and for an agent doing list-then-read. Version sidecars,
+ * attachments, and the index itself are excluded (they aren't docs rows).
+ */
+function regenerateIndex(project: string): void {
+  const docs = listDocs({ project });
+  const items = docs
+    .map((d) => {
+      const summary = d.summary ? ` — ${d.summary.replace(/\s+/g, " ").trim()}` : "";
+      return `- [${d.title}](${d.slug}.md)${summary}`;
+    })
+    .join("\n");
+  const now = (
+    getDb()
+      .prepare("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now') AS t")
+      .get() as { t: string }
+  ).t;
+  const fm = emitFrontmatter([
+    ["title", `${project} — index`],
+    ["project", project],
+    ["kind", "index"],
+    ["updated_at", now],
+  ]);
+  const body = `# ${project}\n\n${items ? `${items}\n` : "_No docs yet._\n"}`;
+  fs.mkdirSync(path.join(docsDir(), project), { recursive: true });
+  fs.writeFileSync(absPath(`${project}/_index.md`), fm + body);
+}
+
 /**
  * Create or update a doc. Identity is (project, slug); slug is derived from
  * the title unless overridden. On an existing slug we update in place: the
- * current body is preserved as <slug>.v<N>.md, the new body is written, and
- * the version is bumped. The FTS row (rowid == doc id) is rewritten to match.
+ * current body is frozen under <project>/_versions/<slug>.v<N>.md, the new body
+ * is written, and the version is bumped. The DB row is the source of truth for
+ * metadata; the file is (re)rendered from it with YAML frontmatter prepended.
+ * The FTS row (rowid == doc id) indexes only the body — not the frontmatter.
+ * The project's _index.md is regenerated after every save.
  */
 export function saveDoc(input: SaveDocInput): SaveDocResult {
   const project = slugify(input.project);
@@ -132,17 +210,19 @@ export function saveDoc(input: SaveDocInput): SaveDocResult {
   fs.mkdirSync(path.join(docsDir(), project), { recursive: true });
 
   const db = getDb();
+  let id: number;
+  let created: boolean;
 
   if (existing) {
-    // Preserve the current body as a versioned sidecar before overwriting.
+    // Freeze the current body as a version sidecar (out of the main folder)
+    // before overwriting.
     const currentAbs = absPath(existing.file_path);
     if (fs.existsSync(currentAbs)) {
-      const priorRel = `${project}/${slug}.v${existing.version}.md`;
+      const priorRel = versionRel(project, slug, existing.version);
+      fs.mkdirSync(path.dirname(absPath(priorRel)), { recursive: true });
       fs.copyFileSync(currentAbs, absPath(priorRel));
     }
-    fs.writeFileSync(absPath(relPath), input.content);
     const attachmentRels = writeAttachments(project, input.attachments);
-    const newVersion = existing.version + 1;
     db.prepare(
       `UPDATE docs SET title = @title, tags = @tags, summary = @summary,
          task_id = COALESCE(@task_id, task_id),
@@ -161,37 +241,46 @@ export function saveDoc(input: SaveDocInput): SaveDocResult {
       file_path: relPath,
       attachments:
         attachmentRels.length > 0 ? JSON.stringify(attachmentRels) : null,
-      version: newVersion,
+      version: existing.version + 1,
     });
-    reindex(existing.id, input);
-    return { doc: getDocRow(existing.id)!, created: false };
+    id = existing.id;
+    created = false;
+  } else {
+    const attachmentRels = writeAttachments(project, input.attachments);
+    const info = db
+      .prepare(
+        `INSERT INTO docs (slug, project, title, tags, task_id, agent_id, summary, file_path, attachments)
+         VALUES (@slug, @project, @title, @tags, @task_id, @agent_id, @summary, @file_path, @attachments)`,
+      )
+      .run({
+        slug,
+        project,
+        title: input.title,
+        tags: input.tags ?? null,
+        task_id: input.task_id ?? null,
+        agent_id: input.agent_id ?? null,
+        summary: input.summary ?? null,
+        file_path: relPath,
+        attachments:
+          attachmentRels.length > 0 ? JSON.stringify(attachmentRels) : null,
+      });
+    id = Number(info.lastInsertRowid);
+    created = true;
   }
 
-  fs.writeFileSync(absPath(relPath), input.content);
-  const attachmentRels = writeAttachments(project, input.attachments);
-  const info = db
-    .prepare(
-      `INSERT INTO docs (slug, project, title, tags, task_id, agent_id, summary, file_path, attachments)
-       VALUES (@slug, @project, @title, @tags, @task_id, @agent_id, @summary, @file_path, @attachments)`,
-    )
-    .run({
-      slug,
-      project,
-      title: input.title,
-      tags: input.tags ?? null,
-      task_id: input.task_id ?? null,
-      agent_id: input.agent_id ?? null,
-      summary: input.summary ?? null,
-      file_path: relPath,
-      attachments:
-        attachmentRels.length > 0 ? JSON.stringify(attachmentRels) : null,
-    });
-  const id = Number(info.lastInsertRowid);
+  // The row is now authoritative; render the file from it and keep FTS + the
+  // project index in sync.
+  const row = getDocRow(id)!;
+  writeDocFile(row, input.content);
   reindex(id, input);
-  return { doc: getDocRow(id)!, created: true };
+  regenerateIndex(project);
+  return { doc: row, created };
 }
 
-/** Keep the FTS row (keyed by rowid == doc id) in sync with a save. */
+/** Keep the FTS row (keyed by rowid == doc id) in sync with a save. The body
+ *  column is the doc body ONLY — the frontmatter written to disk is not indexed
+ *  here (its fields already have their own title/tags/summary FTS columns), so
+ *  the on-disk file and the search body never diverge. */
 function reindex(id: number, input: SaveDocInput): void {
   const db = getDb();
   db.prepare("DELETE FROM docs_fts WHERE rowid = ?").run(id);
@@ -220,7 +309,12 @@ export function getDoc(
   }
   if (!row) return undefined;
   const abs = absPath(row.file_path);
-  const content = fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
+  // Strip the on-disk frontmatter: callers already receive those fields as
+  // structured columns, so returning them again in the body would duplicate
+  // the metadata (and burn an agent's tokens twice).
+  const content = fs.existsSync(abs)
+    ? stripFrontmatter(fs.readFileSync(abs, "utf8"))
+    : "";
   return { ...row, content };
 }
 
@@ -263,8 +357,10 @@ export function listDocs(opts?: { project?: string; tag?: string }): Doc[] {
     params.push(`%${opts.tag}%`);
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  // id DESC breaks updated_at ties so "newest first" is deterministic (the
+  // _index.md ordering and the dashboard depend on it).
   return getDb()
-    .prepare(`SELECT * FROM docs ${where} ORDER BY updated_at DESC`)
+    .prepare(`SELECT * FROM docs ${where} ORDER BY updated_at DESC, id DESC`)
     .all(...params) as Doc[];
 }
 
@@ -308,4 +404,66 @@ export function deleteDoc(id: number): boolean {
   const db = getDb();
   db.prepare("DELETE FROM docs_fts WHERE rowid = ?").run(id);
   return db.prepare("DELETE FROM docs WHERE id = ?").run(id).changes === 1;
+}
+
+/** Move a project's legacy top-level version sidecars (<slug>.v<N>.md) into
+ *  its <project>/_versions/ folder. Returns how many were relocated. */
+function relocateLegacySidecars(project: string): number {
+  const dir = path.join(docsDir(), project);
+  if (!fs.existsSync(dir)) return 0;
+  let moved = 0;
+  for (const name of fs.readdirSync(dir)) {
+    if (!/\.v\d+\.md$/.test(name)) continue;
+    const from = path.join(dir, name);
+    if (!fs.statSync(from).isFile()) continue;
+    const versionsDir = path.join(dir, "_versions");
+    fs.mkdirSync(versionsDir, { recursive: true });
+    const to = path.join(versionsDir, name);
+    // If the relocated copy already exists, just drop the stray top-level one.
+    if (fs.existsSync(to)) fs.rmSync(from);
+    else fs.renameSync(from, to);
+    moved++;
+  }
+  return moved;
+}
+
+/**
+ * Idempotent, one-shot upgrade of the on-disk doc store to the current layout:
+ *  - prepend/refresh YAML frontmatter (derived from the DB row) on every doc
+ *    file, so the folder is self-describing and the index could be rebuilt
+ *    from disk;
+ *  - relocate legacy top-level version sidecars under <project>/_versions/;
+ *  - regenerate each project's _index.md.
+ *
+ * It reads metadata from the DB and rewrites files only — it never bumps
+ * updated_at, touches version counters, or reindexes FTS. Running it a second
+ * time is a no-op (returns zero updated/relocated).
+ */
+export function migrateDocsToFrontmatter(): {
+  updated: number;
+  relocated: number;
+  indexed: number;
+} {
+  const rows = getDb().prepare("SELECT * FROM docs").all() as Doc[];
+  const projects = new Set<string>();
+  let updated = 0;
+  for (const row of rows) {
+    projects.add(row.project);
+    const abs = absPath(row.file_path);
+    if (!fs.existsSync(abs)) continue;
+    const current = fs.readFileSync(abs, "utf8");
+    const desired = frontmatterFor(row) + stripFrontmatter(current);
+    if (desired !== current) {
+      fs.writeFileSync(abs, desired);
+      updated++;
+    }
+  }
+  let relocated = 0;
+  let indexed = 0;
+  for (const project of projects) {
+    relocated += relocateLegacySidecars(project);
+    regenerateIndex(project);
+    indexed++;
+  }
+  return { updated, relocated, indexed };
 }

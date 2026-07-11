@@ -6,6 +6,7 @@ import rehypeSanitize from "rehype-sanitize";
 import { api } from "./api";
 import { blockedByChain, groupByProject, isActive, isArchived, projectOf } from "../../src/lib/board";
 import { openPanel, type Panel } from "../../src/lib/panel";
+import { parseFrontmatter } from "../../src/lib/frontmatter";
 import { Terminal } from "./Terminal";
 import type {
   Agent,
@@ -716,6 +717,19 @@ function DocsView() {
     ? (JSON.parse(selected.attachments) as string[])
     : [];
 
+  // The API already returns the body without frontmatter, but parse defensively
+  // so a doc whose body still embeds a YAML block renders as a compact header
+  // rather than a raw `---` block above the prose.
+  const parsed = selected ? parseFrontmatter(selected.content) : null;
+  const fmTags = parsed?.data.tags;
+  const tags: string[] = selected?.tags
+    ? selected.tags.split(",").map((t) => t.trim()).filter(Boolean)
+    : Array.isArray(fmTags)
+      ? fmTags
+      : typeof fmTags === "string"
+        ? fmTags.split(",").map((t) => t.trim()).filter(Boolean)
+        : [];
+
   return (
     <main>
       <div className="docs-view">
@@ -755,6 +769,15 @@ function DocsView() {
                   {selected.project} · v{selected.version} · updated{" "}
                   {selected.updated_at.slice(0, 10)}
                 </span>
+                {tags.length > 0 && (
+                  <div className="chips">
+                    {tags.map((t) => (
+                      <span key={t} className="chip">
+                        {t}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
               {attachments.length > 0 && (
                 <div className="docs-attachments">
@@ -773,7 +796,7 @@ function DocsView() {
                   })}
                 </div>
               )}
-              <Markdown content={selected.content} />
+              <Markdown content={parsed ? parsed.body : selected.content} />
             </>
           )}
         </section>
