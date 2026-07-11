@@ -35,3 +35,40 @@ export function shiftEnterNewline(e: KeyEventLike): string | null {
   }
   return null;
 }
+
+/** A KeyboardEvent as far as the terminal's key handler cares: classification
+ *  fields plus the two cancellation methods. A real DOM KeyboardEvent satisfies
+ *  this structurally. */
+export interface CancelableKeyEvent extends KeyEventLike {
+  preventDefault(): void;
+  stopPropagation(): void;
+}
+
+/**
+ * The body of xterm's `attachCustomKeyEventHandler`. Returns the boolean xterm
+ * expects: `true` to let xterm process the key normally, `false` to suppress
+ * xterm's own handling.
+ *
+ * For Shift+Enter we send the newline sequence via `send` and return false — but
+ * returning false is NOT enough on its own. In xterm.js a custom handler that
+ * returns false makes xterm skip its keydown handling WITHOUT calling
+ * preventDefault, so the browser still fires the follow-on `keypress`, and
+ * xterm's internal `_keyPress` then emits "\r" — Claude Code would insert our
+ * newline AND immediately submit. So we call `preventDefault()` (which cancels
+ * that keypress) and `stopPropagation()` before returning false. Result:
+ * exactly one ESC+CR reaches the pty, no trailing "\r".
+ *
+ * Every other key (including plain Enter) returns true untouched, so xterm still
+ * emits "\r" and submits.
+ */
+export function handleTerminalKeyEvent(
+  e: CancelableKeyEvent,
+  send: (data: string) => void,
+): boolean {
+  const seq = shiftEnterNewline(e);
+  if (seq === null) return true;
+  e.preventDefault();
+  e.stopPropagation();
+  send(seq);
+  return false;
+}
