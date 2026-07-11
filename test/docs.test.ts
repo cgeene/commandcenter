@@ -59,10 +59,13 @@ describe("docs store (db + filesystem)", () => {
     expect(second.doc.version).toBe(2);
     expect(second.doc.updated_at >= first.doc.updated_at).toBe(true);
 
-    // current body is the new one; the prior body is kept as <slug>.v1.md
+    // current body is the new one; the prior body is frozen under _versions/
     expect(getDoc(first.doc.id)!.content).toBe("v2 body");
-    const priorAbs = path.join(docsDir(), "cogs", "map.v1.md");
-    expect(fs.readFileSync(priorAbs, "utf8")).toBe("v1 body");
+    const priorAbs = path.join(docsDir(), "cogs", "_versions", "map.v1.md");
+    // the sidecar keeps the v1 body (with its era's frontmatter prepended)
+    expect(fs.readFileSync(priorAbs, "utf8")).toContain("v1 body");
+    // and no stale sidecar is left loose in the main project folder
+    expect(fs.existsSync(path.join(docsDir(), "cogs", "map.v1.md"))).toBe(false);
   });
 
   it("writes attachments as sidecar files and records their paths", async () => {
@@ -128,6 +131,102 @@ describe("docs store (db + filesystem)", () => {
     expect(listDocs({ project: "cogs" }).length).toBe(2);
     expect(listDocs({ tag: "billing" }).map((d) => d.title).sort()).toEqual(["A", "C"]);
     expect(listDocs().length).toBe(3);
+  });
+});
+
+describe("docs frontmatter, index, and migration", () => {
+  it("writes YAML frontmatter to disk derived from the stored metadata", async () => {
+    const { saveDoc } = await import("../src/db/docs.js");
+    const { docsDir } = await import("../src/config.js");
+    const { doc } = saveDoc({
+      project: "cogs",
+      title: "Cost: Data Inventory", // colon forces YAML quoting
+      content: "# Inventory\n\nbilling export is live.",
+      tags: "billing, gcp",
+      summary: "one line summary",
+    });
+    const file = fs.readFileSync(path.join(docsDir(), doc.file_path), "utf8");
+    expect(file.startsWith("---\n")).toBe(true);
+    expect(file).toContain('title: "Cost: Data Inventory"');
+    expect(file).toContain("project: cogs");
+    expect(file).toContain("slug: cost-data-inventory");
+    expect(file).toContain("- billing");
+    expect(file).toContain("- gcp");
+    expect(file).toContain("summary: one line summary");
+    expect(file).toContain(`version: ${doc.version}`);
+    // the body follows the closing delimiter, untouched
+    expect(file).toContain("# Inventory\n\nbilling export is live.");
+  });
+
+  it("get_doc returns the body WITHOUT the frontmatter duplicated in", async () => {
+    const { saveDoc, getDoc } = await import("../src/db/docs.js");
+    const body = "# Body\n\nsome prose here.";
+    const { doc } = saveDoc({ project: "cogs", title: "T", content: body, tags: "x" });
+    const fetched = getDoc(doc.id)!;
+    expect(fetched.content).toBe(body);
+    expect(fetched.content).not.toContain("title:");
+    expect(fetched.content).not.toContain("---");
+    // metadata still arrives via the structured columns
+    expect(fetched.tags).toBe("x");
+  });
+
+  it("indexes only the body in FTS, never the emitted frontmatter", async () => {
+    const { saveDoc, searchDocs } = await import("../src/db/docs.js");
+    // body has none of the frontmatter key words; the file on disk does
+    saveDoc({ project: "cogs", title: "Fox", content: "the quick brown fox" });
+    expect(searchDocs("quick").length).toBe(1);
+    // "version"/"slug"/"project" appear only as frontmatter keys on disk — if
+    // the whole file (not just the body) were indexed, these would match
+    expect(searchDocs("version").length).toBe(0);
+    expect(searchDocs("slug").length).toBe(0);
+  });
+
+  it("regenerates a per-project _index.md, newest first", async () => {
+    const { saveDoc } = await import("../src/db/docs.js");
+    const { docsDir } = await import("../src/config.js");
+    saveDoc({ project: "cogs", title: "First", content: "x", summary: "first summary" });
+    saveDoc({ project: "cogs", title: "Second", content: "y", summary: "second summary" });
+    const idx = fs.readFileSync(path.join(docsDir(), "cogs", "_index.md"), "utf8");
+    expect(idx.startsWith("---\n")).toBe(true);
+    expect(idx).toContain("kind: index");
+    expect(idx).toContain("[First](first.md) — first summary");
+    expect(idx).toContain("[Second](second.md) — second summary");
+    // newest (Second) is listed before First
+    expect(idx.indexOf("Second")).toBeLessThan(idx.indexOf("First"));
+  });
+
+  it("migration adds frontmatter, relocates legacy sidecars, and is idempotent", async () => {
+    const { saveDoc, migrateDocsToFrontmatter, getDoc } = await import("../src/db/docs.js");
+    const { docsDir } = await import("../src/config.js");
+    const first = saveDoc({ project: "cogs", title: "Doc", content: "v1 body" });
+    saveDoc({ project: "cogs", title: "Doc", content: "v2 body" }); // freezes v1
+
+    // Degrade to a legacy layout: strip the frontmatter from the main file and
+    // move the version sidecar back up to the top level.
+    const mainAbs = path.join(docsDir(), "cogs", "doc.md");
+    fs.writeFileSync(mainAbs, "v2 body");
+    const relocated = path.join(docsDir(), "cogs", "_versions", "doc.v1.md");
+    const legacy = path.join(docsDir(), "cogs", "doc.v1.md");
+    fs.renameSync(relocated, legacy);
+
+    const r1 = migrateDocsToFrontmatter();
+    expect(r1.updated).toBe(1);
+    expect(r1.relocated).toBe(1);
+    expect(r1.indexed).toBe(1);
+
+    const migrated = fs.readFileSync(mainAbs, "utf8");
+    expect(migrated.startsWith("---\n")).toBe(true);
+    expect(migrated).toContain("v2 body");
+    // sidecar is back under _versions/, gone from the top level
+    expect(fs.existsSync(relocated)).toBe(true);
+    expect(fs.existsSync(legacy)).toBe(false);
+    // updated_at / version untouched by the migration
+    expect(getDoc(first.doc.id)!.version).toBe(2);
+
+    // a second run is a no-op
+    const r2 = migrateDocsToFrontmatter();
+    expect(r2.updated).toBe(0);
+    expect(r2.relocated).toBe(0);
   });
 });
 
