@@ -47,6 +47,7 @@ task
   .option("-f, --prompt-file <file>", "read prompt from a file")
   .option("-r, --repo <path>", "target repo (default: current git repo)")
   .option("-m, --model <model>", "provider-specific worker model slug")
+  .option("-e, --effort <effort>", "Codex reasoning effort (default: high)")
   .option("--provider <provider>", "worker provider (claude|codex)")
   .option("-P, --priority <n>", "0 (highest) - 4", "2")
   .option("-b, --blocked-by <taskId>", "task that must be done first")
@@ -61,6 +62,7 @@ task
       prompt,
       repo,
       model: opts.model,
+      reasoning_effort: opts.effort,
       worker_provider: opts.provider,
       priority: Number(opts.priority),
       blocked_by: opts.blockedBy ? Number(opts.blockedBy) : undefined,
@@ -90,10 +92,11 @@ task
           `p${t.priority}`,
           t.worker_provider,
           t.model ?? "-",
+          t.reasoning_effort ?? "-",
           t.agent_id ? `a${t.agent_id}` : "-",
           truncate(t.title, 60),
         ]),
-        ["id", "status", "pri", "provider", "model", "agent", "title"],
+        ["id", "status", "pri", "provider", "model", "effort", "agent", "title"],
       ),
     );
   });
@@ -112,6 +115,7 @@ task
   .option("-s, --status <status>")
   .option("-P, --priority <n>")
   .option("-m, --model <model>")
+  .option("-e, --effort <effort>", "Codex reasoning effort")
   .option("--provider <provider>", "worker provider (claude|codex)")
   .option("--result <summary>")
   .action(async (id: string, opts) => {
@@ -119,6 +123,7 @@ task
       status: opts.status,
       priority: opts.priority !== undefined ? Number(opts.priority) : undefined,
       model: opts.model,
+      reasoning_effort: opts.effort,
       worker_provider: opts.provider,
       result_summary: opts.result,
     });
@@ -199,6 +204,7 @@ agent
   .requiredOption("-t, --task <id>", "task id")
   .option("--provider <provider>", "worker provider (claude|codex)")
   .option("-m, --model <model>", "override the task's model")
+  .option("-e, --effort <effort>", "override the task's Codex reasoning effort")
   .option("--fresh", "force a fresh session instead of resuming")
   .action(async (opts) => {
     const { agent: a, task: t } = await api<{ agent: Agent; task: Task }>(
@@ -208,6 +214,7 @@ agent
         task_id: Number(opts.task),
         provider: opts.provider,
         model: opts.model,
+        reasoning_effort: opts.effort,
         fresh: opts.fresh,
       },
     );
@@ -235,10 +242,11 @@ agent
           a.provider,
           a.state,
           a.model ?? "-",
+          a.reasoning_effort ?? "-",
           a.task_id ? `#${a.task_id}` : "-",
           a.tmux_target ?? "-",
         ]),
-        ["id", "kind", "provider", "state", "model", "task", "tmux"],
+        ["id", "kind", "provider", "state", "model", "effort", "task", "tmux"],
       ),
     );
   });
@@ -304,6 +312,7 @@ interface CronJob {
   repo: string;
   worker_provider: "claude" | "codex";
   model: string | null;
+  reasoning_effort: string | null;
   enabled: number;
   last_run_at: string | null;
   next_run_at: string | null;
@@ -332,6 +341,7 @@ cron
   .option("-r, --repo <path>", "target repo (default: current git repo)")
   .option("--title <title>", "task title (default: cron name)")
   .option("-m, --model <model>")
+  .option("-e, --effort <effort>", "Codex reasoning effort (default: high)")
   .option("--provider <provider>", "worker provider (claude|codex)")
   .option("-P, --priority <n>", "0-4", "2")
   .option("-v, --verify <cmd>")
@@ -350,6 +360,7 @@ cron
       repo: opts.repo ?? gitToplevel(process.cwd()),
       title: opts.title,
       model: opts.model,
+      reasoning_effort: opts.effort,
       worker_provider: opts.provider,
       priority: Number(opts.priority),
       verify_cmd: opts.verify,
@@ -372,10 +383,11 @@ cron
           x.schedule,
           x.worker_provider,
           x.model ?? "-",
+          x.reasoning_effort ?? "-",
           x.next_run_at?.slice(0, 16) ?? "-",
           x.last_run_at?.slice(0, 16) ?? "never",
         ]),
-        ["id", "en", "name", "schedule", "provider", "model", "next", "last"],
+        ["id", "en", "name", "schedule", "provider", "model", "effort", "next", "last"],
       ),
     );
   });

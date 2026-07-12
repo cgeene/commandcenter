@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   priority       INTEGER NOT NULL DEFAULT 2,
   worker_provider TEXT NOT NULL DEFAULT 'claude',
   model          TEXT,
+  reasoning_effort TEXT,
   blocked_by     INTEGER REFERENCES tasks(id),
   agent_id       INTEGER,
   worktree       TEXT,
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS agents (
   kind          TEXT NOT NULL DEFAULT 'worker',
   provider      TEXT NOT NULL DEFAULT 'claude',
   model         TEXT,
+  reasoning_effort TEXT,
   state         TEXT NOT NULL DEFAULT 'spawning',
   task_id       INTEGER REFERENCES tasks(id),
   tmux_target   TEXT,
@@ -162,6 +164,7 @@ CREATE TABLE IF NOT EXISTS crons (
   repo        TEXT NOT NULL,
   worker_provider TEXT NOT NULL DEFAULT 'claude',
   model       TEXT,
+  reasoning_effort TEXT,
   priority    INTEGER NOT NULL DEFAULT 2,
   verify_cmd  TEXT,
   enabled     INTEGER NOT NULL DEFAULT 1,
@@ -216,6 +219,9 @@ function migrate(db: Database.Database): void {
   if (!cols.includes("session_provider")) {
     db.exec("ALTER TABLE tasks ADD COLUMN session_provider TEXT");
   }
+  if (!cols.includes("reasoning_effort")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN reasoning_effort TEXT");
+  }
   const agentCols = (db.prepare("PRAGMA table_info(agents)").all() as { name: string }[]).map(
     (c) => c.name,
   );
@@ -228,11 +234,17 @@ function migrate(db: Database.Database): void {
   if (!agentCols.includes("runtime_config_path")) {
     db.exec("ALTER TABLE agents ADD COLUMN runtime_config_path TEXT");
   }
+  if (!agentCols.includes("reasoning_effort")) {
+    db.exec("ALTER TABLE agents ADD COLUMN reasoning_effort TEXT");
+  }
   const cronCols = (db.prepare("PRAGMA table_info(crons)").all() as { name: string }[]).map(
     (c) => c.name,
   );
   if (!cronCols.includes("worker_provider")) {
     db.exec("ALTER TABLE crons ADD COLUMN worker_provider TEXT NOT NULL DEFAULT 'claude'");
+  }
+  if (!cronCols.includes("reasoning_effort")) {
+    db.exec("ALTER TABLE crons ADD COLUMN reasoning_effort TEXT");
   }
   const memCols = (db.prepare("PRAGMA table_info(memories)").all() as { name: string }[]).map(
     (c) => c.name,

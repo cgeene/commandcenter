@@ -1,5 +1,9 @@
 import { getDb, type TaskStatus, TASK_STATUSES } from "./db.js";
 import { parseAgentProvider, type AgentProvider } from "../providers.js";
+import {
+  reasoningEffortForProvider,
+  type ReasoningEffort,
+} from "../reasoning.js";
 
 export interface Task {
   id: number;
@@ -10,6 +14,7 @@ export interface Task {
   priority: number;
   worker_provider: AgentProvider;
   model: string | null;
+  reasoning_effort: ReasoningEffort | null;
   blocked_by: number | null;
   agent_id: number | null;
   worktree: string | null;
@@ -41,6 +46,7 @@ export interface NewTask {
   priority?: number;
   worker_provider?: AgentProvider;
   model?: string;
+  reasoning_effort?: ReasoningEffort;
   blocked_by?: number;
   verify_cmd?: string;
   cron_id?: number;
@@ -49,18 +55,20 @@ export interface NewTask {
 
 export function createTask(t: NewTask): Task {
   const db = getDb();
+  const workerProvider = parseAgentProvider(t.worker_provider, "claude");
   const info = db
     .prepare(
-      `INSERT INTO tasks (title, prompt, repo, priority, worker_provider, model, blocked_by, verify_cmd, cron_id, open_pr)
-       VALUES (@title, @prompt, @repo, @priority, @worker_provider, @model, @blocked_by, @verify_cmd, @cron_id, @open_pr)`,
+      `INSERT INTO tasks (title, prompt, repo, priority, worker_provider, model, reasoning_effort, blocked_by, verify_cmd, cron_id, open_pr)
+       VALUES (@title, @prompt, @repo, @priority, @worker_provider, @model, @reasoning_effort, @blocked_by, @verify_cmd, @cron_id, @open_pr)`,
     )
     .run({
       title: t.title,
       prompt: t.prompt,
       repo: t.repo,
       priority: t.priority ?? 2,
-      worker_provider: parseAgentProvider(t.worker_provider, "claude"),
+      worker_provider: workerProvider,
       model: t.model ?? null,
+      reasoning_effort: reasoningEffortForProvider(workerProvider, t.reasoning_effort),
       blocked_by: t.blocked_by ?? null,
       verify_cmd: t.verify_cmd ?? null,
       cron_id: t.cron_id ?? null,
@@ -165,6 +173,7 @@ const UPDATABLE = new Set([
   "priority",
   "worker_provider",
   "model",
+  "reasoning_effort",
   "blocked_by",
   "agent_id",
   "worktree",

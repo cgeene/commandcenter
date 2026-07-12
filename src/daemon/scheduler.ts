@@ -71,6 +71,7 @@ export function fireDueCrons(now: Date): void {
       repo: cron.repo,
       worker_provider: cron.worker_provider,
       model: cron.model ?? undefined,
+      reasoning_effort: cron.reasoning_effort ?? undefined,
       priority: cron.priority,
       verify_cmd: cron.verify_cmd ?? undefined,
       cron_id: cron.id,

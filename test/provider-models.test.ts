@@ -11,12 +11,27 @@ describe("parseCodexModelCatalog", () => {
           description: "Latest frontier agentic coding model.",
           visibility: "list",
           base_instructions: "must never reach the dashboard",
+          supported_reasoning_levels: [
+            { effort: "low", description: "Fast" },
+            { effort: "high", description: "Deep" },
+            { effort: "invented", description: "must be filtered" },
+          ],
         },
         {
           slug: "codex-auto-review",
           display_name: "Codex Auto Review",
           description: "hidden",
           visibility: "hide",
+        },
+        {
+          slug: "gpt-5.6-luna",
+          display_name: "GPT-5.6-Luna",
+          description: "Fast frontier model.",
+          visibility: "list",
+          supported_reasoning_levels: [
+            { effort: "high", description: "Deep" },
+            { effort: "max", description: "Maximum" },
+          ],
         },
         { slug: "gpt-5.6-sol", display_name: "duplicate", visibility: "list" },
         { slug: "invalid model", display_name: "invalid", visibility: "list" },
@@ -28,6 +43,19 @@ describe("parseCodexModelCatalog", () => {
         slug: "gpt-5.6-sol",
         display_name: "GPT-5.6-Sol",
         description: "Latest frontier agentic coding model.",
+        reasoning_levels: [
+          { effort: "low", description: "Fast" },
+          { effort: "high", description: "Deep" },
+        ],
+      },
+      {
+        slug: "gpt-5.6-luna",
+        display_name: "GPT-5.6-Luna",
+        description: "Fast frontier model.",
+        reasoning_levels: [
+          { effort: "high", description: "Deep" },
+          { effort: "max", description: "Maximum" },
+        ],
       },
     ]);
   });

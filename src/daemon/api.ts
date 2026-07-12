@@ -60,9 +60,14 @@ import { resumeAgent, submitPending } from "./resume.js";
 import { capturePane, clearInputLine, windowExists } from "./tmux.js";
 import { parsePane } from "./pane.js";
 import { AGENT_PROVIDERS } from "../providers.js";
+import {
+  DEFAULT_CODEX_REASONING_EFFORT,
+  REASONING_EFFORTS,
+} from "../reasoning.js";
 import { providerModels } from "./provider-models.js";
 
 const providerSchema = z.enum(AGENT_PROVIDERS);
+const reasoningEffortSchema = z.enum(REASONING_EFFORTS);
 const modelIdentifierSchema = z
   .string()
   .trim()
@@ -87,6 +92,7 @@ const newTaskSchema = z.object({
   priority: z.number().int().min(0).max(4).optional(),
   worker_provider: providerSchema.optional(),
   model: z.string().optional(),
+  reasoning_effort: reasoningEffortSchema.optional(),
   blocked_by: z.number().int().optional(),
   verify_cmd: z.string().optional(),
   open_pr: z.boolean().optional(),
@@ -99,6 +105,7 @@ const updateTaskSchema = z.object({
   priority: z.number().int().min(0).max(4).optional(),
   worker_provider: providerSchema.optional(),
   model: z.string().nullable().optional(),
+  reasoning_effort: reasoningEffortSchema.nullable().optional(),
   blocked_by: z.number().int().nullable().optional(),
   verify_cmd: z.string().nullable().optional(),
   result_summary: z.string().nullable().optional(),
@@ -110,6 +117,7 @@ const spawnSchema = z.object({
   task_id: z.number().int(),
   provider: providerSchema.optional(),
   model: z.string().optional(),
+  reasoning_effort: reasoningEffortSchema.optional(),
   fresh: z.boolean().optional(),
 });
 
@@ -149,9 +157,13 @@ export function buildApp(): Hono {
 
   app.post("/api/tasks", async (c) => {
     const body = newTaskSchema.parse(await c.req.json());
+    const workerProvider = body.worker_provider ?? defaultWorkerProvider();
+    if (workerProvider === "claude" && body.reasoning_effort !== undefined) {
+      return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
+    }
     const task = createTask({
       ...body,
-      worker_provider: body.worker_provider ?? defaultWorkerProvider(),
+      worker_provider: workerProvider,
     });
     logEvent("task.created", { taskId: task.id });
     return c.json(task, 201);
@@ -167,6 +179,10 @@ export function buildApp(): Hono {
     if (!getTask(id)) return c.json({ error: "not found" }, 404);
     const body = updateTaskSchema.parse(await c.req.json());
     const before = getTask(id)!;
+    const nextProvider = body.worker_provider ?? before.worker_provider;
+    if (nextProvider === "claude" && body.reasoning_effort != null) {
+      return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
+    }
     if (
       body.worker_provider !== undefined &&
       body.worker_provider !== before.worker_provider &&
@@ -190,6 +206,17 @@ export function buildApp(): Hono {
       body.model === undefined
     ) {
       patch.model = null;
+    }
+    if (body.reasoning_effort === null) {
+      patch.reasoning_effort =
+        nextProvider === "codex" ? DEFAULT_CODEX_REASONING_EFFORT : null;
+    } else if (
+      body.worker_provider !== undefined &&
+      body.worker_provider !== before.worker_provider &&
+      body.reasoning_effort === undefined
+    ) {
+      patch.reasoning_effort =
+        nextProvider === "codex" ? DEFAULT_CODEX_REASONING_EFFORT : null;
     }
     if (body.open_pr !== undefined) patch.open_pr = body.open_pr ? 1 : 0;
     const task = updateTask(id, patch as Parameters<typeof updateTask>[1]);
@@ -255,9 +282,16 @@ export function buildApp(): Hono {
 
   app.post("/api/agents", async (c) => {
     const body = spawnSchema.parse(await c.req.json());
+    const task = getTask(body.task_id);
+    if (!task) return c.json({ error: "not found" }, 404);
+    const provider = body.provider ?? task.worker_provider;
+    if (provider === "claude" && body.reasoning_effort !== undefined) {
+      return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
+    }
     const result = spawnWorker(body.task_id, body.model, {
       fresh: body.fresh,
       provider: body.provider,
+      reasoningEffort: body.reasoning_effort,
     });
     return c.json(result, 201);
   });
@@ -373,7 +407,24 @@ export function buildApp(): Hono {
       : "";
     const command =
       agent.provider === "codex"
-        ? `CC_URL=${quote(baseUrl())} CC_ROLE=${quote(agent.kind)} CC_AGENT_ID=${quote(String(agent.id))}${taskIdEnv} CODEX_HOME=${quote(codexHome())} ${quote(codexBin())} --profile ${quote(codexProfile())} resume ${quote(agent.session_id)}`
+        ? [
+            `CC_URL=${quote(baseUrl())}`,
+            `CC_ROLE=${quote(agent.kind)}`,
+            `CC_AGENT_ID=${quote(String(agent.id))}${taskIdEnv}`,
+            `CODEX_HOME=${quote(codexHome())}`,
+            quote(codexBin()),
+            "--profile",
+            quote(codexProfile()),
+            ...(agent.model ? ["--model", quote(agent.model)] : []),
+            ...(agent.reasoning_effort
+              ? [
+                  "--config",
+                  quote(`model_reasoning_effort="${agent.reasoning_effort}"`),
+                ]
+              : []),
+            "resume",
+            quote(agent.session_id),
+          ].join(" ")
         : (() => {
             const tag =
               agent.kind === "main"
@@ -394,6 +445,8 @@ export function buildApp(): Hono {
     return c.json({
       agent_id: agent.id,
       provider: agent.provider,
+      model: agent.model,
+      reasoning_effort: agent.reasoning_effort,
       session_id: agent.session_id,
       transcript_path: agent.transcript_path,
       cwd: agent.task_id ? getTask(agent.task_id)?.worktree ?? null : null,
@@ -474,6 +527,7 @@ export function buildApp(): Hono {
     worker_provider: providerSchema.optional(),
     title: z.string().optional(),
     model: z.string().optional(),
+    reasoning_effort: reasoningEffortSchema.optional(),
     priority: z.number().int().min(0).max(4).optional(),
     verify_cmd: z.string().optional(),
     enabled: z.boolean().optional(),
@@ -486,6 +540,7 @@ export function buildApp(): Hono {
     repo: z.string().optional(),
     worker_provider: providerSchema.optional(),
     model: z.string().nullable().optional(),
+    reasoning_effort: reasoningEffortSchema.nullable().optional(),
     priority: z.number().int().min(0).max(4).optional(),
     verify_cmd: z.string().nullable().optional(),
     enabled: z.boolean().optional(),
@@ -495,9 +550,13 @@ export function buildApp(): Hono {
 
   app.post("/api/crons", async (c) => {
     const body = newCronSchema.parse(await c.req.json());
+    const workerProvider = body.worker_provider ?? defaultWorkerProvider();
+    if (workerProvider === "claude" && body.reasoning_effort !== undefined) {
+      return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
+    }
     const cron = createCron({
       ...body,
-      worker_provider: body.worker_provider ?? defaultWorkerProvider(),
+      worker_provider: workerProvider,
     }); // throws on invalid schedule -> 500 w/ message
     logEvent("cron.created", { payload: { cron_id: cron.id, name: cron.name } });
     return c.json(cron, 201);
@@ -508,12 +567,25 @@ export function buildApp(): Hono {
     const before = getCron(id);
     if (!before) return c.json({ error: "not found" }, 404);
     const body = cronPatchSchema.parse(await c.req.json());
+    const nextProvider = body.worker_provider ?? before.worker_provider;
+    if (nextProvider === "claude" && body.reasoning_effort != null) {
+      return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
+    }
     const cron = updateCron(id, {
       ...body,
       ...(body.worker_provider !== undefined &&
       body.worker_provider !== before.worker_provider &&
       body.model === undefined
         ? { model: null }
+        : {}),
+      ...(body.reasoning_effort === null ||
+      (body.worker_provider !== undefined &&
+        body.worker_provider !== before.worker_provider &&
+        body.reasoning_effort === undefined)
+        ? {
+            reasoning_effort:
+              nextProvider === "codex" ? DEFAULT_CODEX_REASONING_EFFORT : null,
+          }
         : {}),
       enabled: body.enabled === undefined ? undefined : body.enabled ? 1 : 0,
     } as Parameters<typeof updateCron>[1]);
@@ -538,6 +610,7 @@ export function buildApp(): Hono {
       repo: cron.repo,
       worker_provider: cron.worker_provider,
       model: cron.model ?? undefined,
+      reasoning_effort: cron.reasoning_effort ?? undefined,
       priority: cron.priority,
       verify_cmd: cron.verify_cmd ?? undefined,
       cron_id: cron.id,

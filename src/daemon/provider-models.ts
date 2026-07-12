@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { codexBin, codexHome } from "../config.js";
 import type { AgentProvider } from "../providers.js";
+import { isReasoningEffort, type ReasoningEffort } from "../reasoning.js";
 
 const execFileAsync = promisify(execFile);
 const CACHE_MS = 10 * 60_000;
@@ -11,6 +12,7 @@ export interface ProviderModel {
   slug: string;
   display_name: string;
   description: string;
+  reasoning_levels: Array<{ effort: ReasoningEffort; description: string }>;
 }
 
 const CLAUDE_MODELS: ProviderModel[] = [
@@ -18,10 +20,26 @@ const CLAUDE_MODELS: ProviderModel[] = [
     slug: "fable",
     display_name: "Fable 5",
     description: "Most capable; long-running orchestration and complex work",
+    reasoning_levels: [],
   },
-  { slug: "opus", display_name: "Opus", description: "Complex design and review work" },
-  { slug: "sonnet", display_name: "Sonnet", description: "Balanced implementation work" },
-  { slug: "haiku", display_name: "Haiku", description: "Fast, lightweight work" },
+  {
+    slug: "opus",
+    display_name: "Opus",
+    description: "Complex design and review work",
+    reasoning_levels: [],
+  },
+  {
+    slug: "sonnet",
+    display_name: "Sonnet",
+    description: "Balanced implementation work",
+    reasoning_levels: [],
+  },
+  {
+    slug: "haiku",
+    display_name: "Haiku",
+    description: "Fast, lightweight work",
+    reasoning_levels: [],
+  },
 ];
 
 let codexCache: { expires: number; models: ProviderModel[] } | undefined;
@@ -49,7 +67,23 @@ export function parseCodexModelCatalog(raw: string): ProviderModel[] {
         typeof model.description === "string" && model.description.length <= 300
           ? model.description
           : "";
-      return [{ slug, display_name: display, description }];
+      const seenEfforts = new Set<ReasoningEffort>();
+      const reasoningLevels = Array.isArray(model.supported_reasoning_levels)
+        ? model.supported_reasoning_levels.flatMap((level) => {
+            if (!level || typeof level !== "object") return [];
+            const record = level as Record<string, unknown>;
+            if (!isReasoningEffort(record.effort) || seenEfforts.has(record.effort)) {
+              return [];
+            }
+            seenEfforts.add(record.effort);
+            const levelDescription =
+              typeof record.description === "string" && record.description.length <= 300
+                ? record.description
+                : "";
+            return [{ effort: record.effort, description: levelDescription }];
+          }).slice(0, 6)
+        : [];
+      return [{ slug, display_name: display, description, reasoning_levels: reasoningLevels }];
     })
     .slice(0, 30);
 }

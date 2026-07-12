@@ -30,17 +30,18 @@ describe("provider metadata", () => {
     const { createAgent } = await import("../src/db/agents.js");
     const { createCron } = await import("../src/db/crons.js");
 
-    expect(createTask({ title: "a", prompt: "x", repo: "/r" }).worker_provider).toBe(
-      "claude",
-    );
+    expect(createTask({ title: "a", prompt: "x", repo: "/r" })).toMatchObject({
+      worker_provider: "claude",
+      reasoning_effort: null,
+    });
     expect(
       createTask({
         title: "b",
         prompt: "x",
         repo: "/r",
         worker_provider: "codex",
-      }).worker_provider,
-    ).toBe("codex");
+      }),
+    ).toMatchObject({ worker_provider: "codex", reasoning_effort: "high" });
     expect(createAgent({ provider: "codex" }).provider).toBe("codex");
     expect(
       createCron({
@@ -49,8 +50,8 @@ describe("provider metadata", () => {
         prompt: "x",
         repo: "/r",
         worker_provider: "codex",
-      }).worker_provider,
-    ).toBe("codex");
+      }),
+    ).toMatchObject({ worker_provider: "codex", reasoning_effort: "high" });
   });
 
   it("migrates provider columns onto a legacy database", async () => {
@@ -73,16 +74,19 @@ describe("provider metadata", () => {
         (column) => column.name,
       );
     expect(names("tasks")).toEqual(
-      expect.arrayContaining(["worker_provider", "session_provider"]),
+      expect.arrayContaining(["worker_provider", "session_provider", "reasoning_effort"]),
     );
     expect(names("agents")).toEqual(
       expect.arrayContaining([
         "provider",
         "transcript_path",
         "runtime_config_path",
+        "reasoning_effort",
       ]),
     );
-    expect(names("crons")).toContain("worker_provider");
+    expect(names("crons")).toEqual(
+      expect.arrayContaining(["worker_provider", "reasoning_effort"]),
+    );
   });
 
   it("validates providers at the API boundary and honors the configured default", async () => {
@@ -95,9 +99,10 @@ describe("provider metadata", () => {
       body: JSON.stringify({ title: "t", prompt: "x", repo: "/r" }),
     });
     expect(created.status).toBe(201);
-    expect(((await created.json()) as { worker_provider: string }).worker_provider).toBe(
-      "codex",
-    );
+    expect(await created.json()).toMatchObject({
+      worker_provider: "codex",
+      reasoning_effort: "high",
+    });
 
     const invalid = await app.request("/api/tasks", {
       method: "POST",
@@ -110,6 +115,32 @@ describe("provider metadata", () => {
       }),
     });
     expect(invalid.status).toBe(400);
+
+    const invalidEffort = await app.request("/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        title: "bad effort",
+        prompt: "x",
+        repo: "/r",
+        worker_provider: "codex",
+        reasoning_effort: "impossible",
+      }),
+    });
+    expect(invalidEffort.status).toBe(400);
+
+    const claudeEffort = await app.request("/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        title: "wrong provider",
+        prompt: "x",
+        repo: "/r",
+        worker_provider: "claude",
+        reasoning_effort: "high",
+      }),
+    });
+    expect(claudeEffort.status).toBe(400);
   });
 
   it("clears an incompatible model when a task changes providers", async () => {
@@ -133,8 +164,27 @@ describe("provider metadata", () => {
       body: JSON.stringify({ worker_provider: "codex" }),
     });
     expect(
-      (await changed.json()) as { worker_provider: string; model: string | null },
-    ).toMatchObject({ worker_provider: "codex", model: null });
+      (await changed.json()) as {
+        worker_provider: string;
+        model: string | null;
+        reasoning_effort: string | null;
+      },
+    ).toMatchObject({
+      worker_provider: "codex",
+      model: null,
+      reasoning_effort: "high",
+    });
+
+    const changedBack = await app.request(`/api/tasks/${task.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ worker_provider: "claude" }),
+    });
+    expect(await changedBack.json()).toMatchObject({
+      worker_provider: "claude",
+      model: null,
+      reasoning_effort: null,
+    });
   });
 
   it("rejects a provider change while the task has a live agent", async () => {
@@ -169,6 +219,7 @@ describe("Codex runtime isolation", () => {
       agentId: 7,
       taskId: 9,
       model: "gpt-codex",
+      reasoningEffort: "ultra",
       promptFile: "/tmp/prompt.md",
       resumeSession: "session-123",
     });
@@ -176,6 +227,7 @@ describe("Codex runtime isolation", () => {
     expect(command).toContain("CC_AGENT_ID='7'");
     expect(command).toContain("--sandbox workspace-write");
     expect(command).toContain("--ask-for-approval on-request");
+    expect(command).toContain("--config 'model_reasoning_effort=\"ultra\"'");
     expect(command).toContain("resume 'session-123'");
     expect(command).not.toMatch(/danger-full-access|--yolo|bypass-hook-trust/);
   });
@@ -234,6 +286,8 @@ describe("Codex runtime isolation", () => {
     const agent = createAgent({
       kind: "worker",
       provider: "codex",
+      model: "gpt-5.6-luna",
+      reasoning_effort: "max",
       state: "working",
       task_id: task.id,
     });
@@ -270,14 +324,22 @@ describe("Codex runtime isolation", () => {
     const response = await app.request(`/api/agents/${agent.id}/session`);
     const session = (await response.json()) as {
       provider: string;
+      model: string | null;
+      reasoning_effort: string | null;
       session_id: string;
       resume_command: string;
     };
     expect(session).toMatchObject({
       provider: "codex",
+      model: "gpt-5.6-luna",
+      reasoning_effort: "max",
       session_id: "codex-123",
     });
     expect(session.resume_command).toContain("codex");
+    expect(session.resume_command).toContain("--model 'gpt-5.6-luna'");
+    expect(session.resume_command).toContain(
+      "--config 'model_reasoning_effort=\"max\"'",
+    );
     expect(session.resume_command).toContain("resume 'codex-123'");
     const transcriptResponse = await app.request(`/api/agents/${agent.id}/transcript`);
     expect(transcriptResponse.status).toBe(200);

@@ -30,6 +30,10 @@ import { ORCHESTRATOR_PROMPT } from "../prompts/orchestrator.js";
 import { buildReviewerPrompt } from "../prompts/reviewer.js";
 import { parseAgentProvider, type AgentProvider } from "../providers.js";
 import {
+  reasoningEffortForProvider,
+  type ReasoningEffort,
+} from "../reasoning.js";
+import {
   writeCodexConfig,
   writeMcpConfigFile,
   writeSettingsFile,
@@ -185,6 +189,7 @@ function buildCodexCmd(opts: {
   agentId: number;
   taskId: number;
   model?: string;
+  reasoningEffort: ReasoningEffort;
   promptFile: string;
   resumeSession?: string;
 }): string {
@@ -206,6 +211,8 @@ function buildCodexCmd(opts: {
     "--ask-for-approval",
     "on-request",
     ...(opts.model ? ["--model", shellQuote(opts.model)] : []),
+    "--config",
+    shellQuote(`model_reasoning_effort="${opts.reasoningEffort}"`),
   ];
   const invocation = opts.resumeSession
     ? [...common, "resume", shellQuote(opts.resumeSession)]
@@ -253,7 +260,11 @@ export const _resolveReviewerModelForTest = resolveReviewerModel;
 export function spawnWorker(
   taskId: number,
   modelOverride?: string,
-  opts?: { fresh?: boolean; provider?: AgentProvider },
+  opts?: {
+    fresh?: boolean;
+    provider?: AgentProvider;
+    reasoningEffort?: ReasoningEffort;
+  },
 ): { agent: Agent; task: Task } {
   const task = getTask(taskId);
   if (!task) throw new Error(`task ${taskId} not found`);
@@ -280,6 +291,11 @@ export function spawnWorker(
     const provider = parseAgentProvider(opts?.provider ?? task.worker_provider, "claude");
     const providerChanged = provider !== task.worker_provider;
     const model = modelOverride ?? (providerChanged ? undefined : task.model ?? undefined);
+    const reasoningEffort = reasoningEffortForProvider(
+      provider,
+      opts?.reasoningEffort ??
+        (providerChanged ? undefined : task.reasoning_effort ?? undefined),
+    );
     const { dir, branch } = createWorktree(task.repo, taskId);
 
     // Agent row first: its id is baked into the generated hook + MCP configs.
@@ -287,6 +303,7 @@ export function spawnWorker(
       kind: "worker",
       provider,
       model,
+      reasoning_effort: reasoningEffort ?? undefined,
       state: "spawning",
       task_id: taskId,
     });
@@ -329,6 +346,7 @@ export function spawnWorker(
             agentId: agent.id,
             taskId,
             model,
+            reasoningEffort: reasoningEffort!,
             promptFile,
             resumeSession,
           })
@@ -351,6 +369,7 @@ export function spawnWorker(
       branch,
       worker_provider: provider,
       model: model ?? (providerChanged ? null : task.model),
+      reasoning_effort: reasoningEffort,
     });
     logEvent("agent.spawned", {
       agentId: agent.id,
@@ -359,6 +378,7 @@ export function spawnWorker(
         target,
         provider,
         model,
+        reasoning_effort: reasoningEffort,
         worktree: dir,
         resumed: Boolean(resumeSession),
       },
@@ -384,6 +404,7 @@ export function spawnWorker(
         agent_id: task.agent_id,
         worker_provider: task.worker_provider,
         model: task.model,
+        reasoning_effort: task.reasoning_effort,
       });
     }
     logEvent("agent.spawn_failed", {

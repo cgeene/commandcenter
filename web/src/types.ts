@@ -9,11 +9,13 @@ export type TaskStatus =
   | "cancelled";
 
 export type AgentProvider = "claude" | "codex";
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 
 export interface ProviderModel {
   slug: string;
   display_name: string;
   description: string;
+  reasoning_levels: Array<{ effort: ReasoningEffort; description: string }>;
 }
 
 export interface Task {
@@ -25,6 +27,7 @@ export interface Task {
   priority: number;
   worker_provider: AgentProvider;
   model: string | null;
+  reasoning_effort: ReasoningEffort | null;
   blocked_by: number | null;
   agent_id: number | null;
   worktree: string | null;
@@ -53,6 +56,7 @@ export interface Agent {
   kind: "main" | "worker" | "reviewer";
   provider: AgentProvider;
   model: string | null;
+  reasoning_effort: ReasoningEffort | null;
   state: string;
   task_id: number | null;
   tmux_target: string | null;
@@ -120,6 +124,7 @@ export interface CronJob {
   repo: string;
   worker_provider: AgentProvider;
   model: string | null;
+  reasoning_effort: ReasoningEffort | null;
   priority: number;
   verify_cmd: string | null;
   enabled: number;

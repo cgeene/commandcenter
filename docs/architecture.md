@@ -89,8 +89,10 @@ can record its result without a separate prompt for each platform tool call.
    from the repo's **origin default branch** (fetched fresh, not local `HEAD`),
    writes provider runtime config, opens a tmux window, and launches Claude or
    Codex. Codex uses `workspace-write`, `on-request` approval, and no sandbox
-   network unless an escalation is approved. A session resumes only through the
-   provider that created it (override with `--fresh`).
+   network unless an escalation is approved. Codex reasoning effort is persisted
+   per task, defaults to `high`, and is reapplied to fresh and resumed workers.
+   A session resumes only through the provider that created it (override with
+   `--fresh`).
 3. **Work** — the worker uses its MCP tools and does the work in the worktree.
 4. **Verify** — on the `Stop` hook the daemon runs the task's `verify_cmd` in the
    worktree. Pass → `review`. Fail → the failure output is fed back into the

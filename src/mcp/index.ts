@@ -11,6 +11,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { REASONING_EFFORTS } from "../reasoning.js";
 
 const ROLE =
   process.env.CC_ROLE === "main" || process.env.CC_ROLE === "reviewer"
@@ -56,6 +57,10 @@ server.registerTool(
         .optional()
         .describe("absolute repo path; workers default to their own task's repo"),
       model: z.string().optional(),
+      reasoning_effort: z
+        .enum(REASONING_EFFORTS)
+        .optional()
+        .describe("Codex reasoning effort; defaults to high"),
       worker_provider: z.enum(["claude", "codex"]).optional(),
       priority: z.number().int().min(0).max(4).optional(),
       blocked_by: z.number().int().optional(),
@@ -329,7 +334,7 @@ if (ROLE === "main") {
     "update_task",
     {
       description:
-        "Update a task (status, priority, worker provider, model, prompt, result_summary...).",
+        "Update a task (status, priority, worker provider, model, reasoning effort, prompt, result_summary...).",
       inputSchema: {
         id: z.number().int(),
         status: z
@@ -338,6 +343,10 @@ if (ROLE === "main") {
           .describe("to close a task from any state, use cancel_task instead — it also kills live agents"),
         priority: z.number().int().min(0).max(4).optional(),
         model: z.string().optional(),
+        reasoning_effort: z
+          .enum(REASONING_EFFORTS)
+          .optional()
+          .describe("Codex-only reasoning effort"),
         worker_provider: z.enum(["claude", "codex"]).optional(),
         prompt: z.string().optional(),
         verify_cmd: z.string().optional(),
@@ -383,11 +392,15 @@ if (ROLE === "main") {
     "spawn_worker",
     {
       description:
-        "Spawn a Claude Code or Codex worker for a task in its own git worktree + tmux window. Provider and model default to the task. A previous session resumes only when it belongs to the same provider (pass fresh=true to force a clean start).",
+        "Spawn a Claude Code or Codex worker for a task in its own git worktree + tmux window. Provider, model, and Codex reasoning effort default to the task. A previous session resumes only when it belongs to the same provider (pass fresh=true to force a clean start).",
       inputSchema: {
         task_id: z.number().int(),
         provider: z.enum(["claude", "codex"]).optional(),
         model: z.string().optional().describe("provider-specific model slug"),
+        reasoning_effort: z
+          .enum(REASONING_EFFORTS)
+          .optional()
+          .describe("Codex-only reasoning effort; defaults to high"),
         fresh: z.boolean().optional().describe("force a fresh session instead of resuming"),
       },
     },

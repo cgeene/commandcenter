@@ -12,10 +12,10 @@ agp <group> <command> [options]
 
 | Command | Description |
 |---|---|
-| `task add <title>` | Add a task. `--provider <claude\|codex>`, `-p/--prompt`, `-f/--prompt-file`, `-r/--repo` (default: current git repo), `-m/--model`, `-P/--priority <0-4>` (default 2), `-b/--blocked-by <id>`, `-v/--verify <cmd>`. |
+| `task add <title>` | Add a task. `--provider <claude\|codex>`, `-p/--prompt`, `-f/--prompt-file`, `-r/--repo` (default: current git repo), `-m/--model`, `-e/--effort <low\|medium\|high\|xhigh\|max\|ultra>` (Codex default `high`), `-P/--priority <0-4>` (default 2), `-b/--blocked-by <id>`, `-v/--verify <cmd>`. |
 | `task ls` | List tasks. `-s/--status <status>`, `--ready` (only queued tasks with no open blockers). |
 | `task show <id>` | Full task detail as JSON. |
-| `task update <id>` | Update fields: `-s/--status`, `-P/--priority`, `--provider <claude\|codex>`, `-m/--model`, `--result <summary>`. Provider changes are rejected while the task has a live agent. |
+| `task update <id>` | Update fields: `-s/--status`, `-P/--priority`, `--provider <claude\|codex>`, `-m/--model`, `-e/--effort`, `--result <summary>`. Provider changes are rejected while the task has a live agent. |
 | `task claim <id>` | Atomically claim a queued task. |
 | `task cancel <id>` | Close a task from any state (kills its live worker/reviewer). `--rm-worktree` also removes the worktree (uncommitted work is lost). Reports any tasks left dangling by `blocked_by`. |
 | `task diff <id>` | Show the diff on the task's branch. `--stat` for stat + commits only. |
@@ -32,7 +32,7 @@ never passed to Claude). Watch it with
 
 | Command | Description |
 |---|---|
-| `agent spawn -t <id>` | Spawn a Claude Code or Codex worker. `--provider` and `-m/--model` override the task; `--fresh` forces a clean session. Resume is same-provider only. |
+| `agent spawn -t <id>` | Spawn a Claude Code or Codex worker. `--provider`, `-m/--model`, and Codex `-e/--effort` override the task; `--fresh` forces a clean session. Resume is same-provider only. |
 | `agent ls` | List agents. `-a/--all` includes dead agents. |
 | `agent kill <id>` | Kill an agent's tmux window. `--requeue` puts its task back in the queue; `--rm-worktree` removes the worktree. |
 | `agent peek <id>` | Print the agent's visible terminal output. `-n/--lines <n>` (default 50). |
@@ -63,7 +63,7 @@ See [`configuration.md`](configuration.md) for what each knob does and its defau
 
 | Command | Description |
 |---|---|
-| `cron add <name> -s <cron>` | Create a template. `--provider <claude\|codex>`, `-p/--prompt` or `-f/--prompt-file` (required), `-r/--repo`, `--title`, `-m/--model`, `-P/--priority`, `-v/--verify`. |
+| `cron add <name> -s <cron>` | Create a template. `--provider <claude\|codex>`, `-p/--prompt` or `-f/--prompt-file` (required), `-r/--repo`, `--title`, `-m/--model`, Codex `-e/--effort` (default `high`), `-P/--priority`, `-v/--verify`. |
 | `cron ls` | List crons with enabled state, schedule, and next/last run. |
 | `cron enable <idOrName>` / `cron disable <idOrName>` | Toggle a cron. |
 | `cron run <idOrName>` | Enqueue this cron's task immediately. |

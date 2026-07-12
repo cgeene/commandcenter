@@ -176,6 +176,14 @@ installed, authenticated Codex CLI and presents it as a dropdown. The provider
 default remains the first choice, and `custom model…` accepts a newer, private,
 or otherwise unlisted model slug. Hidden internal models are not shown.
 
+Codex tasks also store an explicit reasoning effort. **High** is the default.
+After a model is selected, the dashboard offers only the effort levels reported
+for that model by the authenticated Codex catalog (for example, Sol and Terra
+currently offer Ultra while Luna does not). Low, Medium, Extra High (`xhigh`),
+Max, and Ultra remain opt-in. The selected effort survives scheduler dispatch,
+crons, requeues, and same-provider session resumes. Ultra may delegate work to
+internal Codex subagents, so use it deliberately.
+
 The dashboard has a separate Claude model selector beside **spawn main agent**.
 Its configured default is Fable 5 (`fable`), which is suited to long-running
 orchestration and delegation; `CC_MAIN_MODEL` or `agp main --model` can override
@@ -183,12 +191,12 @@ it. Fable is a Claude model, so it is intentionally absent from Codex worker
 model choices. Anthropic currently requires 30-day data retention for Fable;
 see [Anthropic's Fable documentation](https://www.anthropic.com/claude/fable).
 
-Provider and model are stored on each task. Model names are provider-specific,
-so a Codex model slug is never passed to Claude and a Claude model name is never
-passed to Codex. A stopped worker resumes only with the provider that owns its
-recorded session; changing provider starts a fresh provider context while
-preserving the task branch and worktree. Command Center rejects provider changes
-while that task still has a live agent.
+Provider, model, and Codex reasoning effort are stored on each task. Model names
+are provider-specific, so a Codex model slug or effort is never passed to Claude
+and a Claude model name is never passed to Codex. A stopped worker resumes only
+with the provider that owns its recorded session; changing provider starts a
+fresh provider context while preserving the task branch and worktree. Command
+Center rejects provider changes while that task still has a live agent.
 
 Whichever worker provider is selected, the surrounding workflow is unchanged:
 one task branch and worktree, lifecycle hooks, transcript auditing, verification,
@@ -268,9 +276,10 @@ Full CLI reference: [`docs/cli.md`](docs/cli.md).
 ### Tasks & the queue
 
 A task carries a `title`, `prompt`, `repo`, `priority` (lower runs first;
-default `2`), an optional `verify_cmd`, and an optional `blocked_by` (another
-task id — it won't become ready until its blocker is `done`). `open_pr` (default
-on) controls whether a worker opens a PR or leaves the branch as the deliverable.
+default `2`), worker provider/model, Codex `reasoning_effort` (default `high`),
+an optional `verify_cmd`, and an optional `blocked_by` (another task id — it
+won't become ready until its blocker is `done`). `open_pr` (default on) controls
+whether a worker opens a PR or leaves the branch as the deliverable.
 Statuses:
 
 ```

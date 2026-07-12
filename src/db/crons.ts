@@ -1,6 +1,10 @@
 import { Cron as CronExpr } from "croner";
 import { getDb } from "./db.js";
 import { parseAgentProvider, type AgentProvider } from "../providers.js";
+import {
+  reasoningEffortForProvider,
+  type ReasoningEffort,
+} from "../reasoning.js";
 
 export interface CronJob {
   id: number;
@@ -11,6 +15,7 @@ export interface CronJob {
   repo: string;
   worker_provider: AgentProvider;
   model: string | null;
+  reasoning_effort: ReasoningEffort | null;
   priority: number;
   verify_cmd: string | null;
   enabled: number; // sqlite boolean
@@ -34,15 +39,17 @@ export function createCron(c: {
   title?: string;
   worker_provider?: AgentProvider;
   model?: string;
+  reasoning_effort?: ReasoningEffort;
   priority?: number;
   verify_cmd?: string;
   enabled?: boolean;
 }): CronJob {
   const next = nextRun(c.schedule, new Date()); // validates too
+  const workerProvider = parseAgentProvider(c.worker_provider, "claude");
   const info = getDb()
     .prepare(
-      `INSERT INTO crons (name, schedule, title, prompt, repo, worker_provider, model, priority, verify_cmd, enabled, next_run_at)
-       VALUES (@name, @schedule, @title, @prompt, @repo, @worker_provider, @model, @priority, @verify_cmd, @enabled, @next_run_at)`,
+      `INSERT INTO crons (name, schedule, title, prompt, repo, worker_provider, model, reasoning_effort, priority, verify_cmd, enabled, next_run_at)
+       VALUES (@name, @schedule, @title, @prompt, @repo, @worker_provider, @model, @reasoning_effort, @priority, @verify_cmd, @enabled, @next_run_at)`,
     )
     .run({
       name: c.name,
@@ -50,8 +57,9 @@ export function createCron(c: {
       title: c.title ?? c.name,
       prompt: c.prompt,
       repo: c.repo,
-      worker_provider: parseAgentProvider(c.worker_provider, "claude"),
+      worker_provider: workerProvider,
       model: c.model ?? null,
+      reasoning_effort: reasoningEffortForProvider(workerProvider, c.reasoning_effort),
       priority: c.priority ?? 2,
       verify_cmd: c.verify_cmd ?? null,
       enabled: c.enabled === false ? 0 : 1,
@@ -87,6 +95,7 @@ const UPDATABLE = new Set([
   "repo",
   "worker_provider",
   "model",
+  "reasoning_effort",
   "priority",
   "verify_cmd",
   "enabled",

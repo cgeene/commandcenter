@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -18,6 +18,7 @@ import type {
   Memory,
   ParsedPane,
   ProviderModel,
+  ReasoningEffort,
   SchedulerInfo,
   Task,
   TranscriptEntry,
@@ -32,6 +33,22 @@ const TABS = [
   { id: "archive", label: "archive" },
 ] as const;
 type TabId = (typeof TABS)[number]["id"];
+
+const ALL_REASONING_LEVELS: Array<{
+  effort: ReasoningEffort;
+  description: string;
+}> = [
+  { effort: "low", description: "Fast responses with lighter reasoning" },
+  { effort: "medium", description: "Balanced speed and reasoning depth" },
+  { effort: "high", description: "Default; greater depth for complex work" },
+  { effort: "xhigh", description: "Extra-high depth for difficult multi-step work" },
+  { effort: "max", description: "Maximum depth for the hardest problems" },
+  { effort: "ultra", description: "Maximum reasoning with automatic delegation" },
+];
+
+const BASE_REASONING_LEVELS = ALL_REASONING_LEVELS.filter((level) =>
+  ["low", "medium", "high", "xhigh"].includes(level.effort),
+);
 
 /** A task-linked PR still awaiting action — merged/closed ones auto-clear. */
 function isOpenPr(t: Task): boolean {
@@ -306,6 +323,7 @@ export function App() {
               </b>
               <span className="muted">
                 {a.state} · {a.provider} · {a.model ?? "default"}
+                {a.reasoning_effort ? ` · ${a.reasoning_effort}` : ""}
               </span>
               <button onClick={() => openTerminal(a.id)}>terminal</button>
               <button
@@ -488,6 +506,7 @@ function TaskCard({
           <span className="chip bad">✗ changes</span>
         )}
         {task.model && <span className="chip">{task.model}</span>}
+        {task.reasoning_effort && <span className="chip">{task.reasoning_effort}</span>}
         <span className="chip">{task.worker_provider}</span>
         {task.agent_id && <span className="chip agent-chip">a{task.agent_id}</span>}
       </div>
@@ -1192,6 +1211,7 @@ function TaskPanel({
           <dd>
             {task.worker_provider}
             {task.model ? ` · ${task.model}` : " · default model"}
+            {task.reasoning_effort ? ` · ${task.reasoning_effort}` : ""}
           </dd>
           {task.branch && (
             <>
@@ -1354,7 +1374,8 @@ function CronsDrawer({ onClose }: { onClose: () => void }) {
               {c.enabled ? `next ${c.next_run_at?.slice(0, 16) ?? "?"}` : "disabled"}
               {c.last_run_at ? ` · last ${c.last_run_at.slice(0, 16)}` : " · never run"}
               {` · ${c.worker_provider}`}
-              {c.model ? ` · ${c.model}` : ""} · {c.repo.split("/").pop()}
+              {c.model ? ` · ${c.model}` : ""}
+              {c.reasoning_effort ? ` · ${c.reasoning_effort}` : ""} · {c.repo.split("/").pop()}
             </div>
             <div>{c.title}</div>
           </div>
@@ -1456,9 +1477,9 @@ function NewTaskForm({
   const [repo, setRepo] = useState("");
   const [modelChoice, setModelChoice] = useState("");
   const [customModel, setCustomModel] = useState("");
-  const [models, setModels] = useState<
-    Array<{ slug: string; display_name: string; description: string }>
-  >([]);
+  const [models, setModels] = useState<ProviderModel[]>([]);
+  const [reasoningEffort, setReasoningEffort] =
+    useState<ReasoningEffort>("high");
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsUnavailable, setModelsUnavailable] = useState(false);
   const [provider, setProvider] = useState<"" | "claude" | "codex">("");
@@ -1492,9 +1513,7 @@ function NewTaskForm({
     let cancelled = false;
     setModelsLoading(true);
     setModelsUnavailable(false);
-    void api<{
-      models: Array<{ slug: string; display_name: string; description: string }>;
-    }>("GET", `/api/providers/${provider}/models`)
+    void api<{ models: ProviderModel[] }>("GET", `/api/providers/${provider}/models`)
       .then((result) => {
         if (!cancelled) setModels(result.models);
       })
@@ -1514,6 +1533,35 @@ function NewTaskForm({
 
   const selectedModel =
     modelChoice === "__custom__" ? customModel.trim() : modelChoice;
+  const selectedCatalogModel = models.find((model) => model.slug === selectedModel);
+  const availableReasoningLevels = useMemo(() => {
+    if (provider !== "codex") return [];
+    if (modelChoice === "__custom__") return ALL_REASONING_LEVELS;
+    if (selectedCatalogModel?.reasoning_levels.length) {
+      return selectedCatalogModel.reasoning_levels;
+    }
+    if (modelChoice) return BASE_REASONING_LEVELS;
+    if (models.length === 0) return BASE_REASONING_LEVELS;
+    const common = ALL_REASONING_LEVELS.filter((level) =>
+      models.every((model) =>
+        model.reasoning_levels.some((candidate) => candidate.effort === level.effort),
+      ),
+    );
+    return common.length > 0 ? common : BASE_REASONING_LEVELS;
+  }, [provider, modelChoice, selectedCatalogModel, models]);
+  const effectiveReasoningEffort = availableReasoningLevels.some(
+    (level) => level.effort === reasoningEffort,
+  )
+    ? reasoningEffort
+    : (availableReasoningLevels.find((level) => level.effort === "high")?.effort ??
+      availableReasoningLevels[0]?.effort ??
+      "high");
+
+  useEffect(() => {
+    if (provider === "codex" && effectiveReasoningEffort !== reasoningEffort) {
+      setReasoningEffort(effectiveReasoningEffort);
+    }
+  }, [provider, reasoningEffort, effectiveReasoningEffort]);
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -1543,6 +1591,7 @@ function NewTaskForm({
               setProvider(e.target.value as "" | "claude" | "codex");
               setModelChoice("");
               setCustomModel("");
+              setReasoningEffort("high");
             }}
           >
             <option value="">provider (system default)</option>
@@ -1572,6 +1621,23 @@ function NewTaskForm({
               onChange={(e) => setCustomModel(e.target.value)}
             />
           )}
+          {provider === "codex" && (
+            <select
+              aria-label="Codex reasoning effort"
+              value={effectiveReasoningEffort}
+              onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort)}
+            >
+              {availableReasoningLevels.map((level) => (
+                <option key={level.effort} value={level.effort}>
+                  {level.effort === "xhigh"
+                    ? "Extra High"
+                    : level.effort[0].toUpperCase() + level.effort.slice(1)}
+                  {level.effort === "high" ? " (default)" : ""}
+                  {level.description ? ` — ${level.description}` : ""}
+                </option>
+              ))}
+            </select>
+          )}
           <select
             value={priority}
             onChange={(e) => setPriority(Number(e.target.value))}
@@ -1599,6 +1665,8 @@ function NewTaskForm({
                 repo,
                 worker_provider: provider || undefined,
                 model: selectedModel || undefined,
+                reasoning_effort:
+                  provider === "codex" ? effectiveReasoningEffort : undefined,
                 priority,
                 verify_cmd: verify || undefined,
               })

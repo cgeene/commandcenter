@@ -1,11 +1,13 @@
 import { getDb, type AgentState } from "./db.js";
 import { parseAgentProvider, type AgentProvider } from "../providers.js";
+import type { ReasoningEffort } from "../reasoning.js";
 
 export interface Agent {
   id: number;
   kind: "main" | "worker" | "reviewer";
   provider: AgentProvider;
   model: string | null;
+  reasoning_effort: ReasoningEffort | null;
   state: AgentState;
   task_id: number | null;
   tmux_target: string | null;
@@ -20,6 +22,7 @@ export function createAgent(a: {
   kind?: "main" | "worker" | "reviewer";
   provider?: AgentProvider;
   model?: string;
+  reasoning_effort?: ReasoningEffort;
   state?: AgentState;
   task_id?: number;
   tmux_target?: string;
@@ -27,13 +30,14 @@ export function createAgent(a: {
 }): Agent {
   const info = getDb()
     .prepare(
-      `INSERT INTO agents (kind, provider, model, state, task_id, tmux_target, runtime_config_path)
-       VALUES (@kind, @provider, @model, @state, @task_id, @tmux_target, @runtime_config_path)`,
+      `INSERT INTO agents (kind, provider, model, reasoning_effort, state, task_id, tmux_target, runtime_config_path)
+       VALUES (@kind, @provider, @model, @reasoning_effort, @state, @task_id, @tmux_target, @runtime_config_path)`,
     )
     .run({
       kind: a.kind ?? "worker",
       provider: parseAgentProvider(a.provider, "claude"),
       model: a.model ?? null,
+      reasoning_effort: a.reasoning_effort ?? null,
       state: a.state ?? "spawning",
       task_id: a.task_id ?? null,
       tmux_target: a.tmux_target ?? null,

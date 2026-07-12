@@ -60,13 +60,17 @@ describe("provider worker spawn failure", () => {
     });
 
     expect(() => spawnWorker(task.id)).toThrow("runtime launch failed");
+    expect(String(newWindow.mock.calls[0]?.[2])).toContain(
+      "--config 'model_reasoning_effort=\"high\"'",
+    );
     expect(getTask(task.id)).toMatchObject({
       status: "queued",
       agent_id: null,
       worker_provider: "codex",
+      reasoning_effort: "high",
     });
     expect(listAgents()).toHaveLength(1);
-    expect(listAgents()[0].state).toBe("dead");
+    expect(listAgents()[0]).toMatchObject({ state: "dead", reasoning_effort: "high" });
     expect(listEvents(10).map((event) => event.kind)).toContain("agent.spawn_failed");
   });
 });
