@@ -8,7 +8,6 @@ import {
   codexHome,
   codexProfile,
   promptsDir,
-  reviewerModel,
 } from "../config.js";
 import {
   createAgent,
@@ -35,7 +34,7 @@ import {
   writeSettingsFile,
 } from "./genconfig.js";
 import { readOnlyProfileAllow } from "./permissions.js";
-import { findTranscript } from "./transcript.js";
+import { findProviderTranscript } from "./transcript.js";
 import { killWindow, newWindow, windowExists } from "./tmux.js";
 import {
   createReviewWorktree,
@@ -94,7 +93,7 @@ function buildWorkerPrompt(task: Task, branch: string): string {
   return lines.join("\n");
 }
 
-/** Continuation message for `claude --resume` — the resumed session holds
+/** Continuation message for provider resume — the resumed session holds
  *  the conversation, but the task prompt is restated: the orchestrator's
  *  "requeue with a better prompt" flow edits task.prompt between sessions,
  *  and a resume that omits it would silently redo the wrong work. */
@@ -225,12 +224,26 @@ function resumableSession(
     task.session_provider === provider ||
     (task.session_provider === null && provider === "claude");
   if (!sameProvider) return undefined;
-  if (provider === "claude" && !findTranscript(task.session_id)) return undefined;
+  const priorPath = listAgents()
+    .filter(
+      (agent) =>
+        agent.kind === "worker" &&
+        agent.task_id === task.id &&
+        agent.provider === provider &&
+        agent.session_id === task.session_id,
+    )
+    .at(-1)?.transcript_path;
+  if (!findProviderTranscript(provider, task.session_id, priorPath)) return undefined;
   return task.session_id;
 }
 
-function resolveReviewerModel(override?: string): string {
-  return override ?? reviewerModel();
+function resolveReviewerModel(task: Task, override?: string): string {
+  return (
+    override ??
+    process.env.CC_REVIEWER_MODEL ??
+    (task.worker_provider === "claude" ? task.model ?? undefined : undefined) ??
+    "opus"
+  );
 }
 
 export const _resumableSessionForTest = resumableSession;
@@ -260,89 +273,125 @@ export function spawnWorker(
     }
   }
 
-  const provider = parseAgentProvider(opts?.provider ?? task.worker_provider, "claude");
-  const providerChanged = provider !== task.worker_provider;
-  const model = modelOverride ?? (providerChanged ? undefined : task.model ?? undefined);
-  const { dir, branch } = createWorktree(task.repo, taskId);
+  let spawnedAgent: Agent | undefined;
+  let target: string | undefined;
+  try {
+    const provider = parseAgentProvider(opts?.provider ?? task.worker_provider, "claude");
+    const providerChanged = provider !== task.worker_provider;
+    const model = modelOverride ?? (providerChanged ? undefined : task.model ?? undefined);
+    const { dir, branch } = createWorktree(task.repo, taskId);
 
-  // Agent row first: its id is baked into the generated hook + MCP configs.
-  const agent = createAgent({
-    kind: "worker",
-    provider,
-    model,
-    state: "spawning",
-    task_id: taskId,
-  });
+    // Agent row first: its id is baked into the generated hook + MCP configs.
+    const agent = createAgent({
+      kind: "worker",
+      provider,
+      model,
+      state: "spawning",
+      task_id: taskId,
+    });
+    spawnedAgent = agent;
 
-  const tag = `task-${taskId}`;
-  let settingsFile: string | undefined;
-  let mcpFile: string | undefined;
-  let runtimeConfigPath: string | undefined;
-  if (provider === "claude") {
-    settingsFile = writeSettingsFile(tag, agent.id, {
-      allow: buildWorkerAllow(branch),
-    });
-    mcpFile = writeMcpConfigFile(tag, {
-      CC_ROLE: "worker",
-      CC_AGENT_ID: String(agent.id),
-      CC_TASK_ID: String(taskId),
-    });
-    runtimeConfigPath = settingsFile;
-  } else {
-    const config = writeCodexConfig();
-    runtimeConfigPath = config.profileFile;
-  }
-  updateAgent(agent.id, { runtime_config_path: runtimeConfigPath });
+    const tag = `task-${taskId}`;
+    let settingsFile: string | undefined;
+    let mcpFile: string | undefined;
+    let runtimeConfigPath: string | undefined;
+    if (provider === "claude") {
+      settingsFile = writeSettingsFile(tag, agent.id, {
+        allow: buildWorkerAllow(branch),
+      });
+      mcpFile = writeMcpConfigFile(tag, {
+        CC_ROLE: "worker",
+        CC_AGENT_ID: String(agent.id),
+        CC_TASK_ID: String(taskId),
+      });
+      runtimeConfigPath = settingsFile;
+    } else {
+      const config = writeCodexConfig();
+      runtimeConfigPath = config.profileFile;
+    }
+    updateAgent(agent.id, { runtime_config_path: runtimeConfigPath });
 
   // A prior session with a surviving transcript means the worker can pick
   // up exactly where it stopped instead of re-learning the task from zero.
-  const resumeSession = resumableSession(task, provider, opts?.fresh);
+    const resumeSession = resumableSession(task, provider, opts?.fresh);
 
-  fs.mkdirSync(promptsDir(), { recursive: true });
-  const promptFile = path.join(promptsDir(), `${tag}.md`);
-  fs.writeFileSync(
-    promptFile,
-    resumeSession ? buildResumePrompt(task) : buildWorkerPrompt(task, branch),
-  );
+    fs.mkdirSync(promptsDir(), { recursive: true });
+    const promptFile = path.join(promptsDir(), `${tag}.md`);
+    fs.writeFileSync(
+      promptFile,
+      resumeSession ? buildResumePrompt(task) : buildWorkerPrompt(task, branch),
+    );
 
-  const command =
-    provider === "codex"
-      ? buildCodexCmd({
-          agentId: agent.id,
-          taskId,
-          model,
-          promptFile,
-          resumeSession,
-        })
-      : buildClaudeCmd({
-          model,
-          settingsFile: settingsFile!,
-          mcpFile: mcpFile!,
-          promptFile,
-          resumeSession,
-        });
-  const target = newWindow(`t${taskId}`, dir, command);
-  updateAgent(agent.id, { tmux_target: target, state: "working" });
-  updateTask(taskId, {
-    status: "in_progress",
-    agent_id: agent.id,
-    worktree: dir,
-    branch,
-    worker_provider: provider,
-    model: model ?? (providerChanged ? null : task.model),
-  });
-  logEvent("agent.spawned", {
-    agentId: agent.id,
-    taskId,
-    payload: {
-      target,
-      provider,
-      model,
+    const command =
+      provider === "codex"
+        ? buildCodexCmd({
+            agentId: agent.id,
+            taskId,
+            model,
+            promptFile,
+            resumeSession,
+          })
+        : buildClaudeCmd({
+            model,
+            settingsFile: settingsFile!,
+            mcpFile: mcpFile!,
+            promptFile,
+            resumeSession,
+          });
+    target = newWindow(`t${taskId}`, dir, command);
+    // SessionStart is the readiness handshake. Leaving the agent in spawning
+    // lets the watchdog detect missing/untrusted hooks instead of pretending a
+    // worker is healthy merely because its tmux window exists.
+    updateAgent(agent.id, { tmux_target: target });
+    updateTask(taskId, {
+      status: "in_progress",
+      agent_id: agent.id,
       worktree: dir,
-      resumed: Boolean(resumeSession),
-    },
-  });
-  return { agent: getAgent(agent.id)!, task: getTask(taskId)! };
+      branch,
+      worker_provider: provider,
+      model: model ?? (providerChanged ? null : task.model),
+    });
+    logEvent("agent.spawned", {
+      agentId: agent.id,
+      taskId,
+      payload: {
+        target,
+        provider,
+        model,
+        worktree: dir,
+        resumed: Boolean(resumeSession),
+      },
+    });
+    return { agent: getAgent(agent.id)!, task: getTask(taskId)! };
+  } catch (error) {
+    if (target && windowExists(target)) {
+      try {
+        killWindow(target);
+      } catch {
+        // Best effort: preserve the original spawn error for the caller.
+      }
+    }
+    if (spawnedAgent) updateAgent(spawnedAgent.id, { state: "dead" });
+    const current = getTask(taskId);
+    if (
+      current &&
+      ["claimed", "in_progress"].includes(current.status) &&
+      (!spawnedAgent || current.agent_id === null || current.agent_id === spawnedAgent.id)
+    ) {
+      updateTask(taskId, {
+        status: task.status,
+        agent_id: task.agent_id,
+        worker_provider: task.worker_provider,
+        model: task.model,
+      });
+    }
+    logEvent("agent.spawn_failed", {
+      agentId: spawnedAgent?.id,
+      taskId,
+      payload: { error: error instanceof Error ? error.message : String(error) },
+    });
+    throw error;
+  }
 }
 
 /**
@@ -368,7 +417,7 @@ export function spawnReviewer(
     throw new Error(`task ${taskId} already has live reviewer a${existing.id}`);
   }
 
-  const model = resolveReviewerModel(modelOverride);
+  const model = resolveReviewerModel(task, modelOverride);
   const dir = createReviewWorktree(task.repo, taskId, task.branch, task.open_pr !== 0);
   const agent = createAgent({
     kind: "reviewer",

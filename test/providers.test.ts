@@ -136,6 +136,27 @@ describe("provider metadata", () => {
       (await changed.json()) as { worker_provider: string; model: string | null },
     ).toMatchObject({ worker_provider: "codex", model: null });
   });
+
+  it("rejects a provider change while the task has a live agent", async () => {
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { buildApp } = await import("../src/daemon/api.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const agent = createAgent({
+      kind: "worker",
+      provider: "claude",
+      state: "working",
+      task_id: task.id,
+    });
+    updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+
+    const changed = await buildApp().request(`/api/tasks/${task.id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ worker_provider: "codex" }),
+    });
+    expect(changed.status).toBe(409);
+  });
 });
 
 describe("Codex runtime isolation", () => {
@@ -161,24 +182,48 @@ describe("Codex runtime isolation", () => {
 
   it("never resumes a session across providers and isolates reviewer models", async () => {
     process.env.CC_REVIEWER_MODEL = "review-opus";
+    process.env.CC_CODEX_HOME = path.join(tmpDir, "codex");
+    const sid = "codex-session";
+    const sessions = path.join(process.env.CC_CODEX_HOME, "sessions");
+    fs.mkdirSync(sessions, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessions, `rollout-${sid}.jsonl`),
+      JSON.stringify({ type: "session_meta", payload: { id: sid } }),
+    );
     const {
       _resumableSessionForTest,
       _resolveReviewerModelForTest,
     } = await import("../src/daemon/spawn.js");
     const task = {
-      session_id: "codex-session",
+      session_id: sid,
       session_provider: "codex",
     } as never;
-    expect(_resumableSessionForTest(task, "codex")).toBe("codex-session");
+    expect(_resumableSessionForTest(task, "codex")).toBe(sid);
     expect(_resumableSessionForTest(task, "claude")).toBeUndefined();
     expect(_resumableSessionForTest(task, "codex", true)).toBeUndefined();
-    expect(_resolveReviewerModelForTest()).toBe("review-opus");
-    expect(_resolveReviewerModelForTest("manual-reviewer")).toBe("manual-reviewer");
+    expect(_resolveReviewerModelForTest(task)).toBe("review-opus");
+    expect(_resolveReviewerModelForTest(task, "manual-reviewer")).toBe(
+      "manual-reviewer",
+    );
+    fs.rmSync(path.join(sessions, `rollout-${sid}.jsonl`));
+    expect(_resumableSessionForTest(task, "codex")).toBeUndefined();
+  });
+
+  it("preserves a Claude task model for reviewers but never reuses a Codex model", async () => {
+    delete process.env.CC_REVIEWER_MODEL;
+    const { _resolveReviewerModelForTest } = await import("../src/daemon/spawn.js");
+    expect(
+      _resolveReviewerModelForTest({ worker_provider: "claude", model: "sonnet" } as never),
+    ).toBe("sonnet");
+    expect(
+      _resolveReviewerModelForTest({ worker_provider: "codex", model: "gpt-codex" } as never),
+    ).toBe("opus");
   });
 
   it("records Codex session ownership, transcript path, and permission waits", async () => {
     const { createTask, updateTask, getTask } = await import("../src/db/tasks.js");
     const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
     const { handleHookEvent } = await import("../src/daemon/hooks.js");
     const task = createTask({
       title: "t",
@@ -193,18 +238,36 @@ describe("Codex runtime isolation", () => {
       task_id: task.id,
     });
     updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+    process.env.CC_CODEX_HOME = path.join(tmpDir, "commandcenter-codex");
+    const sessions = path.join(process.env.CC_CODEX_HOME, "sessions");
+    fs.mkdirSync(sessions, { recursive: true });
+    const transcript = path.join(sessions, "rollout-codex-123.jsonl");
+    fs.writeFileSync(
+      transcript,
+      [
+        JSON.stringify({ type: "session_meta", payload: { id: "codex-123" } }),
+        JSON.stringify({
+          type: "response_item",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "implemented safely" }],
+          },
+        }),
+      ].join("\n"),
+    );
 
     await handleHookEvent(agent.id, {
       hook_event_name: "SessionStart",
       session_id: "codex-123",
-      transcript_path: "/private/session.jsonl",
+      transcript_path: transcript,
     });
     expect(getTask(task.id)?.session_provider).toBe("codex");
-    expect(getAgent(agent.id)?.transcript_path).toBe("/private/session.jsonl");
+    expect(getAgent(agent.id)?.transcript_path).toBe(transcript);
 
-    process.env.CC_CODEX_HOME = "/tmp/commandcenter-codex";
     const { buildApp } = await import("../src/daemon/api.js");
-    const response = await buildApp().request(`/api/agents/${agent.id}/session`);
+    const app = buildApp();
+    const response = await app.request(`/api/agents/${agent.id}/session`);
     const session = (await response.json()) as {
       provider: string;
       session_id: string;
@@ -216,6 +279,24 @@ describe("Codex runtime isolation", () => {
     });
     expect(session.resume_command).toContain("codex");
     expect(session.resume_command).toContain("resume 'codex-123'");
+    const transcriptResponse = await app.request(`/api/agents/${agent.id}/transcript`);
+    expect(transcriptResponse.status).toBe(200);
+    expect(
+      (await transcriptResponse.json()) as { provider: string; entries: unknown[] },
+    ).toMatchObject({
+      provider: "codex",
+      entries: [{ role: "assistant", text: "implemented safely" }],
+    });
+
+    await handleHookEvent(agent.id, {
+      hook_event_name: "PermissionRequest",
+      tool_name: "Bash",
+      tool_input: { command: "git push -u origin agent/task-1" },
+    });
+    expect(getAgent(agent.id)?.state).toBe("working");
+    expect(listEvents(10).map((event) => event.kind)).toContain(
+      "permission.auto_approved",
+    );
 
     await handleHookEvent(agent.id, {
       hook_event_name: "PermissionRequest",
@@ -223,5 +304,77 @@ describe("Codex runtime isolation", () => {
       tool_input: { description: "needs network for git push" },
     });
     expect(getAgent(agent.id)?.state).toBe("waiting_input");
+  });
+});
+
+describe("Codex worker permission policy", () => {
+  it("allows only the exact task-branch push", async () => {
+    const { codexPermissionDecision } = await import("../src/codex-policy.js");
+    const payload = (command: string, event = "PermissionRequest") => ({
+      hook_event_name: event,
+      tool_name: "Bash",
+      tool_input: { command },
+    });
+    expect(
+      codexPermissionDecision(payload("git push -u origin agent/task-12"), "12")
+        ?.behavior,
+    ).toBe("allow");
+    expect(
+      codexPermissionDecision(payload("git push origin agent/task-12:main"), "12")
+        ?.behavior,
+    ).toBe("deny");
+    expect(
+      codexPermissionDecision(payload("git push --force origin main"), "12")?.behavior,
+    ).toBe("deny");
+    expect(codexPermissionDecision(payload("gh pr merge 44"), "12")?.behavior).toBe(
+      "deny",
+    );
+    expect(codexPermissionDecision(payload("npm test"), "12")).toBeUndefined();
+    expect(
+      codexPermissionDecision(payload("env git push origin main", "PreToolUse"), "12")
+        ?.behavior,
+    ).toBe("deny");
+    expect(
+      codexPermissionDecision(
+        payload("git push origin agent/task-12", "PreToolUse"),
+        "12",
+      )?.behavior,
+    ).toBe("allow");
+  });
+});
+
+describe("Codex profile generation", () => {
+  it("preserves Codex-managed trust state while replacing generated settings", async () => {
+    const { _mergeCodexProfileForTest } = await import(
+      "../src/daemon/genconfig.js"
+    );
+    const generated = [
+      'approval_policy = "on-request"',
+      "[features]",
+      "hooks = true",
+      "[mcp_servers.cc]",
+      'command = "/new/node"',
+    ].join("\n");
+    const existing = [
+      'approval_policy = "never"',
+      "[features]",
+      "hooks = false",
+      "[mcp_servers.cc]",
+      'command = "/old/node"',
+      '[projects."/tmp/repo"]',
+      'trust_level = "trusted"',
+      "[hooks.state]",
+      '[hooks.state."hook-key"]',
+      'trusted_hash = "sha256:abc"',
+      "[tui.model_availability_nux]",
+      '"gpt-example" = 1',
+    ].join("\n");
+
+    const merged = _mergeCodexProfileForTest(generated, existing);
+    expect(merged).toContain('command = "/new/node"');
+    expect(merged).not.toContain('command = "/old/node"');
+    expect(merged).toContain('[projects."/tmp/repo"]');
+    expect(merged).toContain('trusted_hash = "sha256:abc"');
+    expect(merged).toContain('[tui.model_availability_nux]');
   });
 });

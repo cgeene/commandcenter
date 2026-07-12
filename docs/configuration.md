@@ -24,7 +24,7 @@ commandcenter has two kinds of configuration:
 | `CC_WORKER_PROVIDER` | `claude` | Default provider for newly created tasks and crons (`claude` or `codex`). |
 | `CC_TMUX_SESSION` | `cc` | tmux session name that hosts agent windows. |
 | `CC_MAIN_MODEL` | `opus` | Default model for `agp main`. |
-| `CC_REVIEWER_MODEL` | `opus` | Default Claude reviewer model, intentionally independent from the worker model. |
+| `CC_REVIEWER_MODEL` | unset | Claude reviewer override; otherwise preserve a Claude task model or use `opus` when reviewing Codex-worker output. |
 | `CC_NTFY_URL` | unset | ntfy topic URL (e.g. `https://ntfy.sh/<topic>`). Unset disables push notifications. |
 | `CC_NTFY_TOKEN` | unset | ntfy auth token for a self-hosted or access-protected topic. |
 | `CC_CLAUDE_PROJECTS` | `~/.claude/projects` | Where Claude Code stores session transcripts — read for token accounting and `--resume`. |
@@ -37,6 +37,8 @@ commandcenter has two kinds of configuration:
 - `settings/` — generated per-agent `--settings` JSON (never your `~/.claude/settings.json`)
 - `mcp/` — generated per-agent `--mcp-config` JSON
 - `codex/` — isolated Codex profile, hooks, login/trust state, and sessions
+- `codex/rules/commandcenter.rules` — push/merge policy that routes pushes
+  through branch validation and keeps merges human-only
 
 Run `agp codex setup` after building, complete the printed isolated `codex
 login`, inspect and trust the static hooks with `/hooks`, then run `agp codex

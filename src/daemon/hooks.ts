@@ -13,15 +13,20 @@ import { resumeAgent } from "./resume.js";
 import { maybeAutoReview } from "./review.js";
 import { killAgent } from "./spawn.js";
 import { detectTransientApiError } from "./stall.js";
-import { sessionTokens } from "./transcript.js";
+import { providerSessionTokens } from "./transcript.js";
 import { capturePane, windowExists } from "./tmux.js";
+import { codexPermissionDecision } from "../codex-policy.js";
 
 export interface HookPayload {
   hook_event_name?: string;
   session_id?: string;
   transcript_path?: string | null;
   tool_name?: string;
-  tool_input?: { description?: string | null; [key: string]: unknown };
+  tool_input?: {
+    command?: string;
+    description?: string | null;
+    [key: string]: unknown;
+  };
   message?: string;
   [key: string]: unknown;
 }
@@ -63,7 +68,6 @@ interface StallCheck {
  */
 async function tryAutoNudge(agent: Agent): Promise<StallCheck> {
   if (
-    agent.provider !== "claude" ||
     agent.kind === "main" ||
     !agent.tmux_target ||
     !windowExists(agent.tmux_target)
@@ -101,10 +105,9 @@ function getEscalateMinutes(): number {
 }
 
 /**
- * Claude Code hook events are the platform's source of truth for agent state:
- * SessionStart registers the session, Notification means the agent is waiting
- * on a human, Stop means the turn ended — for a worker with an in-progress
- * task, that's the "I think I'm done" signal that triggers verification.
+ * Provider lifecycle hooks are the platform's source of truth for agent state:
+ * SessionStart registers the session, Notification/PermissionRequest means the
+ * agent is waiting on input, and Stop triggers worker verification.
  */
 export async function handleHookEvent(
   agentId: number,
@@ -127,7 +130,9 @@ export async function handleHookEvent(
 
   switch (event) {
     case "SessionStart":
-      if (agent.state === "spawning") updateAgent(agentId, { state: "working" });
+      if (agent.state === "spawning" || agent.state === "stalled") {
+        updateAgent(agentId, { state: "working" });
+      }
       // Worker sessions only — a reviewer shares the task_id, and recording
       // its session here would make the next respawn `--resume` the
       // adversarial reviewer's conversation instead of the worker's.
@@ -141,6 +146,31 @@ export async function handleHookEvent(
 
     case "Notification":
     case "PermissionRequest": {
+      const policyDecision =
+        event === "PermissionRequest" && agent.provider === "codex"
+          ? codexPermissionDecision(
+              body,
+              agent.task_id ? String(agent.task_id) : undefined,
+            )
+          : undefined;
+      if (policyDecision) {
+        logEvent(
+          policyDecision.behavior === "allow"
+            ? "permission.auto_approved"
+            : "permission.denied",
+          {
+            agentId,
+            taskId: agent.task_id ?? undefined,
+            payload: {
+              reason:
+                policyDecision.behavior === "allow"
+                  ? "own task branch push"
+                  : "forbidden git operation",
+            },
+          },
+        );
+        break;
+      }
       const msg =
         body.message ??
         body.tool_input?.description ??
@@ -174,6 +204,13 @@ export async function handleHookEvent(
         ? `${msg}\n\n(auto-recovery gave up after ${MAX_AUTO_NUDGES} attempts — last seen: ${stallError})`
         : msg;
 
+      // A Codex PermissionRequest hook runs before Codex paints its approval
+      // prompt. The HTTP hook endpoint has already responded, so a short delay
+      // lets the TUI render before the main agent is told to peek at it.
+      if (agent.provider === "codex" && event === "PermissionRequest") {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+
       // First try the main agent. Only a main that is working/idle — text
       // injected into a main sitting on its own permission menu would be
       // interpreted as an answer to that menu.
@@ -188,7 +225,7 @@ export async function handleHookEvent(
         main &&
         (await resumeAgent(
           main.id,
-          `[commandcenter] ${agent.kind} ${who} is waiting for input: "${fullMsg}". peek_worker(${agentId}) to see exactly what it's asking, then try to unblock it yourself via send_to_worker (for a numbered menu send just the digit). Escalate to the human ONLY if it genuinely needs them: credentials, a judgment call that's theirs, or approval for something destructive/outside the worktree. If unresolved after ${getEscalateMinutes()}m the human is paged automatically.`,
+          `[commandcenter] ${agent.kind} ${who} is waiting for input: "${fullMsg}". peek_worker(${agentId}) to see exactly what it's asking, then try to unblock it yourself via send_to_worker (for a menu send exactly the option key shown). Escalate to the human ONLY if it genuinely needs them: credentials, a judgment call that's theirs, or approval for something destructive/outside the worktree. If unresolved after ${getEscalateMinutes()}m the human is paged automatically.`,
         )) === "sent";
       if (delegated) {
         logEvent("waiting.delegated", {
@@ -225,11 +262,11 @@ export async function handleHookEvent(
  *  sessions only — a reviewer shares the task_id and would clobber the
  *  worker's numbers with its own session total. */
 function recordTokens(agent: Agent, sessionId?: string): void {
-  if (agent.provider !== "claude" || agent.kind !== "worker" || !agent.task_id) return;
+  if (agent.kind !== "worker" || !agent.task_id) return;
   const sid = sessionId ?? agent.session_id;
   if (!sid) return;
   try {
-    const t = sessionTokens(sid);
+    const t = providerSessionTokens(agent.provider, sid, agent.transcript_path);
     if (t?.total) updateTask(agent.task_id, { tokens_used: t.total });
   } catch {
     /* transcript unreadable — not worth failing a hook over */
@@ -276,7 +313,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
 
   // A Stop with no result_summary is a worker giving up mid-turn — exactly
   // the empty-prompt stall this module exists to tell apart from a
-  // transient Anthropic-side error. Check BEFORE running verify_cmd (if any)
+  // transient provider-side error. Check BEFORE running verify_cmd (if any)
   // at all: a trivial verify_cmd can pass on an untouched worktree and
   // falsely mark a stalled turn "done", and a failing one would otherwise
   // burn the separate MAX_VERIFY_NUDGES budget re-sending the wrong message.

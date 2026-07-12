@@ -53,19 +53,20 @@ describe("GET /api/agents/:id/pane", () => {
     expect(res.status).toBe(409);
   });
 
-  it("returns the parsed pane for a live agent", async () => {
+  it("returns the parsed pane for a live Codex agent", async () => {
     paneContent = [
-      "⏺ Anything else before I merge?",
+      "• Anything else before I finish?",
       "",
-      `╭${"─".repeat(40)}╮`,
-      "│ ❯ please double check first                │",
-      `╰${"─".repeat(40)}╯`,
+      "› please double check first",
+      "",
+      "  gpt-5.6-sol default · /tmp/worktree",
     ].join("\n");
 
     const { buildApp } = await import("../src/daemon/api.js");
     const { createAgent } = await import("../src/db/agents.js");
     const agent = createAgent({
       kind: "worker",
+      provider: "codex",
       state: "waiting_input",
       tmux_target: "cc:@5",
     });
@@ -79,7 +80,7 @@ describe("GET /api/agents/:id/pane", () => {
       unsubmitted_input: string | null;
     };
     expect(body.target).toBe("cc:@5");
-    expect(body.pending_question).toBe("Anything else before I merge?");
+    expect(body.pending_question).toBe("Anything else before I finish?");
     expect(body.unsubmitted_input).toBe("please double check first");
   });
 });

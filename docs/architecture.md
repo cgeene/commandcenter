@@ -42,9 +42,14 @@ pointing at `cc-mcp` with a `CC_ROLE` env var. The toolset is scoped by role
 
 **Hooks (lifecycle events).** Claude's generated settings forward
 `SessionStart`, `Stop`, and `Notification`. Codex's static bridge forwards
-`SessionStart`, `Stop`, and `PermissionRequest` from Command Center's isolated
-profile. Worker identity comes from process environment, keeping the hook hash
-stable for one-time trust. A daemon outage never blocks the agent.
+`SessionStart`, `Stop`, `PreToolUse`, and `PermissionRequest` from Command
+Center's isolated profile. `PreToolUse` denies publishing outside the exact
+task branch even after remembered approvals; `PermissionRequest` auto-approves
+that one canonical push. Worker identity comes from process environment,
+keeping the hook hash stable for one-time trust. A daemon outage never blocks
+the agent, while the local publishing policy remains enforced by the hook.
+The local `cc` MCP server is role-scoped and explicitly approved so a worker
+can record its result without a separate prompt for each platform tool call.
 
 ## Lifecycle of a task
 
@@ -133,9 +138,9 @@ live from tasks/agents/events on every request.
 
 ## Operational details
 
-- **Token accounting** — for Claude workers, on each `Stop` the daemon sums the session
-  transcript's per-turn usage (input + output + cache; approximate) into
-  `tasks.tokens_used`.
+- **Token accounting** — for both providers, on each `Stop` the daemon reads the
+  session transcript's usage (per-turn Claude totals or the latest cumulative
+  Codex total; approximate) into `tasks.tokens_used`.
 - **Session resume** — respawning a task uses provider-aware `claude --resume`
   or `codex resume`, so requeued / rejected work keeps its context; outstanding
   review/PR feedback rides along in the resume message.

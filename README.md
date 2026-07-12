@@ -184,13 +184,13 @@ has no auth of its own.
 ```sh
 # 1. file a task
 agp task add "Fix the flaky retry test" \
-  --repo ~/projects/foo -m sonnet -v "npm test" \
+  --repo ~/projects/foo --provider codex -v "npm test" \
   -p "tests/retry.test.ts is flaky because of a real timer. Fix it properly."
 
 agp task ls                       # queue overview
 
 # 2. spawn a worker (omit --provider to use the task/provider default)
-agp agent spawn --task 1 --provider codex
+agp agent spawn --task 1
 agp agent ls
 agp agent peek 1                  # see its terminal without attaching
 agp attach 1                      # interact; detach with Ctrl-b d
@@ -243,7 +243,9 @@ all live on the task record.
 
 A **worker** is an interactive Claude Code or Codex session for one task in a
 dedicated worktree. Codex workers use `workspace-write` plus `on-request`
-approval; Claude workers retain the existing generated permission settings.
+approval plus exec rules and a hook policy that auto-approves only their exact
+task-branch push while denying other pushes and PR merges; Claude workers retain the existing
+generated permission settings.
 When a worker moves a
 task to `review` with commits on its branch, an independent **reviewer** proofs
 it. The reviewer is a *fresh* session in its own detached worktree at the task's
@@ -268,8 +270,8 @@ Every task gets its own git worktree under `$CC_DATA_DIR/worktrees` on branch
 `agent/task-N`, cut from the repo's **origin default branch** (fetched fresh),
 not your local `HEAD` — so branches start clean by construction and your main
 checkout is never touched. Workers may push **only** their own branch and open a
-PR (`git push … agent/task-N`, `gh pr create` are pre-allowed); merges,
-force-pushes, and every other branch stay yours. Reviewers work in a throwaway
+PR (the canonical `git push … agent/task-N` is pre-approved for both providers);
+merges, force-pushes, and every other branch stay yours. Reviewers work in a throwaway
 detached worktree that's reaped with the agent.
 
 ### Platform memory
@@ -346,7 +348,7 @@ All config is either an environment variable read at call time or a value in the
 | `CC_WORKER_PROVIDER` | `claude` | Default provider for new tasks/crons |
 | `CC_TMUX_SESSION` | `cc` | tmux session name |
 | `CC_MAIN_MODEL` | `opus` | Default model for `agp main` |
-| `CC_REVIEWER_MODEL` | `opus` | Claude reviewer model, independent of worker model |
+| `CC_REVIEWER_MODEL` | unset | Claude reviewer override; otherwise preserve a Claude task model or use `opus` for a Codex-worker review |
 | `CC_NTFY_URL` | unset | ntfy topic URL for push notifications (disabled if unset) |
 | `CC_NTFY_TOKEN` | unset | ntfy auth token (self-hosted / protected topics) |
 | `CC_CLAUDE_PROJECTS` | `~/.claude/projects` | Where Claude Code transcripts live (for token accounting & resume) |
@@ -386,7 +388,7 @@ about, on your own machine.
   branch and open a PR; everything else falls to a normal permission prompt.
   Reviewers additionally deny Edit/Write/commit/push. Codex workers use an
   isolated profile with `workspace-write`, network disabled in the sandbox, and
-  `on-request` escalation; no approval or hook-trust bypass is used. The read-only allowlist is
+  `on-request` escalation plus a fail-closed push policy; no approval or hook-trust bypass is used. The read-only allowlist is
   an explicit, auditable list in [`src/daemon/permissions.ts`](src/daemon/permissions.ts).
 - **Humans hold the merge.** Nothing merges itself — not the scheduler, not the
   main agent, not an approved reviewer. Merges, force-pushes, and secrets are

@@ -455,7 +455,7 @@ if (ROLE === "main") {
     "read_worker_transcript",
     {
       description:
-        "Read a Claude agent's session transcript (simplified chat view, last `limit` entries). Codex transcripts are not parsed because their format is unstable; use peek_worker and get_task_diff for Codex.",
+        "Read an agent's session transcript (simplified chat view, last `limit` entries). Use to audit what a worker actually did versus what it claims. Provider formats are parsed defensively and unknown records are skipped.",
       inputSchema: {
         agent_id: z.number().int(),
         limit: z.number().int().min(1).max(500).optional(),
@@ -471,7 +471,7 @@ if (ROLE === "main") {
     "spawn_reviewer",
     {
       description:
-        "Spawn an independent Claude adversarial reviewer for a task in review. It gets the task prompt + diff in a fresh context (never the worker's conversation), tries to reject the work, and submits approve/reject with notes. Its model is independent of the worker model. Rejection feedback flows back automatically; 2 rejected cycles block the task for the human.",
+        "Spawn an independent Claude adversarial reviewer for a task in review. It gets the task prompt + diff in a fresh context (never the worker's conversation), tries to reject the work, and submits approve/reject with notes. Existing Claude tasks preserve their reviewer model behavior; Codex model slugs are never passed to Claude. Rejection feedback flows back automatically; 2 rejected cycles block the task for the human.",
       inputSchema: {
         task_id: z.number().int(),
         model: z.string().optional(),

@@ -154,6 +154,27 @@ describe("deriveAttention — kinds", () => {
     expect(items[0].severity).toBe("yellow");
   });
 
+  it("stale_waiting includes Codex permission waits", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { getDb } = await import("../src/db/db.js");
+    const a = createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "waiting_input",
+    });
+    logEvent("hook.permissionrequest", { agentId: a.id });
+    getDb()
+      .prepare("UPDATE events SET ts = ? WHERE kind = 'hook.permissionrequest'")
+      .run(new Date(Date.now() - 15 * 60_000).toISOString());
+
+    const items = deriveAttention({ isPrOpen: allOpen });
+    expect(items).toHaveLength(1);
+    expect(items[0].kind).toBe("stale_waiting");
+    expect(items[0].agent_id).toBe(a.id);
+  });
+
   it("an escalated wait is reported once, as escalation not stale_waiting", async () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     const { createAgent } = await import("../src/db/agents.js");

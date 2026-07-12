@@ -125,8 +125,11 @@ export function App() {
   const openTask = (id: number) => setPanel((cur) => openPanel(cur, { kind: "task", id }));
   const openTerminal = (agentId: number) =>
     setPanel((cur) => openPanel(cur, { kind: "terminal", agentId }));
-  const openTranscript = async (sessionId: string) => {
-    const r = await api<{ entries: TranscriptEntry[] }>("GET", `/api/transcript/${sessionId}`);
+  const openTranscript = async (sessionId: string, provider: "claude" | "codex") => {
+    const r = await api<{ entries: TranscriptEntry[] }>(
+      "GET",
+      `/api/transcript/${sessionId}?provider=${provider}`,
+    );
     setTranscript(r.entries);
     setPanel((cur) => openPanel(cur, { kind: "transcript", sessionId }));
   };
@@ -1092,7 +1095,7 @@ function TaskPanel({
   onClose: () => void;
   onAction: (fn: () => Promise<unknown>) => Promise<void>;
   onTerminal: (agentId: number) => void;
-  onTranscript: (sessionId: string) => Promise<void>;
+  onTranscript: (sessionId: string, provider: "claude" | "codex") => Promise<void>;
 }) {
   return (
     <div className="drawer">
@@ -1169,8 +1172,12 @@ function TaskPanel({
           {task.agent_id && (
             <button onClick={() => onTerminal(task.agent_id!)}>terminal</button>
           )}
-          {task.session_id && task.session_provider === "claude" && (
-            <button onClick={() => onTranscript(task.session_id!)}>
+          {task.session_id && (
+            <button
+              onClick={() =>
+                onTranscript(task.session_id!, task.session_provider ?? "claude")
+              }
+            >
               transcript
             </button>
           )}
@@ -1409,10 +1416,16 @@ function NewTaskForm({
             <option value="codex">Codex</option>
           </select>
           <input
+            list={provider === "codex" ? undefined : "claude-models"}
             placeholder="model (provider default)"
             value={model}
             onChange={(e) => setModel(e.target.value)}
           />
+          <datalist id="claude-models">
+            <option value="haiku" />
+            <option value="sonnet" />
+            <option value="opus" />
+          </datalist>
           <select
             value={priority}
             onChange={(e) => setPriority(Number(e.target.value))}

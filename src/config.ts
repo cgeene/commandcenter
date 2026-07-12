@@ -56,10 +56,6 @@ export function defaultWorkerProvider(): AgentProvider {
   return parseAgentProvider(process.env.CC_WORKER_PROVIDER, "claude");
 }
 
-export function reviewerModel(): string {
-  return process.env.CC_REVIEWER_MODEL ?? "opus";
-}
-
 export function tmuxSession(): string {
   return process.env.CC_TMUX_SESSION ?? "cc";
 }

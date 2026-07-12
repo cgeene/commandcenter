@@ -18,6 +18,7 @@ import { notify } from "./notify.js";
 import { spawnWorker } from "./spawn.js";
 import { listLiveWindowIds } from "./tmux.js";
 import { versionInfo } from "./version.js";
+import { WAIT_HOOK_EVENTS } from "./waiting.js";
 
 export interface SchedulerDeps {
   spawn: (taskId: number) => void;
@@ -34,6 +35,7 @@ const defaultDeps: SchedulerDeps = {
 // module state for edge-triggered behavior (reset via _resetSchedulerState)
 let lastInWindow: boolean | null = null;
 let budgetNotifiedDay: string | null = null;
+const SESSION_START_TIMEOUT_MS = 90_000;
 
 export function _resetSchedulerState(): void {
   lastInWindow = null;
@@ -190,11 +192,30 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
       continue;
     }
 
+    if (
+      agent.kind === "worker" &&
+      agent.state === "spawning" &&
+      nowMs - Date.parse(agent.spawned_at) > SESSION_START_TIMEOUT_MS
+    ) {
+      updateAgent(agent.id, { state: "stalled" });
+      logEvent("agent.session_start_missing", {
+        agentId: agent.id,
+        taskId: agent.task_id ?? undefined,
+        payload: { provider: agent.provider },
+      });
+      notify(
+        `a${agent.id} did not initialize`,
+        `${agent.provider} SessionStart was not received; inspect the terminal and provider hook setup`,
+        { priority: "high", tags: "warning" },
+      );
+      continue;
+    }
+
     // waiting_input was delegated to the main agent (hooks.ts); if nobody
     // rescued the worker within escalate_minutes, page the human — once per
-    // wait episode (a fresh Notification starts a new episode).
+    // wait episode (a fresh provider wait hook starts a new episode).
     if (agent.kind !== "main" && agent.state === "waiting_input") {
-      const waitStart = latestAgentEventTs(agent.id, ["hook.notification"]);
+      const waitStart = latestAgentEventTs(agent.id, [...WAIT_HOOK_EVENTS]);
       if (
         waitStart &&
         nowMs - Date.parse(waitStart) > cfg.escalate_minutes * 60_000

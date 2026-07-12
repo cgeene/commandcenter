@@ -46,7 +46,7 @@ task
   .option("-p, --prompt <prompt>", "task prompt (defaults to title)")
   .option("-f, --prompt-file <file>", "read prompt from a file")
   .option("-r, --repo <path>", "target repo (default: current git repo)")
-  .option("-m, --model <model>", "model for the worker (sonnet|opus|haiku|...)")
+  .option("-m, --model <model>", "provider-specific worker model slug")
   .option("--provider <provider>", "worker provider (claude|codex)")
   .option("-P, --priority <n>", "0 (highest) - 4", "2")
   .option("-b, --blocked-by <taskId>", "task that must be done first")
@@ -175,7 +175,10 @@ task
 program
   .command("review <taskId>")
   .description("spawn an independent adversarial reviewer for a task in review")
-  .option("-m, --model <model>", "Claude reviewer model (default: CC_REVIEWER_MODEL or opus)")
+  .option(
+    "-m, --model <model>",
+    "Claude reviewer model (override; otherwise CC_REVIEWER_MODEL, the Claude task model, or opus)",
+  )
   .action(async (taskId: string, opts) => {
     const { agent: a } = await api<{ agent: Agent }>(
       "POST",
@@ -588,6 +591,7 @@ codex
     const files = writeCodexConfig();
     console.log(`Codex profile written: ${files.profileFile}`);
     console.log(`Codex hooks written:   ${files.hooksFile}`);
+    console.log(`Codex rules written:   ${files.rulesFile}`);
     const escapedHome = files.home.replaceAll("'", `'\\''`);
     console.log("Authenticate this isolated Codex home once (it does not copy your normal credentials):");
     console.log(`  CODEX_HOME='${escapedHome}' ${codexBin()} login`);
@@ -615,13 +619,75 @@ codex
     const home = codexHome();
     const profileFile = `${home}/${codexProfile()}.config.toml`;
     const hooksFile = `${home}/hooks.json`;
+    const rulesFile = `${home}/rules/commandcenter.rules`;
+    const runtimeEnv = { ...process.env, CODEX_HOME: home };
     const mcpEntry = path.join(pkgRoot(), "dist", "mcp", "index.js");
     const hookEntry = path.join(pkgRoot(), "dist", "scripts", "codex-hook.js");
     checks.push(["profile", fs.existsSync(profileFile), profileFile]);
     checks.push(["hooks", fs.existsSync(hooksFile), hooksFile]);
+    checks.push(["push/merge rules", fs.existsSync(rulesFile), rulesFile]);
     checks.push(["cc MCP build", fs.existsSync(mcpEntry), mcpEntry]);
     checks.push(["hook bridge build", fs.existsSync(hookEntry), hookEntry]);
-    const runtimeEnv = { ...process.env, CODEX_HOME: home };
+    if (fs.existsSync(hookEntry)) {
+      const runHook = (hook_event_name: string, command: string) =>
+        spawnSync(process.execPath, [hookEntry], {
+          encoding: "utf8",
+          input: JSON.stringify({
+            hook_event_name,
+            tool_name: "Bash",
+            tool_input: { command },
+          }),
+          env: { ...process.env, CC_AGENT_ID: "", CC_TASK_ID: "7" },
+          timeout: 5_000,
+        });
+      const hookCheck = runHook(
+        "PermissionRequest",
+        "git push -u origin agent/task-7",
+      );
+      const preToolCheck = runHook("PreToolUse", "env git push origin main");
+      let hookValid = false;
+      try {
+        const output = JSON.parse(hookCheck.stdout) as {
+          hookSpecificOutput?: { decision?: { behavior?: string } };
+        };
+        const preToolOutput = JSON.parse(preToolCheck.stdout) as {
+          hookSpecificOutput?: { permissionDecision?: string };
+        };
+        hookValid =
+          hookCheck.status === 0 &&
+          output.hookSpecificOutput?.decision?.behavior === "allow" &&
+          preToolCheck.status === 0 &&
+          preToolOutput.hookSpecificOutput?.permissionDecision === "deny";
+      } catch {
+        hookValid = false;
+      }
+      checks.push([
+        "hook bridge self-test",
+        hookValid,
+        hookValid ? "policy and JSON contract valid" : "hook bridge output invalid",
+      ]);
+    }
+    if (fs.existsSync(rulesFile)) {
+      const pushPolicy = spawnSync(
+        codexBin(),
+        [
+          "execpolicy",
+          "check",
+          "--rules",
+          rulesFile,
+          "git",
+          "push",
+          "origin",
+          "agent/task-7",
+        ],
+        { encoding: "utf8", env: runtimeEnv },
+      );
+      checks.push([
+        "push rule parse",
+        pushPolicy.status === 0 && pushPolicy.stdout.includes('"decision":"prompt"'),
+        pushPolicy.status === 0 ? "canonical pushes require policy review" : "rules invalid",
+      ]);
+    }
     const auth = spawnSync(codexBin(), ["login", "status"], {
       encoding: "utf8",
       env: runtimeEnv,

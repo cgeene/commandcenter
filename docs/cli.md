@@ -15,7 +15,7 @@ agp <group> <command> [options]
 | `task add <title>` | Add a task. `--provider <claude\|codex>`, `-p/--prompt`, `-f/--prompt-file`, `-r/--repo` (default: current git repo), `-m/--model`, `-P/--priority <0-4>` (default 2), `-b/--blocked-by <id>`, `-v/--verify <cmd>`. |
 | `task ls` | List tasks. `-s/--status <status>`, `--ready` (only queued tasks with no open blockers). |
 | `task show <id>` | Full task detail as JSON. |
-| `task update <id>` | Update fields: `-s/--status`, `-P/--priority`, `-m/--model`, `--result <summary>`. |
+| `task update <id>` | Update fields: `-s/--status`, `-P/--priority`, `--provider <claude\|codex>`, `-m/--model`, `--result <summary>`. Provider changes are rejected while the task has a live agent. |
 | `task claim <id>` | Atomically claim a queued task. |
 | `task cancel <id>` | Close a task from any state (kills its live worker/reviewer). `--rm-worktree` also removes the worktree (uncommitted work is lost). Reports any tasks left dangling by `blocked_by`. |
 | `task diff <id>` | Show the diff on the task's branch. `--stat` for stat + commits only. |
@@ -23,8 +23,9 @@ agp <group> <command> [options]
 ## `agp review <taskId>`
 
 Spawn an independent adversarial reviewer for a task in `review`. `-m/--model`
-overrides the Claude reviewer model (defaults to `CC_REVIEWER_MODEL`, then
-`opus`, never the worker model). Watch it with
+overrides the Claude reviewer model (defaults to `CC_REVIEWER_MODEL`, then the
+task model for an existing Claude workflow, otherwise `opus`; a Codex model is
+never passed to Claude). Watch it with
 `agp agent peek <id>`.
 
 ## `agp agent` — workers
@@ -97,5 +98,7 @@ health-check it — fixes the stale-daemon warning after a source change.
 
 `agp codex setup` generates the isolated Command Center Codex profile and
 static lifecycle hooks, then prints the one-time login and `/hooks` trust steps.
-`agp codex doctor` checks the CLI, profile parse, isolated login, MCP build, and
-hook bridge build. It never bypasses hook trust or the Codex sandbox.
+`agp codex doctor` checks the CLI, profile parse, isolated login, MCP build,
+hook bridge build, and the hook policy/JSON contract. It never bypasses hook
+trust or the Codex sandbox; a missing runtime `SessionStart` is surfaced by the
+watchdog instead of being reported as a healthy worker.

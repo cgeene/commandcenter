@@ -5,6 +5,7 @@ import { getSchedulerConfig } from "../db/settings.js";
 import { listTasks } from "../db/tasks.js";
 import { MAX_REVIEW_CYCLES } from "./review.js";
 import { prStates } from "./prcache.js";
+import { WAIT_HOOK_EVENTS } from "./waiting.js";
 
 /**
  * The "Needs You" action queue: an ordered list of things only the human can
@@ -122,7 +123,7 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   const escalated = new Set<number>();
   for (const a of agents) {
     if (a.kind === "main" || a.state !== "waiting_input") continue;
-    const waitStart = latestAgentEventTs(a.id, ["hook.notification"]);
+    const waitStart = latestAgentEventTs(a.id, [...WAIT_HOOK_EVENTS]);
     const esc = latestAgentEvent(a.id, ["waiting.escalated"]);
     // only if THIS wait episode was escalated (esc newer than the wait start)
     if (!waitStart || !esc || esc.ts < waitStart) continue;
@@ -150,7 +151,7 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   for (const a of agents) {
     if (a.kind === "main" || a.state !== "waiting_input") continue;
     if (escalated.has(a.id)) continue;
-    const waitStart = latestAgentEventTs(a.id, ["hook.notification"]);
+    const waitStart = latestAgentEventTs(a.id, [...WAIT_HOOK_EVENTS]);
     if (!waitStart || nowMs - Date.parse(waitStart) < staleMs) continue;
     const task = a.task_id ? tasks.find((t) => t.id === a.task_id) : undefined;
     push({

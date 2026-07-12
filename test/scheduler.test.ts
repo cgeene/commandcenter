@@ -120,6 +120,31 @@ describe("scheduler tick", () => {
 });
 
 describe("watchdog", () => {
+  it("surfaces a worker whose SessionStart hook never arrives", async () => {
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { getDb } = await import("../src/db/db.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    const agent = createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "spawning",
+    });
+    getDb()
+      .prepare("UPDATE agents SET spawned_at = ? WHERE id = ?")
+      .run("2026-07-03T10:00:00.000Z", agent.id);
+
+    watchdog({
+      spawn: () => {},
+      windowIds: () => [],
+      now: () => new Date("2026-07-03T10:02:00.000Z"),
+    });
+    expect(getAgent(agent.id)?.state).toBe("stalled");
+    expect(listEvents(10).map((event) => event.kind)).toContain(
+      "agent.session_start_missing",
+    );
+  });
+
   it("reaps vanished windows: requeue once, fail on second vanish", async () => {
     const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
     const { createAgent, getAgent } = await import("../src/db/agents.js");

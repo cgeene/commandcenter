@@ -87,6 +87,20 @@ describe("hook events", () => {
     expect(getTask(task.id)?.session_id).toBe("sess-123");
   });
 
+  it("SessionStart is the readiness handshake for a spawning worker", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createAgent, getAgent, updateAgent } = await import("../src/db/agents.js");
+    const agent = createAgent({ kind: "worker", state: "spawning" });
+    await handleHookEvent(agent.id, {
+      hook_event_name: "SessionStart",
+      session_id: "ready-session",
+    });
+    // The spawn path may learn the tmux target after the hook arrives; that
+    // metadata update must not overwrite readiness back to spawning.
+    updateAgent(agent.id, { tmux_target: "cc:@7" });
+    expect(getAgent(agent.id)?.state).toBe("working");
+  });
+
   it("Notification marks the agent waiting_input", async () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");
     const { getAgent } = await import("../src/db/agents.js");

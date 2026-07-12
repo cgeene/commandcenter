@@ -61,6 +61,16 @@ import { parsePane } from "./pane.js";
 import { AGENT_PROVIDERS } from "../providers.js";
 
 const providerSchema = z.enum(AGENT_PROVIDERS);
+const hookPayloadSchema = z
+  .object({
+    hook_event_name: z.string().min(1).max(64).optional(),
+    session_id: z.string().min(1).max(128).optional(),
+    transcript_path: z.string().min(1).max(4096).nullable().optional(),
+    tool_name: z.string().min(1).max(256).optional(),
+    tool_input: z.record(z.string(), z.unknown()).optional(),
+    message: z.string().max(20_000).optional(),
+  })
+  .passthrough();
 
 const newTaskSchema = z.object({
   title: z.string().min(1),
@@ -131,6 +141,19 @@ export function buildApp(): Hono {
     if (!getTask(id)) return c.json({ error: "not found" }, 404);
     const body = updateTaskSchema.parse(await c.req.json());
     const before = getTask(id)!;
+    if (
+      body.worker_provider !== undefined &&
+      body.worker_provider !== before.worker_provider &&
+      before.agent_id
+    ) {
+      const active = getAgent(before.agent_id);
+      if (active && active.state !== "dead") {
+        return c.json(
+          { error: "worker provider cannot change while the task has a live agent" },
+          409,
+        );
+      }
+    }
     // body.open_pr is a boolean (or absent); only present when the caller
     // sent it, so an explicit `undefined` never gets bound as a SQL param
     // (that binds NULL against a NOT NULL column — see the crons.enabled bug).
@@ -245,17 +268,7 @@ export function buildApp(): Hono {
     }
     const lines = Number(c.req.query("lines") ?? 60);
     const raw = capturePane(agent.tmux_target, lines);
-    return c.json(
-      agent.provider === "claude"
-        ? { target: agent.tmux_target, ...parsePane(raw) }
-        : {
-            target: agent.tmux_target,
-            pending_permission: null,
-            pending_question: null,
-            unsubmitted_input: null,
-            raw,
-          },
-    );
+    return c.json({ target: agent.tmux_target, ...parsePane(raw, agent.provider) });
   });
 
   app.post("/api/agents/:id/send", async (c) => {
@@ -302,20 +315,24 @@ export function buildApp(): Hono {
     if (!agent.session_id) {
       return c.json({ error: "agent has no recorded session yet" }, 409);
     }
-    if (agent.provider !== "claude") {
-      return c.json(
-        {
-          error:
-            "structured transcript viewing is unavailable for Codex; use the terminal or resume command",
-        },
-        409,
-      );
-    }
     const limit = Number(c.req.query("limit") ?? 200);
-    const { readTranscript } = await import("./transcript.js");
-    const entries = readTranscript(agent.session_id, limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+      return c.json({ error: "limit must be an integer from 1 to 500" }, 400);
+    }
+    const { readProviderTranscript } = await import("./transcript.js");
+    const entries = readProviderTranscript(
+      agent.provider,
+      agent.session_id,
+      agent.transcript_path,
+      limit,
+    );
     if (!entries) return c.json({ error: "transcript not found" }, 404);
-    return c.json({ agent_id: agent.id, session_id: agent.session_id, entries });
+    return c.json({
+      agent_id: agent.id,
+      provider: agent.provider,
+      session_id: agent.session_id,
+      entries,
+    });
   });
 
   app.get("/api/agents/:id/session", (c) => {
@@ -383,12 +400,13 @@ export function buildApp(): Hono {
     return c.json({ ok: true });
   });
 
-  // Claude Code hooks POST their stdin JSON here (see genconfig.ts).
+  // Provider lifecycle hooks POST their stdin JSON here (see genconfig.ts).
   // Respond immediately — verification can take minutes and the hook's curl
   // has a 5s timeout; the transition runs in the background.
   app.post("/api/hooks/agent/:id", async (c) => {
     const id = Number(c.req.param("id"));
-    const body = (await c.req.json().catch(() => ({}))) as HookPayload;
+    if (!Number.isInteger(id) || id < 1) return c.json({ error: "invalid agent id" }, 400);
+    const body = hookPayloadSchema.parse(await c.req.json().catch(() => ({}))) as HookPayload;
     void handleHookEvent(id, body).catch((err) =>
       logEvent("hook.error", { agentId: id, payload: { error: String(err) } }),
     );
@@ -661,10 +679,12 @@ export function buildApp(): Hono {
     if (!/^[0-9a-f-]{8,64}$/i.test(sessionId)) {
       return c.json({ error: "invalid session id" }, 400);
     }
-    const { readTranscript } = await import("./transcript.js");
-    const entries = readTranscript(sessionId);
+    const providerResult = providerSchema.safeParse(c.req.query("provider") ?? "claude");
+    if (!providerResult.success) return c.json({ error: "invalid provider" }, 400);
+    const { readProviderTranscript } = await import("./transcript.js");
+    const entries = readProviderTranscript(providerResult.data, sessionId);
     if (!entries) return c.json({ error: "transcript not found" }, 404);
-    return c.json({ session_id: sessionId, entries });
+    return c.json({ provider: providerResult.data, session_id: sessionId, entries });
   });
 
   app.onError((err, c) => {
