@@ -14,9 +14,14 @@ export interface ProviderModel {
 }
 
 const CLAUDE_MODELS: ProviderModel[] = [
-  { slug: "haiku", display_name: "Haiku", description: "Fast, lightweight work" },
-  { slug: "sonnet", display_name: "Sonnet", description: "Balanced implementation work" },
+  {
+    slug: "fable",
+    display_name: "Fable 5",
+    description: "Most capable; long-running orchestration and complex work",
+  },
   { slug: "opus", display_name: "Opus", description: "Complex design and review work" },
+  { slug: "sonnet", display_name: "Sonnet", description: "Balanced implementation work" },
+  { slug: "haiku", display_name: "Haiku", description: "Fast, lightweight work" },
 ];
 
 let codexCache: { expires: number; models: ProviderModel[] } | undefined;

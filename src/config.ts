@@ -56,6 +56,11 @@ export function defaultWorkerProvider(): AgentProvider {
   return parseAgentProvider(process.env.CC_WORKER_PROVIDER, "claude");
 }
 
+/** Claude model used by the orchestrator unless a spawn explicitly overrides it. */
+export function defaultMainModel(): string {
+  return process.env.CC_MAIN_MODEL?.trim() || "fable";
+}
+
 export function tmuxSession(): string {
   return process.env.CC_TMUX_SESSION ?? "cc";
 }

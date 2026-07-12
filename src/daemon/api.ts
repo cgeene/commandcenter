@@ -8,6 +8,7 @@ import {
   codexHome,
   codexProfile,
   dataDir,
+  defaultMainModel,
   defaultWorkerProvider,
 } from "../config.js";
 import { TASK_STATUSES, type TaskStatus } from "../db/db.js";
@@ -62,6 +63,12 @@ import { AGENT_PROVIDERS } from "../providers.js";
 import { providerModels } from "./provider-models.js";
 
 const providerSchema = z.enum(AGENT_PROVIDERS);
+const modelIdentifierSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(512)
+  .regex(/^[a-z0-9._:/@-]+$/i, "invalid model identifier");
 const hookPayloadSchema = z
   .object({
     hook_event_name: z.string().min(1).max(64).optional(),
@@ -112,7 +119,11 @@ export function buildApp(): Hono {
   app.get("/healthz", (c) => c.json({ ok: true }));
 
   app.get("/api/providers", (c) =>
-    c.json({ default_worker_provider: defaultWorkerProvider() }),
+    c.json({
+      default_worker_provider: defaultWorkerProvider(),
+      main_provider: "claude" as const,
+      default_main_model: defaultMainModel(),
+    }),
   );
 
   app.get("/api/providers/:provider/models", async (c) => {
@@ -391,7 +402,9 @@ export function buildApp(): Hono {
   });
 
   app.post("/api/main", async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { model?: string };
+    const body = z
+      .object({ model: modelIdentifierSchema.optional() })
+      .parse(await c.req.json().catch(() => ({})));
     return c.json(spawnMain(body.model), 201);
   });
 

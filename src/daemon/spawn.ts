@@ -7,6 +7,7 @@ import {
   codexBin,
   codexHome,
   codexProfile,
+  defaultMainModel,
   promptsDir,
 } from "../config.js";
 import {
@@ -465,7 +466,7 @@ export function spawnMain(model?: string): Agent {
     );
   }
 
-  const resolvedModel = model ?? process.env.CC_MAIN_MODEL ?? "opus";
+  const resolvedModel = model ?? defaultMainModel();
   const agent = createAgent({
     kind: "main",
     provider: "claude",

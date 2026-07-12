@@ -10,6 +10,12 @@ export type TaskStatus =
 
 export type AgentProvider = "claude" | "codex";
 
+export interface ProviderModel {
+  slug: string;
+  display_name: string;
+  description: string;
+}
+
 export interface Task {
   id: number;
   title: string;

@@ -17,6 +17,7 @@ import type {
   Event,
   Memory,
   ParsedPane,
+  ProviderModel,
   SchedulerInfo,
   Task,
   TranscriptEntry,
@@ -259,9 +260,11 @@ export function App() {
           </button>
         )}
         {!liveMain && (
-          <button onClick={() => act(() => api("POST", "/api/main", {}))}>
-            ▶ spawn main agent
-          </button>
+          <MainAgentSpawn
+            onSpawn={(model) =>
+              act(() => api("POST", "/api/main", model ? { model } : {}))
+            }
+          />
         )}
         <button onClick={() => setShowCrons(true)}>crons</button>
         <button onClick={() => setShowMemory(true)}>memory</button>
@@ -1081,6 +1084,79 @@ function TokensView({
         </p>
       </div>
     </main>
+  );
+}
+
+function MainAgentSpawn({
+  onSpawn,
+}: {
+  onSpawn: (model?: string) => Promise<void>;
+}) {
+  const [models, setModels] = useState<ProviderModel[]>([]);
+  const [defaultModel, setDefaultModel] = useState<string | null>(null);
+  const [modelChoice, setModelChoice] = useState("");
+  const [customModel, setCustomModel] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    void api<{ default_main_model?: string }>("GET", "/api/providers")
+      .then((metadata) => {
+        if (!cancelled && metadata.default_main_model) {
+          setDefaultModel(metadata.default_main_model);
+        }
+      })
+      .catch(() => {});
+    void api<{ models: ProviderModel[] }>("GET", "/api/providers/claude/models")
+      .then((catalog) => {
+        if (!cancelled) setModels(catalog.models);
+      })
+      .catch(() => {
+        // The configured default and custom escape hatch still work without a catalog.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const selectedModel =
+    modelChoice === "__custom__" ? customModel.trim() : modelChoice;
+
+  return (
+    <div className="main-spawn">
+      <select
+        aria-label="main agent model"
+        value={modelChoice}
+        onChange={(e) => {
+          setModelChoice(e.target.value);
+          if (e.target.value !== "__custom__") setCustomModel("");
+        }}
+      >
+        <option value="">
+          Claude {defaultModel ? `${defaultModel} (default)` : "configured default"}
+        </option>
+        {models.filter((model) => model.slug !== defaultModel).map((model) => (
+          <option key={model.slug} value={model.slug}>
+            {model.display_name}
+            {model.description ? ` — ${model.description}` : ""}
+          </option>
+        ))}
+        <option value="__custom__">custom Claude model…</option>
+      </select>
+      {modelChoice === "__custom__" && (
+        <input
+          aria-label="custom main agent model"
+          placeholder="Claude model slug"
+          value={customModel}
+          onChange={(e) => setCustomModel(e.target.value)}
+        />
+      )}
+      <button
+        disabled={modelChoice === "__custom__" && !selectedModel}
+        onClick={() => onSpawn(selectedModel || undefined)}
+      >
+        ▶ spawn main agent
+      </button>
+    </div>
   );
 }
 

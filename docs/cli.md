@@ -46,7 +46,7 @@ Attach to an agent's tmux window interactively (detach with `Ctrl-b d`). Uses
 
 ## `agp main`
 
-Spawn the orchestrator main agent. `-m/--model` (default `opus`, or
+Spawn the Claude orchestrator main agent. `-m/--model` (default `fable`, or
 `CC_MAIN_MODEL`). One live main agent at a time.
 
 ## `agp scheduler` — autonomous control

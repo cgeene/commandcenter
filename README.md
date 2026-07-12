@@ -159,9 +159,9 @@ agp codex doctor
 
 Existing all-Claude installations remain fully supported and require no Codex
 configuration. `claude` is still the default worker provider, the main
-orchestrator is Claude, and independent reviewers are Claude. Existing tasks,
-crons, database rows, and legacy Claude sessions continue to behave as Claude
-work without migration-time user action.
+orchestrator is Claude Fable 5 by default, and independent reviewers are Claude.
+Existing tasks, crons, database rows, and legacy Claude sessions continue to
+behave as Claude work without migration-time user action.
 
 Command Center now supports three operating patterns:
 
@@ -175,6 +175,13 @@ In the dashboard, selecting Codex loads the visible model catalog from the
 installed, authenticated Codex CLI and presents it as a dropdown. The provider
 default remains the first choice, and `custom model…` accepts a newer, private,
 or otherwise unlisted model slug. Hidden internal models are not shown.
+
+The dashboard has a separate Claude model selector beside **spawn main agent**.
+Its configured default is Fable 5 (`fable`), which is suited to long-running
+orchestration and delegation; `CC_MAIN_MODEL` or `agp main --model` can override
+it. Fable is a Claude model, so it is intentionally absent from Codex worker
+model choices. Anthropic currently requires 30-day data retention for Fable;
+see [Anthropic's Fable documentation](https://www.anthropic.com/claude/fable).
 
 Provider and model are stored on each task. Model names are provider-specific,
 so a Codex model slug is never passed to Claude and a Claude model name is never
@@ -385,7 +392,7 @@ All config is either an environment variable read at call time or a value in the
 | `CC_CODEX_PROFILE` | `commandcenter` | Generated Codex profile name |
 | `CC_WORKER_PROVIDER` | `claude` | Default provider for new tasks/crons |
 | `CC_TMUX_SESSION` | `cc` | tmux session name |
-| `CC_MAIN_MODEL` | `opus` | Default model for `agp main` |
+| `CC_MAIN_MODEL` | `fable` | Default Claude model for the main orchestrator (`agp main`) |
 | `CC_REVIEWER_MODEL` | unset | Claude reviewer override; otherwise preserve a Claude task model or use `opus` for a Codex-worker review |
 | `CC_NTFY_URL` | unset | ntfy topic URL for push notifications (disabled if unset) |
 | `CC_NTFY_TOKEN` | unset | ntfy auth token (self-hosted / protected topics) |

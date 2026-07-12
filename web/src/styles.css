@@ -35,6 +35,13 @@ header h1 { font-size: 16px; font-weight: 600; }
 .spacer { flex: 1; }
 .muted { color: var(--muted); font-size: 12px; }
 
+.main-spawn { display: flex; align-items: center; gap: 6px; }
+.main-spawn select, .main-spawn input {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 7px; font-size: 12px; max-width: 260px;
+}
+.main-spawn input { width: 150px; }
+
 button {
   background: #21262d; color: var(--fg); border: 1px solid var(--border);
   border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer;

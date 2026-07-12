@@ -42,26 +42,56 @@ describe("parseCodexModelCatalog", () => {
 describe("provider model API", () => {
   it("reports the configured default and the built-in Claude choices", async () => {
     const previous = process.env.CC_WORKER_PROVIDER;
+    const previousMain = process.env.CC_MAIN_MODEL;
     process.env.CC_WORKER_PROVIDER = "codex";
+    delete process.env.CC_MAIN_MODEL;
     try {
       const { buildApp } = await import("../src/daemon/api.js");
       const app = buildApp();
       const providers = await app.request("/api/providers");
-      expect(await providers.json()).toEqual({ default_worker_provider: "codex" });
+      expect(await providers.json()).toEqual({
+        default_worker_provider: "codex",
+        main_provider: "claude",
+        default_main_model: "fable",
+      });
 
       const models = await app.request("/api/providers/claude/models");
       expect(await models.json()).toMatchObject({
         provider: "claude",
         models: [
-          { slug: "haiku" },
-          { slug: "sonnet" },
+          { slug: "fable" },
           { slug: "opus" },
+          { slug: "sonnet" },
+          { slug: "haiku" },
         ],
       });
       expect((await app.request("/api/providers/other/models")).status).toBe(400);
+      expect(
+        (
+          await app.request("/api/main", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ model: "invalid model" }),
+          })
+        ).status,
+      ).toBe(400);
     } finally {
       if (previous === undefined) delete process.env.CC_WORKER_PROVIDER;
       else process.env.CC_WORKER_PROVIDER = previous;
+      if (previousMain === undefined) delete process.env.CC_MAIN_MODEL;
+      else process.env.CC_MAIN_MODEL = previousMain;
+    }
+  });
+
+  it("honors an explicit main-agent model override", async () => {
+    const previous = process.env.CC_MAIN_MODEL;
+    process.env.CC_MAIN_MODEL = "opus";
+    try {
+      const { defaultMainModel } = await import("../src/config.js");
+      expect(defaultMainModel()).toBe("opus");
+    } finally {
+      if (previous === undefined) delete process.env.CC_MAIN_MODEL;
+      else process.env.CC_MAIN_MODEL = previous;
     }
   });
 });
