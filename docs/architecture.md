@@ -1,7 +1,7 @@
 # Architecture
 
-commandcenter is one long-running daemon plus a set of short-lived Claude Code
-sessions it spawns into tmux. State lives in a single SQLite file; agents talk
+commandcenter is one long-running daemon plus Claude Code and Codex sessions it
+spawns into tmux. State lives in a single SQLite file; agents talk
 back through MCP tools (for state changes) and hooks (for lifecycle events). This
 document walks the pieces and the lifecycle of a task.
 
@@ -12,7 +12,7 @@ document walks the pieces and the lifecycle of a task.
 | **`agentd`** (daemon) | `src/daemon/index.ts` → `dist/daemon/index.js` | Owns the queue, REST API + WebSocket on `127.0.0.1:$CC_PORT`, tmux/worktree lifecycle, scheduler, watchdog, PR sync, and serves the dashboard. |
 | **`agp`** (CLI) | `src/cli/index.ts` | Thin REST client for the daemon. |
 | **`cc-mcp`** (MCP server) | `src/mcp/index.ts` | stdio MCP server launched per agent via a generated `--mcp-config`; its toolset is scoped by `CC_ROLE`. |
-| **Agents** | `claude` sessions in tmux windows | Workers, reviewers, and the main orchestrator. |
+| **Agents** | `claude` or `codex` sessions in tmux windows | Workers may use either provider; reviewers and the main orchestrator remain Claude. |
 
 ## Storage
 
@@ -40,11 +40,11 @@ pointing at `cc-mcp` with a `CC_ROLE` env var. The toolset is scoped by role
   `list_agents`, `peek_worker`, `send_to_worker`, `kill_worker`, `get_task_diff`,
   `read_worker_transcript`, `escalate`, `recent_events`, `forget`.
 
-**Hooks (lifecycle events).** Each agent's generated `--settings` wires
-`SessionStart`, `Stop`, and `Notification` hooks to a `curl` that POSTs the
-hook's JSON to `/api/hooks/agent/<id>`. The hook always exits 0, so a daemon
-outage can never block an agent's own work. Hooks are the daemon's signal that an
-agent started, went idle, needs input, or stopped.
+**Hooks (lifecycle events).** Claude's generated settings forward
+`SessionStart`, `Stop`, and `Notification`. Codex's static bridge forwards
+`SessionStart`, `Stop`, and `PermissionRequest` from Command Center's isolated
+profile. Worker identity comes from process environment, keeping the hook hash
+stable for one-time trust. A daemon outage never blocks the agent.
 
 ## Lifecycle of a task
 
@@ -82,10 +82,10 @@ agent started, went idle, needs input, or stopped.
    can never take the same task.
 2. **Spawn** — `src/daemon/spawn.ts` cuts branch `agent/task-N` and a worktree
    from the repo's **origin default branch** (fetched fresh, not local `HEAD`),
-   writes the generated settings + mcp config, opens a tmux window, and launches
-   `claude --permission-mode acceptEdits`. The top relevant memories are injected
-   into the prompt. If a previous transcript exists, it resumes with `--resume`
-   (override with `--fresh`).
+   writes provider runtime config, opens a tmux window, and launches Claude or
+   Codex. Codex uses `workspace-write`, `on-request` approval, and no sandbox
+   network unless an escalation is approved. A session resumes only through the
+   provider that created it (override with `--fresh`).
 3. **Work** — the worker uses its MCP tools and does the work in the worktree.
 4. **Verify** — on the `Stop` hook the daemon runs the task's `verify_cmd` in the
    worktree. Pass → `review`. Fail → the failure output is fed back into the
@@ -133,16 +133,17 @@ live from tasks/agents/events on every request.
 
 ## Operational details
 
-- **Token accounting** — on each worker `Stop` the daemon sums the session
+- **Token accounting** — for Claude workers, on each `Stop` the daemon sums the session
   transcript's per-turn usage (input + output + cache; approximate) into
   `tasks.tokens_used`.
-- **Session resume** — respawning a task with an existing transcript uses
-  `claude --resume`, so requeued / rejected work keeps its context; outstanding
+- **Session resume** — respawning a task uses provider-aware `claude --resume`
+  or `codex resume`, so requeued / rejected work keeps its context; outstanding
   review/PR feedback rides along in the resume message.
 - **Stale-daemon detection** — the daemon snapshots `dist/`'s newest mtime at
   boot; if a rebuild lands while it runs, it warns (dashboard banner +
   `GET /api/version` `stale: true`). `agp upgrade` rebuilds and respawns it.
-- **Watchdog** — every 60s: a worker whose tmux window vanished is reaped (task
+- **Watchdog** — every 60s: a worker whose tmux window vanished or whose retained
+  pane process exited is reaped (task
   requeued once, failed on the second vanish); a worker silent past
   `stall_minutes` is flagged and pushed.
 - **Push notifications** — set `CC_NTFY_URL` (and optionally `CC_NTFY_TOKEN`) to

@@ -19,6 +19,9 @@ import { capturePane, windowExists } from "./tmux.js";
 export interface HookPayload {
   hook_event_name?: string;
   session_id?: string;
+  transcript_path?: string | null;
+  tool_name?: string;
+  tool_input?: { description?: string | null; [key: string]: unknown };
   message?: string;
   [key: string]: unknown;
 }
@@ -59,7 +62,12 @@ interface StallCheck {
  * fold into that notification's text.
  */
 async function tryAutoNudge(agent: Agent): Promise<StallCheck> {
-  if (agent.kind === "main" || !agent.tmux_target || !windowExists(agent.tmux_target)) {
+  if (
+    agent.provider !== "claude" ||
+    agent.kind === "main" ||
+    !agent.tmux_target ||
+    !windowExists(agent.tmux_target)
+  ) {
     return { nudged: false, error: null };
   }
 
@@ -109,6 +117,7 @@ export async function handleHookEvent(
   updateAgent(agentId, {
     last_event_at: now(),
     ...(body.session_id ? { session_id: body.session_id } : {}),
+    ...(body.transcript_path ? { transcript_path: body.transcript_path } : {}),
   });
   logEvent(`hook.${event.toLowerCase()}`, {
     agentId,
@@ -123,12 +132,21 @@ export async function handleHookEvent(
       // its session here would make the next respawn `--resume` the
       // adversarial reviewer's conversation instead of the worker's.
       if (agent.kind === "worker" && agent.task_id && body.session_id) {
-        updateTask(agent.task_id, { session_id: body.session_id });
+        updateTask(agent.task_id, {
+          session_id: body.session_id,
+          session_provider: agent.provider,
+        });
       }
       break;
 
-    case "Notification": {
-      const msg = body.message ?? "waiting for input";
+    case "Notification":
+    case "PermissionRequest": {
+      const msg =
+        body.message ??
+        body.tool_input?.description ??
+        (body.tool_name
+          ? `approval requested for ${body.tool_name}`
+          : "waiting for input");
       const who = `a${agentId}${agent.task_id ? ` (task #${agent.task_id})` : ""}`;
 
       // The main agent asking for input IS the escalation — page the human.
@@ -207,7 +225,7 @@ export async function handleHookEvent(
  *  sessions only — a reviewer shares the task_id and would clobber the
  *  worker's numbers with its own session total. */
 function recordTokens(agent: Agent, sessionId?: string): void {
-  if (agent.kind !== "worker" || !agent.task_id) return;
+  if (agent.provider !== "claude" || agent.kind !== "worker" || !agent.task_id) return;
   const sid = sessionId ?? agent.session_id;
   if (!sid) return;
   try {
@@ -396,4 +414,3 @@ function runVerify(
     );
   });
 }
-

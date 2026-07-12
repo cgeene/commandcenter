@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseAgentProvider, type AgentProvider } from "./providers.js";
 
 // Resolved at call time (not import time) so tests can point CC_DATA_DIR
 // at a temp dir before touching the DB.
@@ -36,6 +37,27 @@ export function baseUrl(): string {
 
 export function claudeBin(): string {
   return process.env.CC_CLAUDE_BIN ?? "claude";
+}
+
+export function codexBin(): string {
+  return process.env.CC_CODEX_BIN ?? "codex";
+}
+
+/** Command Center owns this Codex config root and never rewrites ~/.codex. */
+export function codexHome(): string {
+  return process.env.CC_CODEX_HOME ?? path.join(dataDir(), "codex");
+}
+
+export function codexProfile(): string {
+  return process.env.CC_CODEX_PROFILE ?? "commandcenter";
+}
+
+export function defaultWorkerProvider(): AgentProvider {
+  return parseAgentProvider(process.env.CC_WORKER_PROVIDER, "claude");
+}
+
+export function reviewerModel(): string {
+  return process.env.CC_REVIEWER_MODEL ?? "opus";
 }
 
 export function tmuxSession(): string {

@@ -1,5 +1,6 @@
 import { Cron as CronExpr } from "croner";
 import { getDb } from "./db.js";
+import { parseAgentProvider, type AgentProvider } from "../providers.js";
 
 export interface CronJob {
   id: number;
@@ -8,6 +9,7 @@ export interface CronJob {
   title: string;
   prompt: string;
   repo: string;
+  worker_provider: AgentProvider;
   model: string | null;
   priority: number;
   verify_cmd: string | null;
@@ -30,6 +32,7 @@ export function createCron(c: {
   prompt: string;
   repo: string;
   title?: string;
+  worker_provider?: AgentProvider;
   model?: string;
   priority?: number;
   verify_cmd?: string;
@@ -38,8 +41,8 @@ export function createCron(c: {
   const next = nextRun(c.schedule, new Date()); // validates too
   const info = getDb()
     .prepare(
-      `INSERT INTO crons (name, schedule, title, prompt, repo, model, priority, verify_cmd, enabled, next_run_at)
-       VALUES (@name, @schedule, @title, @prompt, @repo, @model, @priority, @verify_cmd, @enabled, @next_run_at)`,
+      `INSERT INTO crons (name, schedule, title, prompt, repo, worker_provider, model, priority, verify_cmd, enabled, next_run_at)
+       VALUES (@name, @schedule, @title, @prompt, @repo, @worker_provider, @model, @priority, @verify_cmd, @enabled, @next_run_at)`,
     )
     .run({
       name: c.name,
@@ -47,6 +50,7 @@ export function createCron(c: {
       title: c.title ?? c.name,
       prompt: c.prompt,
       repo: c.repo,
+      worker_provider: parseAgentProvider(c.worker_provider, "claude"),
       model: c.model ?? null,
       priority: c.priority ?? 2,
       verify_cmd: c.verify_cmd ?? null,
@@ -81,6 +85,7 @@ const UPDATABLE = new Set([
   "title",
   "prompt",
   "repo",
+  "worker_provider",
   "model",
   "priority",
   "verify_cmd",
@@ -103,6 +108,9 @@ export function updateCron(
     // re-enabling: schedule from now, not from a stale next_run_at
     const cron = getCron(id);
     if (cron) patch.next_run_at = nextRun(cron.schedule, new Date());
+  }
+  if (patch.worker_provider !== undefined) {
+    patch.worker_provider = parseAgentProvider(patch.worker_provider);
   }
   if (patch.enabled !== undefined) patch.enabled = patch.enabled ? 1 : 0;
   const keys = Object.keys(patch);

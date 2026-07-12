@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * "cc" MCP server — how agents touch the platform. Runs as a stdio subprocess
- * of each claude session; all state changes go through the daemon's REST API
+ * of each Claude or Codex session; all state changes go through the daemon's REST API
  * so SQLite keeps a single writer.
  *
  * Roles (CC_ROLE env): "main" gets the full orchestration toolset,
@@ -56,6 +56,7 @@ server.registerTool(
         .optional()
         .describe("absolute repo path; workers default to their own task's repo"),
       model: z.string().optional(),
+      worker_provider: z.enum(["claude", "codex"]).optional(),
       priority: z.number().int().min(0).max(4).optional(),
       blocked_by: z.number().int().optional(),
       verify_cmd: z.string().optional(),
@@ -327,7 +328,8 @@ if (ROLE === "main") {
   server.registerTool(
     "update_task",
     {
-      description: "Update a task (status, priority, model, prompt, result_summary...).",
+      description:
+        "Update a task (status, priority, worker provider, model, prompt, result_summary...).",
       inputSchema: {
         id: z.number().int(),
         status: z
@@ -336,6 +338,7 @@ if (ROLE === "main") {
           .describe("to close a task from any state, use cancel_task instead — it also kills live agents"),
         priority: z.number().int().min(0).max(4).optional(),
         model: z.string().optional(),
+        worker_provider: z.enum(["claude", "codex"]).optional(),
         prompt: z.string().optional(),
         verify_cmd: z.string().optional(),
         result_summary: z.string().optional(),
@@ -380,10 +383,11 @@ if (ROLE === "main") {
     "spawn_worker",
     {
       description:
-        "Spawn a Claude Code worker for a task in its own git worktree + tmux window. Model defaults to the task's model. If the task has a previous session, the worker RESUMES it with full context (pass fresh=true to force a clean start).",
+        "Spawn a Claude Code or Codex worker for a task in its own git worktree + tmux window. Provider and model default to the task. A previous session resumes only when it belongs to the same provider (pass fresh=true to force a clean start).",
       inputSchema: {
         task_id: z.number().int(),
-        model: z.string().optional().describe("haiku | sonnet | opus | ..."),
+        provider: z.enum(["claude", "codex"]).optional(),
+        model: z.string().optional().describe("provider-specific model slug"),
         fresh: z.boolean().optional().describe("force a fresh session instead of resuming"),
       },
     },
@@ -451,7 +455,7 @@ if (ROLE === "main") {
     "read_worker_transcript",
     {
       description:
-        "Read an agent's session transcript (simplified chat view, last `limit` entries). Use to audit what a worker actually did versus what it claims.",
+        "Read a Claude agent's session transcript (simplified chat view, last `limit` entries). Codex transcripts are not parsed because their format is unstable; use peek_worker and get_task_diff for Codex.",
       inputSchema: {
         agent_id: z.number().int(),
         limit: z.number().int().min(1).max(500).optional(),
@@ -467,7 +471,7 @@ if (ROLE === "main") {
     "spawn_reviewer",
     {
       description:
-        "Spawn an independent adversarial reviewer for a task in review. It gets the task prompt + diff in a fresh context (never the worker's conversation), tries to reject the work, and submits approve/reject with notes. Rejection feedback flows back to the worker automatically; 2 rejected cycles block the task for the human.",
+        "Spawn an independent Claude adversarial reviewer for a task in review. It gets the task prompt + diff in a fresh context (never the worker's conversation), tries to reject the work, and submits approve/reject with notes. Its model is independent of the worker model. Rejection feedback flows back automatically; 2 rejected cycles block the task for the human.",
       inputSchema: {
         task_id: z.number().int(),
         model: z.string().optional(),

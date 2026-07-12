@@ -1,18 +1,26 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { Command } from "commander";
-import { pkgRoot, tmuxSession } from "../config.js";
+import {
+  codexBin,
+  codexHome,
+  codexProfile,
+  pkgRoot,
+  tmuxSession,
+} from "../config.js";
 import { buildDreamPrompt } from "../prompts/dreamer.js";
 import type { Agent } from "../db/agents.js";
 import type { Event } from "../db/events.js";
 import type { Task } from "../db/tasks.js";
 import { gitToplevel } from "../daemon/worktree.js";
+import { writeCodexConfig } from "../daemon/genconfig.js";
 import { api } from "./client.js";
 
 const program = new Command()
   .name("agp")
-  .description("commandcenter CLI — task queue + Claude Code workers");
+  .description("commandcenter CLI — task queue + Claude Code or Codex workers");
 
 function table(rows: string[][], headers: string[]): string {
   const all = [headers, ...rows];
@@ -39,6 +47,7 @@ task
   .option("-f, --prompt-file <file>", "read prompt from a file")
   .option("-r, --repo <path>", "target repo (default: current git repo)")
   .option("-m, --model <model>", "model for the worker (sonnet|opus|haiku|...)")
+  .option("--provider <provider>", "worker provider (claude|codex)")
   .option("-P, --priority <n>", "0 (highest) - 4", "2")
   .option("-b, --blocked-by <taskId>", "task that must be done first")
   .option("-v, --verify <cmd>", "verification command run in the worktree")
@@ -52,6 +61,7 @@ task
       prompt,
       repo,
       model: opts.model,
+      worker_provider: opts.provider,
       priority: Number(opts.priority),
       blocked_by: opts.blockedBy ? Number(opts.blockedBy) : undefined,
       verify_cmd: opts.verify,
@@ -78,11 +88,12 @@ task
           `#${t.id}`,
           t.status,
           `p${t.priority}`,
+          t.worker_provider,
           t.model ?? "-",
           t.agent_id ? `a${t.agent_id}` : "-",
           truncate(t.title, 60),
         ]),
-        ["id", "status", "pri", "model", "agent", "title"],
+        ["id", "status", "pri", "provider", "model", "agent", "title"],
       ),
     );
   });
@@ -101,12 +112,14 @@ task
   .option("-s, --status <status>")
   .option("-P, --priority <n>")
   .option("-m, --model <model>")
+  .option("--provider <provider>", "worker provider (claude|codex)")
   .option("--result <summary>")
   .action(async (id: string, opts) => {
     const t = await api<Task>("PATCH", `/api/tasks/${id}`, {
       status: opts.status,
       priority: opts.priority !== undefined ? Number(opts.priority) : undefined,
       model: opts.model,
+      worker_provider: opts.provider,
       result_summary: opts.result,
     });
     console.log(`task #${t.id}: ${t.status}`);
@@ -162,7 +175,7 @@ task
 program
   .command("review <taskId>")
   .description("spawn an independent adversarial reviewer for a task in review")
-  .option("-m, --model <model>", "reviewer model (default: the task's model)")
+  .option("-m, --model <model>", "Claude reviewer model (default: CC_REVIEWER_MODEL or opus)")
   .action(async (taskId: string, opts) => {
     const { agent: a } = await api<{ agent: Agent }>(
       "POST",
@@ -179,15 +192,21 @@ const agent = program.command("agent").description("manage worker agents");
 
 agent
   .command("spawn")
-  .description("spawn a Claude Code worker for a task (resumes its previous session when one exists)")
+  .description("spawn a Claude Code or Codex worker (resumes a same-provider session)")
   .requiredOption("-t, --task <id>", "task id")
+  .option("--provider <provider>", "worker provider (claude|codex)")
   .option("-m, --model <model>", "override the task's model")
   .option("--fresh", "force a fresh session instead of resuming")
   .action(async (opts) => {
     const { agent: a, task: t } = await api<{ agent: Agent; task: Task }>(
       "POST",
       "/api/agents",
-      { task_id: Number(opts.task), model: opts.model, fresh: opts.fresh },
+      {
+        task_id: Number(opts.task),
+        provider: opts.provider,
+        model: opts.model,
+        fresh: opts.fresh,
+      },
     );
     console.log(
       `agent a${a.id} spawned for task #${t.id} in ${a.tmux_target} (worktree: ${t.worktree})`,
@@ -210,12 +229,13 @@ agent
         agents.map((a) => [
           `a${a.id}`,
           a.kind,
+          a.provider,
           a.state,
           a.model ?? "-",
           a.task_id ? `#${a.task_id}` : "-",
           a.tmux_target ?? "-",
         ]),
-        ["id", "kind", "state", "model", "task", "tmux"],
+        ["id", "kind", "provider", "state", "model", "task", "tmux"],
       ),
     );
   });
@@ -253,6 +273,24 @@ agent
     console.log(`sent to a${id}`);
   });
 
+agent
+  .command("session <id>")
+  .description("show the recorded provider session and manual resume command")
+  .action(async (id: string) => {
+    const session = await api<{
+      provider: string;
+      session_id: string;
+      transcript_path: string | null;
+      cwd: string | null;
+      resume_command: string;
+    }>("GET", `/api/agents/${id}/session`);
+    console.log(`provider: ${session.provider}`);
+    console.log(`session:  ${session.session_id}`);
+    if (session.transcript_path) console.log(`transcript: ${session.transcript_path}`);
+    if (session.cwd) console.log(`cwd:       ${session.cwd}`);
+    console.log(`resume:    ${session.resume_command}`);
+  });
+
 // ---- cron ----
 
 interface CronJob {
@@ -261,6 +299,7 @@ interface CronJob {
   schedule: string;
   title: string;
   repo: string;
+  worker_provider: "claude" | "codex";
   model: string | null;
   enabled: number;
   last_run_at: string | null;
@@ -290,6 +329,7 @@ cron
   .option("-r, --repo <path>", "target repo (default: current git repo)")
   .option("--title <title>", "task title (default: cron name)")
   .option("-m, --model <model>")
+  .option("--provider <provider>", "worker provider (claude|codex)")
   .option("-P, --priority <n>", "0-4", "2")
   .option("-v, --verify <cmd>")
   .action(async (name: string, opts) => {
@@ -307,6 +347,7 @@ cron
       repo: opts.repo ?? gitToplevel(process.cwd()),
       title: opts.title,
       model: opts.model,
+      worker_provider: opts.provider,
       priority: Number(opts.priority),
       verify_cmd: opts.verify,
     });
@@ -326,11 +367,12 @@ cron
           x.enabled ? "on" : "off",
           x.name,
           x.schedule,
+          x.worker_provider,
           x.model ?? "-",
           x.next_run_at?.slice(0, 16) ?? "-",
           x.last_run_at?.slice(0, 16) ?? "never",
         ]),
-        ["id", "en", "name", "schedule", "model", "next", "last"],
+        ["id", "en", "name", "schedule", "provider", "model", "next", "last"],
       ),
     );
   });
@@ -384,6 +426,7 @@ dream
       schedule: opts.schedule,
       prompt: buildDreamPrompt(),
       repo: opts.repo ?? pkgRoot().replace(/\/$/, ""),
+      worker_provider: "claude",
       model: opts.model,
       priority: 3,
       enabled: false,
@@ -530,6 +573,88 @@ scheduler
     }
     await api("PATCH", "/api/scheduler", patch);
     await printSchedulerStatus();
+  });
+
+// ---- Codex worker runtime ----
+
+const codex = program
+  .command("codex")
+  .description("configure and diagnose the isolated Codex worker runtime");
+
+codex
+  .command("setup")
+  .description("write Command Center's dedicated Codex profile and lifecycle hooks")
+  .action(() => {
+    const files = writeCodexConfig();
+    console.log(`Codex profile written: ${files.profileFile}`);
+    console.log(`Codex hooks written:   ${files.hooksFile}`);
+    const escapedHome = files.home.replaceAll("'", `'\\''`);
+    console.log("Authenticate this isolated Codex home once (it does not copy your normal credentials):");
+    console.log(`  CODEX_HOME='${escapedHome}' ${codexBin()} login`);
+    console.log("Review and trust these static hooks once:");
+    console.log(
+      `  CODEX_HOME='${escapedHome}' ${codexBin()} --profile ${files.profile}`,
+    );
+    console.log("Then run /hooks in Codex, inspect the hook command, and mark it trusted.");
+    console.log("Finish with: agp codex doctor");
+  });
+
+codex
+  .command("doctor")
+  .description("check the Codex binary, build artifacts, and generated profile")
+  .action(() => {
+    const checks: Array<[string, boolean, string]> = [];
+    const version = spawnSync(codexBin(), ["--version"], { encoding: "utf8" });
+    checks.push([
+      "Codex CLI",
+      version.status === 0,
+      version.status === 0
+        ? (version.stdout || version.stderr).trim()
+        : `not runnable: ${codexBin()}`,
+    ]);
+    const home = codexHome();
+    const profileFile = `${home}/${codexProfile()}.config.toml`;
+    const hooksFile = `${home}/hooks.json`;
+    const mcpEntry = path.join(pkgRoot(), "dist", "mcp", "index.js");
+    const hookEntry = path.join(pkgRoot(), "dist", "scripts", "codex-hook.js");
+    checks.push(["profile", fs.existsSync(profileFile), profileFile]);
+    checks.push(["hooks", fs.existsSync(hooksFile), hooksFile]);
+    checks.push(["cc MCP build", fs.existsSync(mcpEntry), mcpEntry]);
+    checks.push(["hook bridge build", fs.existsSync(hookEntry), hookEntry]);
+    const runtimeEnv = { ...process.env, CODEX_HOME: home };
+    const auth = spawnSync(codexBin(), ["login", "status"], {
+      encoding: "utf8",
+      env: runtimeEnv,
+    });
+    checks.push([
+      "isolated login",
+      auth.status === 0,
+      (auth.stdout || auth.stderr).trim() || "not logged in",
+    ]);
+    if (fs.existsSync(profileFile)) {
+      const parsed = spawnSync(
+        codexBin(),
+        ["--profile", codexProfile(), "debug", "prompt-input", "doctor"],
+        { encoding: "utf8", env: runtimeEnv },
+      );
+      checks.push([
+        "profile parse",
+        parsed.status === 0,
+        parsed.status === 0 ? "valid" : (parsed.stderr || parsed.stdout).trim(),
+      ]);
+    }
+
+    for (const [name, ok, detail] of checks) {
+      console.log(`${ok ? "ok" : "FAIL"}  ${name}: ${detail}`);
+    }
+    if (checks.some(([, ok]) => !ok)) {
+      console.error(
+        "Run npm run build, agp codex setup, complete the isolated login/hook trust, and retry.",
+      );
+      process.exitCode = 1;
+    } else {
+      console.log("Hook trust is intentionally user-reviewed; verify it with /hooks.");
+    }
   });
 
 // ---- upgrade ----

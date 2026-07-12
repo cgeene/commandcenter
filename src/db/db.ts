@@ -39,12 +39,14 @@ CREATE TABLE IF NOT EXISTS tasks (
   repo           TEXT NOT NULL,
   status         TEXT NOT NULL DEFAULT 'queued',
   priority       INTEGER NOT NULL DEFAULT 2,
+  worker_provider TEXT NOT NULL DEFAULT 'claude',
   model          TEXT,
   blocked_by     INTEGER REFERENCES tasks(id),
   agent_id       INTEGER,
   worktree       TEXT,
   branch         TEXT,
   session_id     TEXT,
+  session_provider TEXT,
   verify_cmd     TEXT,
   result_summary TEXT,
   review_verdict TEXT,
@@ -65,11 +67,14 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS agents (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   kind          TEXT NOT NULL DEFAULT 'worker',
+  provider      TEXT NOT NULL DEFAULT 'claude',
   model         TEXT,
   state         TEXT NOT NULL DEFAULT 'spawning',
   task_id       INTEGER REFERENCES tasks(id),
   tmux_target   TEXT,
   session_id    TEXT,
+  transcript_path TEXT,
+  runtime_config_path TEXT,
   last_event_at TEXT,
   spawned_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -155,6 +160,7 @@ CREATE TABLE IF NOT EXISTS crons (
   title       TEXT NOT NULL,
   prompt      TEXT NOT NULL,
   repo        TEXT NOT NULL,
+  worker_provider TEXT NOT NULL DEFAULT 'claude',
   model       TEXT,
   priority    INTEGER NOT NULL DEFAULT 2,
   verify_cmd  TEXT,
@@ -203,6 +209,30 @@ function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE tasks ADD COLUMN pr_checks TEXT");
     db.exec("ALTER TABLE tasks ADD COLUMN pr_synced_at TEXT");
     db.exec("ALTER TABLE tasks ADD COLUMN pr_sync_fails INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!cols.includes("worker_provider")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN worker_provider TEXT NOT NULL DEFAULT 'claude'");
+  }
+  if (!cols.includes("session_provider")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN session_provider TEXT");
+  }
+  const agentCols = (db.prepare("PRAGMA table_info(agents)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!agentCols.includes("provider")) {
+    db.exec("ALTER TABLE agents ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'");
+  }
+  if (!agentCols.includes("transcript_path")) {
+    db.exec("ALTER TABLE agents ADD COLUMN transcript_path TEXT");
+  }
+  if (!agentCols.includes("runtime_config_path")) {
+    db.exec("ALTER TABLE agents ADD COLUMN runtime_config_path TEXT");
+  }
+  const cronCols = (db.prepare("PRAGMA table_info(crons)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!cronCols.includes("worker_provider")) {
+    db.exec("ALTER TABLE crons ADD COLUMN worker_provider TEXT NOT NULL DEFAULT 'claude'");
   }
   const memCols = (db.prepare("PRAGMA table_info(memories)").all() as { name: string }[]).map(
     (c) => c.name,

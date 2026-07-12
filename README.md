@@ -1,21 +1,23 @@
 # commandcenter
 
-**A local-first orchestration platform for fleets of Claude Code agents.**
+**A local-first orchestration platform for Claude Code and Codex agents.**
 
 ![Node >= 22](https://img.shields.io/badge/node-%3E%3D22-informational)
 ![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)
 ![Local-first](https://img.shields.io/badge/local--first-no%20telemetry-success)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
-commandcenter turns a queue of tasks into work done by autonomous [Claude Code](https://claude.com/claude-code)
-agents. A long-running daemon owns a SQLite task queue and spawns each task into
+commandcenter turns a queue of tasks into work done by autonomous Claude Code or
+Codex workers. A long-running daemon owns a SQLite task queue and spawns each task into
 its **own git worktree and tmux window**, so agents run in parallel without
 stepping on each other. Finished work is proofed by an **independent adversarial
 reviewer** before you ever see it, pushed as a normal GitHub PR, and surfaced on
 a **live web dashboard** with a "Needs You" panel that tells you the one thing
 only a human can do next. Agents share a **platform memory** of hard-won lessons
-and an **internal doc store** for research. Everything runs on your machine —
-no hosted control plane, no telemetry.
+and an **internal doc store** for research. The control plane runs on your
+machine — there is no hosted Command Center service or Command Center telemetry.
+Claude Code and Codex still send model requests and selected working context to
+their respective configured services.
 
 <!-- TODO(screenshot): dashboard board view — kanban + agent grid + live terminal -->
 
@@ -39,8 +41,8 @@ no hosted control plane, no telemetry.
 You file tasks (a title, a prompt, a target repo, optionally a `verify_cmd`).
 The daemon claims a ready task, cuts a fresh branch and git worktree from the
 repo's origin default branch, opens a tmux window, and launches an interactive
-`claude` session scoped to that worktree with a generated settings file and an
-MCP toolset. The worker does the work, commits, pushes its branch, and opens a
+provider session scoped to that worktree with an MCP toolset. The worker does
+the work, commits, pushes its branch, and opens a
 PR. A separate reviewer agent — a fresh session with **no** access to the
 worker's conversation and with file-editing tools denied — tries to *reject* the
 work; two rejections block the task for your arbitration. Approved work lands in
@@ -54,7 +56,7 @@ The primitives:
 | **`agentd`** | The daemon. Owns the SQLite queue, a localhost REST API + WebSocket, the tmux/worktree lifecycle, the scheduler, PR sync, and serves the dashboard. |
 | **`agp`** | CLI client for the daemon (`agp task add`, `agp agent spawn`, …). |
 | **`cc-mcp`** | MCP server exposing the platform to agents (scoped per role). |
-| **Workers** | `claude` sessions, one per task, each in `agent/task-N` worktree + branch. |
+| **Workers** | Claude Code or Codex sessions, one per task, each in `agent/task-N` worktree + branch. |
 | **Reviewers** | Independent read-only `claude` sessions that adversarially proof a branch. |
 | **Main agent** | An orchestrator `claude` session that triages the queue and manages workers. |
 | **Dashboard** | React SPA served by the daemon: board, PRs, tokens, live terminals. |
@@ -127,6 +129,7 @@ For a deeper walk-through see [`docs/architecture.md`](docs/architecture.md).
 - **git** with a configured `origin` remote on repos you point tasks at
 - **[GitHub CLI](https://cli.github.com/) (`gh`)**, authenticated (`gh auth login`) — used for PR create/sync
 - **[Claude Code](https://claude.com/claude-code)** installed and authenticated — the `claude` binary must be on your `PATH` (override with `CC_CLAUDE_BIN`)
+- **[Codex CLI](https://developers.openai.com/codex/cli)** installed when using Codex workers — the `codex` binary must be on your `PATH` (override with `CC_CODEX_BIN`)
 
 macOS is the primary target (launchd, tmux); Linux works via `npm run dev:daemon`.
 
@@ -138,6 +141,10 @@ cd commandcenter
 npm install
 npm run build:all   # backend → dist/, dashboard → web/dist/
 npm link            # puts `agentd`, `agp`, `cc-mcp` on your PATH
+
+# one-time Codex worker setup; follow the printed login + hook-trust steps
+agp codex setup
+agp codex doctor
 ```
 
 > The MCP server is loaded from `dist/mcp/index.js`, so agents need a build.
@@ -182,8 +189,8 @@ agp task add "Fix the flaky retry test" \
 
 agp task ls                       # queue overview
 
-# 2. spawn a worker for it (worktree + tmux window + claude)
-agp agent spawn --task 1
+# 2. spawn a worker (omit --provider to use the task/provider default)
+agp agent spawn --task 1 --provider codex
 agp agent ls
 agp agent peek 1                  # see its terminal without attaching
 agp attach 1                      # interact; detach with Ctrl-b d
@@ -234,8 +241,10 @@ all live on the task record.
 
 ### Workers, reviewers & the adversarial review loop
 
-A **worker** is an interactive `claude` session for one task, launched with
-`--permission-mode acceptEdits` into a dedicated worktree. When a worker moves a
+A **worker** is an interactive Claude Code or Codex session for one task in a
+dedicated worktree. Codex workers use `workspace-write` plus `on-request`
+approval; Claude workers retain the existing generated permission settings.
+When a worker moves a
 task to `review` with commits on its branch, an independent **reviewer** proofs
 it. The reviewer is a *fresh* session in its own detached worktree at the task's
 branch with **Edit/Write/commit/push denied** — it gets the same inputs as the
@@ -331,8 +340,13 @@ All config is either an environment variable read at call time or a value in the
 | `CC_PORT` | `4711` | Daemon port (localhost only) |
 | `CC_URL` | `http://127.0.0.1:$CC_PORT` | Base URL agents/hooks use to reach the daemon |
 | `CC_CLAUDE_BIN` | `claude` | Worker/reviewer/main binary (override for testing) |
+| `CC_CODEX_BIN` | `codex` | Codex worker binary |
+| `CC_CODEX_HOME` | `$CC_DATA_DIR/codex` | Isolated Codex profile, login, trust, and sessions |
+| `CC_CODEX_PROFILE` | `commandcenter` | Generated Codex profile name |
+| `CC_WORKER_PROVIDER` | `claude` | Default provider for new tasks/crons |
 | `CC_TMUX_SESSION` | `cc` | tmux session name |
 | `CC_MAIN_MODEL` | `opus` | Default model for `agp main` |
+| `CC_REVIEWER_MODEL` | `opus` | Claude reviewer model, independent of worker model |
 | `CC_NTFY_URL` | unset | ntfy topic URL for push notifications (disabled if unset) |
 | `CC_NTFY_TOKEN` | unset | ntfy auth token (self-hosted / protected topics) |
 | `CC_CLAUDE_PROJECTS` | `~/.claude/projects` | Where Claude Code transcripts live (for token accounting & resume) |
@@ -361,16 +375,18 @@ about, on your own machine.
 - **Everything is local.** The daemon binds to `127.0.0.1` only. State is a local
   SQLite file; the doc store and memory are local markdown/SQLite. There is **no
   telemetry**, no hosted control plane, and no outbound calls except the ones the
-  tools you configure make (`gh` to your GitHub, `claude` to Anthropic, an
-  optional ntfy push).
+  tools you configure make (`gh` to your GitHub, `claude` to Anthropic, `codex`
+  to OpenAI, and an optional ntfy push).
 - **Workers are sandboxed to a worktree.** Each runs in its own `agent/task-N`
   worktree; your main checkout and every other branch are untouched. A worker
   that discovers its work belongs in a different repo is instructed to *report
   blocked*, not to edit it.
-- **Least-privilege permissions.** Agents run against a **generated** settings
+- **Least-privilege permissions.** Claude agents run against a **generated** settings
   file, never your `~/.claude/settings.json`. Workers may push only their own
   branch and open a PR; everything else falls to a normal permission prompt.
-  Reviewers additionally deny Edit/Write/commit/push. The read-only allowlist is
+  Reviewers additionally deny Edit/Write/commit/push. Codex workers use an
+  isolated profile with `workspace-write`, network disabled in the sandbox, and
+  `on-request` escalation; no approval or hook-trust bypass is used. The read-only allowlist is
   an explicit, auditable list in [`src/daemon/permissions.ts`](src/daemon/permissions.ts).
 - **Humans hold the merge.** Nothing merges itself — not the scheduler, not the
   main agent, not an approved reviewer. Merges, force-pushes, and secrets are

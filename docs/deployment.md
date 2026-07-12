@@ -39,9 +39,10 @@ bracketed values:
 
 - `[YOU]` — your macOS username
 - `[/ABSOLUTE/PATH/TO/commandcenter]` — the repo checkout
-- the `PATH` entry must include the directories holding `node`, `claude`, `gh`,
-  `tmux`, and `git` — launchd starts with a minimal `PATH`, so agents will fail
-  to find these tools unless you spell it out (check with `which node claude gh tmux git`).
+- the `PATH` entry must include the directories holding `node`, `claude`,
+  `codex`, `gh`, `tmux`, and `git` — launchd starts with a minimal `PATH`, so
+  agents will fail to find these tools unless you spell it out (check with
+  `which node claude codex gh tmux git`).
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -67,6 +68,7 @@ bracketed values:
     <string>/opt/homebrew/bin:/usr/local/bin:/Users/[YOU]/.local/bin:/usr/bin:/bin</string>
     <!-- optional overrides:
     <key>CC_NTFY_URL</key><string>https://ntfy.sh/your-secret-topic</string>
+    <key>CC_WORKER_PROVIDER</key><string>codex</string>
     -->
   </dict>
 

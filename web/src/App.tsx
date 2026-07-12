@@ -299,7 +299,7 @@ export function App() {
                 a{a.id} {a.kind === "main" ? "· main" : a.task_id ? `· #${a.task_id}` : ""}
               </b>
               <span className="muted">
-                {a.state} · {a.model ?? "?"}
+                {a.state} · {a.provider} · {a.model ?? "default"}
               </span>
               <button onClick={() => openTerminal(a.id)}>terminal</button>
               <button
@@ -482,6 +482,7 @@ function TaskCard({
           <span className="chip bad">✗ changes</span>
         )}
         {task.model && <span className="chip">{task.model}</span>}
+        <span className="chip">{task.worker_provider}</span>
         {task.agent_id && <span className="chip agent-chip">a{task.agent_id}</span>}
       </div>
       {summary && <div className="card-summary">{summary}</div>}
@@ -1108,6 +1109,11 @@ function TaskPanel({
         <dl>
           <dt>repo</dt>
           <dd>{task.repo}</dd>
+          <dt>worker</dt>
+          <dd>
+            {task.worker_provider}
+            {task.model ? ` · ${task.model}` : " · default model"}
+          </dd>
           {task.branch && (
             <>
               <dt>branch</dt>
@@ -1163,7 +1169,7 @@ function TaskPanel({
           {task.agent_id && (
             <button onClick={() => onTerminal(task.agent_id!)}>terminal</button>
           )}
-          {task.session_id && (
+          {task.session_id && task.session_provider === "claude" && (
             <button onClick={() => onTranscript(task.session_id!)}>
               transcript
             </button>
@@ -1264,6 +1270,7 @@ function CronsDrawer({ onClose }: { onClose: () => void }) {
             <div className="muted">
               {c.enabled ? `next ${c.next_run_at?.slice(0, 16) ?? "?"}` : "disabled"}
               {c.last_run_at ? ` · last ${c.last_run_at.slice(0, 16)}` : " · never run"}
+              {` · ${c.worker_provider}`}
               {c.model ? ` · ${c.model}` : ""} · {c.repo.split("/").pop()}
             </div>
             <div>{c.title}</div>
@@ -1365,6 +1372,7 @@ function NewTaskForm({
   const [prompt, setPrompt] = useState("");
   const [repo, setRepo] = useState("");
   const [model, setModel] = useState("");
+  const [provider, setProvider] = useState<"" | "claude" | "codex">("");
   const [verify, setVerify] = useState("");
   const [priority, setPriority] = useState(2);
 
@@ -1390,12 +1398,21 @@ function NewTaskForm({
           onChange={(e) => setRepo(e.target.value)}
         />
         <div className="row">
-          <select value={model} onChange={(e) => setModel(e.target.value)}>
-            <option value="">model (worker default)</option>
-            <option value="haiku">haiku</option>
-            <option value="sonnet">sonnet</option>
-            <option value="opus">opus</option>
+          <select
+            value={provider}
+            onChange={(e) =>
+              setProvider(e.target.value as "" | "claude" | "codex")
+            }
+          >
+            <option value="">provider (system default)</option>
+            <option value="claude">Claude Code</option>
+            <option value="codex">Codex</option>
           </select>
+          <input
+            placeholder="model (provider default)"
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+          />
           <select
             value={priority}
             onChange={(e) => setPriority(Number(e.target.value))}
@@ -1421,6 +1438,7 @@ function NewTaskForm({
                 title,
                 prompt: prompt || title,
                 repo,
+                worker_provider: provider || undefined,
                 model: model || undefined,
                 priority,
                 verify_cmd: verify || undefined,

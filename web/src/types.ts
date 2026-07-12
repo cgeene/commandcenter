@@ -8,6 +8,8 @@ export type TaskStatus =
   | "failed"
   | "cancelled";
 
+export type AgentProvider = "claude" | "codex";
+
 export interface Task {
   id: number;
   title: string;
@@ -15,12 +17,14 @@ export interface Task {
   repo: string;
   status: TaskStatus;
   priority: number;
+  worker_provider: AgentProvider;
   model: string | null;
   blocked_by: number | null;
   agent_id: number | null;
   worktree: string | null;
   branch: string | null;
   session_id: string | null;
+  session_provider: AgentProvider | null;
   verify_cmd: string | null;
   result_summary: string | null;
   review_verdict: string | null;
@@ -41,11 +45,14 @@ export interface Task {
 export interface Agent {
   id: number;
   kind: "main" | "worker" | "reviewer";
+  provider: AgentProvider;
   model: string | null;
   state: string;
   task_id: number | null;
   tmux_target: string | null;
   session_id: string | null;
+  transcript_path: string | null;
+  runtime_config_path: string | null;
   last_event_at: string | null;
   spawned_at: string;
 }
@@ -105,6 +112,7 @@ export interface CronJob {
   title: string;
   prompt: string;
   repo: string;
+  worker_provider: AgentProvider;
   model: string | null;
   priority: number;
   verify_cmd: string | null;

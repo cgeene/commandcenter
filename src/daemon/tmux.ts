@@ -63,6 +63,29 @@ export function listWindowIds(): string[] {
   }
 }
 
+/** Live process windows only. `remain-on-exit` intentionally keeps crashed
+ * windows inspectable, so presence alone is not a worker-health signal. */
+export function listLiveWindowIds(): string[] {
+  try {
+    return tmux(
+      "list-windows",
+      "-t",
+      tmuxSession(),
+      "-F",
+      "#{session_name}:#{window_id}\t#{pane_dead}",
+    )
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .flatMap((line) => {
+        const [target, dead] = line.split("\t");
+        return dead === "0" ? [target] : [];
+      });
+  } catch {
+    return [];
+  }
+}
+
 export function windowExists(target: string): boolean {
   return listWindowIds().includes(target);
 }

@@ -1,7 +1,15 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { claudeBin, promptsDir } from "../config.js";
+import {
+  baseUrl,
+  claudeBin,
+  codexBin,
+  codexHome,
+  codexProfile,
+  promptsDir,
+  reviewerModel,
+} from "../config.js";
 import {
   createAgent,
   getAgent,
@@ -20,7 +28,12 @@ import {
 } from "../db/tasks.js";
 import { ORCHESTRATOR_PROMPT } from "../prompts/orchestrator.js";
 import { buildReviewerPrompt } from "../prompts/reviewer.js";
-import { writeMcpConfigFile, writeSettingsFile } from "./genconfig.js";
+import { parseAgentProvider, type AgentProvider } from "../providers.js";
+import {
+  writeCodexConfig,
+  writeMcpConfigFile,
+  writeSettingsFile,
+} from "./genconfig.js";
 import { readOnlyProfileAllow } from "./permissions.js";
 import { findTranscript } from "./transcript.js";
 import { killWindow, newWindow, windowExists } from "./tmux.js";
@@ -168,10 +181,65 @@ function buildClaudeCmd(opts: {
   ].join(" ");
 }
 
+function buildCodexCmd(opts: {
+  agentId: number;
+  taskId: number;
+  model?: string;
+  promptFile: string;
+  resumeSession?: string;
+}): string {
+  const env = [
+    ["CODEX_HOME", codexHome()],
+    ["CC_URL", baseUrl()],
+    ["CC_ROLE", "worker"],
+    ["CC_AGENT_ID", String(opts.agentId)],
+    ["CC_TASK_ID", String(opts.taskId)],
+  ]
+    .map(([key, value]) => `${key}=${shellQuote(value)}`)
+    .join(" ");
+  const common = [
+    shellQuote(codexBin()),
+    "--profile",
+    shellQuote(codexProfile()),
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "on-request",
+    ...(opts.model ? ["--model", shellQuote(opts.model)] : []),
+  ];
+  const invocation = opts.resumeSession
+    ? [...common, "resume", shellQuote(opts.resumeSession)]
+    : common;
+  return `${env} ${invocation.join(" ")} "$(cat ${shellQuote(opts.promptFile)})"`;
+}
+
+export const _buildCodexCmdForTest = buildCodexCmd;
+
+function resumableSession(
+  task: Task,
+  provider: AgentProvider,
+  fresh = false,
+): string | undefined {
+  if (fresh || !task.session_id) return undefined;
+  const sameProvider =
+    task.session_provider === provider ||
+    (task.session_provider === null && provider === "claude");
+  if (!sameProvider) return undefined;
+  if (provider === "claude" && !findTranscript(task.session_id)) return undefined;
+  return task.session_id;
+}
+
+function resolveReviewerModel(override?: string): string {
+  return override ?? reviewerModel();
+}
+
+export const _resumableSessionForTest = resumableSession;
+export const _resolveReviewerModelForTest = resolveReviewerModel;
+
 export function spawnWorker(
   taskId: number,
   modelOverride?: string,
-  opts?: { fresh?: boolean },
+  opts?: { fresh?: boolean; provider?: AgentProvider },
 ): { agent: Agent; task: Task } {
   const task = getTask(taskId);
   if (!task) throw new Error(`task ${taskId} not found`);
@@ -192,33 +260,43 @@ export function spawnWorker(
     }
   }
 
-  const model = modelOverride ?? task.model ?? undefined;
+  const provider = parseAgentProvider(opts?.provider ?? task.worker_provider, "claude");
+  const providerChanged = provider !== task.worker_provider;
+  const model = modelOverride ?? (providerChanged ? undefined : task.model ?? undefined);
   const { dir, branch } = createWorktree(task.repo, taskId);
 
   // Agent row first: its id is baked into the generated hook + MCP configs.
   const agent = createAgent({
     kind: "worker",
+    provider,
     model,
     state: "spawning",
     task_id: taskId,
   });
 
   const tag = `task-${taskId}`;
-  const settingsFile = writeSettingsFile(tag, agent.id, {
-    allow: buildWorkerAllow(branch),
-  });
-  const mcpFile = writeMcpConfigFile(tag, {
-    CC_ROLE: "worker",
-    CC_AGENT_ID: String(agent.id),
-    CC_TASK_ID: String(taskId),
-  });
+  let settingsFile: string | undefined;
+  let mcpFile: string | undefined;
+  let runtimeConfigPath: string | undefined;
+  if (provider === "claude") {
+    settingsFile = writeSettingsFile(tag, agent.id, {
+      allow: buildWorkerAllow(branch),
+    });
+    mcpFile = writeMcpConfigFile(tag, {
+      CC_ROLE: "worker",
+      CC_AGENT_ID: String(agent.id),
+      CC_TASK_ID: String(taskId),
+    });
+    runtimeConfigPath = settingsFile;
+  } else {
+    const config = writeCodexConfig();
+    runtimeConfigPath = config.profileFile;
+  }
+  updateAgent(agent.id, { runtime_config_path: runtimeConfigPath });
 
   // A prior session with a surviving transcript means the worker can pick
   // up exactly where it stopped instead of re-learning the task from zero.
-  const resumeSession =
-    !opts?.fresh && task.session_id && findTranscript(task.session_id)
-      ? task.session_id
-      : undefined;
+  const resumeSession = resumableSession(task, provider, opts?.fresh);
 
   fs.mkdirSync(promptsDir(), { recursive: true });
   const promptFile = path.join(promptsDir(), `${tag}.md`);
@@ -227,23 +305,42 @@ export function spawnWorker(
     resumeSession ? buildResumePrompt(task) : buildWorkerPrompt(task, branch),
   );
 
-  const target = newWindow(
-    `t${taskId}`,
-    dir,
-    buildClaudeCmd({ model, settingsFile, mcpFile, promptFile, resumeSession }),
-  );
+  const command =
+    provider === "codex"
+      ? buildCodexCmd({
+          agentId: agent.id,
+          taskId,
+          model,
+          promptFile,
+          resumeSession,
+        })
+      : buildClaudeCmd({
+          model,
+          settingsFile: settingsFile!,
+          mcpFile: mcpFile!,
+          promptFile,
+          resumeSession,
+        });
+  const target = newWindow(`t${taskId}`, dir, command);
   updateAgent(agent.id, { tmux_target: target, state: "working" });
   updateTask(taskId, {
     status: "in_progress",
     agent_id: agent.id,
     worktree: dir,
     branch,
-    model: model ?? task.model,
+    worker_provider: provider,
+    model: model ?? (providerChanged ? null : task.model),
   });
   logEvent("agent.spawned", {
     agentId: agent.id,
     taskId,
-    payload: { target, model, worktree: dir, resumed: Boolean(resumeSession) },
+    payload: {
+      target,
+      provider,
+      model,
+      worktree: dir,
+      resumed: Boolean(resumeSession),
+    },
   });
   return { agent: getAgent(agent.id)!, task: getTask(taskId)! };
 }
@@ -271,10 +368,11 @@ export function spawnReviewer(
     throw new Error(`task ${taskId} already has live reviewer a${existing.id}`);
   }
 
-  const model = modelOverride ?? task.model ?? undefined;
+  const model = resolveReviewerModel(modelOverride);
   const dir = createReviewWorktree(task.repo, taskId, task.branch, task.open_pr !== 0);
   const agent = createAgent({
     kind: "reviewer",
+    provider: "claude",
     model,
     state: "spawning",
     task_id: taskId,
@@ -290,6 +388,7 @@ export function spawnReviewer(
     CC_AGENT_ID: String(agent.id),
     CC_TASK_ID: String(taskId),
   });
+  updateAgent(agent.id, { runtime_config_path: settingsFile });
 
   fs.mkdirSync(promptsDir(), { recursive: true });
   const promptFile = path.join(promptsDir(), `${tag}.md`);
@@ -320,6 +419,7 @@ export function spawnMain(model?: string): Agent {
   const resolvedModel = model ?? process.env.CC_MAIN_MODEL ?? "opus";
   const agent = createAgent({
     kind: "main",
+    provider: "claude",
     model: resolvedModel,
     state: "spawning",
   });
@@ -329,6 +429,7 @@ export function spawnMain(model?: string): Agent {
     CC_ROLE: "main",
     CC_AGENT_ID: String(agent.id),
   });
+  updateAgent(agent.id, { runtime_config_path: settingsFile });
 
   fs.mkdirSync(promptsDir(), { recursive: true });
   const promptFile = path.join(promptsDir(), "main.md");

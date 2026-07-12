@@ -1,5 +1,15 @@
 import { Hono } from "hono";
+import path from "node:path";
 import { z } from "zod";
+import {
+  baseUrl,
+  claudeBin,
+  codexBin,
+  codexHome,
+  codexProfile,
+  dataDir,
+  defaultWorkerProvider,
+} from "../config.js";
 import { TASK_STATUSES, type TaskStatus } from "../db/db.js";
 import { getAgent, listAgents } from "../db/agents.js";
 import {
@@ -48,12 +58,16 @@ import {
 import { resumeAgent, submitPending } from "./resume.js";
 import { capturePane, clearInputLine, windowExists } from "./tmux.js";
 import { parsePane } from "./pane.js";
+import { AGENT_PROVIDERS } from "../providers.js";
+
+const providerSchema = z.enum(AGENT_PROVIDERS);
 
 const newTaskSchema = z.object({
   title: z.string().min(1),
   prompt: z.string().min(1),
   repo: z.string().min(1),
   priority: z.number().int().min(0).max(4).optional(),
+  worker_provider: providerSchema.optional(),
   model: z.string().optional(),
   blocked_by: z.number().int().optional(),
   verify_cmd: z.string().optional(),
@@ -65,6 +79,7 @@ const updateTaskSchema = z.object({
   prompt: z.string().min(1).optional(),
   status: z.enum(TASK_STATUSES as [TaskStatus, ...TaskStatus[]]).optional(),
   priority: z.number().int().min(0).max(4).optional(),
+  worker_provider: providerSchema.optional(),
   model: z.string().nullable().optional(),
   blocked_by: z.number().int().nullable().optional(),
   verify_cmd: z.string().nullable().optional(),
@@ -75,6 +90,7 @@ const updateTaskSchema = z.object({
 
 const spawnSchema = z.object({
   task_id: z.number().int(),
+  provider: providerSchema.optional(),
   model: z.string().optional(),
   fresh: z.boolean().optional(),
 });
@@ -97,7 +113,10 @@ export function buildApp(): Hono {
 
   app.post("/api/tasks", async (c) => {
     const body = newTaskSchema.parse(await c.req.json());
-    const task = createTask(body);
+    const task = createTask({
+      ...body,
+      worker_provider: body.worker_provider ?? defaultWorkerProvider(),
+    });
     logEvent("task.created", { taskId: task.id });
     return c.json(task, 201);
   });
@@ -116,6 +135,13 @@ export function buildApp(): Hono {
     // sent it, so an explicit `undefined` never gets bound as a SQL param
     // (that binds NULL against a NOT NULL column — see the crons.enabled bug).
     const patch: Record<string, unknown> = { ...body };
+    if (
+      body.worker_provider !== undefined &&
+      body.worker_provider !== before.worker_provider &&
+      body.model === undefined
+    ) {
+      patch.model = null;
+    }
     if (body.open_pr !== undefined) patch.open_pr = body.open_pr ? 1 : 0;
     const task = updateTask(id, patch as Parameters<typeof updateTask>[1]);
     if (body.status && body.status !== before.status) {
@@ -180,7 +206,10 @@ export function buildApp(): Hono {
 
   app.post("/api/agents", async (c) => {
     const body = spawnSchema.parse(await c.req.json());
-    const result = spawnWorker(body.task_id, body.model, { fresh: body.fresh });
+    const result = spawnWorker(body.task_id, body.model, {
+      fresh: body.fresh,
+      provider: body.provider,
+    });
     return c.json(result, 201);
   });
 
@@ -215,10 +244,18 @@ export function buildApp(): Hono {
       return c.json({ error: "no live tmux window" }, 409);
     }
     const lines = Number(c.req.query("lines") ?? 60);
-    return c.json({
-      target: agent.tmux_target,
-      ...parsePane(capturePane(agent.tmux_target, lines)),
-    });
+    const raw = capturePane(agent.tmux_target, lines);
+    return c.json(
+      agent.provider === "claude"
+        ? { target: agent.tmux_target, ...parsePane(raw) }
+        : {
+            target: agent.tmux_target,
+            pending_permission: null,
+            pending_question: null,
+            unsubmitted_input: null,
+            raw,
+          },
+    );
   });
 
   app.post("/api/agents/:id/send", async (c) => {
@@ -265,11 +302,60 @@ export function buildApp(): Hono {
     if (!agent.session_id) {
       return c.json({ error: "agent has no recorded session yet" }, 409);
     }
+    if (agent.provider !== "claude") {
+      return c.json(
+        {
+          error:
+            "structured transcript viewing is unavailable for Codex; use the terminal or resume command",
+        },
+        409,
+      );
+    }
     const limit = Number(c.req.query("limit") ?? 200);
     const { readTranscript } = await import("./transcript.js");
     const entries = readTranscript(agent.session_id, limit);
     if (!entries) return c.json({ error: "transcript not found" }, 404);
     return c.json({ agent_id: agent.id, session_id: agent.session_id, entries });
+  });
+
+  app.get("/api/agents/:id/session", (c) => {
+    const agent = getAgent(Number(c.req.param("id")));
+    if (!agent) return c.json({ error: "not found" }, 404);
+    if (!agent.session_id) {
+      return c.json({ error: "agent has no recorded session yet" }, 409);
+    }
+    const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
+    const taskIdEnv = agent.task_id
+      ? ` CC_TASK_ID=${quote(String(agent.task_id))}`
+      : "";
+    const command =
+      agent.provider === "codex"
+        ? `CC_URL=${quote(baseUrl())} CC_ROLE=${quote(agent.kind)} CC_AGENT_ID=${quote(String(agent.id))}${taskIdEnv} CODEX_HOME=${quote(codexHome())} ${quote(codexBin())} --profile ${quote(codexProfile())} resume ${quote(agent.session_id)}`
+        : (() => {
+            const tag =
+              agent.kind === "main"
+                ? "main"
+                : `task-${agent.task_id}${agent.kind === "reviewer" ? "-review" : ""}`;
+            const mcpFile = path.join(dataDir(), "mcp", `${tag}.json`);
+            return [
+              quote(claudeBin()),
+              "--resume",
+              quote(agent.session_id),
+              ...(agent.runtime_config_path
+                ? ["--settings", quote(agent.runtime_config_path)]
+                : []),
+              "--mcp-config",
+              quote(mcpFile),
+            ].join(" ");
+          })();
+    return c.json({
+      agent_id: agent.id,
+      provider: agent.provider,
+      session_id: agent.session_id,
+      transcript_path: agent.transcript_path,
+      cwd: agent.task_id ? getTask(agent.task_id)?.worktree ?? null : null,
+      resume_command: command,
+    });
   });
 
   app.post("/api/main", async (c) => {
@@ -339,6 +425,7 @@ export function buildApp(): Hono {
     schedule: z.string().min(1),
     prompt: z.string().min(1),
     repo: z.string().min(1),
+    worker_provider: providerSchema.optional(),
     title: z.string().optional(),
     model: z.string().optional(),
     priority: z.number().int().min(0).max(4).optional(),
@@ -351,6 +438,7 @@ export function buildApp(): Hono {
     title: z.string().optional(),
     prompt: z.string().optional(),
     repo: z.string().optional(),
+    worker_provider: providerSchema.optional(),
     model: z.string().nullable().optional(),
     priority: z.number().int().min(0).max(4).optional(),
     verify_cmd: z.string().nullable().optional(),
@@ -361,17 +449,26 @@ export function buildApp(): Hono {
 
   app.post("/api/crons", async (c) => {
     const body = newCronSchema.parse(await c.req.json());
-    const cron = createCron(body); // throws on invalid schedule -> 500 w/ message
+    const cron = createCron({
+      ...body,
+      worker_provider: body.worker_provider ?? defaultWorkerProvider(),
+    }); // throws on invalid schedule -> 500 w/ message
     logEvent("cron.created", { payload: { cron_id: cron.id, name: cron.name } });
     return c.json(cron, 201);
   });
 
   app.patch("/api/crons/:id", async (c) => {
     const id = Number(c.req.param("id"));
-    if (!getCron(id)) return c.json({ error: "not found" }, 404);
+    const before = getCron(id);
+    if (!before) return c.json({ error: "not found" }, 404);
     const body = cronPatchSchema.parse(await c.req.json());
     const cron = updateCron(id, {
       ...body,
+      ...(body.worker_provider !== undefined &&
+      body.worker_provider !== before.worker_provider &&
+      body.model === undefined
+        ? { model: null }
+        : {}),
       enabled: body.enabled === undefined ? undefined : body.enabled ? 1 : 0,
     } as Parameters<typeof updateCron>[1]);
     logEvent("cron.updated", { payload: { cron_id: id, patch: body } });
@@ -393,6 +490,7 @@ export function buildApp(): Hono {
       title: cron.title,
       prompt: cron.prompt,
       repo: cron.repo,
+      worker_provider: cron.worker_provider,
       model: cron.model ?? undefined,
       priority: cron.priority,
       verify_cmd: cron.verify_cmd ?? undefined,

@@ -16,7 +16,7 @@ import {
 } from "../db/tasks.js";
 import { notify } from "./notify.js";
 import { spawnWorker } from "./spawn.js";
-import { listWindowIds } from "./tmux.js";
+import { listLiveWindowIds } from "./tmux.js";
 import { versionInfo } from "./version.js";
 
 export interface SchedulerDeps {
@@ -27,7 +27,7 @@ export interface SchedulerDeps {
 
 const defaultDeps: SchedulerDeps = {
   spawn: (id) => void spawnWorker(id),
-  windowIds: listWindowIds,
+  windowIds: listLiveWindowIds,
   now: () => new Date(),
 };
 
@@ -67,6 +67,7 @@ export function fireDueCrons(now: Date): void {
       title: cron.title,
       prompt: cron.prompt,
       repo: cron.repo,
+      worker_provider: cron.worker_provider,
       model: cron.model ?? undefined,
       priority: cron.priority,
       verify_cmd: cron.verify_cmd ?? undefined,

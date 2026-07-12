@@ -1,4 +1,5 @@
 import { getDb, type TaskStatus, TASK_STATUSES } from "./db.js";
+import { parseAgentProvider, type AgentProvider } from "../providers.js";
 
 export interface Task {
   id: number;
@@ -7,12 +8,14 @@ export interface Task {
   repo: string;
   status: TaskStatus;
   priority: number;
+  worker_provider: AgentProvider;
   model: string | null;
   blocked_by: number | null;
   agent_id: number | null;
   worktree: string | null;
   branch: string | null;
   session_id: string | null;
+  session_provider: AgentProvider | null;
   verify_cmd: string | null;
   result_summary: string | null;
   review_verdict: string | null;
@@ -36,6 +39,7 @@ export interface NewTask {
   prompt: string;
   repo: string;
   priority?: number;
+  worker_provider?: AgentProvider;
   model?: string;
   blocked_by?: number;
   verify_cmd?: string;
@@ -47,14 +51,15 @@ export function createTask(t: NewTask): Task {
   const db = getDb();
   const info = db
     .prepare(
-      `INSERT INTO tasks (title, prompt, repo, priority, model, blocked_by, verify_cmd, cron_id, open_pr)
-       VALUES (@title, @prompt, @repo, @priority, @model, @blocked_by, @verify_cmd, @cron_id, @open_pr)`,
+      `INSERT INTO tasks (title, prompt, repo, priority, worker_provider, model, blocked_by, verify_cmd, cron_id, open_pr)
+       VALUES (@title, @prompt, @repo, @priority, @worker_provider, @model, @blocked_by, @verify_cmd, @cron_id, @open_pr)`,
     )
     .run({
       title: t.title,
       prompt: t.prompt,
       repo: t.repo,
       priority: t.priority ?? 2,
+      worker_provider: parseAgentProvider(t.worker_provider, "claude"),
       model: t.model ?? null,
       blocked_by: t.blocked_by ?? null,
       verify_cmd: t.verify_cmd ?? null,
@@ -158,12 +163,14 @@ const UPDATABLE = new Set([
   "prompt",
   "status",
   "priority",
+  "worker_provider",
   "model",
   "blocked_by",
   "agent_id",
   "worktree",
   "branch",
   "session_id",
+  "session_provider",
   "verify_cmd",
   "result_summary",
   "review_verdict",
@@ -187,6 +194,12 @@ export function updateTask(
   if (keys.length === 0) return getTask(id);
   if (fields.status && !TASK_STATUSES.includes(fields.status)) {
     throw new Error(`invalid status: ${fields.status}`);
+  }
+  if (fields.worker_provider !== undefined) {
+    parseAgentProvider(fields.worker_provider);
+  }
+  if (fields.session_provider !== undefined && fields.session_provider !== null) {
+    parseAgentProvider(fields.session_provider);
   }
   const sets = keys.map((k) => `${k} = @${k}`).join(", ");
   getDb()

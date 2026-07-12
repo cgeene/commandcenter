@@ -12,7 +12,7 @@ agp <group> <command> [options]
 
 | Command | Description |
 |---|---|
-| `task add <title>` | Add a task. `-p/--prompt`, `-f/--prompt-file`, `-r/--repo` (default: current git repo), `-m/--model`, `-P/--priority <0-4>` (default 2), `-b/--blocked-by <id>`, `-v/--verify <cmd>`. |
+| `task add <title>` | Add a task. `--provider <claude\|codex>`, `-p/--prompt`, `-f/--prompt-file`, `-r/--repo` (default: current git repo), `-m/--model`, `-P/--priority <0-4>` (default 2), `-b/--blocked-by <id>`, `-v/--verify <cmd>`. |
 | `task ls` | List tasks. `-s/--status <status>`, `--ready` (only queued tasks with no open blockers). |
 | `task show <id>` | Full task detail as JSON. |
 | `task update <id>` | Update fields: `-s/--status`, `-P/--priority`, `-m/--model`, `--result <summary>`. |
@@ -23,18 +23,20 @@ agp <group> <command> [options]
 ## `agp review <taskId>`
 
 Spawn an independent adversarial reviewer for a task in `review`. `-m/--model`
-overrides the reviewer model (defaults to the task's model). Watch it with
+overrides the Claude reviewer model (defaults to `CC_REVIEWER_MODEL`, then
+`opus`, never the worker model). Watch it with
 `agp agent peek <id>`.
 
 ## `agp agent` — workers
 
 | Command | Description |
 |---|---|
-| `agent spawn -t <id>` | Spawn a Claude Code worker for a task (resumes its previous session if one exists). `-m/--model` overrides the task's model; `--fresh` forces a clean session. |
+| `agent spawn -t <id>` | Spawn a Claude Code or Codex worker. `--provider` and `-m/--model` override the task; `--fresh` forces a clean session. Resume is same-provider only. |
 | `agent ls` | List agents. `-a/--all` includes dead agents. |
 | `agent kill <id>` | Kill an agent's tmux window. `--requeue` puts its task back in the queue; `--rm-worktree` removes the worktree. |
 | `agent peek <id>` | Print the agent's visible terminal output. `-n/--lines <n>` (default 50). |
 | `agent send <id> <text…>` | Send a message into an agent's interactive session. |
+| `agent session <id>` | Show provider, session ID, transcript path (when available), working directory, and a copyable provider-specific resume command. |
 
 ## `agp attach <agentId>`
 
@@ -60,7 +62,7 @@ See [`configuration.md`](configuration.md) for what each knob does and its defau
 
 | Command | Description |
 |---|---|
-| `cron add <name> -s <cron>` | Create a template. `-p/--prompt` or `-f/--prompt-file` (required), `-r/--repo`, `--title`, `-m/--model`, `-P/--priority`, `-v/--verify`. |
+| `cron add <name> -s <cron>` | Create a template. `--provider <claude\|codex>`, `-p/--prompt` or `-f/--prompt-file` (required), `-r/--repo`, `--title`, `-m/--model`, `-P/--priority`, `-v/--verify`. |
 | `cron ls` | List crons with enabled state, schedule, and next/last run. |
 | `cron enable <idOrName>` / `cron disable <idOrName>` | Toggle a cron. |
 | `cron run <idOrName>` | Enqueue this cron's task immediately. |
@@ -90,3 +92,10 @@ Recent platform events. `-n/--limit <n>` (default 30).
 Rebuild (`npm run build:all`) and restart the daemon's tmux window in place, then
 health-check it — fixes the stale-daemon warning after a source change.
 `--main` also respawns the main agent so it picks up new MCP tools.
+
+## `agp codex`
+
+`agp codex setup` generates the isolated Command Center Codex profile and
+static lifecycle hooks, then prints the one-time login and `/hooks` trust steps.
+`agp codex doctor` checks the CLI, profile parse, isolated login, MCP build, and
+hook bridge build. It never bypasses hook trust or the Codex sandbox.
