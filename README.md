@@ -141,7 +141,12 @@ cd commandcenter
 npm install
 npm run build:all   # backend → dist/, dashboard → web/dist/
 npm link            # puts `agentd`, `agp`, `cc-mcp` on your PATH
+```
 
+That is the complete installation for an all-Claude deployment. Codex is
+optional. Only run the following if you want Codex workers:
+
+```sh
 # one-time Codex worker setup; follow the printed login + hook-trust steps
 agp codex setup
 agp codex doctor
@@ -149,6 +154,34 @@ agp codex doctor
 
 > The MCP server is loaded from `dist/mcp/index.js`, so agents need a build.
 > Re-run `npm run build:all` (or `agp upgrade`) after changing source.
+
+### Choose the worker mode
+
+Existing all-Claude installations remain fully supported and require no Codex
+configuration. `claude` is still the default worker provider, the main
+orchestrator is Claude, and independent reviewers are Claude. Existing tasks,
+crons, database rows, and legacy Claude sessions continue to behave as Claude
+work without migration-time user action.
+
+Command Center now supports three operating patterns:
+
+| Mode | Configuration | Runtime behavior |
+|---|---|---|
+| **All Claude (default)** | Do nothing, or set `CC_WORKER_PROVIDER=claude` | Claude main, Claude workers, Claude reviewers. This is the original behavior. |
+| **Hybrid** | Set `CC_WORKER_PROVIDER=codex` after `agp codex setup` | Claude main dispatches Codex workers; Claude reviewers independently review their branches. |
+| **Per-task choice** | Pass `--provider claude` or `--provider codex` to `agp task add` | The selected provider runs that worker, overriding the system default. |
+
+Provider and model are stored on each task. Model names are provider-specific,
+so a Codex model slug is never passed to Claude and a Claude model name is never
+passed to Codex. A stopped worker resumes only with the provider that owns its
+recorded session; changing provider starts a fresh provider context while
+preserving the task branch and worktree. Command Center rejects provider changes
+while that task still has a live agent.
+
+Whichever worker provider is selected, the surrounding workflow is unchanged:
+one task branch and worktree, lifecycle hooks, transcript auditing, verification,
+commit and push boundaries, an independent Claude review, and a human-controlled
+merge.
 
 ### Start the daemon
 
