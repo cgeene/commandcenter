@@ -171,6 +171,11 @@ Command Center now supports three operating patterns:
 | **Hybrid** | Set `CC_WORKER_PROVIDER=codex` after `agp codex setup` | Claude main dispatches Codex workers; Claude reviewers independently review their branches. |
 | **Per-task choice** | Pass `--provider claude` or `--provider codex` to `agp task add` | The selected provider runs that worker, overriding the system default. |
 
+In the dashboard, selecting Codex loads the visible model catalog from the
+installed, authenticated Codex CLI and presents it as a dropdown. The provider
+default remains the first choice, and `custom model…` accepts a newer, private,
+or otherwise unlisted model slug. Hidden internal models are not shown.
+
 Provider and model are stored on each task. Model names are provider-specific,
 so a Codex model slug is never passed to Claude and a Claude model name is never
 passed to Codex. A stopped worker resumes only with the provider that owns its

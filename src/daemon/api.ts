@@ -59,6 +59,7 @@ import { resumeAgent, submitPending } from "./resume.js";
 import { capturePane, clearInputLine, windowExists } from "./tmux.js";
 import { parsePane } from "./pane.js";
 import { AGENT_PROVIDERS } from "../providers.js";
+import { providerModels } from "./provider-models.js";
 
 const providerSchema = z.enum(AGENT_PROVIDERS);
 const hookPayloadSchema = z
@@ -109,6 +110,20 @@ export function buildApp(): Hono {
   const app = new Hono();
 
   app.get("/healthz", (c) => c.json({ ok: true }));
+
+  app.get("/api/providers", (c) =>
+    c.json({ default_worker_provider: defaultWorkerProvider() }),
+  );
+
+  app.get("/api/providers/:provider/models", async (c) => {
+    const parsed = providerSchema.safeParse(c.req.param("provider"));
+    if (!parsed.success) return c.json({ error: "invalid provider" }, 400);
+    try {
+      return c.json({ provider: parsed.data, models: await providerModels(parsed.data) });
+    } catch {
+      return c.json({ error: "model catalog unavailable" }, 503);
+    }
+  });
 
   app.get("/api/version", async (c) => {
     const { versionInfo } = await import("./version.js");

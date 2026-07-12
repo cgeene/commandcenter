@@ -1378,10 +1378,66 @@ function NewTaskForm({
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [repo, setRepo] = useState("");
-  const [model, setModel] = useState("");
+  const [modelChoice, setModelChoice] = useState("");
+  const [customModel, setCustomModel] = useState("");
+  const [models, setModels] = useState<
+    Array<{ slug: string; display_name: string; description: string }>
+  >([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsUnavailable, setModelsUnavailable] = useState(false);
   const [provider, setProvider] = useState<"" | "claude" | "codex">("");
   const [verify, setVerify] = useState("");
   const [priority, setPriority] = useState(2);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api<{ default_worker_provider: "claude" | "codex" }>(
+      "GET",
+      "/api/providers",
+    )
+      .then((result) => {
+        if (!cancelled) {
+          setProvider((current) => current || result.default_worker_provider);
+        }
+      })
+      .catch(() => {
+        // Older daemons do not expose provider metadata; keep system default.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!provider) {
+      setModels([]);
+      return;
+    }
+    let cancelled = false;
+    setModelsLoading(true);
+    setModelsUnavailable(false);
+    void api<{
+      models: Array<{ slug: string; display_name: string; description: string }>;
+    }>("GET", `/api/providers/${provider}/models`)
+      .then((result) => {
+        if (!cancelled) setModels(result.models);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setModels([]);
+          setModelsUnavailable(true);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setModelsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [provider]);
+
+  const selectedModel =
+    modelChoice === "__custom__" ? customModel.trim() : modelChoice;
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -1407,25 +1463,39 @@ function NewTaskForm({
         <div className="row">
           <select
             value={provider}
-            onChange={(e) =>
-              setProvider(e.target.value as "" | "claude" | "codex")
-            }
+            onChange={(e) => {
+              setProvider(e.target.value as "" | "claude" | "codex");
+              setModelChoice("");
+              setCustomModel("");
+            }}
           >
             <option value="">provider (system default)</option>
             <option value="claude">Claude Code</option>
             <option value="codex">Codex</option>
           </select>
-          <input
-            list={provider === "codex" ? undefined : "claude-models"}
-            placeholder="model (provider default)"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-          />
-          <datalist id="claude-models">
-            <option value="haiku" />
-            <option value="sonnet" />
-            <option value="opus" />
-          </datalist>
+          <select
+            value={modelChoice}
+            onChange={(e) => setModelChoice(e.target.value)}
+          >
+            <option value="">model (provider default)</option>
+            {modelsLoading && <option disabled>loading models…</option>}
+            {models.map((option) => (
+              <option key={option.slug} value={option.slug}>
+                {option.display_name}
+                {option.description ? ` — ${option.description}` : ""}
+              </option>
+            ))}
+            <option value="__custom__">
+              {modelsUnavailable ? "model catalog unavailable — type model…" : "custom model…"}
+            </option>
+          </select>
+          {modelChoice === "__custom__" && (
+            <input
+              placeholder="provider model slug"
+              value={customModel}
+              onChange={(e) => setCustomModel(e.target.value)}
+            />
+          )}
           <select
             value={priority}
             onChange={(e) => setPriority(Number(e.target.value))}
@@ -1452,7 +1522,7 @@ function NewTaskForm({
                 prompt: prompt || title,
                 repo,
                 worker_provider: provider || undefined,
-                model: model || undefined,
+                model: selectedModel || undefined,
                 priority,
                 verify_cmd: verify || undefined,
               })
