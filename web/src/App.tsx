@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -7,6 +7,7 @@ import { api } from "./api";
 import { blockedByChain, groupByProject, isActive, isArchived, projectOf } from "../../src/lib/board";
 import { openPanel, type Panel } from "../../src/lib/panel";
 import { parseFrontmatter } from "../../src/lib/frontmatter";
+import { softenLineBreaks } from "../../src/lib/markdown";
 import { Terminal } from "./Terminal";
 import type {
   Agent,
@@ -653,16 +654,76 @@ function ArchiveView({
  * through to the DOM (no dangerouslySetInnerHTML), so embedded <script>/<img
  * onerror> in a doc is shown as inert text; rehype-sanitize is layered on as
  * defense-in-depth. remark-gfm adds tables, task lists, and fenced code.
+ *
+ * `looseLineBreaks` is for prose fields (task prompt/result_summary/review
+ * notes) that are markdown-ish but not guaranteed valid markdown — plain
+ * single newlines there must still render as visible line breaks, so the
+ * content is run through softenLineBreaks first. Curated docs (Docs tab)
+ * leave it off so intentionally-wrapped paragraphs still fill.
  */
-function Markdown({ content }: { content: string }) {
+function Markdown({
+  content,
+  looseLineBreaks = false,
+}: {
+  content: string;
+  looseLineBreaks?: boolean;
+}) {
   return (
     <div className="markdown">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeSanitize]}
+        components={{
+          a: ({ node, href, children, ...rest }) => (
+            <a {...rest} href={href} target="_blank" rel="noreferrer">
+              {children}
+            </a>
+          ),
+        }}
       >
-        {content}
+        {looseLineBreaks ? softenLineBreaks(content) : content}
       </ReactMarkdown>
+    </div>
+  );
+}
+
+/**
+ * Markdown with a max-height clamp + expand/collapse toggle, so a long
+ * result_summary/review_notes/prompt doesn't dominate the task panel. The
+ * toggle only appears when the rendered content actually overflows the cap.
+ */
+function CollapsibleMarkdown({
+  content,
+  looseLineBreaks = false,
+  maxHeight = 220,
+}: {
+  content: string;
+  looseLineBreaks?: boolean;
+  maxHeight?: number;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [overflowing, setOverflowing] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const el = bodyRef.current;
+    setOverflowing(!!el && el.scrollHeight > maxHeight + 2);
+  }, [content, maxHeight]);
+
+  return (
+    <div className="clamp-wrap">
+      <div
+        ref={bodyRef}
+        className={overflowing && !expanded ? "clamp-body clamped" : "clamp-body"}
+        style={overflowing && !expanded ? { maxHeight } : undefined}
+      >
+        <Markdown content={content} looseLineBreaks={looseLineBreaks} />
+      </div>
+      {overflowing && (
+        <button className="clamp-toggle" onClick={() => setExpanded((v) => !v)}>
+          {expanded ? "▲ collapse" : "▼ expand"}
+        </button>
+      )}
     </div>
   );
 }
@@ -1104,7 +1165,10 @@ function TaskPanel({
         <button onClick={onClose}>close</button>
       </div>
       <div className="panel-body">
-        <pre className="prompt">{task.prompt}</pre>
+        <div className="field-label">prompt</div>
+        <div className="prompt">
+          <CollapsibleMarkdown content={task.prompt} looseLineBreaks />
+        </div>
         <dl>
           <dt>repo</dt>
           <dd>{task.repo}</dd>
@@ -1142,13 +1206,19 @@ function TaskPanel({
               </dd>
             </>
           )}
-          {task.result_summary && (
-            <>
-              <dt>result</dt>
-              <dd>{task.result_summary}</dd>
-            </>
-          )}
         </dl>
+        {task.result_summary && (
+          <>
+            <div className="field-label">result</div>
+            <CollapsibleMarkdown content={task.result_summary} looseLineBreaks />
+          </>
+        )}
+        {task.review_notes && (
+          <>
+            <div className="field-label">review notes</div>
+            <CollapsibleMarkdown content={task.review_notes} looseLineBreaks />
+          </>
+        )}
         <div className="actions">
           {["queued", "claimed"].includes(task.status) && (
             <button

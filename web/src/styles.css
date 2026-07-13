@@ -205,15 +205,33 @@ main { display: flex; }
   padding: 10px 14px; border-bottom: 1px solid var(--border);
 }
 .panel-body { padding: 14px; overflow-y: auto; }
+.field-label {
+  font-size: 11px; text-transform: uppercase; color: var(--muted);
+  margin-bottom: 4px;
+}
 .prompt {
   background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
-  padding: 10px; font-size: 12px; white-space: pre-wrap; margin-bottom: 12px;
-  font-family: SF Mono, Menlo, monospace;
+  padding: 10px; margin-bottom: 12px;
+  --clamp-fade-bg: var(--bg);
 }
+.prompt .markdown, .clamp-body .markdown { font-size: 12px; }
 dl { display: grid; grid-template-columns: 90px 1fr; gap: 4px 10px; font-size: 12px; margin-bottom: 12px; }
 dt { color: var(--muted); }
 dd { word-break: break-all; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.clamp-wrap { margin-bottom: 12px; }
+.clamp-body { overflow: hidden; }
+.clamp-body.clamped { position: relative; }
+.clamp-body.clamped::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 32px;
+  background: linear-gradient(to bottom, transparent, var(--clamp-fade-bg, var(--panel)));
+  pointer-events: none;
+}
+.clamp-toggle {
+  margin-top: 6px; background: none; border: none; color: var(--accent);
+  font-size: 12px; cursor: pointer; padding: 0;
+}
 
 .terminal-wrap { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .termbar {
