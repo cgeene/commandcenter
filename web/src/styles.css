@@ -212,6 +212,7 @@ main { display: flex; }
 .prompt {
   background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
   padding: 10px; margin-bottom: 12px;
+  --clamp-fade-bg: var(--bg);
 }
 .prompt .markdown, .clamp-body .markdown { font-size: 12px; }
 dl { display: grid; grid-template-columns: 90px 1fr; gap: 4px 10px; font-size: 12px; margin-bottom: 12px; }
@@ -224,7 +225,7 @@ dd { word-break: break-all; }
 .clamp-body.clamped { position: relative; }
 .clamp-body.clamped::after {
   content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 32px;
-  background: linear-gradient(to bottom, transparent, var(--panel));
+  background: linear-gradient(to bottom, transparent, var(--clamp-fade-bg, var(--panel)));
   pointer-events: none;
 }
 .clamp-toggle {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -674,7 +674,7 @@ function Markdown({
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeSanitize]}
         components={{
-          a: ({ href, children, ...rest }) => (
+          a: ({ node, href, children, ...rest }) => (
             <a {...rest} href={href} target="_blank" rel="noreferrer">
               {children}
             </a>
@@ -705,7 +705,7 @@ function CollapsibleMarkdown({
   const [overflowing, setOverflowing] = useState(false);
   const bodyRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const el = bodyRef.current;
     setOverflowing(!!el && el.scrollHeight > maxHeight + 2);
   }, [content, maxHeight]);
