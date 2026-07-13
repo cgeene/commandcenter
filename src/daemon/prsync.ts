@@ -29,6 +29,9 @@ export interface PrState {
   comments: PrComment[];
   /** Rolled-up CI status; absent when not fetched (older callers/tests). */
   checks?: CheckRollup;
+  /** GitHub draft state; absent when not fetched (older callers/tests). A
+   *  draft PR means the platform's internal review is still pending/rejecting. */
+  isDraft?: boolean;
 }
 
 const POLL_MS = 120_000;
@@ -90,12 +93,13 @@ export async function fetchPrState(prUrl: string): Promise<PrState> {
   const ref = parsePrUrl(prUrl);
   if (!ref) throw new Error(`not a GitHub PR url: ${prUrl}`);
   const [view, issueComments, reviewComments] = await Promise.all([
-    gh(["pr", "view", prUrl, "--json", "state,reviewDecision,reviews,statusCheckRollup"]),
+    gh(["pr", "view", prUrl, "--json", "state,isDraft,reviewDecision,reviews,statusCheckRollup"]),
     gh(["api", `repos/${ref.owner}/${ref.repo}/issues/${ref.number}/comments`]),
     gh(["api", `repos/${ref.owner}/${ref.repo}/pulls/${ref.number}/comments`]),
   ]);
   const v = JSON.parse(view) as {
     state: PrState["state"];
+    isDraft?: boolean;
     reviewDecision: string | null;
     reviews?: { author?: { login?: string }; body?: string; submittedAt?: string }[];
     statusCheckRollup?: RollupEntry[];
@@ -130,6 +134,7 @@ export async function fetchPrState(prUrl: string): Promise<PrState> {
     reviewDecision: v.reviewDecision,
     comments,
     checks: computeCheckRollup(v.statusCheckRollup ?? []),
+    isDraft: v.isDraft ?? false,
   };
 }
 
@@ -259,12 +264,16 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
  * these columns instead of shelling out to gh on every render.
  */
 export function recordSyncSuccess(taskId: number, pr: PrState): void {
-  updateTask(taskId, {
+  const fields: Partial<Task> = {
     pr_state: pr.state.toLowerCase(),
     pr_checks: pr.checks ?? null,
     pr_synced_at: new Date().toISOString(),
     pr_sync_fails: 0,
-  });
+  };
+  // Only touch pr_is_draft when the caller actually fetched it — older
+  // callers/tests omit it, and writing null would clobber a known value.
+  if (pr.isDraft !== undefined) fields.pr_is_draft = pr.isDraft ? 1 : 0;
+  updateTask(taskId, fields);
 }
 
 /**

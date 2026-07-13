@@ -69,7 +69,10 @@ function buildWorkerPrompt(task: Task, branch: string): string {
     );
   } else {
     lines.push(
-      `When done and you have commits: push your branch (\`git push -u origin ${branch}\`) and open a PR with \`gh pr create\` against the repo's default branch — title in conventional-commit style, body covering what/why/how you verified, ending with "commandcenter task #${task.id}". The human reviews PRs in GitHub, not transcripts. Never push any other branch, never merge, never touch an existing PR that isn't yours. If the repo has no GitHub remote, the push fails, or you made no commits, skip the PR and say so in result_summary.`,
+      `When done and you have commits: push your branch (\`git push -u origin ${branch}\`) and open a PR as a DRAFT with \`gh pr create --draft\` against the repo's default branch — title in conventional-commit style, body covering what/why/how you verified, ending with "commandcenter task #${task.id}". The draft is intentional: the platform runs an internal adversarial review on the draft and flips the PR to ready-for-review only once that review approves, so on GitHub "ready for review" means "passed internal review". Do NOT run \`gh pr ready\` yourself — the platform owns the draft/ready state.`,
+      `If \`--draft\` fails (some repos/plans don't support draft PRs), fall back to a normal \`gh pr create\`, prepend "${"[UNREVIEWED] "}" to the PR title, and note in your result_summary that a draft PR wasn't available (the platform strips the "[UNREVIEWED]" prefix when it approves).`,
+      "If a PR already exists for this branch (e.g. you're pushing a fix round for review feedback), just push your fixes to it and leave its draft/ready state exactly as-is — the platform manages that state.",
+      `The human reviews PRs in GitHub, not transcripts. Never push any other branch, never merge, never touch an existing PR that isn't yours. If the repo has no GitHub remote, the push fails, or you made no commits, skip the PR and say so in result_summary.`,
       "When done: set result_summary via update_my_task with a short summary of what you did and how you verified it (include pr_url if you opened a PR), then stop.",
     );
   }
@@ -104,7 +107,7 @@ function buildResumePrompt(task: Task): string {
     "",
     task.open_pr === 0
       ? "Everything from your original instructions still applies: verify your work, commit and push your branch — Do NOT open a PR, the branch itself is the deliverable — then set result_summary via update_my_task and stop."
-      : "Everything from your original instructions still applies: verify your work, push your branch and open/update the PR if you have commits, then set result_summary via update_my_task and stop.",
+      : "Everything from your original instructions still applies: verify your work, push your branch and open/update the PR if you have commits, then set result_summary via update_my_task and stop. Open any NEW PR as a draft (`gh pr create --draft`); if you're pushing a fix round to an existing PR, push your fixes but leave its draft/ready state as-is — the platform manages it.",
   );
   return lines.join("\n");
 }

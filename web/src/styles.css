@@ -329,6 +329,7 @@ dd { word-break: break-all; }
 .pr-ci.ci-none { color: var(--muted); }
 .pr-verdict.approved { color: var(--green); }
 .pr-verdict.bad { color: var(--red); }
+.pr-verdict.draft { color: var(--muted); font-style: italic; border: 1px dashed var(--muted); background: transparent; }
 .pr-age { flex-shrink: 0; white-space: nowrap; }
 
 /* ---- tokens view ---- */

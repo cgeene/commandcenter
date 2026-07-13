@@ -81,6 +81,10 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
     if (t.review_verdict !== "approve") continue;
     if (!t.pr_url || t.open_pr === 0) continue;
     if (t.status !== "review" && t.status !== "done") continue;
+    // Defense in depth: a still-draft PR has not passed internal review, so it
+    // must never be offered for merge. Approval flips it to ready (pr_is_draft
+    // 0); pr_is_draft === 1 here means the ready-flip failed or is stale.
+    if (t.pr_is_draft === 1) continue;
     if (!deps.isPrOpen(t.pr_url)) continue; // already merged/closed — nothing to do
 
     const apply = APPLY_RE.test(t.prompt);

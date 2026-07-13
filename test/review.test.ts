@@ -16,6 +16,8 @@ afterEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+  _setGhRunner(null); // restore the real gh runner for the next file
 });
 
 /** A task in review with a (dead-window) worker agent attached. */
@@ -93,6 +95,116 @@ describe("handleVerdict", () => {
     const prompt = _buildWorkerPromptForTest(getTask(task.id)!, "agent/task-1");
     expect(prompt).toContain("REJECTED");
     expect(prompt).toContain("empty-input case");
+  });
+});
+
+describe("handleVerdict — PR draft state", () => {
+  /** A review task that also has an open PR in a given draft state. */
+  async function setupPrReviewTask(
+    prIsDraft: number | null,
+    fields: { review_cycles?: number } = {},
+  ) {
+    const { updateTask } = await import("../src/db/tasks.js");
+    const { task, worker } = await setupReviewTask(fields);
+    updateTask(task.id, {
+      pr_url: "https://github.com/nylas/repo/pull/7",
+      pr_is_draft: prIsDraft,
+    });
+    return { task, worker };
+  }
+
+  it("approve flips the draft PR to ready and emits pr.marked_ready", async () => {
+    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const calls: string[][] = [];
+    _setGhRunner(async (args) => {
+      calls.push(args);
+      return args[1] === "view" ? "feat: do the thing" : "";
+    });
+    const { task } = await setupPrReviewTask(1);
+    await handleVerdict(task.id, 99, "approve", "diff checks out");
+    expect(calls.some((a) => a[0] === "pr" && a[1] === "ready" && a[2] !== "--undo")).toBe(true);
+    expect(getTask(task.id)?.pr_is_draft).toBe(0);
+    expect(listEvents(10).map((e) => e.kind)).toContain("pr.marked_ready");
+  });
+
+  it("approve strips an [UNREVIEWED] title prefix from the fallback path", async () => {
+    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const calls: string[][] = [];
+    _setGhRunner(async (args) => {
+      calls.push(args);
+      return args[1] === "view" ? "[UNREVIEWED] feat: do the thing" : "";
+    });
+    const { task } = await setupPrReviewTask(1);
+    await handleVerdict(task.id, 99, "approve", "ok");
+    const edit = calls.find((a) => a[1] === "edit");
+    expect(edit).toBeDefined();
+    expect(edit).toContain("feat: do the thing");
+    expect(edit?.join(" ")).not.toContain("[UNREVIEWED]");
+  });
+
+  it("approve surfaces a failed ready-flip loudly instead of silently", async () => {
+    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    _setGhRunner(async () => {
+      throw new Error("draft PRs not supported on this plan");
+    });
+    const { task } = await setupPrReviewTask(1);
+    await handleVerdict(task.id, 99, "approve", "ok");
+    const t = getTask(task.id)!;
+    expect(t.review_verdict).toBe("approve"); // approval still recorded
+    expect(t.pr_is_draft).toBe(1); // stayed draft — the flip failed
+    expect(listEvents(10).map((e) => e.kind)).toContain("pr.ready_failed");
+  });
+
+  it("reject re-drafts a PR that is currently ready", async () => {
+    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const calls: string[][] = [];
+    _setGhRunner(async (args) => {
+      calls.push(args);
+      return "";
+    });
+    const { task } = await setupPrReviewTask(0); // currently ready
+    await handleVerdict(task.id, 99, "reject", "the retry test is missing");
+    expect(calls.some((a) => a[1] === "ready" && a[2] === "--undo")).toBe(true);
+    expect(getTask(task.id)?.pr_is_draft).toBe(1);
+    expect(listEvents(20).map((e) => e.kind)).toContain("pr.redrafted");
+  });
+
+  it("reject does NOT touch a PR that is already a draft", async () => {
+    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const calls: string[][] = [];
+    _setGhRunner(async (args) => {
+      calls.push(args);
+      return "";
+    });
+    const { task } = await setupPrReviewTask(1); // already a draft
+    await handleVerdict(task.id, 99, "reject", "still broken");
+    expect(calls).toHaveLength(0); // no gh call at all
+    expect(listEvents(20).map((e) => e.kind)).not.toContain("pr.redrafted");
+  });
+
+  it("reject leaves a never-synced (unknown draft state) PR alone", async () => {
+    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const calls: string[][] = [];
+    _setGhRunner(async (args) => {
+      calls.push(args);
+      return "";
+    });
+    const { task } = await setupPrReviewTask(null); // unknown
+    await handleVerdict(task.id, 99, "reject", "nope");
+    expect(calls).toHaveLength(0);
   });
 });
 
@@ -229,6 +341,29 @@ describe("open_pr prompt wiring", () => {
     const prompt = _buildWorkerPromptForTest(task, "agent/task-1");
     expect(prompt).toContain("gh pr create");
     expect(prompt).not.toContain("Do NOT open a PR");
+  });
+
+  it("worker prompt opens the PR as a draft with a fallback", async () => {
+    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const prompt = _buildWorkerPromptForTest(task, "agent/task-1");
+    expect(prompt).toContain("gh pr create --draft");
+    // graceful fallback: normal PR + [UNREVIEWED] prefix when drafts unsupported
+    expect(prompt).toContain("[UNREVIEWED]");
+    // fix-round instruction: don't touch draft/ready state of an existing PR
+    expect(prompt).toContain("leave its draft/ready state");
+    // workers must not run gh pr ready themselves — the platform owns it
+    expect(prompt).toContain("Do NOT run `gh pr ready`");
+  });
+
+  it("resume prompt tells a normal task to keep new PRs draft and leave existing state alone", async () => {
+    const { _buildResumePromptForTest } = await import("../src/daemon/spawn.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const prompt = _buildResumePromptForTest(task);
+    expect(prompt).toContain("gh pr create --draft");
+    expect(prompt).toContain("leave its draft/ready state");
   });
 
   it("resume prompt carries the branch-only instruction too", async () => {

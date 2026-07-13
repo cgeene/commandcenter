@@ -30,6 +30,7 @@ export interface Task {
   pr_feedback_at: string | null;
   pr_state: string | null; // open | merged | closed
   pr_checks: string | null; // pass | fail | pending | none
+  pr_is_draft: number | null; // 1 draft (internal review pending), 0 ready, NULL unknown
   pr_synced_at: string | null;
   pr_sync_fails: number;
   open_pr: number;

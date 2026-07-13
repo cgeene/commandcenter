@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   pr_feedback_at TEXT,
   pr_state       TEXT,
   pr_checks      TEXT,
+  pr_is_draft    INTEGER,
   pr_synced_at   TEXT,
   pr_sync_fails  INTEGER NOT NULL DEFAULT 0,
   open_pr        INTEGER NOT NULL DEFAULT 1,
@@ -203,6 +204,11 @@ function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE tasks ADD COLUMN pr_checks TEXT");
     db.exec("ALTER TABLE tasks ADD COLUMN pr_synced_at TEXT");
     db.exec("ALTER TABLE tasks ADD COLUMN pr_sync_fails INTEGER NOT NULL DEFAULT 0");
+  }
+  // pr_is_draft: 1 = draft (internal review pending/rejecting), 0 = ready
+  // (internal review approved), NULL = unknown/not yet synced.
+  if (!cols.includes("pr_is_draft")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN pr_is_draft INTEGER");
   }
   const memCols = (db.prepare("PRAGMA table_info(memories)").all() as { name: string }[]).map(
     (c) => c.name,

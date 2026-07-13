@@ -244,10 +244,20 @@ prompted to find reasons to **reject**: unmet requirements, weakened tests,
 summary/diff mismatches. It calls `submit_review(approve|reject, notes)`.
 
 - **Reject** → notes go straight back into the worker's session (or into the
-  respawn prompt if it's gone), task returns to `in_progress`.
+  respawn prompt if it's gone), task returns to `in_progress`. If the PR had
+  already been flipped to ready, it's converted back to a **draft**.
 - After **2 rejected cycles** (`MAX_REVIEW_CYCLES`) the task is **blocked** and
-  escalated to you with both sides' notes.
-- **Approve** → pings you; the merge is still yours.
+  escalated to you with both sides' notes. The PR stays a **draft**.
+- **Approve** → the PR is flipped from **draft** to **ready for review** and you
+  get pinged; the merge is still yours.
+
+Worker PRs are opened as **drafts** (`gh pr create --draft`) and only flip to
+ready-for-review once internal review approves — so on GitHub, **"ready for
+review" means "passed internal review — safe for you to merge"**, and a PR still
+in draft has not yet been internally approved. (If a repo can't create drafts,
+the fallback is a normal PR titled `[UNREVIEWED] …`, which the platform renames
+on approval.) The PRs board and **Needs You** panel treat drafts distinctly: a
+draft never appears as a merge action, only a ready+approved PR does.
 
 The `Stop` hook re-verifies any task a worker moved to `review` itself, so
 `verify_cmd` can't be bypassed. Auto-review is on by default
