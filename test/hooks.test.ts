@@ -194,6 +194,70 @@ describe("hook events", () => {
     expect(getAgent(agent.id)?.state).toBe("waiting_input");
   });
 
+  it("an idle main notification stays eligible for the next worker wait", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const worker = createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "waiting_input",
+      tmux_target: "cc:@1",
+    });
+    logEvent("hook.permissionrequest", {
+      agentId: worker.id,
+    });
+    const main = createAgent({
+      kind: "main",
+      provider: "claude",
+      state: "idle",
+      tmux_target: "cc:@2",
+    });
+    paneContent = [
+      "$ go test ./...",
+      "",
+      "› 1. Yes, proceed (y)",
+      "  2. No (esc)",
+      "",
+      "Press enter to confirm or esc to cancel",
+    ].join("\n");
+
+    await handleHookEvent(main.id, {
+      hook_event_name: "Notification",
+      notification_type: "idle_prompt",
+      message: "Claude is waiting for your input",
+    });
+
+    expect(sendText).toHaveBeenCalledWith(
+      "cc:@2",
+      expect.stringContaining(`peek_worker(${worker.id})`),
+    );
+    expect(getAgent(main.id)?.state).toBe("working");
+    expect(
+      listEvents(20).filter((event) => event.kind === "waiting.delegated"),
+    ).toHaveLength(1);
+  });
+
+  it("a main permission notification still requires human input", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const main = createAgent({
+      kind: "main",
+      provider: "claude",
+      state: "idle",
+      tmux_target: "cc:@2",
+    });
+
+    await handleHookEvent(main.id, {
+      hook_event_name: "Notification",
+      notification_type: "permission_prompt",
+      message: "Claude needs permission",
+    });
+
+    expect(getAgent(main.id)?.state).toBe("waiting_input");
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
   it("Stop with no verify_cmd + a result_summary moves the task to review", async () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");
     const { getTask, updateTask } = await import("../src/db/tasks.js");

@@ -79,6 +79,12 @@ const hookPayloadSchema = z
     hook_event_name: z.string().min(1).max(64).optional(),
     session_id: z.string().min(1).max(128).optional(),
     transcript_path: z.string().min(1).max(4096).nullable().optional(),
+    notification_type: z
+      .string()
+      .min(1)
+      .max(64)
+      .regex(/^[a-z_]+$/)
+      .optional(),
     tool_name: z.string().min(1).max(256).optional(),
     tool_input: z.record(z.string(), z.unknown()).optional(),
     message: z.string().max(20_000).optional(),

@@ -24,6 +24,7 @@ export interface HookPayload {
   hook_event_name?: string;
   session_id?: string;
   transcript_path?: string | null;
+  notification_type?: string;
   tool_name?: string;
   tool_input?: {
     command?: string;
@@ -105,6 +106,28 @@ function now(): string {
 
 function getEscalateMinutes(): number {
   return getSchedulerConfig().escalate_minutes;
+}
+
+/** Claude's Notification hook is also its ordinary idle signal. Only the
+ * permission/elicitation variants mean the orchestrator itself needs human
+ * input; treating idle_prompt as a permission parks the main and prevents it
+ * from rescuing subsequent worker approvals. Unknown future variants fail
+ * closed as input-requiring below. */
+function mainNotificationDisposition(
+  notificationType: string | undefined,
+): "idle" | "ignore" | "input" {
+  switch (notificationType) {
+    case "idle_prompt":
+      return "idle";
+    case "auth_success":
+    case "elicitation_complete":
+    case "elicitation_response":
+      return "ignore";
+    case "permission_prompt":
+    case "elicitation_dialog":
+    default:
+      return "input";
+  }
 }
 
 function isTrustPermission(
@@ -220,10 +243,19 @@ export async function handleHookEvent(
     ...(body.session_id ? { session_id: body.session_id } : {}),
     ...(body.transcript_path ? { transcript_path: body.transcript_path } : {}),
   });
+  const eventPayload =
+    body.message || body.notification_type
+      ? {
+          ...(body.message ? { message: body.message } : {}),
+          ...(body.notification_type
+            ? { notification_type: body.notification_type }
+            : {}),
+        }
+      : undefined;
   logEvent(`hook.${event.toLowerCase()}`, {
     agentId,
     taskId: agent.task_id ?? undefined,
-    payload: body.message ? { message: body.message } : undefined,
+    payload: eventPayload,
   });
 
   switch (event) {
@@ -287,8 +319,23 @@ export async function handleHookEvent(
           : "waiting for input");
       const who = `a${agentId}${agent.task_id ? ` (task #${agent.task_id})` : ""}`;
 
-      // The main agent asking for input IS the escalation — page the human.
+      // An idle_prompt is Claude's ordinary "ready for another turn" signal,
+      // not a question. Keep the main eligible and immediately catch up a
+      // worker wait that arrived while it was finishing its prior turn.
       if (agent.kind === "main") {
+        if (event === "Notification") {
+          const disposition = mainNotificationDisposition(body.notification_type);
+          if (disposition === "ignore") break;
+          if (disposition === "idle") {
+            updateAgent(agentId, { state: "idle" });
+            const main = getAgent(agentId);
+            if (main) await delegateExistingWait(main);
+            break;
+          }
+        }
+
+        // A real main-agent permission or elicitation is the escalation: it
+        // must remain a human decision and is never delegated to a model.
         updateAgent(agentId, { state: "waiting_input" });
         notify(`${who} needs input`, msg, { priority: "high", tags: "warning" });
         break;
