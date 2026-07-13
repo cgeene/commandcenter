@@ -104,6 +104,20 @@ describe("humanizeEvent", () => {
     expect(s).toContain('{"a":1}');
   });
 
+  it("agent.reaped names the worker, task, and terminal status", () => {
+    const s = humanizeEvent(
+      ev({ kind: "agent.reaped", agent_id: 7, task_id: 42, payload: JSON.stringify({ task_status: "done" }) }),
+    );
+    expect(s).toBe("Reaped worker 7 — #42 finished (done), freeing its slot");
+  });
+
+  it("scheduler.capacity_blocked reports the taken slots", () => {
+    const s = humanizeEvent(
+      ev({ kind: "scheduler.capacity_blocked", payload: JSON.stringify({ live_workers: 3, max_concurrent: 3 }) }),
+    );
+    expect(s).toBe("Scheduler stalled — 3/3 worker slots taken while tasks wait");
+  });
+
   it("tolerates missing/garbage payloads without throwing", () => {
     expect(humanizeEvent(ev({ kind: "review.rejected", task_id: 2, payload: null }))).toBe(
       "Reviewer rejected #2",

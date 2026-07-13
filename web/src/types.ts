@@ -118,7 +118,8 @@ export type AttentionKind =
   | "merge_and_apply"
   | "decision"
   | "escalation"
-  | "stale_waiting";
+  | "stale_waiting"
+  | "scheduler_stalled";
 
 export interface AttentionItem {
   id: string;

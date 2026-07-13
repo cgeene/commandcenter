@@ -873,6 +873,7 @@ const KIND_ICON: Record<AttentionItem["kind"], string> = {
   decision: "⚖",
   escalation: "⛔",
   stale_waiting: "⏳",
+  scheduler_stalled: "🚦",
 };
 
 /**

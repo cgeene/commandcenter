@@ -464,6 +464,7 @@ interface SchedulerInfo {
     active_hours: { start: number; end: number } | null;
     auto_review: boolean;
     escalate_minutes: number;
+    reap_after_minutes: number;
   };
   status: { live_workers: number; spawns_today: number };
 }
@@ -478,7 +479,7 @@ async function printSchedulerStatus(): Promise<void> {
     ? `${config.active_hours.start}:00-${config.active_hours.end}:00`
     : "always";
   console.log(
-    `scheduler: ${config.enabled ? "ON" : "OFF"} · workers ${status.live_workers}/${config.max_concurrent} · spawns today ${status.spawns_today}/${config.daily_spawn_limit} · window ${hours} · stall ${config.stall_minutes}m · auto-review ${config.auto_review ? "on" : "off"} · escalate ${config.escalate_minutes}m`,
+    `scheduler: ${config.enabled ? "ON" : "OFF"} · workers ${status.live_workers}/${config.max_concurrent} · spawns today ${status.spawns_today}/${config.daily_spawn_limit} · window ${hours} · stall ${config.stall_minutes}m · auto-review ${config.auto_review ? "on" : "off"} · escalate ${config.escalate_minutes}m · reap ${config.reap_after_minutes}m`,
   );
 }
 
@@ -512,11 +513,13 @@ scheduler
   .option("--hours <range>", '"22-6" for overnight, or "always"')
   .option("--auto-review <on|off>", "auto-review tasks when they reach review")
   .option("--escalate <minutes>", "minutes a waiting worker gets before the human is paged")
+  .option("--reap <minutes>", "minutes a finished worker sits idle before it's reaped")
   .action(async (opts) => {
     const patch: Record<string, unknown> = {};
     if (opts.max) patch.max_concurrent = Number(opts.max);
     if (opts.autoReview) patch.auto_review = opts.autoReview === "on";
     if (opts.escalate) patch.escalate_minutes = Number(opts.escalate);
+    if (opts.reap) patch.reap_after_minutes = Number(opts.reap);
     if (opts.limit) patch.daily_spawn_limit = Number(opts.limit);
     if (opts.stall) patch.stall_minutes = Number(opts.stall);
     if (opts.hours === "always") patch.active_hours = null;

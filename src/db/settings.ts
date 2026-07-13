@@ -22,6 +22,11 @@ export interface SchedulerConfig {
   read_only_extra_allow: string[];
   /** Minutes an agent may sit in waiting_input before the "Needs You" panel flags it as stale. */
   attention_stale_minutes: number;
+  /** Minutes a worker on a TERMINAL task (done/cancelled/failed) may sit idle
+   *  before the watchdog auto-reaps it (kills its tmux window, frees the
+   *  max_concurrent slot). Grace covers a human reading the terminal right
+   *  after completion. */
+  reap_after_minutes: number;
 }
 
 export const SCHEDULER_DEFAULTS: SchedulerConfig = {
@@ -34,6 +39,7 @@ export const SCHEDULER_DEFAULTS: SchedulerConfig = {
   escalate_minutes: 5,
   read_only_extra_allow: [],
   attention_stale_minutes: 10,
+  reap_after_minutes: 10,
 };
 
 function getSetting(key: string): string | undefined {

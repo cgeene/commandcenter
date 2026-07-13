@@ -1,8 +1,14 @@
 import { dismissedKeys } from "../db/attention.js";
 import { listAgents } from "../db/agents.js";
-import { latestAgentEvent, latestAgentEventTs } from "../db/events.js";
+import {
+  countEventsToday,
+  earliestEventTsAfter,
+  latestAgentEvent,
+  latestAgentEventTs,
+  latestEventTs,
+} from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
-import { listTasks } from "../db/tasks.js";
+import { listTasks, readyTasks } from "../db/tasks.js";
 import { MAX_REVIEW_CYCLES } from "./review.js";
 import { prStates } from "./prcache.js";
 
@@ -18,7 +24,8 @@ export type AttentionKind =
   | "merge_and_apply"
   | "decision"
   | "escalation"
-  | "stale_waiting";
+  | "stale_waiting"
+  | "scheduler_stalled";
 
 export type Severity = "red" | "orange" | "yellow";
 
@@ -44,6 +51,11 @@ const SEVERITY_RANK: Record<Severity, number> = { red: 3, orange: 2, yellow: 1 }
 // terraform/gcloud/kubectl apply steps rot every day they go unapplied
 // (e.g. the cost-allocation PR lost COGS history) — worth their own kind.
 const APPLY_RE = /terraform apply|gcloud .* apply|kubectl apply/i;
+
+// The scheduler emits capacity_blocked / budget_reached the moment auto-spawn
+// stalls, but a brief stall is normal churn. Only nag the human once it has
+// persisted past this — long enough that it's a real stuck queue, not a blip.
+const SCHEDULER_STALL_MS = 15 * 60_000;
 
 function excerpt(s: string | null | undefined, n = 200): string {
   if (!s) return "";
@@ -167,6 +179,63 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
       pr_url: task?.pr_url ?? null,
       created_at: waitStart,
     });
+  }
+
+  // --- scheduler_stalled: auto-spawn has ready work it can't start, because
+  //     every worker slot is held (idle finished workers squatting, the bug
+  //     this whole feature exists to surface) or the daily budget is spent.
+  //     Only shown once the blockage has persisted, and only when the
+  //     scheduler is actually enabled (a disabled scheduler isn't "stalled"). -
+  if (cfg.enabled) {
+    const ready = readyTasks();
+    if (ready.length > 0) {
+      const liveWorkers = agents.filter((a) => a.kind === "worker");
+
+      // capacity: all slots taken. Anchor to the FIRST capacity_blocked event
+      // of the current episode (since the last successful spawn) so the age is
+      // stable across the scheduler's hourly re-emits.
+      if (cfg.max_concurrent - liveWorkers.length <= 0) {
+        const since = latestEventTs("scheduler.spawned") ?? null;
+        const anchor = earliestEventTsAfter("scheduler.capacity_blocked", since);
+        if (anchor && nowMs - Date.parse(anchor) > SCHEDULER_STALL_MS) {
+          const who = liveWorkers.map((w) => `a${w.id}`).join(", ");
+          push({
+            id: `scheduler_stalled:capacity:${anchor}`,
+            kind: "scheduler_stalled",
+            title: `Scheduler stalled — ${liveWorkers.length} idle workers holding slots`,
+            context: `${ready.length} task${ready.length === 1 ? "" : "s"} ready but all ${cfg.max_concurrent} worker slots are taken (${who}); kill idle workers or raise max_concurrent`,
+            severity: "yellow",
+            urgent: false,
+            task_id: null,
+            agent_id: null,
+            pr_url: null,
+            created_at: anchor,
+          });
+        }
+      }
+
+      // budget: today's autonomous spawn budget is spent while work waits.
+      const spawnsToday =
+        countEventsToday("scheduler.spawned") +
+        countEventsToday("reviewer.auto_spawned");
+      if (spawnsToday >= cfg.daily_spawn_limit) {
+        const anchor = latestEventTs("scheduler.budget_reached");
+        if (anchor && nowMs - Date.parse(anchor) > SCHEDULER_STALL_MS) {
+          push({
+            id: `scheduler_stalled:budget:${anchor}`,
+            kind: "scheduler_stalled",
+            title: `Scheduler paused — daily spawn budget spent`,
+            context: `${ready.length} task${ready.length === 1 ? "" : "s"} ready but ${spawnsToday}/${cfg.daily_spawn_limit} autonomous spawns used today; raise the limit or spawn manually`,
+            severity: "yellow",
+            urgent: false,
+            task_id: null,
+            agent_id: null,
+            pr_url: null,
+            created_at: anchor,
+          });
+        }
+      }
+    }
   }
 
   // severity desc, then oldest first (a problem that has festered ranks above
