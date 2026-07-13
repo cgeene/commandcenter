@@ -3,4 +3,7 @@
 export const WAIT_HOOK_EVENTS = [
   "hook.notification",
   "hook.permissionrequest",
+  // Trust/startup prompts appear before provider hooks are available, so the
+  // watchdog records the beginning of that wait itself.
+  "agent.startup_permission",
 ] as const;

@@ -175,6 +175,30 @@ describe("deriveAttention — kinds", () => {
     expect(items[0].agent_id).toBe(a.id);
   });
 
+  it("stale_waiting includes provider startup trust waits", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { getDb } = await import("../src/db/db.js");
+    const a = createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "waiting_input",
+    });
+    logEvent("agent.startup_permission", {
+      agentId: a.id,
+      payload: { trust: true },
+    });
+    getDb()
+      .prepare("UPDATE events SET ts = ? WHERE kind = 'agent.startup_permission'")
+      .run(new Date(Date.now() - 15 * 60_000).toISOString());
+
+    const items = deriveAttention({ isPrOpen: allOpen });
+    expect(items).toHaveLength(1);
+    expect(items[0].kind).toBe("stale_waiting");
+    expect(items[0].agent_id).toBe(a.id);
+  });
+
   it("an escalated wait is reported once, as escalation not stale_waiting", async () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     const { createAgent } = await import("../src/db/agents.js");

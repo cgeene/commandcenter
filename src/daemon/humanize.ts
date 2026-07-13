@@ -50,6 +50,7 @@ const TEMPLATES: Record<string, Template> = {
     `Reopened ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
   "task.requeued": (e, p) =>
     `Requeued ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
+  "task.recovered": (e) => `Recovered ${taskRef(e)} after a false window-loss signal`,
 
   // --- review ---
   "review.approved": (e, p) =>
@@ -85,6 +86,11 @@ const TEMPLATES: Record<string, Template> = {
   "agent.killed": (e) => `Killed ${agentRef(e)}`,
   "agent.stalled": (e) => `${worker(e)} stalled on ${taskRef(e)}`,
   "agent.vanished": (e) => `${worker(e)} vanished`,
+  "agent.window_missing": (e) =>
+    `${agentRef(e)} window missing once — awaiting confirmation`,
+  "agent.recovered": (e) => `${agentRef(e)} recovered while its process was still live`,
+  "agent.startup_permission": (e, p) =>
+    `${agentRef(e)} needs ${p.trust ? "one-time trust review" : "startup approval"}`,
   "agent.sent": (e) => `Sent input to ${worker(e)}`,
   "agent.send_failed": (e) => `Failed to send input to ${worker(e)}`,
   "agent.input_submitted": (e) => `Submitted ${worker(e)}'s pending input`,
@@ -134,6 +140,8 @@ const TEMPLATES: Record<string, Template> = {
   "main.escalated": (_e, p) => `Main agent escalated: ${clip(p.title, 80)}`,
   "attention.dismissed": () => `Dismissed a "needs you" item`,
   "scheduler.config": () => `Scheduler settings changed`,
+  "watchdog.tmux_unavailable": () => `tmux health observation unavailable — no agents changed`,
+  "watchdog.tmux_recovered": () => `tmux health observation recovered`,
   "daemon.stale": () => `Daemon is running stale code`,
 };
 

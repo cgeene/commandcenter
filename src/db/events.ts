@@ -68,14 +68,16 @@ export function latestAgentEventTs(
 export function latestAgentEvent(
   agentId: number,
   kinds: string[],
-): { id: number; ts: string } | undefined {
+): Pick<Event, "id" | "ts" | "kind" | "payload"> | undefined {
   const marks = kinds.map(() => "?").join(",");
   return getDb()
     .prepare(
-      `SELECT id, ts FROM events WHERE agent_id = ? AND kind IN (${marks})
+      `SELECT id, ts, kind, payload FROM events WHERE agent_id = ? AND kind IN (${marks})
        ORDER BY id DESC LIMIT 1`,
     )
-    .get(agentId, ...kinds) as { id: number; ts: string } | undefined;
+    .get(agentId, ...kinds) as
+    | Pick<Event, "id" | "ts" | "kind" | "payload">
+    | undefined;
 }
 
 /** Id of the task's most recent event of any of `kinds`. Ids order events

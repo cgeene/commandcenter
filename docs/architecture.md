@@ -51,6 +51,16 @@ the agent, while the local publishing policy remains enforced by the hook.
 The local `cc` MCP server is role-scoped and explicitly approved so a worker
 can record its result without a separate prompt for each platform tool call.
 
+Provider trust prompts occur before lifecycle hooks are available. The
+watchdog parses those startup screens and marks the agent `waiting_input` so
+the human can answer in the dashboard; it never delegates repository/folder
+trust to another model. The Claude main agent starts in the empty
+`$CC_DATA_DIR/main-workspace` rather than the user's home directory. After its
+`SessionStart` hook arrives, outstanding routine worker approvals are delegated
+to it. A tmux window must be missing in two consecutive successful health
+snapshots before an agent is reaped, and an unreliable tmux observation causes
+no agent/task mutation.
+
 ## Lifecycle of a task
 
 ```

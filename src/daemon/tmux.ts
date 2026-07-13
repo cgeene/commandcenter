@@ -46,12 +46,13 @@ export function killWindow(target: string): void {
   tmux("kill-window", "-t", target);
 }
 
+/** All local tmux window targets, including an older agent session retained
+ * across a CC_TMUX_SESSION change. Callers still match exact stored targets. */
 export function listWindowIds(): string[] {
   try {
     return tmux(
       "list-windows",
-      "-t",
-      tmuxSession(),
+      "-a",
       "-F",
       "#{session_name}:#{window_id}",
     )
@@ -63,14 +64,30 @@ export function listWindowIds(): string[] {
   }
 }
 
-/** Live process windows only. `remain-on-exit` intentionally keeps crashed
- * windows inspectable, so presence alone is not a worker-health signal. */
-export function listLiveWindowIds(): string[] {
+/**
+ * A null snapshot means tmux could not be observed reliably. That must be
+ * distinguished from an empty, successful snapshot: treating a transient
+ * client/socket error as "every window vanished" orphans still-running
+ * provider processes from Command Center's database.
+ */
+export type LiveWindowSnapshot = string[] | null;
+
+function tmuxSessionIsDefinitelyAbsent(error: unknown): boolean {
+  const detail =
+    error instanceof Error
+      ? `${error.message} ${String((error as Error & { stderr?: unknown }).stderr ?? "")}`
+      : String(error);
+  return /can't find session|no server running/i.test(detail);
+}
+
+/** Live process windows across all local tmux sessions. `remain-on-exit`
+ * intentionally keeps crashed windows inspectable, so presence alone is not
+ * a worker-health signal. */
+export function listLiveWindowIds(): LiveWindowSnapshot {
   try {
     return tmux(
       "list-windows",
-      "-t",
-      tmuxSession(),
+      "-a",
       "-F",
       "#{session_name}:#{window_id}\t#{pane_dead}",
     )
@@ -81,8 +98,11 @@ export function listLiveWindowIds(): string[] {
         const [target, dead] = line.split("\t");
         return dead === "0" ? [target] : [];
       });
-  } catch {
-    return [];
+  } catch (error) {
+    // A missing session is a trustworthy empty result. Permission/socket/
+    // locale/client failures are not; the watchdog must retry without
+    // mutating agent or task state.
+    return tmuxSessionIsDefinitelyAbsent(error) ? [] : null;
   }
 }
 

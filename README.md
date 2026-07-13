@@ -152,6 +152,15 @@ agp codex setup
 agp codex doctor
 ```
 
+On the first Claude-main launch, the dashboard may show a one-time folder-trust
+prompt. It applies only to the empty, mode-`0700`
+`$CC_DATA_DIR/main-workspace`, not to your home directory. Likewise, the first
+Codex task for a repository may ask you to trust that repository before
+project-local config, hooks, or exec policies can load. Command Center surfaces
+both prompts in the browser, but intentionally does not let one model approve a
+provider trust boundary for another. After trust is established, routine worker
+approval prompts are delegated to the Claude main agent first.
+
 > The MCP server is loaded from `dist/mcp/index.js`, so agents need a build.
 > Re-run `npm run build:all` (or `agp upgrade`) after changing source.
 
@@ -402,6 +411,7 @@ All config is either an environment variable read at call time or a value in the
 | `CC_WORKER_PROVIDER` | `claude` | Default provider for new tasks/crons |
 | `CC_TMUX_SESSION` | `cc` | tmux session name |
 | `CC_MAIN_MODEL` | `fable` | Default Claude model for the main orchestrator (`agp main`) |
+| `CC_MAIN_WORKSPACE` | `$CC_DATA_DIR/main-workspace` | Absolute, empty least-privilege cwd used by the Claude main orchestrator |
 | `CC_REVIEWER_MODEL` | unset | Claude reviewer override; otherwise preserve a Claude task model or use `opus` for a Codex-worker review |
 | `CC_NTFY_URL` | unset | ntfy topic URL for push notifications (disabled if unset) |
 | `CC_NTFY_TOKEN` | unset | ntfy auth token (self-hosted / protected topics) |
@@ -444,6 +454,12 @@ about, on your own machine.
   isolated profile with `workspace-write`, network disabled in the sandbox, and
   `on-request` escalation plus a fail-closed push policy; no approval or hook-trust bypass is used. The read-only allowlist is
   an explicit, auditable list in [`src/daemon/permissions.ts`](src/daemon/permissions.ts).
+- **Trust stays human; routine approval is orchestrated.** Provider
+  repository/folder trust enables project-local hooks and policy, so it is
+  surfaced in the browser for an explicit one-time human choice. Once the
+  provider lifecycle hook is active, safe routine worker prompts go to the
+  Claude main agent before Command Center pages you. The main agent itself runs
+  in `$CC_DATA_DIR/main-workspace`, not your home directory.
 - **Humans hold the merge.** Nothing merges itself — not the scheduler, not the
   main agent, not an approved reviewer. Merges, force-pushes, and secrets are
   yours.

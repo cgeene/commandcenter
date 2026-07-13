@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {
   baseUrl,
@@ -8,6 +7,7 @@ import {
   codexHome,
   codexProfile,
   defaultMainModel,
+  mainWorkspaceDir,
   promptsDir,
 } from "../config.js";
 import {
@@ -257,6 +257,23 @@ function resolveReviewerModel(task: Task, override?: string): string {
 export const _resumableSessionForTest = resumableSession;
 export const _resolveReviewerModelForTest = resolveReviewerModel;
 
+function prepareMainWorkspace(): string {
+  const workspace = mainWorkspaceDir();
+  if (!path.isAbsolute(workspace)) {
+    throw new Error("main workspace must be an absolute path");
+  }
+  fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
+  const workspaceStat = fs.lstatSync(workspace);
+  if (!workspaceStat.isDirectory() || workspaceStat.isSymbolicLink()) {
+    throw new Error("main workspace must be a real directory");
+  }
+  if (fs.readdirSync(workspace).length > 0) {
+    throw new Error("main workspace must be empty");
+  }
+  fs.chmodSync(workspace, 0o700);
+  return workspace;
+}
+
 export function spawnWorker(
   taskId: number,
   modelOverride?: string,
@@ -470,7 +487,10 @@ export function spawnReviewer(
     dir,
     buildClaudeCmd({ model, settingsFile, mcpFile, promptFile }),
   );
-  updateAgent(agent.id, { tmux_target: target, state: "working" });
+  // SessionStart is the readiness handshake, just as it is for workers.
+  // Keeping the reviewer in spawning lets the watchdog surface a provider
+  // trust prompt instead of claiming the reviewer is already healthy.
+  updateAgent(agent.id, { tmux_target: target });
   logEvent("reviewer.spawned", {
     agentId: agent.id,
     taskId,
@@ -488,6 +508,9 @@ export function spawnMain(model?: string): Agent {
   }
 
   const resolvedModel = model ?? defaultMainModel();
+  // Validate the trust boundary before creating the DB row so a bad override
+  // cannot strand an unstartable "live" main agent.
+  const workspace = prepareMainWorkspace();
   const agent = createAgent({
     kind: "main",
     provider: "claude",
@@ -495,7 +518,11 @@ export function spawnMain(model?: string): Agent {
     state: "spawning",
   });
 
-  const settingsFile = writeSettingsFile("main", agent.id);
+  const settingsFile = writeSettingsFile("main", agent.id, {
+    // The orchestrator manages the queue through cc MCP; it never needs to
+    // edit files or execute shell commands in its workspace.
+    deny: ["Edit", "Write", "NotebookEdit", "Bash"],
+  });
   const mcpFile = writeMcpConfigFile("main", {
     CC_ROLE: "main",
     CC_AGENT_ID: String(agent.id),
@@ -508,10 +535,12 @@ export function spawnMain(model?: string): Agent {
 
   const target = newWindow(
     "main",
-    os.homedir(),
+    workspace,
     buildClaudeCmd({ model: resolvedModel, settingsFile, mcpFile, promptFile }),
   );
-  updateAgent(agent.id, { tmux_target: target, state: "working" });
+  // Do not report the orchestrator as working until its SessionStart hook
+  // arrives. The provider may first require a one-time workspace-trust choice.
+  updateAgent(agent.id, { tmux_target: target });
   logEvent("agent.spawned", {
     agentId: agent.id,
     payload: { target, model: resolvedModel, kind: "main" },
@@ -568,14 +597,29 @@ export function killAgent(
 ): Agent {
   const agent = getAgent(agentId);
   if (!agent) throw new Error(`agent ${agentId} not found`);
-  if (agent.state === "dead") return agent;
+  const liveWindow = Boolean(
+    agent.tmux_target && windowExists(agent.tmux_target),
+  );
+  // A false watchdog observation can leave a live provider process behind a
+  // DB row marked dead. "kill" must still stop that split-brain process.
+  if (agent.state === "dead" && !liveWindow) return agent;
 
-  if (agent.tmux_target && windowExists(agent.tmux_target)) {
+  if (agent.tmux_target && liveWindow) {
     killWindow(agent.tmux_target);
   }
   updateAgent(agentId, { state: "dead" });
 
   const task = agent.task_id ? getTask(agent.task_id) : undefined;
+  // A dead DB row no longer owns task state. Stop its stray process and leave
+  // the already-requeued or reassigned task untouched.
+  if (agent.state === "dead") {
+    logEvent("agent.killed", {
+      agentId,
+      taskId: agent.task_id ?? undefined,
+      payload: { ...opts, split_brain: true },
+    });
+    return getAgent(agentId)!;
+  }
   if (task && agent.kind === "reviewer") {
     // A reviewer only ever owns its own detached worktree — never the
     // worker's tree, and killing it must not requeue the task.

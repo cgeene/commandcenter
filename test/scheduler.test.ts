@@ -20,13 +20,22 @@ afterEach(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-function deps(overrides: Partial<{ spawned: number[]; windows: string[]; now: Date }> = {}) {
+function deps(
+  overrides: Partial<{
+    spawned: number[];
+    windows: string[] | null;
+    now: Date;
+  }> = {},
+) {
   const spawned: number[] = overrides.spawned ?? [];
   return {
     spawned,
     deps: {
       spawn: (id: number) => spawned.push(id),
-      windowIds: () => overrides.windows ?? [],
+      windowIds: () =>
+        Object.prototype.hasOwnProperty.call(overrides, "windows")
+          ? (overrides.windows ?? null)
+          : [],
       now: () => overrides.now ?? new Date("2026-07-03T12:00:00"),
     },
   };
@@ -145,7 +154,7 @@ describe("watchdog", () => {
     );
   });
 
-  it("reaps vanished windows: requeue once, fail on second vanish", async () => {
+  it("confirms a missing window before requeueing, then fails on a second confirmed vanish", async () => {
     const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
     const { createAgent, getAgent } = await import("../src/db/agents.js");
     const { watchdog } = await import("../src/daemon/scheduler.js");
@@ -154,14 +163,118 @@ describe("watchdog", () => {
     const a1 = createAgent({ kind: "worker", state: "working", task_id: task.id, tmux_target: "cc:@9" });
     updateTask(task.id, { status: "in_progress", agent_id: a1.id });
 
-    watchdog({ spawn: () => {}, windowIds: () => [], now: () => new Date() });
+    const missing = { spawn: () => {}, windowIds: () => [], now: () => new Date() };
+    watchdog(missing);
+    expect(getAgent(a1.id)?.state).toBe("working");
+    expect(getTask(task.id)?.status).toBe("in_progress");
+    watchdog(missing);
     expect(getAgent(a1.id)?.state).toBe("dead");
     expect(getTask(task.id)?.status).toBe("queued"); // first vanish -> retry
 
     const a2 = createAgent({ kind: "worker", state: "working", task_id: task.id, tmux_target: "cc:@10" });
     updateTask(task.id, { status: "in_progress", agent_id: a2.id });
-    watchdog({ spawn: () => {}, windowIds: () => [], now: () => new Date() });
+    watchdog(missing);
+    expect(getAgent(a2.id)?.state).toBe("working");
+    watchdog(missing);
     expect(getTask(task.id)?.status).toBe("failed"); // second vanish -> give up
+  });
+
+  it("never mutates agents when tmux cannot be observed reliably", async () => {
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const agent = createAgent({
+      kind: "worker",
+      state: "working",
+      task_id: task.id,
+      tmux_target: "cc:@9",
+    });
+    updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+
+    watchdog({ spawn: () => {}, windowIds: () => null, now: () => new Date() });
+    watchdog({ spawn: () => {}, windowIds: () => null, now: () => new Date() });
+
+    expect(getAgent(agent.id)?.state).toBe("working");
+    expect(getTask(task.id)?.status).toBe("in_progress");
+    expect(
+      listEvents(20).filter((event) => event.kind === "watchdog.tmux_unavailable"),
+    ).toHaveLength(1);
+  });
+
+  it("surfaces a startup trust prompt before SessionStart is available", async () => {
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    const main = createAgent({
+      kind: "main",
+      provider: "claude",
+      state: "spawning",
+      tmux_target: "cc:@9",
+    });
+
+    watchdog({
+      spawn: () => {},
+      windowIds: () => ["cc:@9"],
+      now: () => new Date(),
+      pendingPermission: () => ({
+        question: "Security guide",
+        options: [
+          { n: 1, label: "Yes, I trust this folder" },
+          { n: 2, label: "No, exit" },
+        ],
+      }),
+    });
+
+    expect(getAgent(main.id)?.state).toBe("waiting_input");
+    expect(listEvents(10).map((event) => event.kind)).toContain(
+      "agent.startup_permission",
+    );
+  });
+
+  it("recovers a false vanish only while its original task is still unclaimed", async () => {
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent, updateAgent } = await import("../src/db/agents.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const agent = createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "working",
+      task_id: task.id,
+      tmux_target: "cc:@9",
+    });
+    updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+    const missing = { spawn: () => {}, windowIds: () => [], now: () => new Date() };
+    watchdog(missing);
+    watchdog(missing);
+    expect(getTask(task.id)?.status).toBe("queued");
+
+    watchdog({
+      spawn: () => {},
+      windowIds: () => ["cc:@9"],
+      now: () => new Date(),
+      pendingPermission: () => ({
+        question: "run command?",
+        options: [
+          { n: 1, label: "Yes, proceed" },
+          { n: 2, label: "No" },
+        ],
+      }),
+    });
+
+    expect(getAgent(agent.id)?.state).toBe("waiting_input");
+    expect(getTask(task.id)).toMatchObject({
+      status: "in_progress",
+      agent_id: agent.id,
+    });
+
+    // The recovered false signal must not spend the task's one real retry.
+    updateAgent(agent.id, { state: "working" });
+    watchdog(missing);
+    watchdog(missing);
+    expect(getTask(task.id)?.status).toBe("queued");
   });
 
   it("marks silent working agents stalled", async () => {

@@ -24,6 +24,7 @@ commandcenter has two kinds of configuration:
 | `CC_WORKER_PROVIDER` | `claude` | Default provider for newly created tasks and crons (`claude` or `codex`). |
 | `CC_TMUX_SESSION` | `cc` | tmux session name that hosts agent windows. |
 | `CC_MAIN_MODEL` | `fable` | Default Claude model for the main orchestrator (`agp main`). |
+| `CC_MAIN_WORKSPACE` | `$CC_DATA_DIR/main-workspace` | Absolute, empty mode-`0700` cwd used by the Claude main orchestrator, keeping its trust boundary away from the user's home directory. Populated directories and symlinks fail closed. |
 | `CC_REVIEWER_MODEL` | unset | Claude reviewer override; otherwise preserve a Claude task model or use `opus` when reviewing Codex-worker output. |
 | `CC_NTFY_URL` | unset | ntfy topic URL (e.g. `https://ntfy.sh/<topic>`). Unset disables push notifications. |
 | `CC_NTFY_TOKEN` | unset | ntfy auth token for a self-hosted or access-protected topic. |
@@ -36,6 +37,7 @@ commandcenter has two kinds of configuration:
 - `prompts/` — generated worker/reviewer/main prompt files
 - `settings/` — generated per-agent `--settings` JSON (never your `~/.claude/settings.json`)
 - `mcp/` — generated per-agent `--mcp-config` JSON
+- `main-workspace/` — empty least-privilege cwd for the Claude main agent
 - `codex/` — isolated Codex profile, hooks, login/trust state, and sessions
 - `codex/rules/commandcenter.rules` — push/merge policy that routes pushes
   through branch validation and keeps merges human-only
