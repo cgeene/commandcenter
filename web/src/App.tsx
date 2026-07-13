@@ -381,6 +381,7 @@ export function App() {
 
       {selTask && (
         <TaskPanel
+          key={selTask.id}
           task={selTask}
           onClose={closePanel}
           onAction={act}
