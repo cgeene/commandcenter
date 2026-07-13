@@ -173,6 +173,20 @@ CREATE TABLE IF NOT EXISTS attention_dismissed (
   dismissed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- Orchestrator notifications ("worker aN is waiting for input") that could not
+-- be delivered to the main agent yet — its turn was mid-flight or its composer
+-- held the human's unsubmitted draft. Held here (persisted so a daemon restart
+-- doesn't drop them) and flushed as one batched message when the main next
+-- goes idle with an empty prompt. See src/daemon/notifqueue.ts.
+CREATE TABLE IF NOT EXISTS queued_notifications (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  main_id    INTEGER NOT NULL,
+  worker_id  INTEGER,
+  task_id    INTEGER,
+  message    TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
 `;

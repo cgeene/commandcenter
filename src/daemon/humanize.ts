@@ -106,6 +106,12 @@ const TEMPLATES: Record<string, Template> = {
   // --- waiting / delegation ---
   "waiting.escalated": (e) => `Escalated ${worker(e)} — still waiting for input`,
   "waiting.delegated": (e) => `Delegated ${worker(e)}'s question to the main agent`,
+  "notification.queued": (e) =>
+    `Held ${worker(e)}'s notification — main agent's prompt was busy`,
+  "notification.flushed": (_e, p) => {
+    const n = Number(p.count) || 0;
+    return `Delivered ${n} queued notification${n === 1 ? "" : "s"} to the main agent`;
+  },
 
   // --- scheduler / crons ---
   "scheduler.spawned": (e) => `Scheduler spawned a worker for ${taskRef(e)}`,
