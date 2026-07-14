@@ -59,14 +59,59 @@ describe("parsePrUrl", () => {
 });
 
 describe("applyPrState", () => {
-  it("merged PR completes the task", async () => {
+  it("merged approved PR auto-completes the task and unblocks dependents", async () => {
     const { applyPrState } = await import("../src/daemon/prsync.js");
-    const { getTask } = await import("../src/db/tasks.js");
+    const { getTask, updateTask, createTask, readyTasks } = await import(
+      "../src/db/tasks.js"
+    );
     const { listEvents } = await import("../src/db/events.js");
     const { task } = await setupPrTask();
+    updateTask(task.id, { review_verdict: "approve" });
+    const dep = createTask({
+      title: "dependent",
+      prompt: "x",
+      repo: "/r",
+      blocked_by: task.id,
+    });
+    expect(readyTasks().map((t) => t.id)).not.toContain(dep.id); // gated on task
     await applyPrState(task.id, open({ state: "MERGED" }));
     expect(getTask(task.id)?.status).toBe("done");
-    expect(listEvents(10).map((e) => e.kind)).toContain("pr.merged");
+    const kinds = listEvents(10).map((e) => e.kind);
+    expect(kinds).toContain("task.autocompleted");
+    expect(kinds).not.toContain("pr.merged"); // superseded by task.autocompleted
+    expect(readyTasks().map((t) => t.id)).toContain(dep.id); // dependent freed
+  });
+
+  it("merged PR still auto-completes an un-reviewed task (verdict=null)", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { task } = await setupPrTask(); // no verdict recorded
+    await applyPrState(task.id, open({ state: "MERGED" }));
+    expect(getTask(task.id)?.status).toBe("done");
+  });
+
+  it("never auto-completes a rejected task whose PR a human merged deliberately", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task } = await setupPrTask();
+    updateTask(task.id, { review_verdict: "reject" });
+    await applyPrState(task.id, open({ state: "MERGED" }));
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("review"); // left for the orchestrator/human to resolve
+    const kinds = listEvents(10).map((e) => e.kind);
+    expect(kinds).not.toContain("task.autocompleted");
+    expect(kinds).toContain("pr.merged"); // merge recorded for the audit trail
+  });
+
+  it("never auto-completes a task that burned through its review cycles", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { MAX_REVIEW_CYCLES } = await import("../src/daemon/review.js");
+    const { task } = await setupPrTask();
+    updateTask(task.id, { review_cycles: MAX_REVIEW_CYCLES });
+    await applyPrState(task.id, open({ state: "MERGED" }));
+    expect(getTask(task.id)?.status).toBe("review");
   });
 
   it("closed-unmerged PR blocks the task and reaps its worker", async () => {

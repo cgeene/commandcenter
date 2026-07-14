@@ -52,6 +52,24 @@ describe("humanizeEvent", () => {
     expect(s).toBe("#7 moved queued → in_progress");
   });
 
+  it("task.autocompleted names the task and reason", () => {
+    const s = humanizeEvent(
+      ev({ kind: "task.autocompleted", task_id: 70, payload: JSON.stringify({ reason: "PR merged" }) }),
+    );
+    expect(s).toBe("Auto-completed #70 (PR merged)");
+  });
+
+  it("pr.merged (override branch) does NOT claim the task is done", () => {
+    // pr.merged now fires only when a human merged a rejected/capped PR that
+    // prsync deliberately left in review — the line must not say "done".
+    const s = humanizeEvent(
+      ev({ kind: "pr.merged", task_id: 20, payload: JSON.stringify({ autocompleted: false }) }),
+    );
+    expect(s).toContain("#20");
+    expect(s).toContain("left in review");
+    expect(s).not.toMatch(/\bdone\b/);
+  });
+
   it("pr.sync_broken surfaces the failure count and error", () => {
     const s = humanizeEvent(
       ev({ kind: "pr.sync_broken", task_id: 41, payload: JSON.stringify({ fails: 3, error: "gh: not found" }) }),

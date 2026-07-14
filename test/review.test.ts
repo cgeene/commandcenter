@@ -18,34 +18,90 @@ afterEach(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-/** A task in review with a (dead-window) worker agent attached. */
-async function setupReviewTask(fields: { review_cycles?: number } = {}) {
+/** A task in review with a (dead-window) worker agent attached. Defaults to a
+ *  normal code task with an open PR — the merge-gated case. Pass open_pr:false
+ *  (and no pr_url) for a doc-only task, which has no merge gate. */
+async function setupReviewTask(
+  fields: { review_cycles?: number; open_pr?: boolean; pr_url?: string | null } = {},
+) {
   const { createTask, updateTask } = await import("../src/db/tasks.js");
   const { createAgent } = await import("../src/db/agents.js");
-  const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+  const openPr = fields.open_pr ?? true;
+  const task = createTask({ title: "t", prompt: "x", repo: "/r", open_pr: openPr });
   const worker = createAgent({ kind: "worker", state: "idle", task_id: task.id });
+  const prUrl =
+    fields.pr_url !== undefined
+      ? fields.pr_url
+      : openPr
+        ? `https://github.com/x/y/pull/${task.id}`
+        : null;
   updateTask(task.id, {
     status: "review",
     agent_id: worker.id,
     branch: `agent/task-${task.id}`,
     result_summary: "claims done",
     review_cycles: fields.review_cycles ?? 0,
+    pr_url: prUrl,
   });
   return { task, worker };
 }
 
 describe("handleVerdict", () => {
-  it("approve flags the task and keeps it in review for the human", async () => {
+  it("approve on an open-PR task keeps it in review for the human to merge", async () => {
     const { handleVerdict } = await import("../src/daemon/review.js");
     const { getTask } = await import("../src/db/tasks.js");
     const { listEvents } = await import("../src/db/events.js");
-    const { task } = await setupReviewTask();
+    const { task } = await setupReviewTask(); // merge-gated: open_pr=true + pr_url
     await handleVerdict(task.id, 99, "approve", "checked the diff, all good");
     const t = getTask(task.id)!;
-    expect(t.status).toBe("review");
+    expect(t.status).toBe("review"); // NOT auto-completed — waits for the merge
     expect(t.review_verdict).toBe("approve");
     expect(t.review_notes).toContain("all good");
-    expect(listEvents(10).map((e) => e.kind)).toContain("review.approved");
+    const kinds = listEvents(10).map((e) => e.kind);
+    expect(kinds).toContain("review.approved");
+    expect(kinds).not.toContain("task.autocompleted");
+  });
+
+  it("approve on a doc-only (open_pr=false) task auto-completes it", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task } = await setupReviewTask({ open_pr: false }); // no merge gate
+    await handleVerdict(task.id, 99, "approve", "doc reads well");
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("done"); // approve IS completion — nothing to merge
+    expect(t.review_verdict).toBe("approve");
+    const kinds = listEvents(10).map((e) => e.kind);
+    expect(kinds).toContain("task.autocompleted");
+    expect(kinds).toContain("review.approved");
+  });
+
+  it("approve on a code task whose pr_url isn't recorded yet stays in review", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    // A worker can reach review with pr_url still null (open_pr=1). Auto-
+    // completing here would strand real code on an unmerged branch — the gate
+    // is open_pr===0 only, so this waits for the normal merge path instead.
+    const { task } = await setupReviewTask({ open_pr: true, pr_url: null });
+    await handleVerdict(task.id, 99, "approve", "looks complete");
+    expect(getTask(task.id)?.status).toBe("review");
+    expect(listEvents(10).map((e) => e.kind)).not.toContain("task.autocompleted");
+  });
+
+  it("doc-only auto-completion unblocks its dependents", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { createTask, readyTasks } = await import("../src/db/tasks.js");
+    const { task } = await setupReviewTask({ open_pr: false });
+    const dep = createTask({
+      title: "dependent",
+      prompt: "x",
+      repo: "/r",
+      blocked_by: task.id,
+    });
+    expect(readyTasks().map((t) => t.id)).not.toContain(dep.id); // blocked
+    await handleVerdict(task.id, 99, "approve", "ok");
+    expect(readyTasks().map((t) => t.id)).toContain(dep.id); // now ready
   });
 
   it("reject with a dead worker requeues with notes and bumps the cycle", async () => {
