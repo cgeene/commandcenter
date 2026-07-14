@@ -15,6 +15,7 @@ import {
   readyTasks,
   updateTask,
 } from "../db/tasks.js";
+import { flushMainQueue } from "./notifqueue.js";
 import { notify } from "./notify.js";
 import { killAgent, spawnWorker } from "./spawn.js";
 import { listWindowIds } from "./tmux.js";
@@ -254,6 +255,14 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
           continue;
         }
       }
+    }
+
+    // Retry flushing notifications queued for an idle main whose flush was
+    // deferred because the human was mid-typing at Stop. flushMainQueue
+    // re-checks the prompt and respects its own backoff; a busy prompt just
+    // defers again. Fire-and-forget — a flush must never break the watchdog.
+    if (agent.kind === "main" && agent.state === "idle") {
+      void flushMainQueue(agent.id, { nowMs }).catch(() => {});
     }
 
     // waiting_input was delegated to the main agent (hooks.ts); if nobody

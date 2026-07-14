@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { getAgent, listAgents, updateAgent, type Agent } from "../db/agents.js";
+import { getAgent, updateAgent, type Agent } from "../db/agents.js";
 import {
   countAgentEvents,
   countTaskEvents,
@@ -7,7 +7,7 @@ import {
   logEvent,
 } from "../db/events.js";
 import { getTask, updateTask, type Task } from "../db/tasks.js";
-import { getSchedulerConfig } from "../db/settings.js";
+import { delegateToMain, flushMainQueue } from "./notifqueue.js";
 import { notify } from "./notify.js";
 import { resumeAgent } from "./resume.js";
 import { maybeAutoReview } from "./review.js";
@@ -88,10 +88,6 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function getEscalateMinutes(): number {
-  return getSchedulerConfig().escalate_minutes;
-}
-
 /**
  * Claude Code hook events are the platform's source of truth for agent state:
  * SessionStart registers the session, Notification means the agent is waiting
@@ -156,37 +152,25 @@ export async function handleHookEvent(
         ? `${msg}\n\n(auto-recovery gave up after ${MAX_AUTO_NUDGES} attempts — last seen: ${stallError})`
         : msg;
 
-      // First try the main agent. Only a main that is working/idle — text
-      // injected into a main sitting on its own permission menu would be
-      // interpreted as an answer to that menu.
-      const main = listAgents({ live: true }).find(
-        (a) =>
-          a.kind === "main" &&
-          ["working", "idle"].includes(a.state) &&
-          a.tmux_target !== null &&
-          windowExists(a.tmux_target),
-      );
-      const delegated =
-        main &&
-        (await resumeAgent(
-          main.id,
-          `[commandcenter] ${agent.kind} ${who} is waiting for input: "${fullMsg}". peek_worker(${agentId}) to see exactly what it's asking, then try to unblock it yourself via send_to_worker (for a numbered menu send just the digit). Escalate to the human ONLY if it genuinely needs them: credentials, a judgment call that's theirs, or approval for something destructive/outside the worktree. If unresolved after ${getEscalateMinutes()}m the human is paged automatically.`,
-        )) === "sent";
-      if (delegated) {
-        logEvent("waiting.delegated", {
-          agentId,
-          taskId: agent.task_id ?? undefined,
-          payload: { to: main!.id, message: fullMsg },
-        });
-      } else {
-        notify(`${who} needs input`, fullMsg, { priority: "high", tags: "warning" });
-      }
+      // Hand it to the main agent — delivered now only if its prompt is idle
+      // and empty, otherwise queued so it never clobbers the human's draft or
+      // fires mid-turn (see notifqueue.ts). Queuing leaves this worker's
+      // waiting_input state and hook.notification timestamp untouched, so the
+      // watchdog's escalate-to-human page still fires on time.
+      await delegateToMain(agent, fullMsg);
       break;
     }
 
     case "Stop": {
       updateAgent(agentId, { state: "idle" });
       recordTokens(agent, body.session_id);
+      if (agent.kind === "main") {
+        // The main's turn just ended — its prompt should be clear now, so
+        // flush any notifications queued while it was busy (batched, and only
+        // after re-confirming the human isn't mid-typing).
+        await flushMainQueue(agentId, { force: true });
+        break;
+      }
       if (agent.kind === "reviewer") {
         await reviewerStopped(agent);
         break;
