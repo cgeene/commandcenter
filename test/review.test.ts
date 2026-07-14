@@ -76,13 +76,17 @@ describe("handleVerdict", () => {
     expect(kinds).toContain("review.approved");
   });
 
-  it("approve on a task with no pr_url auto-completes it (no merge gate)", async () => {
+  it("approve on a code task whose pr_url isn't recorded yet stays in review", async () => {
     const { handleVerdict } = await import("../src/daemon/review.js");
     const { getTask } = await import("../src/db/tasks.js");
-    // open_pr=true but the PR was never opened -> nothing for prsync to gate on
+    const { listEvents } = await import("../src/db/events.js");
+    // A worker can reach review with pr_url still null (open_pr=1). Auto-
+    // completing here would strand real code on an unmerged branch — the gate
+    // is open_pr===0 only, so this waits for the normal merge path instead.
     const { task } = await setupReviewTask({ open_pr: true, pr_url: null });
     await handleVerdict(task.id, 99, "approve", "looks complete");
-    expect(getTask(task.id)?.status).toBe("done");
+    expect(getTask(task.id)?.status).toBe("review");
+    expect(listEvents(10).map((e) => e.kind)).not.toContain("task.autocompleted");
   });
 
   it("doc-only auto-completion unblocks its dependents", async () => {

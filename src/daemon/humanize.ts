@@ -70,7 +70,12 @@ const TEMPLATES: Record<string, Template> = {
   "verify.failed": (e) => `${taskRef(e)} failed verification`,
 
   // --- PRs ---
-  "pr.merged": (e) => `PR merged — ${taskRef(e)} done`,
+  // pr.merged now fires ONLY in the guarded override branch: a human merged the
+  // PR of a rejected/cycle-capped task, which prsync deliberately does NOT
+  // auto-complete (left for the orchestrator). A normal merge completes via
+  // task.autocompleted, so this line must never claim the task is done.
+  "pr.merged": (e) =>
+    `PR merged for ${taskRef(e)} — left in review (rejected verdict; needs orchestrator)`,
   "pr.closed": (e) => `PR closed without merge — ${taskRef(e)} blocked`,
   "pr.feedback": (e, p) => {
     const n = Number(p.comments) || 0;

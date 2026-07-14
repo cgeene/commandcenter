@@ -111,14 +111,19 @@ export async function handleVerdict(
   });
 
   if (verdict === "approve") {
-    // A task with a mergeable PR still waits for the human's merge — prsync
-    // completes it when the PR merges. But a task with no merge gate (doc-only
-    // tasks created open_pr=false, or any task with no pr_url) has nothing left
-    // to gate on, so approve IS completion: mark it done here and let the next
-    // scheduler pass pick up newly-unblocked dependents. Mirrors the reject
-    // guard by construction — reject never reaches this branch.
-    const mergeGated = task.open_pr !== 0 && !!task.pr_url;
-    if (!mergeGated) {
+    // Doc-only tasks (created open_pr=false) never produce a PR, so there is no
+    // merge to gate completion on — approve IS completion: mark done here and
+    // let the next scheduler pass pick up newly-unblocked dependents. Mirrors
+    // the reject guard by construction (reject never reaches this branch).
+    //
+    // We gate strictly on open_pr === 0, NOT on "no pr_url": a normal code task
+    // (open_pr=1) can reach review before its pr_url is recorded (see
+    // hooks.ts — a worker may move itself to review with pr_url still null).
+    // Auto-completing that on approve would mark real code done with its work
+    // stranded on an unmerged branch. Such a task stays in review and completes
+    // the normal way once prsync sees its PR merge.
+    const docOnly = task.open_pr === 0;
+    if (docOnly) {
       updateTask(taskId, {
         status: "done",
         review_verdict: "approve",
