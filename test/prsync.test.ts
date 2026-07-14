@@ -145,6 +145,130 @@ describe("applyPrState", () => {
     expect(t.pr_feedback_at).toBe("2026-07-04T02:00:00Z");
   });
 
+  // --- PR review classification (task #84): an approval is not feedback ---
+
+  it("a bare human approval never re-queues and preserves the internal notes", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task } = await setupPrTask();
+    // internal reviewer's evidence that must survive
+    updateTask(task.id, { review_notes: "internal reviewer: verified, approve" });
+    await applyPrState(
+      task.id,
+      open({
+        reviewDecision: "APPROVED",
+        reviews: [
+          {
+            author: "twongkeeny",
+            body: "approve",
+            state: "APPROVED",
+            created_at: "2026-07-14T16:59:00Z",
+          },
+        ],
+      }),
+    );
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("review"); // NOT re-queued
+    expect(t.pr_feedback_at).toBeNull(); // watermark untouched
+    expect(t.review_notes).toBe("internal reviewer: verified, approve"); // NOT clobbered
+    expect(t.human_approved_at).toBe("2026-07-14T16:59:00Z"); // signal recorded
+    const kinds = listEvents(10).map((e) => e.kind);
+    expect(kinds).toContain("pr.human_approved");
+    expect(kinds).not.toContain("task.requeued");
+    expect(kinds).not.toContain("pr.feedback");
+  });
+
+  it("an empty-body APPROVED/COMMENTED review is not feedback and is not re-logged each pass", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task } = await setupPrTask();
+    const state = open({
+      reviewDecision: "APPROVED",
+      reviews: [
+        { author: "twongkeeny", body: "", state: "APPROVED", created_at: "2026-07-14T16:59:00Z" },
+        { author: "bob", body: "   ", state: "COMMENTED", created_at: "2026-07-14T16:58:00Z" },
+      ],
+    });
+    await applyPrState(task.id, state);
+    expect(getTask(task.id)?.status).toBe("review");
+    await applyPrState(task.id, state); // second pass: same approval, still "fresh"
+    // recorded exactly once — no every-2min event spam
+    const approved = listEvents(20).map((e) => e.kind).filter((k) => k === "pr.human_approved");
+    expect(approved).toHaveLength(1);
+  });
+
+  it("an APPROVED review WITH a change request in its body DOES re-queue", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { task } = await setupPrTask();
+    await applyPrState(
+      task.id,
+      open({
+        reviewDecision: "APPROVED",
+        reviews: [
+          {
+            author: "twongkeeny",
+            body: "approve, but please rename the helper",
+            state: "APPROVED",
+            created_at: "2026-07-14T17:00:00Z",
+          },
+        ],
+      }),
+    );
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("queued");
+    expect(t.review_notes).toContain("rename the helper");
+    expect(t.pr_feedback_at).toBe("2026-07-14T17:00:00Z");
+  });
+
+  it("a CHANGES_REQUESTED review re-queues even with an empty body, appending to notes", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { task } = await setupPrTask();
+    updateTask(task.id, { review_notes: "prior internal evidence" });
+    await applyPrState(
+      task.id,
+      open({
+        reviewDecision: "CHANGES_REQUESTED",
+        reviews: [
+          { author: "twongkeeny", body: "", state: "CHANGES_REQUESTED", created_at: "2026-07-14T17:05:00Z" },
+        ],
+      }),
+    );
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("queued");
+    expect(t.review_notes).toContain("prior internal evidence"); // preserved
+    expect(t.review_notes).toContain("CHANGES REQUESTED"); // appended
+    expect(t.pr_feedback_at).toBe("2026-07-14T17:05:00Z");
+  });
+
+  it("a mixed batch (approval + a real comment) re-queues on the comment and still records the approval", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task } = await setupPrTask();
+    await applyPrState(
+      task.id,
+      open({
+        reviewDecision: "APPROVED",
+        comments: [
+          { author: "caleb", body: "one nit: guard the null case", created_at: "2026-07-14T17:10:00Z" },
+        ],
+        reviews: [
+          { author: "twongkeeny", body: "lgtm", state: "APPROVED", created_at: "2026-07-14T17:09:00Z" },
+        ],
+      }),
+    );
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("queued");
+    expect(t.review_notes).toContain("guard the null case");
+    expect(t.review_notes).not.toContain("lgtm"); // the approval is not forwarded as feedback
+    expect(t.human_approved_at).toBe("2026-07-14T17:09:00Z");
+    expect(listEvents(10).map((e) => e.kind)).toContain("pr.human_approved");
+  });
+
   it("already-forwarded comments are not re-sent", async () => {
     const { applyPrState } = await import("../src/daemon/prsync.js");
     const { getTask, updateTask } = await import("../src/db/tasks.js");

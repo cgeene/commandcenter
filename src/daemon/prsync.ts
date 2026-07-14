@@ -21,13 +21,27 @@ export interface PrComment {
   created_at: string;
 }
 
+/** A submitted PR review. Unlike a comment it carries a state, which is what
+ *  lets us tell an actionable "changes requested" from a bare "approve". */
+export interface PrReview {
+  author: string;
+  body: string;
+  /** APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED (uppercased). */
+  state: string;
+  created_at: string;
+}
+
 /** CI check rollup for a PR — how the dashboard badges its health. */
 export type CheckRollup = "pass" | "fail" | "pending" | "none";
 
 export interface PrState {
   state: "OPEN" | "MERGED" | "CLOSED";
   reviewDecision: string | null;
+  /** Top-level PR comments + inline review comments (never review verdicts). */
   comments: PrComment[];
+  /** Submitted reviews with their verdict state; absent when not fetched
+   *  (older callers/tests). */
+  reviews?: PrReview[];
   /** Rolled-up CI status; absent when not fetched (older callers/tests). */
   checks?: CheckRollup;
   /** GitHub draft state; absent when not fetched (older callers/tests). A
@@ -102,10 +116,13 @@ export async function fetchPrState(prUrl: string): Promise<PrState> {
     state: PrState["state"];
     isDraft?: boolean;
     reviewDecision: string | null;
-    reviews?: { author?: { login?: string }; body?: string; submittedAt?: string }[];
+    reviews?: { author?: { login?: string }; body?: string; state?: string; submittedAt?: string }[];
     statusCheckRollup?: RollupEntry[];
   };
   type RawComment = { user?: { login?: string }; body?: string; created_at?: string };
+  const notBot = (author: string) => !author.endsWith("[bot]");
+  // Top-level PR comments + inline review comments. Review verdicts are kept
+  // separate (see `reviews` below) so their state can gate re-queueing.
   const comments: PrComment[] = [
     ...(JSON.parse(issueComments) as RawComment[]).map((c) => ({
       author: c.user?.login ?? "?",
@@ -117,26 +134,74 @@ export async function fetchPrState(prUrl: string): Promise<PrState> {
       body: c.body ?? "",
       created_at: c.created_at ?? "",
     })),
-    ...(v.reviews ?? [])
-      .filter((r) => r.body?.trim())
-      .map((r) => ({
-        author: r.author?.login ?? "?",
-        body: r.body ?? "",
-        created_at: r.submittedAt ?? "",
-      })),
   ]
     .filter((c) => c.body.trim() && c.created_at)
     // CI chatter (codecov[bot], github-actions[bot], ...) is not review
     // feedback — forwarding it would yank the task out of review for nothing.
-    .filter((c) => !c.author.endsWith("[bot]"));
+    .filter((c) => notBot(c.author));
   comments.sort((a, b) => a.created_at.localeCompare(b.created_at));
+  // Submitted reviews, kept WITH their state and even when the body is empty:
+  // an empty CHANGES_REQUESTED is still actionable, and an empty/trivial
+  // APPROVED must be recognizable so we don't re-queue on it. PENDING reviews
+  // (no submittedAt) are dropped.
+  const reviews: PrReview[] = (v.reviews ?? [])
+    .map((r) => ({
+      author: r.author?.login ?? "?",
+      body: r.body ?? "",
+      state: (r.state ?? "").toUpperCase(),
+      created_at: r.submittedAt ?? "",
+    }))
+    .filter((r) => r.created_at && notBot(r.author))
+    .sort((a, b) => a.created_at.localeCompare(b.created_at));
   return {
     state: v.state,
     reviewDecision: v.reviewDecision,
     comments,
+    reviews,
     checks: computeCheckRollup(v.statusCheckRollup ?? []),
     isDraft: v.isDraft ?? false,
   };
+}
+
+const TRIVIAL_APPROVAL_BODIES = new Set([
+  "approve",
+  "approved",
+  "approving",
+  "lgtm",
+  "looks good",
+  "looks good to me",
+  "ship it",
+  "shipit",
+  "+1",
+  "ok",
+  "okay",
+  "done",
+  "thanks",
+  "ty",
+  "nice",
+]);
+
+/** A bare approval acknowledgment ("approve", "lgtm", "👍") carries no change
+ *  request. We normalize away punctuation/emoji so "LGTM!" and "👍" collapse to
+ *  the empty/known set. Anything with real prose ("approve, but rename X")
+ *  falls through as non-trivial. */
+function isTrivialApproval(body: string): boolean {
+  const normalized = body
+    .toLowerCase()
+    .replace(/[^a-z0-9+]+/g, " ")
+    .trim();
+  return normalized === "" || TRIVIAL_APPROVAL_BODIES.has(normalized);
+}
+
+/** Does a submitted review count as actionable PR feedback? Key off state AND
+ *  body — never state alone:
+ *  - CHANGES_REQUESTED is always feedback (even with an empty body).
+ *  - Any other verdict (APPROVED/COMMENTED/DISMISSED) is feedback only when its
+ *    body carries a real request; an empty or trivial-approval body is a
+ *    thumbs-up, not a re-queue trigger. */
+export function reviewIsFeedback(r: PrReview): boolean {
+  if (r.state === "CHANGES_REQUESTED") return true;
+  return r.body.trim() !== "" && !isTrivialApproval(r.body);
 }
 
 function reapTaskAgents(task: Task, opts?: { rmWorktree?: boolean }): void {
@@ -217,8 +282,42 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
   // OPEN: forward new human feedback. pr_feedback_at is the high-water mark;
   // null means the PR was just created — everything so far is feedback.
   const since = task.pr_feedback_at ?? "";
-  const fresh = pr.comments.filter((c) => c.created_at > since);
-  const changesRequested = pr.reviewDecision === "CHANGES_REQUESTED";
+  const freshComments = pr.comments.filter((c) => c.created_at > since);
+  const freshReviews = (pr.reviews ?? []).filter((r) => r.created_at > since);
+
+  // A bare approval is a signal, not feedback. Record it (event + lightweight
+  // field) so the dashboard can show "human approved", but never let it
+  // re-queue a finished task or overwrite the internal reviewer's notes.
+  const approvals = freshReviews.filter(
+    (r) => r.state === "APPROVED" && !reviewIsFeedback(r),
+  );
+  if (approvals.length) {
+    const latest = approvals[approvals.length - 1].created_at;
+    if ((task.human_approved_at ?? "") < latest) {
+      updateTask(taskId, { human_approved_at: latest });
+      logEvent("pr.human_approved", {
+        taskId,
+        payload: { pr_url: task.pr_url, reviewers: approvals.map((a) => a.author) },
+      });
+    }
+  }
+
+  // Only reviews that actually request changes re-queue; approvals are dropped.
+  const feedbackReviews = freshReviews.filter(reviewIsFeedback);
+  const changesRequested =
+    pr.reviewDecision === "CHANGES_REQUESTED" ||
+    feedbackReviews.some((r) => r.state === "CHANGES_REQUESTED");
+
+  // Merge comments and actionable reviews into one time-ordered feedback list.
+  const fresh = [
+    ...freshComments.map((c) => ({ author: c.author, body: c.body, created_at: c.created_at })),
+    ...feedbackReviews.map((r) => ({
+      author: r.author,
+      body: r.body.trim() || `(${r.state.toLowerCase().replace(/_/g, " ")})`,
+      created_at: r.created_at,
+    })),
+  ].sort((a, b) => a.created_at.localeCompare(b.created_at));
+
   if (fresh.length === 0 && !changesRequested) return;
   if (fresh.length === 0 && changesRequested && task.pr_feedback_at) return; // already forwarded
 
@@ -263,12 +362,18 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
     // not_live: fall through to requeue
   }
 
-  // notes flow into the respawn prompt, same as a reviewer rejection
+  // notes flow into the respawn prompt, same as a reviewer rejection. Append
+  // rather than overwrite — the internal reviewer's evidence (and any earlier
+  // PR-feedback round) must survive, else it's lost the moment a human comments.
+  const feedbackNote = `PR feedback (${task.pr_url}) — address every point and push to the same branch:\n${feedback}`;
+  const notes = task.review_notes
+    ? `${task.review_notes}\n\n---\n\n${feedbackNote}`
+    : feedbackNote;
   updateTask(taskId, {
     status: "queued",
     agent_id: null,
     pr_feedback_at: mark,
-    review_notes: `PR feedback (${task.pr_url}) — address every point and push to the same branch:\n${feedback}`,
+    review_notes: notes,
   });
   logEvent("pr.feedback", {
     taskId,
