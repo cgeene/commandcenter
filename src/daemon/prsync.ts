@@ -3,6 +3,7 @@ import { listAgents } from "../db/agents.js";
 import { logEvent } from "../db/events.js";
 import { getTask, tasksNeedingPrSync, updateTask, type Task } from "../db/tasks.js";
 import { notify } from "./notify.js";
+import { MAX_REVIEW_CYCLES } from "./review.js";
 import { resumeAgent } from "./resume.js";
 import { killAgent } from "./spawn.js";
 import { git, removeWorktree } from "./worktree.js";
@@ -150,6 +151,21 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
   if (!task || task.status !== "review") return;
 
   if (pr.state === "MERGED") {
+    // A merged PR normally auto-completes its task and unblocks its dependents.
+    // The one exception is a deliberate human merge of a rejected/blocked PR
+    // (the known override case — see cc PR #20): if the latest verdict is
+    // reject or the task burned through its review cycles, never auto-complete
+    // it. Leave it for the orchestrator/human to resolve deliberately. (A
+    // blocked task is already excluded by the status !== "review" guard above;
+    // this is the defensive check for a review-status task that still carries a
+    // reject verdict.)
+    if (task.review_verdict === "reject" || task.review_cycles >= MAX_REVIEW_CYCLES) {
+      logEvent("pr.merged", {
+        taskId,
+        payload: { pr_url: task.pr_url, autocompleted: false },
+      });
+      return;
+    }
     reapTaskAgents(task, { rmWorktree: true });
     const fresh = getTask(taskId)!;
     if (fresh.worktree) {
@@ -168,8 +184,11 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
       }
     }
     updateTask(taskId, { status: "done" });
-    logEvent("pr.merged", { taskId, payload: { pr_url: task.pr_url } });
-    notify(`task #${taskId} done — PR merged`, task.title, { tags: "tada" });
+    logEvent("task.autocompleted", {
+      taskId,
+      payload: { pr_url: task.pr_url, reason: "PR merged" },
+    });
+    notify(`task #${taskId} auto-completed — PR merged`, task.title, { tags: "tada" });
     return;
   }
 

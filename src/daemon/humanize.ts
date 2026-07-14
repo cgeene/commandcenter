@@ -50,6 +50,8 @@ const TEMPLATES: Record<string, Template> = {
     `Reopened ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
   "task.requeued": (e, p) =>
     `Requeued ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
+  "task.autocompleted": (e, p) =>
+    `Auto-completed ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
 
   // --- review ---
   "review.approved": (e, p) =>

@@ -111,6 +111,30 @@ export async function handleVerdict(
   });
 
   if (verdict === "approve") {
+    // A task with a mergeable PR still waits for the human's merge — prsync
+    // completes it when the PR merges. But a task with no merge gate (doc-only
+    // tasks created open_pr=false, or any task with no pr_url) has nothing left
+    // to gate on, so approve IS completion: mark it done here and let the next
+    // scheduler pass pick up newly-unblocked dependents. Mirrors the reject
+    // guard by construction — reject never reaches this branch.
+    const mergeGated = task.open_pr !== 0 && !!task.pr_url;
+    if (!mergeGated) {
+      updateTask(taskId, {
+        status: "done",
+        review_verdict: "approve",
+        review_notes: notes,
+      });
+      logEvent("task.autocompleted", {
+        taskId,
+        payload: { reason: "approved (no PR to merge)" },
+      });
+      notify(
+        `task #${taskId} auto-completed`,
+        `${task.title} — approved by reviewer, no PR to merge`,
+        { tags: "tada" },
+      );
+      return getTask(taskId)!;
+    }
     updateTask(taskId, { review_verdict: "approve", review_notes: notes });
     notify(
       `task #${taskId} approved by reviewer`,
