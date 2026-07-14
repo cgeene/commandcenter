@@ -53,22 +53,38 @@ button.sched-on:hover { background: #da3633; border-color: #da3633; }
   padding: 6px 16px; font-size: 12px; cursor: pointer;
 }
 
+/* Agents list as a single vertical column: the main orchestrator pinned on
+   top, worker/reviewer sub-agents beneath. Rows stack cleanly regardless of
+   how many are waiting — no horizontal wrapping to interleave awkwardly. */
 .agents {
-  display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 16px;
-  border-bottom: 1px solid var(--border); min-height: 52px; align-items: flex-start;
+  display: flex; flex-direction: column; gap: 8px; padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
 }
-.agent-card {
-  display: flex; align-items: center; gap: 8px; white-space: nowrap;
+.agents-workers { display: flex; flex-direction: column; gap: 6px; }
+.agents-section-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px;
+}
+.agents-section-label span { opacity: 0.7; }
+
+.agent-entry {
   background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
   padding: 6px 10px; font-size: 12px;
 }
-/* A waiting_input card breaks out to full width so its pane content has
-   room to breathe instead of being crammed into a horizontal-scroll chip. */
-.agent-card.waiting {
-  flex-basis: 100%; flex-direction: column; align-items: stretch; white-space: normal;
-  border-color: var(--yellow);
+/* Main orchestrator: pinned + accented so its terminal is always one click. */
+.agent-entry.main { border-color: var(--accent); background: #58a6ff12; }
+.agent-entry.main.empty { border-style: dashed; background: none; }
+/* Waiting is a subtle, contained cue — a thin yellow left border + a small
+   badge — never a full-width box that grows and dominates the layout. */
+.agent-entry.waiting { border-left: 3px solid var(--yellow); }
+.agent-entry-row { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+.agent-entry-row .agent-state {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
 }
-.agent-card-row { display: flex; align-items: center; gap: 8px; }
+.waiting-badge {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--yellow); border: 1px solid var(--yellow); border-radius: 8px;
+  padding: 0 6px; flex-shrink: 0;
+}
 .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 
 .agent-pane { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }

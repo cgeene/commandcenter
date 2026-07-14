@@ -185,11 +185,18 @@ export function buildApp(): Hono {
   });
 
   app.post("/api/agents/:id/kill", async (c) => {
+    const id = Number(c.req.param("id"));
+    // Defense-in-depth for the dashboard hiding the main agent's kill button:
+    // killing the orchestrator from here is a footgun, so reject it server-side
+    // too. Internal shutdown paths call killAgent() directly and are unaffected.
+    if (getAgent(id)?.kind === "main") {
+      return c.json({ error: "refusing to kill the main agent" }, 403);
+    }
     const body = (await c.req.json().catch(() => ({}))) as {
       requeue?: boolean;
       rm_worktree?: boolean;
     };
-    const agent = killAgent(Number(c.req.param("id")), {
+    const agent = killAgent(id, {
       requeue: body.requeue,
       rmWorktree: body.rm_worktree,
     });
