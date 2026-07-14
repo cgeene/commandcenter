@@ -92,8 +92,13 @@ agent started, went idle, needs input, or stopped.
    session (up to 2 nudges, then `blocked`). The `Stop` hook re-verifies even a
    task the worker moved to `review` itself, so `verify_cmd` can't be bypassed.
 5. **Review** — an independent reviewer proofs the branch (details below).
-6. **PR** — the worker pushes its own branch and opens a PR, recording it via
-   `update_my_task(pr_url)`.
+6. **PR** — the worker pushes its own branch and opens a PR **as a draft**
+   (`gh pr create --draft`), recording it via `update_my_task(pr_url)`. The draft
+   is the GitHub-native signal that internal review has not yet approved: the
+   platform flips it to ready-for-review only on approval (below), so on GitHub
+   "ready for review" literally means "passed internal review — safe to merge".
+   If a repo can't create drafts the worker falls back to a normal PR titled
+   `[UNREVIEWED] …`; the platform strips that prefix when it approves.
 7. **PR sync** — every ~2 minutes the daemon polls GitHub via `gh` for tasks in
    `review` with a `pr_url`. Merged → `done` (agents reaped, worktree removed,
    local branch pruned). Closed without merge → `blocked`. New comments or a
@@ -112,10 +117,16 @@ independence is the point — and is prompted to find reasons to **reject**. It
 calls `submit_review(approve|reject, notes)`:
 
 - **reject** → notes go back into the worker's session (or a respawn prompt);
-  task returns to `in_progress`.
+  task returns to `in_progress`. If the PR had already been flipped to ready
+  (a fix round on a previously-approved PR), it is sent back to draft
+  (`gh pr ready --undo`) so its GitHub state keeps meaning "not yet approved".
 - after **2** rejected cycles (`MAX_REVIEW_CYCLES`) → `blocked`, escalated to the
-  human with both sides' notes.
-- **approve** → pings the human; the merge stays human.
+  human with both sides' notes. The PR stays a draft — the GitHub-visible "still
+  not approved" signal.
+- **approve** → the platform flips the draft PR to ready-for-review
+  (`gh pr ready`, emitting `pr.marked_ready`) and pings the human; the merge
+  stays human. A failed flip is surfaced loudly (event + push) so an approved PR
+  is never silently stuck as a draft.
 
 The main agent also gets `get_task_diff` and `read_worker_transcript`, so it can
 proof workers with evidence rather than terminal peeks.

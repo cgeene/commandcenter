@@ -22,6 +22,7 @@ export interface Task {
   pr_feedback_at: string | null;
   pr_state: string | null; // open | merged | closed (lowercased gh state)
   pr_checks: string | null; // CI rollup: pass | fail | pending | none
+  pr_is_draft: number | null; // 1 draft (internal review pending), 0 ready, NULL unknown
   pr_synced_at: string | null; // last successful prsync
   pr_sync_fails: number; // consecutive prsync failures; escalates at 3
   open_pr: number; // sqlite boolean, default 1
@@ -173,6 +174,7 @@ const UPDATABLE = new Set([
   "pr_feedback_at",
   "pr_state",
   "pr_checks",
+  "pr_is_draft",
   "pr_synced_at",
   "pr_sync_fails",
   "open_pr",

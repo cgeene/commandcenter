@@ -376,6 +376,25 @@ describe("recordSyncSuccess", () => {
     expect(t.pr_synced_at).not.toBeNull();
     expect(t.pr_sync_fails).toBe(0);
   });
+
+  it("captures the PR draft state (isDraft true -> 1, false -> 0)", async () => {
+    const { recordSyncSuccess } = await import("../src/daemon/prsync.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { task } = await setupPrTask();
+    recordSyncSuccess(task.id, open({ isDraft: true }));
+    expect(getTask(task.id)?.pr_is_draft).toBe(1);
+    recordSyncSuccess(task.id, open({ isDraft: false }));
+    expect(getTask(task.id)?.pr_is_draft).toBe(0);
+  });
+
+  it("does not clobber a known draft state when isDraft is absent", async () => {
+    const { recordSyncSuccess } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { task } = await setupPrTask();
+    updateTask(task.id, { pr_is_draft: 1 });
+    recordSyncSuccess(task.id, open()); // no isDraft on the state
+    expect(getTask(task.id)?.pr_is_draft).toBe(1); // untouched
+  });
 });
 
 describe("recordSyncFailure escalation", () => {

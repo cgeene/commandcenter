@@ -520,8 +520,16 @@ function CiBadge({ checks }: { checks: string | null }) {
 }
 
 /** The reviewer verdict — "reviewer approved — awaiting merge" is the state
- *  the whole board is built to surface. */
+ *  the whole board is built to surface. A draft PR is called out distinctly:
+ *  it has NOT passed internal adversarial review, so it is not merge-ready. */
 function VerdictBadge({ task }: { task: Task }) {
+  if (task.pr_is_draft === 1) {
+    return (
+      <span className="pr-verdict draft" title="draft PR — internal adversarial review pending; flips to ready only on approval">
+        ✎ draft — in internal review
+      </span>
+    );
+  }
   if (task.review_verdict === "approve") {
     return <span className="pr-verdict approved">✓ reviewer approved — awaiting merge</span>;
   }

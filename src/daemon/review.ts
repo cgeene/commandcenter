@@ -2,6 +2,7 @@ import { countEventsToday, logEvent } from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { getTask, updateTask, type Task } from "../db/tasks.js";
 import { notify } from "./notify.js";
+import { markPrDraft, markPrReady } from "./prdraft.js";
 import { resumeAgent } from "./resume.js";
 import { killAgent, spawnReviewer } from "./spawn.js";
 import { git } from "./worktree.js";
@@ -141,12 +142,62 @@ export async function handleVerdict(
       return getTask(taskId)!;
     }
     updateTask(taskId, { review_verdict: "approve", review_notes: notes });
+    // Passed internal review -> flip the draft PR to ready-for-review so
+    // GitHub's own "ready" state now means "safe for human merge". A failure
+    // here leaves an approved PR stuck as a draft, which would hide it from
+    // the merge queue, so it must be LOUD, never swallowed.
+    if (task.open_pr !== 0 && task.pr_url) {
+      try {
+        await markPrReady(task.pr_url);
+        updateTask(taskId, { pr_is_draft: 0 });
+        logEvent("pr.marked_ready", { taskId, agentId, payload: { pr_url: task.pr_url } });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logEvent("pr.ready_failed", {
+          taskId,
+          agentId,
+          payload: { pr_url: task.pr_url, error: msg },
+        });
+        notify(
+          `task #${taskId} approved but PR is STILL A DRAFT`,
+          `${task.title} — 'gh pr ready' failed: ${msg}\nMark it ready manually or it won't surface for merge:\n${task.pr_url}`,
+          { priority: "high", tags: "rotating_light" },
+        );
+      }
+    }
     notify(
       `task #${taskId} approved by reviewer`,
       `${task.title} — ready for your final review/merge${task.pr_url ? `\n${task.pr_url}` : ""}`,
       { tags: "white_check_mark" },
     );
     return getTask(taskId)!;
+  }
+
+  // Reject. If this PR had already been flipped to ready (a fix round on a
+  // previously-approved PR, or any drift to ready), send it back to draft so
+  // the GitHub-visible state keeps meaning "not yet internally approved". On
+  // the 2-cycle block below the PR therefore stays a draft. Only act when the
+  // PR is known-ready (pr_is_draft === 0); a still-draft or unknown PR is left
+  // untouched. A failure is loud — a rejected PR showing as ready could be
+  // merged by mistake.
+  if (task.open_pr !== 0 && task.pr_url && task.pr_is_draft === 0) {
+    try {
+      await markPrDraft(task.pr_url);
+      updateTask(taskId, { pr_is_draft: 1 });
+      logEvent("pr.redrafted", { taskId, agentId, payload: { pr_url: task.pr_url } });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logEvent("pr.redraft_failed", {
+        taskId,
+        agentId,
+        payload: { pr_url: task.pr_url, error: msg },
+      });
+      notify(
+        `task #${taskId} rejected but PR is STILL READY`,
+        `${task.title} — 'gh pr ready --undo' failed: ${msg}\nConvert it back to a draft manually so it isn't merged by mistake:\n${task.pr_url}`,
+        { priority: "high", tags: "rotating_light" },
+      );
+    }
   }
 
   const cycles = task.review_cycles + 1;

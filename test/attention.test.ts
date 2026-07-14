@@ -87,6 +87,24 @@ describe("deriveAttention — kinds", () => {
     expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
   });
 
+  it("skips a still-draft PR (never merge a PR that hasn't passed internal review)", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    const t = await approvedPrTask();
+    updateTask(t.id, { pr_is_draft: 1 }); // ready-flip failed or stale
+    expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
+  });
+
+  it("still surfaces a ready (pr_is_draft=0) approved PR for merge", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    const t = await approvedPrTask();
+    updateTask(t.id, { pr_is_draft: 0 });
+    const items = deriveAttention({ isPrOpen: allOpen });
+    expect(items).toHaveLength(1);
+    expect(items[0].kind).toBe("merge_pr");
+  });
+
   it("decision for a task blocked after >= MAX_REVIEW_CYCLES", async () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     const { createTask, updateTask } = await import("../src/db/tasks.js");
