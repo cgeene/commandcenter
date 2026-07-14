@@ -285,45 +285,12 @@ export function App() {
       )}
 
       {tab === "board" && (
-      <section className="agents">
-        {agents.map((a) => (
-          <div
-            key={a.id}
-            className={`agent-card ${a.state === "waiting_input" ? "waiting" : ""}`}
-          >
-            <div className="agent-card-row">
-              <span
-                className="dot"
-                style={{ background: STATE_COLORS[a.state] ?? "#8b949e" }}
-              />
-              <b>
-                a{a.id} {a.kind === "main" ? "· main" : a.task_id ? `· #${a.task_id}` : ""}
-              </b>
-              <span className="muted">
-                {a.state} · {a.model ?? "?"}
-              </span>
-              <button onClick={() => openTerminal(a.id)}>terminal</button>
-              <button
-                className="danger"
-                onClick={() =>
-                  act(() => api("POST", `/api/agents/${a.id}/kill`, { requeue: a.kind === "worker" }))
-                }
-              >
-                kill
-              </button>
-            </div>
-            {a.state === "waiting_input" && (
-              <AgentPane
-                agentId={a.id}
-                pane={panes[a.id]}
-                onAction={act}
-                onOpenTerminal={() => openTerminal(a.id)}
-              />
-            )}
-          </div>
-        ))}
-        {agents.length === 0 && <span className="muted">no live agents</span>}
-      </section>
+        <AgentList
+          agents={agents}
+          panes={panes}
+          onOpenTerminal={openTerminal}
+          onAction={act}
+        />
       )}
 
       {tab === "tokens" && <TokensView tasks={tasks} onSelect={(t) => openTask(t.id)} />}
@@ -951,7 +918,160 @@ function AttentionPanel({
 }
 
 /**
- * Inline "what is this agent asking?" panel for a waiting_input card — the
+ * The live-agent list. The MAIN orchestrator is pinned at the top as a
+ * prominent entry — Caleb jumps into its terminal constantly — with its
+ * open-terminal action emphasized and no kill button (killing the
+ * orchestrator from the dashboard is a footgun). Worker and reviewer
+ * sub-agents list below as compact rows that keep their kill buttons.
+ */
+function AgentList({
+  agents,
+  panes,
+  onOpenTerminal,
+  onAction,
+}: {
+  agents: Agent[];
+  panes: Record<number, ParsedPane>;
+  onOpenTerminal: (agentId: number) => void;
+  onAction: (fn: () => Promise<unknown>) => Promise<void>;
+}) {
+  // At most one respond pane open at a time — mirrors the single-panel model
+  // used elsewhere and keeps every waiting row compact until asked to expand.
+  const [respondId, setRespondId] = useState<number | null>(null);
+  const main = agents.find((a) => a.kind === "main");
+  const workers = agents.filter((a) => a.kind !== "main");
+  const toggleRespond = (id: number) =>
+    setRespondId((cur) => (cur === id ? null : id));
+
+  return (
+    <section className="agents">
+      {main ? (
+        <AgentEntry
+          agent={main}
+          prominent
+          pane={panes[main.id]}
+          expanded={respondId === main.id}
+          onToggleRespond={() => toggleRespond(main.id)}
+          onOpenTerminal={onOpenTerminal}
+          onAction={onAction}
+        />
+      ) : (
+        <div className="agent-entry main empty">
+          <span className="muted">no main agent — spawn one above</span>
+        </div>
+      )}
+
+      <div className="agents-workers">
+        <div className="agents-section-label muted">
+          workers <span>{workers.length}</span>
+        </div>
+        {workers.map((a) => (
+          <AgentEntry
+            key={a.id}
+            agent={a}
+            pane={panes[a.id]}
+            expanded={respondId === a.id}
+            onToggleRespond={() => toggleRespond(a.id)}
+            onOpenTerminal={onOpenTerminal}
+            onAction={onAction}
+          />
+        ))}
+        {workers.length === 0 && (
+          <span className="muted">no worker agents</span>
+        )}
+      </div>
+    </section>
+  );
+}
+
+/**
+ * One agent row. Stays a compact single line for every state; a waiting_input
+ * agent is marked with a thin yellow left border + "waiting" badge, and its
+ * inline respond pane (see AgentPane) is revealed on demand via "respond" so
+ * it never expands the layout on its own. The main orchestrator (`prominent`)
+ * gets an emphasized terminal button and no kill button.
+ */
+function AgentEntry({
+  agent,
+  prominent = false,
+  pane,
+  expanded,
+  onToggleRespond,
+  onOpenTerminal,
+  onAction,
+}: {
+  agent: Agent;
+  prominent?: boolean;
+  pane: ParsedPane | undefined;
+  expanded: boolean;
+  onToggleRespond: () => void;
+  onOpenTerminal: (agentId: number) => void;
+  onAction: (fn: () => Promise<unknown>) => Promise<void>;
+}) {
+  const waiting = agent.state === "waiting_input";
+  const label = prominent
+    ? "main agent"
+    : `a${agent.id}${
+        agent.task_id
+          ? ` · #${agent.task_id}`
+          : agent.kind === "reviewer"
+            ? " · review"
+            : ""
+      }`;
+  return (
+    <div
+      className={`agent-entry${prominent ? " main" : ""}${waiting ? " waiting" : ""}`}
+    >
+      <div className="agent-entry-row">
+        <span
+          className="dot"
+          style={{ background: STATE_COLORS[agent.state] ?? "#8b949e" }}
+        />
+        <b>{label}</b>
+        <span className="muted agent-state">
+          {agent.state} · {agent.model ?? "?"}
+        </span>
+        {waiting && <span className="waiting-badge">waiting</span>}
+        {waiting && (
+          <button onClick={onToggleRespond}>
+            {expanded ? "hide" : "respond"}
+          </button>
+        )}
+        <button
+          className={prominent ? "primary" : ""}
+          onClick={() => onOpenTerminal(agent.id)}
+        >
+          terminal
+        </button>
+        {!prominent && (
+          <button
+            className="danger"
+            onClick={() =>
+              onAction(() =>
+                api("POST", `/api/agents/${agent.id}/kill`, {
+                  requeue: agent.kind === "worker",
+                }),
+              )
+            }
+          >
+            kill
+          </button>
+        )}
+      </div>
+      {waiting && expanded && (
+        <AgentPane
+          agentId={agent.id}
+          pane={pane}
+          onAction={onAction}
+          onOpenTerminal={() => onOpenTerminal(agent.id)}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Inline "what is this agent asking?" panel for a waiting_input row — the
  * whole point being that Caleb (or the orchestrator) can answer it right
  * here instead of opening the terminal to find out. Every action is an
  * explicit click; nothing here is ever auto-sent.
