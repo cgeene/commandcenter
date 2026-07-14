@@ -66,3 +66,28 @@ export function claudeProjectsDir(): string {
     path.join(os.homedir(), ".claude", "projects")
   );
 }
+
+/**
+ * Explicit workspace-context mapping: directory-prefix -> CLAUDE.md path(s).
+ * Any repo whose path sits under a prefix imports that prefix's file(s) into
+ * its worktree, on top of what's inferred from the repo's ancestor dirs (see
+ * src/lib/context-roots.ts). Set via CC_CONTEXT_ROOTS as JSON, e.g.
+ *   {"/Users/me/projects/nylas":"/Users/me/notes/nylas.md",
+ *    "/opt/repos":["/opt/shared/CLAUDE.md"]}
+ * A string value is treated as a single-element list. Malformed JSON is
+ * ignored (returns {}) so a typo can never crash the daemon.
+ */
+export function contextRoots(): Record<string, string[]> {
+  const raw = process.env.CC_CONTEXT_ROOTS;
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const out: Record<string, string[]> = {};
+    for (const [prefix, value] of Object.entries(parsed)) {
+      out[prefix] = Array.isArray(value) ? value.map(String) : [String(value)];
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
