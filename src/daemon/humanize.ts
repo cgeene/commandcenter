@@ -82,6 +82,10 @@ const TEMPLATES: Record<string, Template> = {
     const cr = p.changes_requested ? ", changes requested" : "";
     return `New PR feedback on ${taskRef(e)} (${n} comment${n === 1 ? "" : "s"}${cr})`;
   },
+  "pr.human_approved": (e, p) => {
+    const who = Array.isArray(p.reviewers) ? (p.reviewers as string[]).join(", ") : "";
+    return `Human approved the PR for ${taskRef(e)}${who ? ` (${who})` : ""} — no changes requested`;
+  },
   "pr.sync_error": (e, p) =>
     `PR sync failed for ${taskRef(e)}: ${clip(p.error, 80)}`,
   "pr.sync_broken": (e, p) =>

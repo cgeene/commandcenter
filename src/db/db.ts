@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   pr_state       TEXT,
   pr_checks      TEXT,
   pr_is_draft    INTEGER,
+  human_approved_at TEXT,
   pr_synced_at   TEXT,
   pr_sync_fails  INTEGER NOT NULL DEFAULT 0,
   open_pr        INTEGER NOT NULL DEFAULT 1,
@@ -223,6 +224,12 @@ function migrate(db: Database.Database): void {
   // (internal review approved), NULL = unknown/not yet synced.
   if (!cols.includes("pr_is_draft")) {
     db.exec("ALTER TABLE tasks ADD COLUMN pr_is_draft INTEGER");
+  }
+  // human_approved_at: timestamp of the latest human GitHub approval that
+  // carried no change request. A signal for the dashboard, NOT a re-queue
+  // trigger (see prsync.applyPrState).
+  if (!cols.includes("human_approved_at")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN human_approved_at TEXT");
   }
   const memCols = (db.prepare("PRAGMA table_info(memories)").all() as { name: string }[]).map(
     (c) => c.name,

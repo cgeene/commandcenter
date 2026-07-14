@@ -23,6 +23,7 @@ export interface Task {
   pr_state: string | null; // open | merged | closed (lowercased gh state)
   pr_checks: string | null; // CI rollup: pass | fail | pending | none
   pr_is_draft: number | null; // 1 draft (internal review pending), 0 ready, NULL unknown
+  human_approved_at: string | null; // latest human GitHub approval (signal only, not a re-queue trigger)
   pr_synced_at: string | null; // last successful prsync
   pr_sync_fails: number; // consecutive prsync failures; escalates at 3
   open_pr: number; // sqlite boolean, default 1
@@ -175,6 +176,7 @@ const UPDATABLE = new Set([
   "pr_state",
   "pr_checks",
   "pr_is_draft",
+  "human_approved_at",
   "pr_synced_at",
   "pr_sync_fails",
   "open_pr",
