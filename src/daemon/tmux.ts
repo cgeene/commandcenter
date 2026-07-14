@@ -78,9 +78,25 @@ export async function sendText(target: string, text: string): Promise<void> {
   tmux("send-keys", "-t", target, "Enter");
 }
 
-/** Capture the visible pane content (for `agp peek`). */
-export function capturePane(target: string, lines = 50): string {
-  const out = tmux("capture-pane", "-p", "-t", target, "-S", `-${lines}`);
+/**
+ * Capture the visible pane content (for `agp peek`).
+ *
+ * Pass `{ escapes: true }` to keep tmux's ANSI escape sequences (`capture-pane
+ * -e`). The structured pane parser needs them: Claude Code renders its
+ * ghost-text prompt suggestions dim (SGR 2) while real typed input is
+ * default-styled, and that styling is the only reliable way to tell them
+ * apart. Plain callers (the raw peek view) leave escapes off so the output
+ * stays human-readable.
+ */
+export function capturePane(
+  target: string,
+  lines = 50,
+  opts: { escapes?: boolean } = {},
+): string {
+  const args = ["capture-pane", "-p"];
+  if (opts.escapes) args.push("-e");
+  args.push("-t", target, "-S", `-${lines}`);
+  const out = tmux(...args);
   return out.replace(/\n+$/, "");
 }
 

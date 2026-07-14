@@ -22,6 +22,38 @@ export function stripAnsi(text: string): string {
   return text.replace(ANSI_RE, "");
 }
 
+// SGR (Select Graphic Rendition) sequences — the subset of ANSI that carries
+// text styling. Built via RegExp() from \u-escapes so the source never holds a
+// raw ESC byte (see the module note above). SGR 2 = faint/dim, which is how
+// Claude Code renders ghost-text prompt suggestions; SGR 0 / 22 clear it.
+const SGR_RE = new RegExp("[\\u001B\\u009B]\\[([0-9;]*)m", "g");
+
+/**
+ * Return a line's visible text with any run styled dim (SGR 2) removed, then
+ * strip whatever ANSI is left. Ghost-text suggestions Claude Code paints into
+ * an idle composer are dim; real typed input is default-styled. On a plain
+ * (escape-free) line this is just stripAnsi — dim state never turns on — so
+ * callers that pass unstyled text keep the old "all text is real" behavior.
+ */
+function visibleNonGhost(line: string): string {
+  let dim = false;
+  let out = "";
+  let last = 0;
+  SGR_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = SGR_RE.exec(line)) !== null) {
+    if (!dim) out += line.slice(last, m.index);
+    for (const part of m[1].split(";")) {
+      const code = part === "" ? 0 : Number(part);
+      if (code === 2) dim = true;
+      else if (code === 0 || code === 22) dim = false;
+    }
+    last = m.index + m[0].length;
+  }
+  if (!dim) out += line.slice(last);
+  return stripAnsi(out);
+}
+
 export interface PaneOption {
   n: number;
   label: string;
@@ -99,9 +131,70 @@ function parsePermission(lines: string[]): PendingPermission | null {
   return options.length > 0 ? { question, options } : null;
 }
 
+// A full-width horizontal rule (U+2500). Current Claude Code versions frame
+// the composer between two of these rather than a rounded box; the input line
+// is a bare "❯ …" between them, with no side borders to unwrap.
+const RULE_RE = /^\s*─{8,}\s*$/;
+// Strip the "❯" marker and the whitespace after it. In the live TUI
+// that separator is a non-breaking space (U+00A0); JS `\s` matches it.
+const MARKER_RE = /^❯\s*(.*)$/;
+
 /** Text sitting after the input marker that hasn't been sent yet — may wrap
- *  across multiple physical lines within the input box at pane width. */
-function parseUnsubmittedInput(lines: string[]): string | null {
+ *  across multiple physical lines at pane width. Ghost-text suggestions
+ *  (rendered dim) are excluded; only default-styled text a human actually
+ *  typed counts. Tries the current rule-framed composer first, then the older
+ *  box-bordered layout. `styled` retains ANSI (for the dim check); `plain` is
+ *  the same lines with ANSI stripped (for structural detection). */
+function parseUnsubmittedInput(styled: string[], plain: string[]): string | null {
+  return parseRuleComposer(styled, plain) ?? parseBoxComposer(plain);
+}
+
+/** Current layout: a bare "❯ …" line between two full-width `─` rules. */
+function parseRuleComposer(styled: string[], plain: string[]): string | null {
+  let bottom = -1;
+  for (let i = plain.length - 1; i >= 0; i--) {
+    if (RULE_RE.test(plain[i])) {
+      bottom = i;
+      break;
+    }
+  }
+  if (bottom < 1) return null;
+  let top = -1;
+  for (let i = bottom - 1; i >= 0; i--) {
+    if (RULE_RE.test(plain[i])) {
+      top = i;
+      break;
+    }
+  }
+  if (top === -1) return null;
+
+  // The region between the two rules must actually hold the composer marker,
+  // otherwise this is some other rule-delimited block, not the input line.
+  let seenMarker = false;
+  const parts: string[] = [];
+  for (let i = top + 1; i < bottom; i++) {
+    const pTrim = plain[i].trim();
+    if (pTrim === "") continue;
+    const styledLine = styled[i] ?? plain[i];
+    if (pTrim.startsWith("❯")) {
+      seenMarker = true;
+      // A menu cursor ("❯ 1. Yes") is not the free-text input line.
+      const after = pTrim.replace(/^❯\s*/, "");
+      if (/^\d{1,2}[.)]\s/.test(after)) continue;
+      const real = MARKER_RE.exec(visibleNonGhost(styledLine).trim());
+      if (real && real[1].trim()) parts.push(real[1].trim());
+    } else {
+      // A wrapped continuation of the typed text.
+      const real = visibleNonGhost(styledLine).trim();
+      if (real) parts.push(real);
+    }
+  }
+  if (!seenMarker) return null;
+  return parts.length > 0 ? parts.join(" ") : null;
+}
+
+/** Older layout: "❯ …" inside a rounded box, bordered by `│` on both sides. */
+function parseBoxComposer(lines: string[]): string | null {
   const unwrapped = lines.map(unwrap);
   let start = -1;
   let firstText = "";
@@ -154,12 +247,19 @@ function parseQuestion(lines: string[]): string | null {
 }
 
 export function parsePane(rawTail: string): ParsedPane {
+  // `rawTail` may or may not carry ANSI escapes: the pane parser is fed a
+  // `capture-pane -e` (styled) capture so ghost text can be told from real
+  // input, but plain captures (and test fixtures) still work — stripAnsi and
+  // the dim check both no-op on escape-free text.
+  const styledLines = rawTail.replace(/\r/g, "").split("\n");
   const clean = stripAnsi(rawTail).replace(/\r/g, "");
   const raw = clean.length > MAX_RAW_CHARS ? clean.slice(-MAX_RAW_CHARS) : clean;
   const lines = clean.split("\n");
 
   const pending_permission = parsePermission(lines);
-  const unsubmitted_input = pending_permission ? null : parseUnsubmittedInput(lines);
+  const unsubmitted_input = pending_permission
+    ? null
+    : parseUnsubmittedInput(styledLines, lines);
   const pending_question = pending_permission ? null : parseQuestion(lines);
 
   return { pending_permission, pending_question, unsubmitted_input, raw };

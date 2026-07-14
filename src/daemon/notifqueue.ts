@@ -78,7 +78,9 @@ export function buildDelegateMessage(
  */
 export function mainPromptClear(target: string): boolean {
   try {
-    const pane = parsePane(capturePane(target, PANE_TAIL_LINES));
+    // Styled capture so a dim ghost-text suggestion in the main's composer is
+    // not mistaken for a human draft (which would wrongly block delivery).
+    const pane = parsePane(capturePane(target, PANE_TAIL_LINES, { escapes: true }));
     return pane.unsubmitted_input === null && pane.pending_permission === null;
   } catch {
     return false;
