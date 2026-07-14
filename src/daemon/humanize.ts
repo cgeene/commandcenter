@@ -84,6 +84,8 @@ const TEMPLATES: Record<string, Template> = {
   "agent.spawned": (e) => `Spawned ${agentRef(e)}${e.task_id != null ? ` on ${taskRef(e)}` : ""}`,
   "agent.killed": (e) => `Killed ${agentRef(e)}`,
   "agent.stalled": (e) => `${worker(e)} stalled on ${taskRef(e)}`,
+  "agent.reaped": (e, p) =>
+    `Reaped ${worker(e)} — ${taskRef(e)} finished${p.task_status ? ` (${str(p.task_status)})` : ""}, freeing its slot`,
   "agent.vanished": (e) => `${worker(e)} vanished`,
   "agent.sent": (e) => `Sent input to ${worker(e)}`,
   "agent.send_failed": (e) => `Failed to send input to ${worker(e)}`,
@@ -103,6 +105,11 @@ const TEMPLATES: Record<string, Template> = {
   "scheduler.spawn_error": (e, p) =>
     `Scheduler failed to spawn for ${taskRef(e)}: ${clip(p.error, 80)}`,
   "scheduler.budget_reached": () => `Daily spawn budget reached`,
+  "scheduler.capacity_blocked": (_e, p) => {
+    const live = Number(p.live_workers) || 0;
+    const max = Number(p.max_concurrent) || 0;
+    return `Scheduler stalled — ${live}/${max} worker slots taken while tasks wait`;
+  },
   "cron.fired": (e, p) =>
     `Ran cron ${str(p.name) || `#${str(p.cron_id)}`} → ${taskRef(e)}`,
   "cron.skipped": (e, p) =>

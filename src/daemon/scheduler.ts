@@ -1,12 +1,13 @@
-import { listAgents, updateAgent } from "../db/agents.js";
+import { type Agent, listAgents, updateAgent } from "../db/agents.js";
 import { dueCrons, nextRun, openTasksFor, updateCron } from "../db/crons.js";
 import {
   countEventsToday,
   countTaskEvents,
   latestAgentEventTs,
+  latestEventTs,
   logEvent,
 } from "../db/events.js";
-import { getSchedulerConfig } from "../db/settings.js";
+import { getSchedulerConfig, type SchedulerConfig } from "../db/settings.js";
 import {
   createTask,
   getTask,
@@ -15,18 +16,26 @@ import {
   updateTask,
 } from "../db/tasks.js";
 import { notify } from "./notify.js";
-import { spawnWorker } from "./spawn.js";
+import { killAgent, spawnWorker } from "./spawn.js";
 import { listWindowIds } from "./tmux.js";
 import { versionInfo } from "./version.js";
 
+/** Task statuses that mean the worker has nothing left to do — safe to reap. */
+const TERMINAL_STATUSES = ["done", "cancelled", "failed"];
+/** capacity_blocked / budget events fire at most this often (throttle). */
+const BLOCKED_EVENT_THROTTLE_MS = 60 * 60_000;
+
 export interface SchedulerDeps {
   spawn: (taskId: number) => void;
+  /** Kill an agent's window and mark it dead (no requeue, no worktree rm). */
+  kill?: (agentId: number) => void;
   windowIds: () => string[];
   now: () => Date;
 }
 
 const defaultDeps: SchedulerDeps = {
   spawn: (id) => void spawnWorker(id),
+  kill: (id) => void killAgent(id),
   windowIds: listWindowIds,
   now: () => new Date(),
 };
@@ -97,18 +106,25 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
 
   if (!cfg.enabled || !inWin) return;
 
+  const ready = readyTasks();
   const liveWorkers = listAgents({ live: true }).filter(
     (a) => a.kind === "worker",
   );
   let capacity = cfg.max_concurrent - liveWorkers.length;
-  if (capacity <= 0) return;
+  if (capacity <= 0) {
+    // Ready work but no free slots: without this the scheduler no-ops silently
+    // (the exact bug that let finished workers squat every slot). Surface it,
+    // throttled so it's a once-an-hour heads-up, not a per-tick alarm.
+    if (ready.length > 0) noteCapacityBlocked(cfg, liveWorkers, now);
+    return;
+  }
 
   // auto-spawned reviewers draw from the same daily budget as worker spawns
   let spawnsToday =
     countEventsToday("scheduler.spawned") +
     countEventsToday("reviewer.auto_spawned");
 
-  for (const task of readyTasks()) {
+  for (const task of ready) {
     if (capacity <= 0) break;
     if (spawnsToday >= cfg.daily_spawn_limit) {
       const day = now.toISOString().slice(0, 10);
@@ -147,11 +163,38 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
   }
 }
 
+/** Record (throttled) that the auto-spawn pass has ready work but no free
+ *  slots, naming the workers holding them and their task statuses so the
+ *  dashboard/attention panel can show WHY the queue stopped moving. */
+function noteCapacityBlocked(
+  cfg: SchedulerConfig,
+  liveWorkers: Agent[],
+  now: Date,
+): void {
+  const last = latestEventTs("scheduler.capacity_blocked");
+  if (last && now.getTime() - Date.parse(last) < BLOCKED_EVENT_THROTTLE_MS) {
+    return;
+  }
+  const workers = liveWorkers.map((w) => {
+    const task = w.task_id ? getTask(w.task_id) : undefined;
+    return { agent_id: w.id, task_id: w.task_id, task_status: task?.status ?? null };
+  });
+  logEvent("scheduler.capacity_blocked", {
+    payload: { max_concurrent: cfg.max_concurrent, live_workers: liveWorkers.length, workers },
+  });
+  notify(
+    "scheduler stalled — no free slots",
+    `${liveWorkers.length}/${cfg.max_concurrent} worker slots taken while tasks wait — check for idle workers holding slots`,
+    { tags: "construction" },
+  );
+}
+
 /** Health pass: reap vanished tmux windows (requeue once, then fail the
  *  task) and flag silent workers as stalled. Runs every 60s, even when the
  *  scheduler is disabled — it only observes and repairs, never spawns. */
 export function watchdog(deps: SchedulerDeps = defaultDeps): void {
   const cfg = getSchedulerConfig();
+  const kill = deps.kill ?? ((id: number) => void killAgent(id));
   const windowIds = deps.windowIds();
   const nowMs = deps.now().getTime();
 
@@ -187,6 +230,30 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
         }
       }
       continue;
+    }
+
+    // auto-reap: a worker whose task has reached a terminal state (done/
+    // cancelled/failed) has nothing left to do, but it sits idle in tmux
+    // forever — counted as live, silently starving max_concurrent. After a
+    // grace period (reap_after_minutes, enough for a human to read the
+    // terminal right after completion) kill its window and free the slot.
+    // NEVER requeue and NEVER rm the worktree — the branch/worktree may still
+    // be read by a dependent task or a reviewer. Reviewers (own worktree, may
+    // still be reviewing) and the main agent are excluded by the kind check.
+    if (agent.kind === "worker") {
+      const task = agent.task_id ? getTask(agent.task_id) : undefined;
+      if (task && TERMINAL_STATUSES.includes(task.status)) {
+        const last = Date.parse(agent.last_event_at ?? agent.spawned_at);
+        if (nowMs - last > cfg.reap_after_minutes * 60_000) {
+          kill(agent.id);
+          logEvent("agent.reaped", {
+            agentId: agent.id,
+            taskId: task.id,
+            payload: { task_status: task.status },
+          });
+          continue;
+        }
+      }
     }
 
     // waiting_input was delegated to the main agent (hooks.ts); if nobody

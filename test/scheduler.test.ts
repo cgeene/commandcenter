@@ -158,3 +158,120 @@ describe("watchdog", () => {
     expect(getAgent(agent.id)?.state).toBe("stalled");
   });
 });
+
+describe("watchdog auto-reap", () => {
+  async function setup() {
+    const tasks = await import("../src/db/tasks.js");
+    const agents = await import("../src/db/agents.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    const { listEvents } = await import("../src/db/events.js");
+    setSchedulerConfig({ reap_after_minutes: 10 });
+    return { ...tasks, ...agents, watchdog, listEvents };
+  }
+
+  // window still alive throughout; only the reap decision is under test
+  function reapDeps(killed: number[], nowIso: string) {
+    return {
+      spawn: () => {},
+      kill: (id: number) => killed.push(id),
+      windowIds: () => ["cc:@9"],
+      now: () => new Date(nowIso),
+    };
+  }
+
+  it("reaps a finished worker once the grace period elapses, freeing its slot", async () => {
+    const { createTask, updateTask, createAgent, updateAgent, watchdog, listEvents } = await setup();
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const a = createAgent({ kind: "worker", state: "idle", task_id: task.id, tmux_target: "cc:@9" });
+    updateTask(task.id, { status: "done", agent_id: a.id });
+    updateAgent(a.id, { last_event_at: "2026-07-03T10:00:00.000Z" });
+
+    const killed: number[] = [];
+    watchdog(reapDeps(killed, "2026-07-03T10:20:00.000Z")); // 20m > 10m grace
+    expect(killed).toEqual([a.id]);
+    const reaped = listEvents().find((e) => e.kind === "agent.reaped");
+    expect(reaped?.agent_id).toBe(a.id);
+    expect(reaped?.task_id).toBe(task.id);
+  });
+
+  it("does NOT reap before the grace period elapses", async () => {
+    const { createTask, updateTask, createAgent, updateAgent, watchdog } = await setup();
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const a = createAgent({ kind: "worker", state: "idle", task_id: task.id, tmux_target: "cc:@9" });
+    updateTask(task.id, { status: "done", agent_id: a.id });
+    updateAgent(a.id, { last_event_at: "2026-07-03T10:00:00.000Z" });
+
+    const killed: number[] = [];
+    watchdog(reapDeps(killed, "2026-07-03T10:05:00.000Z")); // 5m < 10m grace
+    expect(killed).toEqual([]);
+  });
+
+  it("reaps for every terminal status but never a non-terminal one", async () => {
+    const { createTask, updateTask, createAgent, updateAgent, watchdog } = await setup();
+    const mk = (status: string) => {
+      const t = createTask({ title: status, prompt: "x", repo: "/r" });
+      const a = createAgent({ kind: "worker", state: "idle", task_id: t.id, tmux_target: "cc:@9" });
+      updateTask(t.id, { status: status as never, agent_id: a.id });
+      updateAgent(a.id, { last_event_at: "2026-07-03T10:00:00.000Z" });
+      return a.id;
+    };
+    const done = mk("done");
+    const cancelled = mk("cancelled");
+    const failed = mk("failed");
+    const inProgress = mk("in_progress"); // active — must survive
+    const review = mk("review"); // may still get rejection feedback — survive
+
+    const killed: number[] = [];
+    watchdog(reapDeps(killed, "2026-07-03T11:00:00.000Z"));
+    expect(killed.sort((x, y) => x - y)).toEqual([done, cancelled, failed].sort((x, y) => x - y));
+    expect(killed).not.toContain(inProgress);
+    expect(killed).not.toContain(review);
+  });
+
+  it("never reaps the main agent or a reviewer, even on a terminal task", async () => {
+    const { createTask, updateTask, createAgent, updateAgent, watchdog } = await setup();
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    updateTask(task.id, { status: "done" });
+    const main = createAgent({ kind: "main", state: "idle", tmux_target: "cc:@9" });
+    updateAgent(main.id, { last_event_at: "2026-07-03T10:00:00.000Z" });
+    const reviewer = createAgent({ kind: "reviewer", state: "working", task_id: task.id, tmux_target: "cc:@9" });
+    updateAgent(reviewer.id, { last_event_at: "2026-07-03T10:00:00.000Z" });
+
+    const killed: number[] = [];
+    watchdog(reapDeps(killed, "2026-07-03T11:00:00.000Z"));
+    expect(killed).toEqual([]);
+  });
+});
+
+describe("scheduler capacity_blocked visibility", () => {
+  it("emits capacity_blocked (once, throttled) when ready work has no free slot", async () => {
+    const { createTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { countEventsToday } = await import("../src/db/events.js");
+    const { tick } = await import("../src/daemon/scheduler.js");
+    setSchedulerConfig({ enabled: true, max_concurrent: 1 });
+    createAgent({ kind: "worker", state: "idle" }); // holds the only slot
+    createTask({ title: "waiting", prompt: "x", repo: "/r" });
+
+    const { spawned, deps: d } = deps({ now: new Date("2026-07-03T12:00:00Z") });
+    tick(d);
+    tick(d); // same minute -> throttled, no second event
+    expect(spawned).toEqual([]);
+    expect(countEventsToday("scheduler.capacity_blocked")).toBe(1);
+  });
+
+  it("does not emit capacity_blocked when the queue is empty", async () => {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { countEventsToday } = await import("../src/db/events.js");
+    const { tick } = await import("../src/daemon/scheduler.js");
+    setSchedulerConfig({ enabled: true, max_concurrent: 1 });
+    createAgent({ kind: "worker", state: "idle" });
+
+    const { deps: d } = deps();
+    tick(d);
+    expect(countEventsToday("scheduler.capacity_blocked")).toBe(0);
+  });
+});

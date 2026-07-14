@@ -236,6 +236,109 @@ describe("deriveAttention — dismissal", () => {
   });
 });
 
+describe("deriveAttention — scheduler_stalled", () => {
+  async function backdateEvent(kind: string, minutesAgo: number) {
+    const { getDb } = await import("../src/db/db.js");
+    getDb()
+      .prepare("UPDATE events SET ts = ? WHERE kind = ?")
+      .run(new Date(Date.now() - minutesAgo * 60_000).toISOString(), kind);
+  }
+
+  it("surfaces a yellow capacity item once the blockage persists past 15m", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { logEvent } = await import("../src/db/events.js");
+    setSchedulerConfig({ enabled: true, max_concurrent: 1 });
+    createAgent({ kind: "worker", state: "idle" }); // holds the only slot
+    createTask({ title: "waiting", prompt: "x", repo: "/r" }); // ready
+    logEvent("scheduler.capacity_blocked", { payload: { max_concurrent: 1 } });
+    await backdateEvent("scheduler.capacity_blocked", 20);
+
+    const items = deriveAttention({ isPrOpen: allOpen });
+    const stalled = items.filter((i) => i.kind === "scheduler_stalled");
+    expect(stalled).toHaveLength(1);
+    expect(stalled[0].severity).toBe("yellow");
+    expect(stalled[0].id).toContain("scheduler_stalled:capacity");
+  });
+
+  it("does not surface a capacity item before the 15m threshold", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { logEvent } = await import("../src/db/events.js");
+    setSchedulerConfig({ enabled: true, max_concurrent: 1 });
+    createAgent({ kind: "worker", state: "idle" });
+    createTask({ title: "waiting", prompt: "x", repo: "/r" });
+    logEvent("scheduler.capacity_blocked", { payload: { max_concurrent: 1 } });
+    await backdateEvent("scheduler.capacity_blocked", 5); // fresh blip
+
+    expect(
+      deriveAttention({ isPrOpen: allOpen }).some((i) => i.kind === "scheduler_stalled"),
+    ).toBe(false);
+  });
+
+  it("surfaces a budget item when today's spawn budget is spent with work waiting", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { logEvent } = await import("../src/db/events.js");
+    setSchedulerConfig({ enabled: true, max_concurrent: 3, daily_spawn_limit: 2 });
+    createTask({ title: "waiting", prompt: "x", repo: "/r" }); // ready, slots free
+    logEvent("scheduler.spawned");
+    logEvent("scheduler.spawned"); // 2/2 budget spent today
+    logEvent("scheduler.budget_reached");
+    await backdateEvent("scheduler.budget_reached", 20);
+
+    const stalled = deriveAttention({ isPrOpen: allOpen }).filter(
+      (i) => i.kind === "scheduler_stalled",
+    );
+    expect(stalled).toHaveLength(1);
+    expect(stalled[0].id).toContain("scheduler_stalled:budget");
+  });
+
+  it("stays quiet when the scheduler is disabled", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { logEvent } = await import("../src/db/events.js");
+    setSchedulerConfig({ enabled: false, max_concurrent: 1 });
+    createAgent({ kind: "worker", state: "idle" });
+    createTask({ title: "waiting", prompt: "x", repo: "/r" });
+    logEvent("scheduler.capacity_blocked", { payload: { max_concurrent: 1 } });
+    await backdateEvent("scheduler.capacity_blocked", 20);
+
+    expect(
+      deriveAttention({ isPrOpen: allOpen }).some((i) => i.kind === "scheduler_stalled"),
+    ).toBe(false);
+  });
+
+  it("a dismissed capacity item drops out", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { dismissAttention } = await import("../src/db/attention.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { logEvent } = await import("../src/db/events.js");
+    setSchedulerConfig({ enabled: true, max_concurrent: 1 });
+    createAgent({ kind: "worker", state: "idle" });
+    createTask({ title: "waiting", prompt: "x", repo: "/r" });
+    logEvent("scheduler.capacity_blocked", { payload: { max_concurrent: 1 } });
+    await backdateEvent("scheduler.capacity_blocked", 20);
+
+    const item = deriveAttention({ isPrOpen: allOpen }).find(
+      (i) => i.kind === "scheduler_stalled",
+    )!;
+    dismissAttention(item.id);
+    expect(
+      deriveAttention({ isPrOpen: allOpen }).some((i) => i.kind === "scheduler_stalled"),
+    ).toBe(false);
+  });
+});
+
 describe("prcache", () => {
   it("returns a fresh cached value without shelling out", async () => {
     const { prState, _seedPrCache } = await import("../src/daemon/prcache.js");

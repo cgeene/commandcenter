@@ -94,6 +94,30 @@ export function latestTaskEventId(
   return row?.id;
 }
 
+/** Timestamp of the most recent event of `kind` (any agent/task). */
+export function latestEventTs(kind: string): string | undefined {
+  const row = getDb()
+    .prepare("SELECT ts FROM events WHERE kind = ? ORDER BY id DESC LIMIT 1")
+    .get(kind) as { ts: string } | undefined;
+  return row?.ts;
+}
+
+/** Timestamp of the earliest event of `kind` strictly newer than `afterTs`
+ *  (or the earliest overall when `afterTs` is null). Used to anchor the start
+ *  of an ongoing situation (e.g. a capacity-blocked episode) so its age is
+ *  stable across throttled re-emits. */
+export function earliestEventTsAfter(
+  kind: string,
+  afterTs: string | null,
+): string | undefined {
+  const row = getDb()
+    .prepare(
+      `SELECT ts FROM events WHERE kind = ? AND ts > ? ORDER BY id ASC LIMIT 1`,
+    )
+    .get(kind, afterTs ?? "") as { ts: string } | undefined;
+  return row?.ts;
+}
+
 /** Events of `kind` since UTC midnight — used for the daily spawn budget. */
 export function countEventsToday(kind: string): number {
   const row = getDb()

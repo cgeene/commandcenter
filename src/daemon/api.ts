@@ -534,6 +534,7 @@ export function buildApp(): Hono {
     escalate_minutes: z.number().int().min(1).max(120).optional(),
     read_only_extra_allow: z.array(z.string()).optional(),
     attention_stale_minutes: z.number().int().min(1).max(240).optional(),
+    reap_after_minutes: z.number().int().min(1).max(240).optional(),
   });
 
   app.get("/api/scheduler", (c) => {
