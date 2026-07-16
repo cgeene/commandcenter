@@ -220,7 +220,7 @@ normal one-time folder-trust decision; no trust or permission bypass is used.
 
 Existing all-Claude installations remain fully supported and require no Codex
 configuration. `claude` is still the default worker provider, the main
-orchestrator is Claude Opus by default, and independent reviewers are Claude.
+orchestrator is Claude Fable 5 by default, and independent reviewers are Claude.
 Existing tasks, crons, database rows, and legacy Claude sessions continue to
 behave as Claude work without migration-time user action.
 
@@ -246,12 +246,13 @@ crons, requeues, and same-provider session resumes. Ultra may delegate work to
 internal Codex subagents, so use it deliberately.
 
 The dashboard has a separate Claude model selector beside **spawn main agent**.
-Its default is Opus (`opus`); `CC_MAIN_MODEL` or `agp main --model` can override
-it. Fable 5 (`fable`), suited to long-running orchestration and delegation, is
-an explicit opt-in (`CC_MAIN_MODEL=fable` / `agp main --model fable`); adopting
-it as the orchestrator default is a separate, deliberate change (PR #31) that
-carries its own data-retention consideration. The main model is a Claude model
-either way, so it is intentionally absent from Codex worker model choices.
+Its default is Fable 5 (`fable`), which is suited to long-running orchestration
+and delegation; `CC_MAIN_MODEL` or `agp main --model` can override it (for
+example `CC_MAIN_MODEL=opus`). The main model is a Claude model either way, so it
+is intentionally absent from Codex worker model choices. Note that Anthropic's
+Fable model requires 30-day data retention (per [Anthropic's Fable
+documentation](https://www.anthropic.com/claude/fable)); set `CC_MAIN_MODEL=opus`
+if that retention consideration does not fit your installation.
 
 Provider, model, and Codex reasoning effort are stored on each task. Model names
 are provider-specific, so a Codex model slug or effort is never passed to Claude
@@ -495,7 +496,7 @@ All config is either an environment variable read at call time or a value in the
 | `CC_CODEX_MCP_SOURCE_HOME` | unset | Trusted normal Codex home whose MCP transports may be mirrored into the isolated worker home |
 | `CC_WORKER_PROVIDER` | `claude` | Default provider for new tasks/crons |
 | `CC_TMUX_SESSION` | `cc` | tmux session name |
-| `CC_MAIN_MODEL` | `opus` | Default Claude model for the main orchestrator (`agp main`); Fable is an opt-in (`CC_MAIN_MODEL=fable`, see PR #31) |
+| `CC_MAIN_MODEL` | `fable` | Default Claude model for the main orchestrator (`agp main`); override with `CC_MAIN_MODEL=opus` |
 | `CC_REVIEWER_MODEL` | unset | Claude reviewer override; otherwise preserve a Claude task model or use `opus` for a Codex-worker review |
 | `CC_NTFY_URL` | unset | ntfy topic URL for push notifications (disabled if unset) |
 | `CC_NTFY_TOKEN` | unset | ntfy auth token (self-hosted / protected topics) |

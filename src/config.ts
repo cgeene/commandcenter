@@ -86,10 +86,10 @@ export function defaultWorkerProvider(): AgentProvider {
 }
 
 /** Claude model used by the orchestrator unless a spawn explicitly overrides it.
- *  Defaults to opus (the current production orchestrator model); adopting Fable
- *  for orchestration is deferred to a separate, deliberate change. */
+ *  Defaults to Fable 5, which is suited to long-running orchestration and
+ *  delegation; override with CC_MAIN_MODEL (e.g. CC_MAIN_MODEL=opus). */
 export function defaultMainModel(): string {
-  return process.env.CC_MAIN_MODEL?.trim() || "opus";
+  return process.env.CC_MAIN_MODEL?.trim() || "fable";
 }
 
 /** Optional pinned reviewer provider (CC_REVIEWER_PROVIDER). Undefined means

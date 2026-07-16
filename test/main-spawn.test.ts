@@ -22,6 +22,7 @@ beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-main-spawn-"));
   process.env.CC_DATA_DIR = tmpDir;
   delete process.env.CC_MAIN_WORKSPACE;
+  delete process.env.CC_MAIN_MODEL;
   newWindow.mockClear();
   windowExists.mockReset();
   windowExists.mockReturnValue(false);
@@ -34,15 +35,16 @@ afterEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   delete process.env.CC_MAIN_WORKSPACE;
+  delete process.env.CC_MAIN_MODEL;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
 describe("main orchestrator spawn", () => {
-  it("defaults to opus, runs in $HOME, and waits for SessionStart", async () => {
-    // The Codex landing keeps main's current orchestrator behavior: opus model,
-    // cwd = $HOME, and no extra deny list. The Fable-model switch + workspace
-    // isolation + Edit/Write/Bash lock-down (from the codex branch's f55e0e9)
-    // are intentionally split out into a separate, deliberate change.
+  it("defaults to fable, runs in $HOME, and waits for SessionStart", async () => {
+    // The orchestrator now defaults to Fable 5 (suited to long-running
+    // orchestration and delegation); everything else about main's spawn is
+    // unchanged from the Codex landing: cwd = $HOME, no extra deny list, and
+    // it stays "spawning" until its SessionStart hook reports in.
     const { spawnMain } = await import("../src/daemon/spawn.js");
 
     const main = spawnMain();
@@ -50,7 +52,7 @@ describe("main orchestrator spawn", () => {
     expect(main).toMatchObject({
       kind: "main",
       provider: "claude",
-      model: "opus",
+      model: "fable",
       state: "spawning",
       tmux_target: "cc:@7",
     });
@@ -59,6 +61,13 @@ describe("main orchestrator spawn", () => {
       os.homedir(),
       expect.any(String),
     );
+  });
+
+  it("lets CC_MAIN_MODEL override the fable default", async () => {
+    const { spawnMain } = await import("../src/daemon/spawn.js");
+
+    process.env.CC_MAIN_MODEL = "opus";
+    expect(spawnMain().model).toBe("opus");
   });
 
   it("can kill a live split-brain process even when its DB row says dead", async () => {
