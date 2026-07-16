@@ -397,78 +397,70 @@ describe("watchdog auto-reap", () => {
     expect(killed).toEqual([]);
   });
 
-  // --- early-reap: approved, awaiting human merge ---
+});
 
-  /** An in-review task whose internal review APPROVED and whose PR is ready,
-   *  with a finished (idle) worker that has been silent past the grace. */
-  async function approvedReadyWorker(
-    setupFns: Awaited<ReturnType<typeof setup>>,
-    overrides: Record<string, unknown> = {},
-  ) {
-    const { createTask, updateTask, createAgent, updateAgent } = setupFns;
-    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
-    const a = createAgent({ kind: "worker", state: "idle", task_id: task.id, tmux_target: "cc:@9" });
-    updateTask(task.id, {
-      status: "review",
-      agent_id: a.id,
-      review_verdict: "approve",
-      pr_is_draft: 0,
-      ...overrides,
-    });
-    updateAgent(a.id, { last_event_at: "2026-07-03T10:00:00.000Z" });
-    return a.id;
+describe("watchdog stall detection (unaffected by idle-in-review suppression)", () => {
+  async function setup() {
+    const tasks = await import("../src/db/tasks.js");
+    const agents = await import("../src/db/agents.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    const { listEvents } = await import("../src/db/events.js");
+    setSchedulerConfig({ stall_minutes: 15 });
+    return { ...tasks, ...agents, watchdog, listEvents };
   }
 
-  it("early-reaps an approved worker whose PR has flipped ready, after the grace", async () => {
-    const fns = await setup();
-    const id = await approvedReadyWorker(fns);
-    const killed: number[] = [];
-    fns.watchdog(reapDeps(killed, "2026-07-03T10:20:00.000Z")); // 20m > 10m grace
-    expect(killed).toEqual([id]);
-    const reaped = fns.listEvents().find((e) => e.kind === "agent.reaped");
-    expect(JSON.parse(reaped?.payload ?? "{}").reason).toBe("approved_awaiting_merge");
+  function stallDeps(nowIso: string) {
+    return {
+      spawn: () => {},
+      kill: () => {},
+      windowIds: () => ["cc:@9"],
+      now: () => new Date(nowIso),
+    };
+  }
+
+  it("still stalls a silent working WORKER (stall is a separate detector from idle suppression)", async () => {
+    const { createTask, updateTask, createAgent, updateAgent, watchdog, listEvents } = await setup();
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const a = createAgent({ kind: "worker", state: "working", task_id: task.id, tmux_target: "cc:@9" });
+    updateTask(task.id, { status: "in_progress", agent_id: a.id });
+    updateAgent(a.id, { last_event_at: "2026-07-03T10:00:00.000Z" });
+
+    watchdog(stallDeps("2026-07-03T10:20:00.000Z")); // 20m > 15m stall
+    const stalled = listEvents().filter((e) => e.kind === "agent.stalled");
+    expect(stalled.map((e) => e.agent_id)).toEqual([a.id]);
+    expect(listEvents().map((e) => e.kind)).not.toContain("waiting.suppressed_in_review");
   });
 
-  it("early-reaps an approved no-PR task's worker", async () => {
-    const fns = await setup();
-    const id = await approvedReadyWorker(fns, { open_pr: 0, pr_is_draft: null });
-    const killed: number[] = [];
-    fns.watchdog(reapDeps(killed, "2026-07-03T10:20:00.000Z"));
-    expect(killed).toEqual([id]);
+  it("stalls (escalates) a frozen working REVIEWER mid-review — idle suppression does not touch it", async () => {
+    const { createTask, updateTask, createAgent, updateAgent, watchdog, listEvents } = await setup();
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    updateTask(task.id, { status: "review" });
+    const reviewer = createAgent({
+      kind: "reviewer",
+      state: "working",
+      task_id: task.id,
+      tmux_target: "cc:@9",
+    });
+    updateAgent(reviewer.id, { last_event_at: "2026-07-03T10:00:00.000Z" });
+
+    watchdog(stallDeps("2026-07-03T10:20:00.000Z")); // 20m > 15m stall
+    const stalled = listEvents().filter((e) => e.kind === "agent.stalled");
+    expect(stalled.map((e) => e.agent_id)).toEqual([reviewer.id]);
+    const { getAgent } = await import("../src/db/agents.js");
+    expect(getAgent(reviewer.id)?.state).toBe("stalled");
+    expect(listEvents().map((e) => e.kind)).not.toContain("waiting.suppressed_in_review");
   });
 
-  it("does NOT early-reap while the PR is still a draft (internal review pending)", async () => {
-    const fns = await setup();
-    await approvedReadyWorker(fns, { pr_is_draft: 1 });
-    const killed: number[] = [];
-    fns.watchdog(reapDeps(killed, "2026-07-03T11:00:00.000Z"));
-    expect(killed).toEqual([]);
-  });
+  it("does NOT stall before stall_minutes elapses", async () => {
+    const { createTask, updateTask, createAgent, updateAgent, watchdog, listEvents } = await setup();
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    updateTask(task.id, { status: "review" });
+    const reviewer = createAgent({ kind: "reviewer", state: "working", task_id: task.id, tmux_target: "cc:@9" });
+    updateAgent(reviewer.id, { last_event_at: "2026-07-03T10:00:00.000Z" });
 
-  it("does NOT early-reap a rejected or unreviewed in-review worker (a fix round may resume it live)", async () => {
-    const fns = await setup();
-    await approvedReadyWorker(fns, { review_verdict: "reject" });
-    await approvedReadyWorker(fns, { review_verdict: null });
-    const killed: number[] = [];
-    fns.watchdog(reapDeps(killed, "2026-07-03T11:00:00.000Z"));
-    expect(killed).toEqual([]);
-  });
-
-  it("never early-reaps a worker that is still mid-turn (not idle)", async () => {
-    const fns = await setup();
-    const id = await approvedReadyWorker(fns);
-    fns.updateAgent(id, { state: "working" }); // resumed / still working
-    const killed: number[] = [];
-    fns.watchdog(reapDeps(killed, "2026-07-03T11:00:00.000Z"));
-    expect(killed).toEqual([]);
-  });
-
-  it("does NOT early-reap before the grace period elapses", async () => {
-    const fns = await setup();
-    await approvedReadyWorker(fns);
-    const killed: number[] = [];
-    fns.watchdog(reapDeps(killed, "2026-07-03T10:05:00.000Z")); // 5m < 10m grace
-    expect(killed).toEqual([]);
+    watchdog(stallDeps("2026-07-03T10:05:00.000Z")); // 5m < 15m
+    expect(listEvents().map((e) => e.kind)).not.toContain("agent.stalled");
   });
 });
 

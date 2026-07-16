@@ -111,9 +111,7 @@ const TEMPLATES: Record<string, Template> = {
   "agent.killed": (e) => `Killed ${agentRef(e)}`,
   "agent.stalled": (e) => `${worker(e)} stalled on ${taskRef(e)}`,
   "agent.reaped": (e, p) =>
-    p.reason === "approved_awaiting_merge"
-      ? `Reaped ${worker(e)} — ${taskRef(e)} approved, awaiting merge; freeing its slot`
-      : `Reaped ${worker(e)} — ${taskRef(e)} finished${p.task_status ? ` (${str(p.task_status)})` : ""}, freeing its slot`,
+    `Reaped ${worker(e)} — ${taskRef(e)} finished${p.task_status ? ` (${str(p.task_status)})` : ""}, freeing its slot`,
   "agent.vanished": (e) => `${worker(e)} vanished`,
   "agent.window_missing": (e) =>
     `${agentRef(e)} window missing once — awaiting confirmation`,

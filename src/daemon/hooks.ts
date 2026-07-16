@@ -418,7 +418,7 @@ export async function handleHookEvent(
       const isIdlePrompt =
         event === "Notification" && body.notification_type === "idle_prompt";
 
-      // A finished worker whose task is already in review (or done/cancelled and
+      // A finished WORKER whose task is already in review (or done/cancelled and
       // merely awaiting the reaper) needs no human or main-agent action: PR
       // #36's automatic review⇄fix loop resumes it on reject and
       // completes+reaps it on approve→merge. Suppress the delegation and the
@@ -427,7 +427,13 @@ export async function handleHookEvent(
       // a mid-work permission prompt would fail that check, and a fix round
       // after a rejection moves the task back to in_progress so the status
       // guard self-reverses. Still leave a low-key event for the feed.
-      if (isIdlePrompt) {
+      //
+      // Scoped to kind==="worker": a REVIEWER shares the task_id (status
+      // "review"), so without this guard a Claude reviewer that Stops without a
+      // verdict and then idles would be silenced here — losing the very
+      // re-escalation path (idle → waiting_input → watchdog page) the task says
+      // reviewers must keep. Reviewers fall through to the normal wait path.
+      if (agent.kind === "worker" && isIdlePrompt) {
         const task = agent.task_id ? getTask(agent.task_id) : undefined;
         if (
           task &&
@@ -462,7 +468,9 @@ export async function handleHookEvent(
       // not cover (e.g. a worker that stopped without a result and idles on an
       // in_progress task): an identical idle_prompt for the same finished turn
       // should not re-delegate to the main more than once per throttle window.
-      if (isIdlePrompt && idleRedelegateThrottled(agentId)) {
+      // Worker-scoped like the suppression, so a reviewer keeps its exact prior
+      // delegation/escalation behavior.
+      if (agent.kind === "worker" && isIdlePrompt && idleRedelegateThrottled(agentId)) {
         logEvent("waiting.idle_redelegate_throttled", {
           agentId,
           taskId: agent.task_id ?? undefined,

@@ -425,6 +425,25 @@ describe("idle-prompt suppression for finished workers in review", () => {
     expect(suppressed).toHaveLength(1); // only the first, in-review occurrence
   });
 
+  it("does NOT suppress a REVIEWER's idle ping in review (reviewers must keep escalating)", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    // A reviewer shares the task_id; its task is in review by definition.
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    updateTask(task.id, { status: "review" });
+    const reviewer = createAgent({ kind: "reviewer", state: "working", task_id: task.id });
+    await handleHookEvent(reviewer.id, { hook_event_name: "Stop" }); // no verdict → reviewerStopped
+    await handleHookEvent(reviewer.id, IDLE_PROMPT);
+
+    // Reviewer keeps the normal wait path (idle → waiting_input → escalation),
+    // never silenced by the worker-scoped suppression.
+    expect(getAgent(reviewer.id)?.state).toBe("waiting_input");
+    const kinds = listEvents(30).map((e) => e.kind);
+    expect(kinds).not.toContain("waiting.suppressed_in_review");
+  });
+
   it("throttles a repeated idle re-delegation for the same finished turn", async () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");
     const { updateAgent } = await import("../src/db/agents.js");
