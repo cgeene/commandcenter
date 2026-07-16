@@ -27,6 +27,28 @@ describe("task queue", () => {
     expect(tasks.map((t) => t.title)).toEqual(["high", "low"]);
   });
 
+  it("preserves legacy direct/repository defaults and stores orchestration metadata", async () => {
+    const { createTask } = await import("../src/db/tasks.js");
+    expect(createTask({ title: "legacy", prompt: "x", repo: "/r" })).toMatchObject({
+      workspace_kind: "repo",
+      dispatch_mode: "direct",
+      parent_task_id: null,
+    });
+    expect(
+      createTask({
+        title: "new",
+        prompt: "x",
+        repo: "/root",
+        workspace_kind: "portfolio",
+        dispatch_mode: "orchestrated",
+        open_pr: false,
+      }),
+    ).toMatchObject({
+      workspace_kind: "portfolio",
+      dispatch_mode: "orchestrated",
+    });
+  });
+
   it("claims atomically — second claim loses", async () => {
     const { createTask, claimTask } = await import("../src/db/tasks.js");
     const t = createTask({ title: "t", prompt: "x", repo: "/r" });
@@ -48,6 +70,21 @@ describe("task queue", () => {
     expect(readyTasks().map((t) => t.id)).toEqual([a.id]);
     updateTask(a.id, { status: "done" });
     expect(readyTasks().map((t) => t.id)).toEqual([b.id]);
+  });
+
+  it("readyTasks can isolate direct scheduler work from main-orchestrated work", async () => {
+    const { createTask, readyTasks } = await import("../src/db/tasks.js");
+    const direct = createTask({ title: "direct", prompt: "x", repo: "/r" });
+    const orchestrated = createTask({
+      title: "main",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+    });
+    expect(readyTasks("direct").map((task) => task.id)).toEqual([direct.id]);
+    expect(readyTasks("orchestrated").map((task) => task.id)).toEqual([
+      orchestrated.id,
+    ]);
   });
 
   it("rejects invalid status updates", async () => {

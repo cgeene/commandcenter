@@ -87,6 +87,102 @@ describe("hook events", () => {
     expect(getTask(task.id)?.session_id).toBe("sess-123");
   });
 
+  it("SessionStart is the readiness handshake for a spawning worker", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createAgent, getAgent, updateAgent } = await import("../src/db/agents.js");
+    const agent = createAgent({ kind: "worker", state: "spawning" });
+    await handleHookEvent(agent.id, {
+      hook_event_name: "SessionStart",
+      session_id: "ready-session",
+    });
+    // The spawn path may learn the tmux target after the hook arrives; that
+    // metadata update must not overwrite readiness back to spawning.
+    updateAgent(agent.id, { tmux_target: "cc:@7" });
+    expect(getAgent(agent.id)?.state).toBe("working");
+  });
+
+  it("SessionStart clears a startup trust wait and delegates an existing worker wait", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const worker = createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "waiting_input",
+      tmux_target: "cc:@1",
+    });
+    logEvent("agent.startup_permission", { agentId: worker.id });
+    const main = createAgent({
+      kind: "main",
+      provider: "claude",
+      state: "waiting_input",
+      tmux_target: "cc:@2",
+    });
+    paneContent = [
+      "Would you like to run the following command?",
+      "",
+      "› 1. Yes, proceed",
+      "  2. No",
+      "",
+      "Press enter to confirm or esc to cancel",
+    ].join("\n");
+
+    await handleHookEvent(main.id, {
+      hook_event_name: "SessionStart",
+      session_id: "main-ready",
+    });
+
+    expect(getAgent(main.id)?.state).toBe("working");
+    expect(sendText).toHaveBeenCalledWith(
+      "cc:@2",
+      expect.stringContaining(`peek_worker(${worker.id})`),
+    );
+    expect(listEvents(20).map((event) => event.kind)).toContain(
+      "waiting.delegated",
+    );
+  });
+
+  it("never delegates a repository trust decision to the main model", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const worker = createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "waiting_input",
+      tmux_target: "cc:@1",
+    });
+    logEvent("agent.startup_permission", {
+      agentId: worker.id,
+      payload: { trust: true },
+    });
+    const main = createAgent({
+      kind: "main",
+      provider: "claude",
+      state: "waiting_input",
+      tmux_target: "cc:@2",
+    });
+    paneContent = [
+      "Do you trust the contents of this directory?",
+      "",
+      "› 1. Yes, continue",
+      "  2. No, quit",
+      "",
+      "Press enter to continue",
+    ].join("\n");
+
+    await handleHookEvent(main.id, {
+      hook_event_name: "SessionStart",
+      session_id: "main-ready",
+    });
+
+    expect(getAgent(main.id)?.state).toBe("working");
+    expect(sendText).not.toHaveBeenCalled();
+    expect(listEvents(20).map((event) => event.kind)).not.toContain(
+      "waiting.delegated",
+    );
+  });
+
   it("Notification marks the agent waiting_input", async () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");
     const { getAgent } = await import("../src/db/agents.js");
@@ -96,6 +192,70 @@ describe("hook events", () => {
       message: "needs permission",
     });
     expect(getAgent(agent.id)?.state).toBe("waiting_input");
+  });
+
+  it("an idle main notification stays eligible for the next worker wait", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const worker = createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "waiting_input",
+      tmux_target: "cc:@1",
+    });
+    logEvent("hook.permissionrequest", {
+      agentId: worker.id,
+    });
+    const main = createAgent({
+      kind: "main",
+      provider: "claude",
+      state: "idle",
+      tmux_target: "cc:@2",
+    });
+    paneContent = [
+      "$ go test ./...",
+      "",
+      "› 1. Yes, proceed (y)",
+      "  2. No (esc)",
+      "",
+      "Press enter to confirm or esc to cancel",
+    ].join("\n");
+
+    await handleHookEvent(main.id, {
+      hook_event_name: "Notification",
+      notification_type: "idle_prompt",
+      message: "Claude is waiting for your input",
+    });
+
+    expect(sendText).toHaveBeenCalledWith(
+      "cc:@2",
+      expect.stringContaining(`peek_worker(${worker.id})`),
+    );
+    expect(getAgent(main.id)?.state).toBe("working");
+    expect(
+      listEvents(20).filter((event) => event.kind === "waiting.delegated"),
+    ).toHaveLength(1);
+  });
+
+  it("a main permission notification still requires human input", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const main = createAgent({
+      kind: "main",
+      provider: "claude",
+      state: "idle",
+      tmux_target: "cc:@2",
+    });
+
+    await handleHookEvent(main.id, {
+      hook_event_name: "Notification",
+      notification_type: "permission_prompt",
+      message: "Claude needs permission",
+    });
+
+    expect(getAgent(main.id)?.state).toBe("waiting_input");
+    expect(sendText).not.toHaveBeenCalled();
   });
 
   it("Stop with no verify_cmd + a result_summary moves the task to review", async () => {

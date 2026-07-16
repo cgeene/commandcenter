@@ -86,6 +86,22 @@ describe("watchdog escalation", () => {
     expect(listEvents(20).map((e) => e.kind)).not.toContain("waiting.escalated");
   });
 
+  it("pages for an overdue Codex PermissionRequest wait", async () => {
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const worker = createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "waiting_input",
+    });
+    logEvent("hook.permissionrequest", { agentId: worker.id });
+    await backdateLatest("hook.permissionrequest", 10);
+
+    watchdog(noopDeps);
+    expect(listEvents(20).map((event) => event.kind)).toContain("waiting.escalated");
+  });
+
   it("a fresh wait after rescue is a new escalation episode", async () => {
     const { watchdog } = await import("../src/daemon/scheduler.js");
     const { createAgent } = await import("../src/db/agents.js");

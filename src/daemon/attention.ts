@@ -11,6 +11,7 @@ import { getSchedulerConfig } from "../db/settings.js";
 import { listTasks, readyTasks } from "../db/tasks.js";
 import { MAX_REVIEW_CYCLES } from "./review.js";
 import { prStates } from "./prcache.js";
+import { WAIT_HOOK_EVENTS } from "./waiting.js";
 
 /**
  * The "Needs You" action queue: an ordered list of things only the human can
@@ -25,7 +26,8 @@ export type AttentionKind =
   | "decision"
   | "escalation"
   | "stale_waiting"
-  | "scheduler_stalled";
+  | "scheduler_stalled"
+  | "orchestration";
 
 export type Severity = "red" | "orange" | "yellow";
 
@@ -88,6 +90,38 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
     items.push({ ...item, age_ms: Math.max(0, nowMs - Date.parse(item.created_at)) });
   };
 
+  // An orchestrated task must never silently fall back to the direct
+  // scheduler. If Claude main is absent or blocked on its own input, make the
+  // queue ownership visible to the human.
+  const tasksById = new Map(tasks.map((task) => [task.id, task]));
+  const pendingOrchestration = tasks.filter((task) => {
+    if (task.status !== "queued" || task.dispatch_mode !== "orchestrated") {
+      return false;
+    }
+    return task.blocked_by === null || tasksById.get(task.blocked_by)?.status === "done";
+  });
+  const main = agents.find((agent) => agent.kind === "main");
+  const mainAvailable = main && ["working", "idle"].includes(main.state);
+  if (pendingOrchestration.length > 0 && !mainAvailable) {
+    const ordered = [...pendingOrchestration].sort((a, b) => a.id - b.id);
+    const oldest = ordered[0];
+    const newest = ordered[ordered.length - 1];
+    push({
+      id: `orchestration:${newest.id}:${main?.id ?? "none"}`,
+      kind: "orchestration",
+      title: main
+        ? `Unblock Claude main — ${pendingOrchestration.length} task${pendingOrchestration.length === 1 ? "" : "s"} awaiting triage`
+        : `Start Claude main — ${pendingOrchestration.length} task${pendingOrchestration.length === 1 ? "" : "s"} awaiting triage`,
+      context: `Oldest: #${oldest.id} ${oldest.title}`,
+      severity: "yellow",
+      urgent: false,
+      task_id: oldest.id,
+      agent_id: main?.id ?? null,
+      pr_url: null,
+      created_at: oldest.created_at,
+    });
+  }
+
   // --- merge_pr / merge_and_apply: approved work waiting on a human merge ---
   for (const t of tasks) {
     if (t.review_verdict !== "approve") continue;
@@ -138,7 +172,7 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   const escalated = new Set<number>();
   for (const a of agents) {
     if (a.kind === "main" || a.state !== "waiting_input") continue;
-    const waitStart = latestAgentEventTs(a.id, ["hook.notification"]);
+    const waitStart = latestAgentEventTs(a.id, [...WAIT_HOOK_EVENTS]);
     const esc = latestAgentEvent(a.id, ["waiting.escalated"]);
     // only if THIS wait episode was escalated (esc newer than the wait start)
     if (!waitStart || !esc || esc.ts < waitStart) continue;
@@ -166,7 +200,7 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   for (const a of agents) {
     if (a.kind === "main" || a.state !== "waiting_input") continue;
     if (escalated.has(a.id)) continue;
-    const waitStart = latestAgentEventTs(a.id, ["hook.notification"]);
+    const waitStart = latestAgentEventTs(a.id, [...WAIT_HOOK_EVENTS]);
     if (!waitStart || nowMs - Date.parse(waitStart) < staleMs) continue;
     const task = a.task_id ? tasks.find((t) => t.id === a.task_id) : undefined;
     push({

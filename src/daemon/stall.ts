@@ -7,6 +7,8 @@ const ANCHOR_RE = /^\s*⏺\s*API Error:/i;
 const SIGNATURE_RE =
   /(Server error|Overloaded|overloaded_error|rate.?limit|Internal server error)/i;
 const BLOCK_START_RE = /^\s*⏺/;
+const CODEX_ERROR_RE =
+  /^\s*(?:■|⚠)\s*(?:stream disconnected|connection (?:closed|failed)|unexpected status|error sending request|server error|internal server error|rate.?limit)/i;
 
 /**
  * Look for a transient-API-error line sitting at the very end of an agent's
@@ -25,7 +27,21 @@ export function detectTransientApiError(paneText: string): string | null {
       break;
     }
   }
-  if (anchorIdx === -1) return null;
+  if (anchorIdx === -1) {
+    // Codex uses a square/warning marker rather than Claude's ⏺ API Error
+    // prefix. Require that marker at the start of the last visible non-empty
+    // block so quoted error prose cannot trigger an automatic continuation.
+    let end = lines.length - 1;
+    while (end >= 0 && !lines[end].trim()) end--;
+    if (end < 0) return null;
+    let start = end;
+    while (start > 0 && lines[start - 1].trim()) start--;
+    if (!CODEX_ERROR_RE.test(lines[start])) return null;
+    return lines
+      .slice(start, end + 1)
+      .map((line) => line.trim())
+      .join(" ");
+  }
 
   for (let i = anchorIdx + 1; i < lines.length; i++) {
     if (BLOCK_START_RE.test(lines[i])) return null;

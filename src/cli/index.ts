@@ -1,18 +1,26 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { Command } from "commander";
-import { pkgRoot, tmuxSession } from "../config.js";
+import {
+  codexBin,
+  codexHome,
+  codexProfile,
+  pkgRoot,
+  tmuxSession,
+} from "../config.js";
 import { buildDreamPrompt } from "../prompts/dreamer.js";
 import type { Agent } from "../db/agents.js";
 import type { Event } from "../db/events.js";
 import type { Task } from "../db/tasks.js";
 import { gitToplevel } from "../daemon/worktree.js";
+import { writeCodexConfig } from "../daemon/genconfig.js";
 import { api } from "./client.js";
 
 const program = new Command()
   .name("agp")
-  .description("commandcenter CLI — task queue + Claude Code workers");
+  .description("commandcenter CLI — task queue + Claude Code or Codex workers");
 
 function table(rows: string[][], headers: string[]): string {
   const all = [headers, ...rows];
@@ -38,25 +46,45 @@ task
   .option("-p, --prompt <prompt>", "task prompt (defaults to title)")
   .option("-f, --prompt-file <file>", "read prompt from a file")
   .option("-r, --repo <path>", "target repo (default: current git repo)")
-  .option("-m, --model <model>", "model for the worker (sonnet|opus|haiku|...)")
+  .option(
+    "-w, --workspace <kind>",
+    "workspace kind: repo|portfolio|scratch",
+    "repo",
+  )
+  .option("--repo-root <path>", "configured root for a portfolio task")
+  .option("-m, --model <model>", "provider-specific worker model slug")
+  .option("-e, --effort <effort>", "Codex reasoning effort (default: high)")
+  .option("--provider <provider>", "worker provider (claude|codex)")
   .option("-P, --priority <n>", "0 (highest) - 4", "2")
   .option("-b, --blocked-by <taskId>", "task that must be done first")
   .option("-v, --verify <cmd>", "verification command run in the worktree")
   .action(async (title: string, opts) => {
-    const repo = opts.repo ?? gitToplevel(process.cwd());
+    const workspace = String(opts.workspace);
+    if (!["repo", "portfolio", "scratch"].includes(workspace)) {
+      throw new Error("workspace must be repo, portfolio, or scratch");
+    }
+    const repo = workspace === "repo"
+      ? (opts.repo ?? gitToplevel(process.cwd()))
+      : undefined;
     const prompt = opts.promptFile
       ? fs.readFileSync(opts.promptFile, "utf8")
       : (opts.prompt ?? title);
     const t = await api<Task>("POST", "/api/tasks", {
       title,
       prompt,
-      repo,
+      workspace_kind: workspace,
+      ...(repo ? { repo } : {}),
+      ...(workspace === "portfolio"
+        ? { repo_root: opts.repoRoot ?? opts.repo }
+        : {}),
       model: opts.model,
+      reasoning_effort: opts.effort,
+      worker_provider: opts.provider,
       priority: Number(opts.priority),
       blocked_by: opts.blockedBy ? Number(opts.blockedBy) : undefined,
       verify_cmd: opts.verify,
     });
-    console.log(`task #${t.id} queued: ${t.title}`);
+    console.log(`task #${t.id} queued for Claude main: ${t.title}`);
   });
 
 task
@@ -78,11 +106,13 @@ task
           `#${t.id}`,
           t.status,
           `p${t.priority}`,
+          t.worker_provider,
           t.model ?? "-",
+          t.reasoning_effort ?? "-",
           t.agent_id ? `a${t.agent_id}` : "-",
           truncate(t.title, 60),
         ]),
-        ["id", "status", "pri", "model", "agent", "title"],
+        ["id", "status", "pri", "provider", "model", "effort", "agent", "title"],
       ),
     );
   });
@@ -101,12 +131,16 @@ task
   .option("-s, --status <status>")
   .option("-P, --priority <n>")
   .option("-m, --model <model>")
+  .option("-e, --effort <effort>", "Codex reasoning effort")
+  .option("--provider <provider>", "worker provider (claude|codex)")
   .option("--result <summary>")
   .action(async (id: string, opts) => {
     const t = await api<Task>("PATCH", `/api/tasks/${id}`, {
       status: opts.status,
       priority: opts.priority !== undefined ? Number(opts.priority) : undefined,
       model: opts.model,
+      reasoning_effort: opts.effort,
+      worker_provider: opts.provider,
       result_summary: opts.result,
     });
     console.log(`task #${t.id}: ${t.status}`);
@@ -162,7 +196,10 @@ task
 program
   .command("review <taskId>")
   .description("spawn an independent adversarial reviewer for a task in review")
-  .option("-m, --model <model>", "reviewer model (default: the task's model)")
+  .option(
+    "-m, --model <model>",
+    "Claude reviewer model (override; otherwise CC_REVIEWER_MODEL, the Claude task model, or opus)",
+  )
   .action(async (taskId: string, opts) => {
     const { agent: a } = await api<{ agent: Agent }>(
       "POST",
@@ -179,15 +216,23 @@ const agent = program.command("agent").description("manage worker agents");
 
 agent
   .command("spawn")
-  .description("spawn a Claude Code worker for a task (resumes its previous session when one exists)")
+  .description("spawn a Claude Code or Codex worker (resumes a same-provider session)")
   .requiredOption("-t, --task <id>", "task id")
+  .option("--provider <provider>", "worker provider (claude|codex)")
   .option("-m, --model <model>", "override the task's model")
+  .option("-e, --effort <effort>", "override the task's Codex reasoning effort")
   .option("--fresh", "force a fresh session instead of resuming")
   .action(async (opts) => {
     const { agent: a, task: t } = await api<{ agent: Agent; task: Task }>(
       "POST",
       "/api/agents",
-      { task_id: Number(opts.task), model: opts.model, fresh: opts.fresh },
+      {
+        task_id: Number(opts.task),
+        provider: opts.provider,
+        model: opts.model,
+        reasoning_effort: opts.effort,
+        fresh: opts.fresh,
+      },
     );
     console.log(
       `agent a${a.id} spawned for task #${t.id} in ${a.tmux_target} (worktree: ${t.worktree})`,
@@ -210,12 +255,14 @@ agent
         agents.map((a) => [
           `a${a.id}`,
           a.kind,
+          a.provider,
           a.state,
           a.model ?? "-",
+          a.reasoning_effort ?? "-",
           a.task_id ? `#${a.task_id}` : "-",
           a.tmux_target ?? "-",
         ]),
-        ["id", "kind", "state", "model", "task", "tmux"],
+        ["id", "kind", "provider", "state", "model", "effort", "task", "tmux"],
       ),
     );
   });
@@ -253,6 +300,24 @@ agent
     console.log(`sent to a${id}`);
   });
 
+agent
+  .command("session <id>")
+  .description("show the recorded provider session and manual resume command")
+  .action(async (id: string) => {
+    const session = await api<{
+      provider: string;
+      session_id: string;
+      transcript_path: string | null;
+      cwd: string | null;
+      resume_command: string;
+    }>("GET", `/api/agents/${id}/session`);
+    console.log(`provider: ${session.provider}`);
+    console.log(`session:  ${session.session_id}`);
+    if (session.transcript_path) console.log(`transcript: ${session.transcript_path}`);
+    if (session.cwd) console.log(`cwd:       ${session.cwd}`);
+    console.log(`resume:    ${session.resume_command}`);
+  });
+
 // ---- cron ----
 
 interface CronJob {
@@ -261,7 +326,9 @@ interface CronJob {
   schedule: string;
   title: string;
   repo: string;
+  worker_provider: "claude" | "codex";
   model: string | null;
+  reasoning_effort: string | null;
   enabled: number;
   last_run_at: string | null;
   next_run_at: string | null;
@@ -290,6 +357,8 @@ cron
   .option("-r, --repo <path>", "target repo (default: current git repo)")
   .option("--title <title>", "task title (default: cron name)")
   .option("-m, --model <model>")
+  .option("-e, --effort <effort>", "Codex reasoning effort (default: high)")
+  .option("--provider <provider>", "worker provider (claude|codex)")
   .option("-P, --priority <n>", "0-4", "2")
   .option("-v, --verify <cmd>")
   .action(async (name: string, opts) => {
@@ -307,6 +376,8 @@ cron
       repo: opts.repo ?? gitToplevel(process.cwd()),
       title: opts.title,
       model: opts.model,
+      reasoning_effort: opts.effort,
+      worker_provider: opts.provider,
       priority: Number(opts.priority),
       verify_cmd: opts.verify,
     });
@@ -326,11 +397,13 @@ cron
           x.enabled ? "on" : "off",
           x.name,
           x.schedule,
+          x.worker_provider,
           x.model ?? "-",
+          x.reasoning_effort ?? "-",
           x.next_run_at?.slice(0, 16) ?? "-",
           x.last_run_at?.slice(0, 16) ?? "never",
         ]),
-        ["id", "en", "name", "schedule", "model", "next", "last"],
+        ["id", "en", "name", "schedule", "provider", "model", "effort", "next", "last"],
       ),
     );
   });
@@ -384,6 +457,7 @@ dream
       schedule: opts.schedule,
       prompt: buildDreamPrompt(),
       repo: opts.repo ?? pkgRoot().replace(/\/$/, ""),
+      worker_provider: "claude",
       model: opts.model,
       priority: 3,
       enabled: false,
@@ -535,6 +609,170 @@ scheduler
     await printSchedulerStatus();
   });
 
+// ---- Codex worker runtime ----
+
+const codex = program
+  .command("codex")
+  .description("configure and diagnose the isolated Codex worker runtime");
+
+codex
+  .command("setup")
+  .description("write Command Center's dedicated Codex profile and lifecycle hooks")
+  .action(() => {
+    let files: ReturnType<typeof writeCodexConfig>;
+    try {
+      files = writeCodexConfig();
+    } catch (error) {
+      console.error(
+        `Codex setup failed: ${error instanceof Error ? error.message : "invalid configuration"}`,
+      );
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`Codex profile written: ${files.profileFile}`);
+    console.log(`Codex hooks written:   ${files.hooksFile}`);
+    console.log(`Codex rules written:   ${files.rulesFile}`);
+    if (files.inheritedMcpNames.length > 0) {
+      console.log(
+        `Inherited MCP servers:  ${files.inheritedMcpNames.join(", ")}`,
+      );
+    }
+    const escapedHome = files.home.replaceAll("'", `'\\''`);
+    console.log("Authenticate this isolated Codex home once (it does not copy your normal credentials):");
+    console.log(`  CODEX_HOME='${escapedHome}' ${codexBin()} login`);
+    console.log("Review and trust these static hooks once:");
+    console.log(
+      `  CODEX_HOME='${escapedHome}' ${codexBin()} --profile ${files.profile}`,
+    );
+    console.log("Then run /hooks in Codex, inspect the hook command, and mark it trusted.");
+    console.log("Finish with: agp codex doctor");
+  });
+
+codex
+  .command("doctor")
+  .description("check the Codex binary, build artifacts, and generated profile")
+  .action(() => {
+    const checks: Array<[string, boolean, string]> = [];
+    const version = spawnSync(codexBin(), ["--version"], { encoding: "utf8" });
+    checks.push([
+      "Codex CLI",
+      version.status === 0,
+      version.status === 0
+        ? (version.stdout || version.stderr).trim()
+        : `not runnable: ${codexBin()}`,
+    ]);
+    const home = codexHome();
+    const profileFile = `${home}/${codexProfile()}.config.toml`;
+    const hooksFile = `${home}/hooks.json`;
+    const rulesFile = `${home}/rules/commandcenter.rules`;
+    const runtimeEnv = { ...process.env, CODEX_HOME: home };
+    const mcpEntry = path.join(pkgRoot(), "dist", "mcp", "index.js");
+    const hookEntry = path.join(pkgRoot(), "dist", "scripts", "codex-hook.js");
+    checks.push(["profile", fs.existsSync(profileFile), profileFile]);
+    checks.push(["hooks", fs.existsSync(hooksFile), hooksFile]);
+    checks.push(["push/merge rules", fs.existsSync(rulesFile), rulesFile]);
+    checks.push(["cc MCP build", fs.existsSync(mcpEntry), mcpEntry]);
+    checks.push(["hook bridge build", fs.existsSync(hookEntry), hookEntry]);
+    if (fs.existsSync(hookEntry)) {
+      const runHook = (hook_event_name: string, command: string) =>
+        spawnSync(process.execPath, [hookEntry], {
+          encoding: "utf8",
+          input: JSON.stringify({
+            hook_event_name,
+            tool_name: "Bash",
+            tool_input: { command },
+          }),
+          env: {
+            ...process.env,
+            CC_AGENT_ID: "",
+            CC_TASK_ID: "7",
+            CC_WORKSPACE_KIND: "repo",
+          },
+          timeout: 5_000,
+        });
+      const hookCheck = runHook(
+        "PermissionRequest",
+        "git push -u origin agent/task-7",
+      );
+      const preToolCheck = runHook("PreToolUse", "env git push origin main");
+      let hookValid = false;
+      try {
+        const output = JSON.parse(hookCheck.stdout) as {
+          hookSpecificOutput?: { decision?: { behavior?: string } };
+        };
+        const preToolOutput = JSON.parse(preToolCheck.stdout) as {
+          hookSpecificOutput?: { permissionDecision?: string };
+        };
+        hookValid =
+          hookCheck.status === 0 &&
+          output.hookSpecificOutput?.decision?.behavior === "allow" &&
+          preToolCheck.status === 0 &&
+          preToolOutput.hookSpecificOutput?.permissionDecision === "deny";
+      } catch {
+        hookValid = false;
+      }
+      checks.push([
+        "hook bridge self-test",
+        hookValid,
+        hookValid ? "policy and JSON contract valid" : "hook bridge output invalid",
+      ]);
+    }
+    if (fs.existsSync(rulesFile)) {
+      const pushPolicy = spawnSync(
+        codexBin(),
+        [
+          "execpolicy",
+          "check",
+          "--rules",
+          rulesFile,
+          "git",
+          "push",
+          "origin",
+          "agent/task-7",
+        ],
+        { encoding: "utf8", env: runtimeEnv },
+      );
+      checks.push([
+        "push rule parse",
+        pushPolicy.status === 0 && pushPolicy.stdout.includes('"decision":"prompt"'),
+        pushPolicy.status === 0 ? "canonical pushes require policy review" : "rules invalid",
+      ]);
+    }
+    const auth = spawnSync(codexBin(), ["login", "status"], {
+      encoding: "utf8",
+      env: runtimeEnv,
+    });
+    checks.push([
+      "isolated login",
+      auth.status === 0,
+      (auth.stdout || auth.stderr).trim() || "not logged in",
+    ]);
+    if (fs.existsSync(profileFile)) {
+      const parsed = spawnSync(
+        codexBin(),
+        ["--profile", codexProfile(), "debug", "prompt-input", "doctor"],
+        { encoding: "utf8", env: runtimeEnv },
+      );
+      checks.push([
+        "profile parse",
+        parsed.status === 0,
+        parsed.status === 0 ? "valid" : (parsed.stderr || parsed.stdout).trim(),
+      ]);
+    }
+
+    for (const [name, ok, detail] of checks) {
+      console.log(`${ok ? "ok" : "FAIL"}  ${name}: ${detail}`);
+    }
+    if (checks.some(([, ok]) => !ok)) {
+      console.error(
+        "Run npm run build, agp codex setup, complete the isolated login/hook trust, and retry.",
+      );
+      process.exitCode = 1;
+    } else {
+      console.log("Hook trust is intentionally user-reviewed; verify it with /hooks.");
+    }
+  });
+
 // ---- upgrade ----
 
 program
@@ -593,7 +831,7 @@ program
 program
   .command("main")
   .description("spawn the orchestrator main agent")
-  .option("-m, --model <model>", "model (default: opus, or CC_MAIN_MODEL)")
+  .option("-m, --model <model>", "model (default: fable, or CC_MAIN_MODEL)")
   .action(async (opts) => {
     const a = await api<Agent>("POST", "/api/main", { model: opts.model });
     console.log(`main agent a${a.id} spawned in ${a.tmux_target} (${a.model})`);

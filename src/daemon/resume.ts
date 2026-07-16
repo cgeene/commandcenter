@@ -16,7 +16,7 @@ export type ResumeOutcome = "sent" | "not_live" | "waiting_input";
  * - send-before-commit ordering: nothing is persisted until the text is in
  *   the pane, so a failed send reports "not_live" and the caller can fall
  *   back (requeue, retry next pass) instead of losing the message;
- * - the state flip. No Claude Code hook fires when a resumed session picks
+ * - the state flip. No provider hook fires when a resumed session picks
  *   work back up — Notification is the only thing that sets waiting_input
  *   and only Stop clears it — so delivered input is the one signal that the
  *   agent is working again. last_event_at is bumped so the stall watchdog

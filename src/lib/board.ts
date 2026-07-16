@@ -11,6 +11,7 @@ export interface BoardTask {
   id: number;
   status: string;
   repo: string;
+  workspace_kind?: "repo" | "portfolio" | "scratch";
   blocked_by: number | null;
 }
 
@@ -19,6 +20,12 @@ export function projectOf(repo: string): string {
   const trimmed = repo.replace(/[/\\]+$/, "");
   const parts = trimmed.split(/[/\\]/);
   return parts[parts.length - 1] || repo;
+}
+
+export function projectOfTask(task: BoardTask): string {
+  if (task.workspace_kind === "portfolio") return "all repositories";
+  if (task.workspace_kind === "scratch") return "investigations";
+  return projectOf(task.repo);
 }
 
 /** Terminal statuses — finished work that clutters the active board. These
@@ -62,7 +69,7 @@ export function groupByProject<T extends BoardTask>(
   const order: string[] = [];
   const byProject = new Map<string, T[]>();
   for (const t of tasks) {
-    const p = projectOf(t.repo);
+    const p = projectOfTask(t);
     let bucket = byProject.get(p);
     if (!bucket) {
       bucket = [];

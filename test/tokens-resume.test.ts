@@ -12,12 +12,14 @@ beforeEach(async () => {
   fs.mkdirSync(projectsDir);
   process.env.CC_DATA_DIR = tmpDir;
   process.env.CC_CLAUDE_PROJECTS = projectsDir;
+  process.env.CC_CODEX_HOME = path.join(tmpDir, "codex");
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
 });
 
 afterEach(async () => {
   delete process.env.CC_CLAUDE_PROJECTS;
+  delete process.env.CC_CODEX_HOME;
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -70,6 +72,57 @@ describe("sessionTokens", () => {
     updateTask(task.id, { status: "in_progress", agent_id: worker.id });
     await handleHookEvent(worker.id, { hook_event_name: "Stop", session_id: SID });
     expect(getTask(task.id)?.tokens_used).toBe(750);
+  });
+
+  it("Stop hook records cumulative Codex tokens on the worker's task", async () => {
+    const sid = "bbbb2222-0000-0000-0000-000000000000";
+    const sessions = path.join(process.env.CC_CODEX_HOME!, "sessions");
+    fs.mkdirSync(sessions, { recursive: true });
+    const file = path.join(sessions, `rollout-${sid}.jsonl`);
+    fs.writeFileSync(
+      file,
+      [
+        JSON.stringify({ type: "session_meta", payload: { id: sid } }),
+        JSON.stringify({
+          type: "event_msg",
+          payload: {
+            type: "token_count",
+            info: {
+              total_token_usage: {
+                input_tokens: 700,
+                cached_input_tokens: 200,
+                output_tokens: 80,
+                reasoning_output_tokens: 20,
+                total_tokens: 800,
+              },
+            },
+          },
+        }),
+      ].join("\n"),
+    );
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createTask, updateTask, getTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const task = createTask({
+      title: "t",
+      prompt: "x",
+      repo: "/r",
+      worker_provider: "codex",
+    });
+    const worker = createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "working",
+      task_id: task.id,
+    });
+    updateTask(task.id, { status: "in_progress", agent_id: worker.id });
+    await handleHookEvent(worker.id, {
+      hook_event_name: "SessionStart",
+      session_id: sid,
+      transcript_path: file,
+    });
+    await handleHookEvent(worker.id, { hook_event_name: "Stop", session_id: sid });
+    expect(getTask(task.id)?.tokens_used).toBe(800);
   });
 });
 

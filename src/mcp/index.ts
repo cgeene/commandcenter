@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * "cc" MCP server — how agents touch the platform. Runs as a stdio subprocess
- * of each claude session; all state changes go through the daemon's REST API
+ * of each Claude or Codex session; all state changes go through the daemon's REST API
  * so SQLite keeps a single writer.
  *
  * Roles (CC_ROLE env): "main" gets the full orchestration toolset,
@@ -11,6 +11,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { REASONING_EFFORTS } from "../reasoning.js";
 
 const ROLE =
   process.env.CC_ROLE === "main" || process.env.CC_ROLE === "reviewer"
@@ -47,7 +48,7 @@ server.registerTool(
   "add_task",
   {
     description:
-      "Add a task to the queue. Workers: use this to file follow-up work you notice but should not do yourself.",
+      "Add a main-orchestrated task to the queue. For portfolio decomposition, create repo children with parent_task_id. Workers: use this only to file follow-up work you should not do yourself.",
     inputSchema: {
       title: z.string(),
       prompt: z.string(),
@@ -55,7 +56,26 @@ server.registerTool(
         .string()
         .optional()
         .describe("absolute repo path; workers default to their own task's repo"),
+      repo_root: z
+        .string()
+        .optional()
+        .describe("configured repository root for an all-repositories task"),
+      workspace_kind: z
+        .enum(["repo", "portfolio", "scratch"])
+        .optional()
+        .describe("repo (default), portfolio/all repositories, or non-Git scratch"),
+      parent_task_id: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("portfolio parent task when creating a per-repository child"),
       model: z.string().optional(),
+      reasoning_effort: z
+        .enum(REASONING_EFFORTS)
+        .optional()
+        .describe("Codex reasoning effort; defaults to high"),
+      worker_provider: z.enum(["claude", "codex"]).optional(),
       priority: z.number().int().min(0).max(4).optional(),
       blocked_by: z.number().int().optional(),
       verify_cmd: z.string().optional(),
@@ -69,12 +89,31 @@ server.registerTool(
   },
   async (args) => {
     let repo = args.repo;
-    if (!repo && MY_TASK_ID) {
-      const mine = await call<{ repo: string }>("GET", `/api/tasks/${MY_TASK_ID}`);
-      repo = mine.repo;
+    let workspaceKind = args.workspace_kind;
+    if (!workspaceKind && !repo && MY_TASK_ID) {
+      const mine = await call<{ repo: string; workspace_kind: string }>(
+        "GET",
+        `/api/tasks/${MY_TASK_ID}`,
+      );
+      workspaceKind = mine.workspace_kind === "scratch" ? "scratch" : "repo";
+      if (workspaceKind === "repo") repo = mine.repo;
     }
-    if (!repo) throw new Error("repo is required");
-    return asText(await call("POST", "/api/tasks", { ...args, repo }));
+    workspaceKind ??= "repo";
+    if (!repo && MY_TASK_ID && workspaceKind === "repo") {
+      const mine = await call<{ repo: string; workspace_kind: string }>(
+        "GET",
+        `/api/tasks/${MY_TASK_ID}`,
+      );
+      if (mine.workspace_kind === "repo") repo = mine.repo;
+    }
+    if (workspaceKind === "repo" && !repo) throw new Error("repo is required");
+    return asText(
+      await call("POST", "/api/tasks", {
+        ...args,
+        repo,
+        workspace_kind: workspaceKind ?? "repo",
+      }),
+    );
   },
 );
 
@@ -310,11 +349,42 @@ if (ROLE === "main") {
       inputSchema: {
         status: z.string().optional(),
         ready: z.boolean().optional(),
+        dispatch_mode: z.enum(["direct", "orchestrated"]).optional(),
       },
     },
-    async ({ status, ready }) => {
-      const qs = ready ? "?ready=true" : status ? `?status=${status}` : "";
+    async ({ status, ready, dispatch_mode }) => {
+      const params = new URLSearchParams();
+      if (ready) params.set("ready", "true");
+      else if (status) params.set("status", status);
+      if (dispatch_mode) params.set("dispatch_mode", dispatch_mode);
+      const qs = params.size > 0 ? `?${params.toString()}` : "";
       return asText(await call("GET", `/api/tasks${qs}`));
+    },
+  );
+
+  server.registerTool(
+    "list_repositories",
+    {
+      description:
+        "List the server-validated repository catalog and configured roots. Use this to scope all-repositories tasks before creating isolated child tasks.",
+      inputSchema: {
+        query: z.string().max(200).optional(),
+      },
+    },
+    async ({ query }) => {
+      const catalog = await call<{
+        roots: unknown[];
+        repositories: Array<{ name: string; relative_path: string; path: string }>;
+      }>("GET", "/api/workspaces");
+      const needle = query?.trim().toLowerCase();
+      return asText({
+        ...catalog,
+        repositories: needle
+          ? catalog.repositories.filter((repo) =>
+              `${repo.name} ${repo.relative_path}`.toLowerCase().includes(needle),
+            )
+          : catalog.repositories,
+      });
     },
   );
 
@@ -327,7 +397,8 @@ if (ROLE === "main") {
   server.registerTool(
     "update_task",
     {
-      description: "Update a task (status, priority, model, prompt, result_summary...).",
+      description:
+        "Update a task (status, priority, worker provider, model, reasoning effort, prompt, result_summary...).",
       inputSchema: {
         id: z.number().int(),
         status: z
@@ -336,6 +407,15 @@ if (ROLE === "main") {
           .describe("to close a task from any state, use cancel_task instead — it also kills live agents"),
         priority: z.number().int().min(0).max(4).optional(),
         model: z.string().optional(),
+        reasoning_effort: z
+          .enum(REASONING_EFFORTS)
+          .optional()
+          .describe("Codex-only reasoning effort"),
+        worker_provider: z.enum(["claude", "codex"]).optional(),
+        repo: z
+          .string()
+          .optional()
+          .describe("new allow-listed Git root; kill the prior worker first"),
         prompt: z.string().optional(),
         verify_cmd: z.string().optional(),
         result_summary: z.string().optional(),
@@ -380,10 +460,15 @@ if (ROLE === "main") {
     "spawn_worker",
     {
       description:
-        "Spawn a Claude Code worker for a task in its own git worktree + tmux window. Model defaults to the task's model. If the task has a previous session, the worker RESUMES it with full context (pass fresh=true to force a clean start).",
+        "Spawn a Claude Code or Codex worker in the task's isolated repository worktree or scratch workspace. Portfolio parents cannot be spawned. Provider, model, and Codex reasoning effort default to the task. A previous session resumes only when it belongs to the same provider (pass fresh=true to force a clean start).",
       inputSchema: {
         task_id: z.number().int(),
-        model: z.string().optional().describe("haiku | sonnet | opus | ..."),
+        provider: z.enum(["claude", "codex"]).optional(),
+        model: z.string().optional().describe("provider-specific model slug"),
+        reasoning_effort: z
+          .enum(REASONING_EFFORTS)
+          .optional()
+          .describe("Codex-only reasoning effort; defaults to high"),
         fresh: z.boolean().optional().describe("force a fresh session instead of resuming"),
       },
     },
@@ -451,7 +536,7 @@ if (ROLE === "main") {
     "read_worker_transcript",
     {
       description:
-        "Read an agent's session transcript (simplified chat view, last `limit` entries). Use to audit what a worker actually did versus what it claims.",
+        "Read an agent's session transcript (simplified chat view, last `limit` entries). Use to audit what a worker actually did versus what it claims. Provider formats are parsed defensively and unknown records are skipped.",
       inputSchema: {
         agent_id: z.number().int(),
         limit: z.number().int().min(1).max(500).optional(),
@@ -467,7 +552,7 @@ if (ROLE === "main") {
     "spawn_reviewer",
     {
       description:
-        "Spawn an independent adversarial reviewer for a task in review. It gets the task prompt + diff in a fresh context (never the worker's conversation), tries to reject the work, and submits approve/reject with notes. Rejection feedback flows back to the worker automatically; 2 rejected cycles block the task for the human.",
+        "Spawn an independent Claude adversarial reviewer for a task in review. It gets the task prompt + diff in a fresh context (never the worker's conversation), tries to reject the work, and submits approve/reject with notes. Existing Claude tasks preserve their reviewer model behavior; Codex model slugs are never passed to Claude. Rejection feedback flows back automatically; 2 rejected cycles block the task for the human.",
       inputSchema: {
         task_id: z.number().int(),
         model: z.string().optional(),

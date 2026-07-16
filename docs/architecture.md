@@ -1,7 +1,7 @@
 # Architecture
 
-commandcenter is one long-running daemon plus a set of short-lived Claude Code
-sessions it spawns into tmux. State lives in a single SQLite file; agents talk
+commandcenter is one long-running daemon plus Claude Code and Codex sessions it
+spawns into tmux. State lives in a single SQLite file; agents talk
 back through MCP tools (for state changes) and hooks (for lifecycle events). This
 document walks the pieces and the lifecycle of a task.
 
@@ -12,7 +12,7 @@ document walks the pieces and the lifecycle of a task.
 | **`agentd`** (daemon) | `src/daemon/index.ts` → `dist/daemon/index.js` | Owns the queue, REST API + WebSocket on `127.0.0.1:$CC_PORT`, tmux/worktree lifecycle, scheduler, watchdog, PR sync, and serves the dashboard. |
 | **`agp`** (CLI) | `src/cli/index.ts` | Thin REST client for the daemon. |
 | **`cc-mcp`** (MCP server) | `src/mcp/index.ts` | stdio MCP server launched per agent via a generated `--mcp-config`; its toolset is scoped by `CC_ROLE`. |
-| **Agents** | `claude` sessions in tmux windows | Workers, reviewers, and the main orchestrator. |
+| **Agents** | `claude` or `codex` sessions in tmux windows | Workers may use either provider; reviewers and the main orchestrator remain Claude. |
 
 ## Storage
 
@@ -22,6 +22,7 @@ Everything is under `$CC_DATA_DIR` (default `~/.commandcenter`):
   `events`, `memories` (+ FTS5), `docs` (+ FTS5), `crons`, `settings`,
   `attention_dismissed`.
 - **`worktrees/`** — one git worktree per task.
+- **`scratch/`** — mode-`0700`, non-Git investigation workspaces, one per task.
 - **`prompts/`, `settings/`, `mcp/`** — generated per-agent files.
 - **`docs/`** (or `$CC_DOCS_DIR`) — the internal doc store, as plain markdown.
 
@@ -36,17 +37,55 @@ pointing at `cc-mcp` with a `CC_ROLE` env var. The toolset is scoped by role
 - **Worker:** `get_my_task`, `update_my_task`, `report_blocked`.
 - **Reviewer:** `get_my_task`, `get_task_diff`, `submit_review`.
 - **Main (orchestrator):** the full set — `list_tasks`, `get_task`,
-  `update_task`, `claim_task`, `cancel_task`, `spawn_worker`, `spawn_reviewer`,
+  `list_repositories`, `update_task`, `claim_task`, `cancel_task`, `spawn_worker`, `spawn_reviewer`,
   `list_agents`, `peek_worker`, `send_to_worker`, `kill_worker`, `get_task_diff`,
   `read_worker_transcript`, `escalate`, `recent_events`, `forget`.
 
-**Hooks (lifecycle events).** Each agent's generated `--settings` wires
-`SessionStart`, `Stop`, and `Notification` hooks to a `curl` that POSTs the
-hook's JSON to `/api/hooks/agent/<id>`. The hook always exits 0, so a daemon
-outage can never block an agent's own work. Hooks are the daemon's signal that an
-agent started, went idle, needs input, or stopped.
+**Hooks (lifecycle events).** Claude's generated settings forward
+`SessionStart`, `Stop`, and `Notification`. Codex's static bridge forwards
+`SessionStart`, `Stop`, `PreToolUse`, and `PermissionRequest` from Command
+Center's isolated profile. `PreToolUse` denies publishing outside the exact
+task branch even after remembered approvals; `PermissionRequest` auto-approves
+that one canonical push. Worker identity comes from process environment,
+keeping the hook hash stable for one-time trust. A daemon outage never blocks
+the agent, while the local publishing policy remains enforced by the hook.
+The local `cc` MCP server is role-scoped and explicitly approved so a worker
+can record its result without a separate prompt for each platform tool call.
+
+Provider trust prompts occur before lifecycle hooks are available. The
+watchdog parses those startup screens and marks the agent `waiting_input` so
+the human can answer in the dashboard; it never delegates repository/folder
+trust to another model. The Claude main agent starts in the empty
+`$CC_DATA_DIR/main-workspace` rather than the user's home directory. After its
+`SessionStart` hook arrives, outstanding routine worker approvals are delegated
+to it. A tmux window must be missing in two consecutive successful health
+snapshots before an agent is reaped, and an unreliable tmux observation causes
+no agent/task mutation.
+
+Codex scratch tasks are pre-trusted only at the exact server-created task
+directory. The scratch parent and general temporary directories are never
+trusted. Repository trust remains a human decision.
 
 ## Lifecycle of a task
+
+Explicit dashboard, CLI, and MCP submissions start with Claude-main triage:
+
+```
+  add explicit workspace -> queued -> Claude main studies task
+                                      | repo       -> claim/spawn one worker
+                                      | scratch    -> claim/spawn one non-Git worker
+                                      ` portfolio  -> in_progress parent
+                                                     `-> scoped repo children -> claim/spawn
+```
+
+The portfolio parent is never spawned, and its broad repository root is never a
+write-capable worker cwd. Child repositories are canonicalized beneath that
+parent root and inherit the selected provider/model/reasoning effort unless main
+records a deliberate override. If main stops between child creation and spawn,
+the queued child is redelivered on main's next start/idle event. Legacy API tasks
+and crons retain the direct scheduler path below for compatibility.
+
+Repository task lifecycle:
 
 ```
   add
@@ -77,29 +116,43 @@ agent started, went idle, needs input, or stopped.
   (cancelled is reachable from ANY state via `agp task cancel`)
 ```
 
-1. **Claim** — the scheduler (or `agp task claim`) claims a `queued` task whose
+1. **Triage** — an explicit workspace task is delivered to a live Claude main.
+   If main is unavailable, it remains queued and the Needs You panel surfaces
+   the ownership gap; it never falls through to direct scheduler dispatch.
+2. **Claim** — Claude main, the scheduler for direct/cron work, or
+   `agp task claim` claims a `queued` task whose
    `blocked_by` is satisfied, with a single atomic SQLite `UPDATE` — two agents
    can never take the same task.
-2. **Spawn** — `src/daemon/spawn.ts` cuts branch `agent/task-N` and a worktree
-   from the repo's **origin default branch** (fetched fresh, not local `HEAD`),
-   writes the generated settings + mcp config, opens a tmux window, and launches
-   `claude --permission-mode acceptEdits`. The top relevant memories are injected
-   into the prompt. If a previous transcript exists, it resumes with `--resume`
-   (override with `--fresh`).
-3. **Work** — the worker uses its MCP tools and does the work in the worktree.
-4. **Verify** — on the `Stop` hook the daemon runs the task's `verify_cmd` in the
-   worktree. Pass → `review`. Fail → the failure output is fed back into the
+3. **Spawn** — for repository work, `src/daemon/spawn.ts` cuts branch
+   `agent/task-N` and a worktree from the repo's **origin default branch**
+   (fetched fresh, not local `HEAD`). For scratch work it validates the
+   server-created directory and creates no Git state. It then writes provider
+   runtime config, opens a tmux window, and launches Claude or
+   Codex. Codex uses `workspace-write`, `on-request` approval routed to an
+   automatic Codex reviewer, and no sandbox network unless an escalation is
+   approved. Codex reasoning effort is persisted
+   per task, defaults to `high`, and is reapplied to fresh and resumed workers.
+   A session resumes only through the provider that created it (override with
+   `--fresh`).
+4. **Work** — the worker uses its MCP tools inside its isolated worktree or
+   scratch directory. Scratch prompts prohibit Git initialization, commits,
+   pushes, and PRs and direct durable findings to the internal doc store.
+5. **Verify** — on the `Stop` hook the daemon runs the task's `verify_cmd` in the
+   task workspace. Pass → `review`. Fail → the failure output is fed back into the
    session (up to 2 nudges, then `blocked`). The `Stop` hook re-verifies even a
    task the worker moved to `review` itself, so `verify_cmd` can't be bypassed.
-5. **Review** — an independent reviewer proofs the branch (details below).
-6. **PR** — the worker pushes its own branch and opens a PR **as a draft**
-   (`gh pr create --draft`), recording it via `update_my_task(pr_url)`. The draft
-   is the GitHub-native signal that internal review has not yet approved: the
-   platform flips it to ready-for-review only on approval (below), so on GitHub
-   "ready for review" literally means "passed internal review — safe to merge".
-   If a repo can't create drafts the worker falls back to a normal PR titled
-   `[UNREVIEWED] …`; the platform strips that prefix when it approves.
-7. **PR sync** — every ~2 minutes the daemon polls GitHub via `gh` for tasks in
+6. **Review** — an independent reviewer proofs a repository branch (details
+   below). Scratch work has no branch reviewer; main checks its transcript,
+   result summary, saved docs, and external read-only evidence.
+7. **PR** — the repository worker pushes its own branch and opens a PR **as a
+   draft** (`gh pr create --draft`), recording it via `update_my_task(pr_url)`.
+   The draft is the GitHub-native signal that internal review has not yet
+   approved: the platform flips it to ready-for-review only on approval (below),
+   so on GitHub "ready for review" literally means "passed internal review —
+   safe to merge". If a repo can't create drafts the worker falls back to a
+   normal PR titled `[UNREVIEWED] …`; the platform strips that prefix when it
+   approves.
+8. **PR sync** — every ~2 minutes the daemon polls GitHub via `gh` for tasks in
    `review` with a `pr_url`. Merged → `done` (agents reaped, worktree removed,
    local branch pruned). Closed without merge → `blocked`. New comments or a
    CHANGES_REQUESTED verdict → piped into the live worker (or baked into a
@@ -144,16 +197,24 @@ live from tasks/agents/events on every request.
 
 ## Operational details
 
-- **Token accounting** — on each worker `Stop` the daemon sums the session
-  transcript's per-turn usage (input + output + cache; approximate) into
-  `tasks.tokens_used`.
-- **Session resume** — respawning a task with an existing transcript uses
-  `claude --resume`, so requeued / rejected work keeps its context; outstanding
+- **Token accounting** — for both providers, on each `Stop` the daemon reads the
+  session transcript's usage (per-turn Claude totals or the latest cumulative
+  Codex total; approximate) into `tasks.tokens_used`.
+- **Session resume** — respawning a task uses provider-aware `claude --resume`
+  or `codex resume`, so requeued / rejected work keeps its context; outstanding
   review/PR feedback rides along in the resume message.
+- **Optional Codex MCP inheritance** — `CC_CODEX_MCP_SOURCE_HOME` mirrors only
+  explicit `mcp_servers` into the isolated Codex base config. Plugin-provided
+  MCPs are flattened into transport entries instead of enabling the plugin or
+  its skills/apps. Effective server names, enabled states, transport types, and
+  credential-variable names must match before a worker can spawn. Declared
+  credential variables are passed pane-by-pane; normal auth, sessions, history,
+  hooks, trust, model, and sandbox state are not inherited.
 - **Stale-daemon detection** — the daemon snapshots `dist/`'s newest mtime at
   boot; if a rebuild lands while it runs, it warns (dashboard banner +
   `GET /api/version` `stale: true`). `agp upgrade` rebuilds and respawns it.
-- **Watchdog** — every 60s: a worker whose tmux window vanished is reaped (task
+- **Watchdog** — every 60s: a worker whose tmux window vanished or whose retained
+  pane process exited is reaped (task
   requeued once, failed on the second vanish); a worker silent past
   `stall_minutes` is flagged and pushed.
 - **Push notifications** — set `CC_NTFY_URL` (and optionally `CC_NTFY_TOKEN`) to

@@ -422,6 +422,26 @@ describe("open_pr prompt wiring", () => {
     expect(prompt).toContain("leave its draft/ready state");
   });
 
+  it("scratch worker prompts prohibit Git/PR work and require evidence", async () => {
+    const { _buildWorkerPromptForTest, _buildWorkerAllowForTest } = await import(
+      "../src/daemon/spawn.js"
+    );
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({
+      title: "investigate",
+      prompt: "inspect Kubernetes",
+      repo: "/scratch/task-ABC123",
+      workspace_kind: "scratch",
+      open_pr: false,
+    });
+    const prompt = _buildWorkerPromptForTest(task, null);
+    expect(prompt).toContain("not a Git repository");
+    expect(prompt).toContain("Do not initialize Git");
+    expect(prompt).toContain("Prefer read-only inspection");
+    expect(prompt).not.toContain("git push -u origin");
+    expect(_buildWorkerAllowForTest(null)).not.toContain("Bash(gh pr create*)");
+  });
+
   it("resume prompt carries the branch-only instruction too", async () => {
     const { _buildResumePromptForTest } = await import("../src/daemon/spawn.js");
     const { createTask } = await import("../src/db/tasks.js");

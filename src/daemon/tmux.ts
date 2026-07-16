@@ -16,16 +16,43 @@ export function ensureSession(): void {
   }
 }
 
+function tmuxEnvironmentArgs(environment?: Record<string, string>): string[] {
+  if (!environment) return [];
+  const entries = Object.entries(environment).sort(([left], [right]) =>
+    left.localeCompare(right),
+  );
+  if (entries.length > 64) {
+    throw new Error("too many pane-scoped environment variables");
+  }
+  return entries.flatMap(([name, value]) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name)) {
+      throw new Error("invalid pane-scoped environment variable name");
+    }
+    if (value.includes("\0") || Buffer.byteLength(value, "utf8") > 64 * 1024) {
+      throw new Error(`invalid pane-scoped environment value for ${name}`);
+    }
+    return ["-e", `${name}=${value}`];
+  });
+}
+
+export const _tmuxEnvironmentArgsForTest = tmuxEnvironmentArgs;
+
 /**
  * Create a detached window running `command` (a shell string) with cwd.
  * Returns a stable tmux target (session:window_id, e.g. "cc:@3") —
  * window IDs don't shift when other windows close, unlike indexes.
  */
-export function newWindow(name: string, cwd: string, command: string): string {
+export function newWindow(
+  name: string,
+  cwd: string,
+  command: string,
+  environment?: Record<string, string>,
+): string {
   ensureSession();
   const target = tmux(
     "new-window",
     "-d",
+    ...tmuxEnvironmentArgs(environment),
     "-t",
     tmuxSession(),
     "-n",
@@ -46,12 +73,13 @@ export function killWindow(target: string): void {
   tmux("kill-window", "-t", target);
 }
 
+/** All local tmux window targets, including an older agent session retained
+ * across a CC_TMUX_SESSION change. Callers still match exact stored targets. */
 export function listWindowIds(): string[] {
   try {
     return tmux(
       "list-windows",
-      "-t",
-      tmuxSession(),
+      "-a",
       "-F",
       "#{session_name}:#{window_id}",
     )
@@ -60,6 +88,48 @@ export function listWindowIds(): string[] {
       .filter(Boolean);
   } catch {
     return []; // session itself is gone
+  }
+}
+
+/**
+ * A null snapshot means tmux could not be observed reliably. That must be
+ * distinguished from an empty, successful snapshot: treating a transient
+ * client/socket error as "every window vanished" orphans still-running
+ * provider processes from Command Center's database.
+ */
+export type LiveWindowSnapshot = string[] | null;
+
+function tmuxSessionIsDefinitelyAbsent(error: unknown): boolean {
+  const detail =
+    error instanceof Error
+      ? `${error.message} ${String((error as Error & { stderr?: unknown }).stderr ?? "")}`
+      : String(error);
+  return /can't find session|no server running/i.test(detail);
+}
+
+/** Live process windows across all local tmux sessions. `remain-on-exit`
+ * intentionally keeps crashed windows inspectable, so presence alone is not
+ * a worker-health signal. */
+export function listLiveWindowIds(): LiveWindowSnapshot {
+  try {
+    return tmux(
+      "list-windows",
+      "-a",
+      "-F",
+      "#{session_name}:#{window_id}\t#{pane_dead}",
+    )
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .flatMap((line) => {
+        const [target, dead] = line.split("\t");
+        return dead === "0" ? [target] : [];
+      });
+  } catch (error) {
+    // A missing session is a trustworthy empty result. Permission/socket/
+    // locale/client failures are not; the watchdog must retry without
+    // mutating agent or task state.
+    return tmuxSessionIsDefinitelyAbsent(error) ? [] : null;
   }
 }
 
