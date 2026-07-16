@@ -44,6 +44,12 @@ export interface Task {
   human_approved_at: string | null; // latest human GitHub approval (signal only, not a re-queue trigger)
   pr_synced_at: string | null; // last successful prsync
   pr_sync_fails: number; // consecutive prsync failures; escalates at 3
+  jira_key: string | null; // JIRA issue key, e.g. "EN-1234"; NULL = no ticket yet
+  jira_state: string | null; // cached JIRA status name, lowercased (open | in progress | merged | done | will not do)
+  jira_status_category: string | null; // cached status category: new | indeterminate | done
+  jira_synced_at: string | null; // last successful jirasync
+  jira_sync_fails: number; // consecutive jirasync failures; escalates at 3
+  jira_project: string | null; // resolved (or per-task override) JIRA project key
   open_pr: number; // sqlite boolean, default 1
   tokens_used: number | null;
   cron_id: number | null;
@@ -196,6 +202,58 @@ export function tasksNeedingPrReconcile(maxReviewCycles: number): Task[] {
     .all({ maxReviewCycles }) as Task[];
 }
 
+/**
+ * Tasks whose existing JIRA ticket still needs polling: jira_key is set and the
+ * cached status is not yet terminal. Terminal states — the "done" / "will not
+ * do" status names AND anything in the "done" status *category* — drop out so
+ * they are never re-polled (saving JIRA API quota), the direct analogue of
+ * merged/closed PRs dropping out of tasksNeedingPrSync. Both NULL checks are
+ * explicit and deliberate (task #38 lesson): `NULL NOT IN (...)` / `NULL != ...`
+ * evaluate to NULL, not true, so a just-created ticket whose status hasn't been
+ * fetched yet (jira_state / jira_status_category still NULL) would otherwise be
+ * silently skipped and never synced.
+ *
+ * Ticket CREATION is a separate query (tasksNeedingJiraCreate) — this only syncs
+ * tickets that already exist.
+ */
+export function tasksNeedingJiraSync(): Task[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM tasks
+       WHERE jira_key IS NOT NULL
+         AND (jira_state IS NULL OR jira_state NOT IN ('done', 'will not do'))
+         AND (jira_status_category IS NULL OR jira_status_category != 'done')
+       ORDER BY id ASC`,
+    )
+    .all() as Task[];
+}
+
+/**
+ * Tasks that need a JIRA ticket created: they have a PR (pr_url set and
+ * PR-opening enabled via open_pr != 0 — the iff-PR rule enforced at the query
+ * level, so doc-only tasks are structurally excluded), don't yet have a ticket
+ * (jira_key IS NULL — the idempotency guard, so a task never re-enters the
+ * create path once its key is recorded), live in a JIRA-enabled repo, and are
+ * not cancelled/failed. `enabledRepos` is the config-derived opt-in gate
+ * (JiraConfig, §6); an empty list means no repo is enabled, so there are no
+ * candidates. Repos are bound as parameters (never interpolated) so the gate is
+ * injection-safe.
+ */
+export function tasksNeedingJiraCreate(enabledRepos: string[]): Task[] {
+  if (enabledRepos.length === 0) return [];
+  const placeholders = enabledRepos.map(() => "?").join(", ");
+  return getDb()
+    .prepare(
+      `SELECT * FROM tasks
+       WHERE pr_url IS NOT NULL AND open_pr != 0
+         AND jira_key IS NULL
+         AND repo IN (${placeholders})
+         AND status NOT IN ('cancelled', 'failed')
+       ORDER BY id ASC`,
+    )
+    .all(...enabledRepos) as Task[];
+}
+
 /** Open tasks waiting on `taskId` via blocked_by. A cancelled blocker never
  *  becomes 'done', so these stay stuck unless the human re-points them. */
 export function openDependents(taskId: number): Task[] {
@@ -255,6 +313,12 @@ const UPDATABLE = new Set([
   "human_approved_at",
   "pr_synced_at",
   "pr_sync_fails",
+  "jira_key",
+  "jira_state",
+  "jira_status_category",
+  "jira_synced_at",
+  "jira_sync_fails",
+  "jira_project",
   "open_pr",
   "tokens_used",
   "workspace_kind",

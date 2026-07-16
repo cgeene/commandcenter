@@ -131,6 +131,23 @@ export function ntfyToken(): string | undefined {
   return process.env.CC_NTFY_TOKEN;
 }
 
+/** JIRA Cloud base URL. Defaults to the Nylas instance. */
+export function jiraBaseUrl(): string {
+  return process.env.CC_JIRA_BASE_URL?.trim() || "https://nylas.atlassian.net";
+}
+
+/** Account email the JIRA API token belongs to (Basic auth username). */
+export function jiraEmail(): string | undefined {
+  return process.env.CC_JIRA_EMAIL?.trim() || undefined;
+}
+
+/** JIRA API token — the secret. Read from env at startup only; NEVER persisted
+ *  to the settings table, written to events, or logged. Unset ⇒ the whole JIRA
+ *  subsystem stays inert (fail-closed). CC_NTFY_TOKEN is the precedent. */
+export function jiraToken(): string | undefined {
+  return process.env.CC_JIRA_TOKEN;
+}
+
 export function claudeProjectsDir(): string {
   return (
     process.env.CC_CLAUDE_PROJECTS ??
