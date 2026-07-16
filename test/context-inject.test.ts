@@ -62,7 +62,7 @@ describe("injectWorkspaceContext", () => {
     const { injectWorkspaceContext, INJECT_MARKER } = await import(
       "../src/daemon/context.js"
     );
-    injectWorkspaceContext(repo, wt, 1, { home });
+    injectWorkspaceContext(repo, wt, 1, "claude", { home });
 
     const index = path.join(wt, ".claude", "CLAUDE.md");
     expect(fs.existsSync(index)).toBe(true);
@@ -84,7 +84,7 @@ describe("injectWorkspaceContext", () => {
     const wt = initWorkingTree("svc-wt");
 
     const { injectWorkspaceContext } = await import("../src/daemon/context.js");
-    injectWorkspaceContext(repo, wt, 1, { home });
+    injectWorkspaceContext(repo, wt, 1, "claude", { home });
 
     expect(fs.existsSync(path.join(wt, ".claude", "cc-workspace", "1.md"))).toBe(true);
     // Nothing injected shows up as a change a worker could commit.
@@ -101,7 +101,7 @@ describe("injectWorkspaceContext", () => {
     git(wt, "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-m", "add claude");
 
     const { injectWorkspaceContext } = await import("../src/daemon/context.js");
-    injectWorkspaceContext(repo, wt, 1, { home });
+    injectWorkspaceContext(repo, wt, 1, "claude", { home });
 
     expect(fs.readFileSync(repoClaude, "utf8")).toBe("REPO OWN CONTENT\n");
     expect(fs.existsSync(path.join(wt, ".claude", "CLAUDE.md"))).toBe(true);
@@ -120,7 +120,7 @@ describe("injectWorkspaceContext", () => {
     const { injectWorkspaceContext, INJECT_MARKER } = await import(
       "../src/daemon/context.js"
     );
-    injectWorkspaceContext(repo, wt, 1, { home });
+    injectWorkspaceContext(repo, wt, 1, "claude", { home });
 
     expect(fs.readFileSync(repoDotClaude, "utf8")).toBe("REPO DOTCLAUDE CONTENT\n");
     const local = path.join(wt, "CLAUDE.local.md");
@@ -136,7 +136,7 @@ describe("injectWorkspaceContext", () => {
     const wt = initWorkingTree("svc-wt");
 
     const { injectWorkspaceContext } = await import("../src/daemon/context.js");
-    injectWorkspaceContext(repo, wt, 1, { home });
+    injectWorkspaceContext(repo, wt, 1, "claude", { home });
 
     expect(fs.existsSync(path.join(wt, ".claude", "CLAUDE.md"))).toBe(false);
     expect(fs.existsSync(path.join(wt, "CLAUDE.local.md"))).toBe(false);
@@ -151,7 +151,7 @@ describe("injectWorkspaceContext", () => {
     const wt = initWorkingTree("svc-wt");
 
     const { injectWorkspaceContext } = await import("../src/daemon/context.js");
-    injectWorkspaceContext(repo, wt, 1, {
+    injectWorkspaceContext(repo, wt, 1, "claude", {
       home,
       roots: { [path.join(home, "work", "nylas")]: [explicit] },
     });
@@ -167,7 +167,7 @@ describe("injectWorkspaceContext", () => {
     const wt = initWorkingTree("svc-wt");
 
     const { injectWorkspaceContext } = await import("../src/daemon/context.js");
-    injectWorkspaceContext(repo, wt, 1, { home });
+    injectWorkspaceContext(repo, wt, 1, "claude", { home });
 
     const body = fs.readFileSync(path.join(wt, ".claude", "CLAUDE.md"), "utf8");
     expect(importPaths(body)).toEqual(["cc-workspace/1.md", "cc-workspace/2.md"]);
@@ -186,8 +186,8 @@ describe("injectWorkspaceContext", () => {
     const wt = initWorkingTree("svc-wt");
 
     const { injectWorkspaceContext } = await import("../src/daemon/context.js");
-    injectWorkspaceContext(repo, wt, 1, { home });
-    injectWorkspaceContext(repo, wt, 1, { home });
+    injectWorkspaceContext(repo, wt, 1, "claude", { home });
+    injectWorkspaceContext(repo, wt, 1, "claude", { home });
 
     const body = fs.readFileSync(path.join(wt, ".claude", "CLAUDE.md"), "utf8");
     expect(importPaths(body)).toEqual(["cc-workspace/1.md"]);
@@ -202,6 +202,75 @@ describe("injectWorkspaceContext", () => {
     expect(
       exclude.split("\n").filter((l) => l.trim() === "/.claude/cc-workspace/"),
     ).toHaveLength(1);
+    expect(git(wt, "status", "--porcelain")).toBe("");
+  });
+});
+
+describe("injectWorkspaceContext — Codex (AGENTS.md) provider path", () => {
+  it("materializes workspace content into a worktree-root AGENTS.md (not .claude/CLAUDE.md)", async () => {
+    write(path.join(home, "projects", "nylas", "CLAUDE.md"), "WORKSPACE RULES\n");
+    const repo = path.join(home, "projects", "nylas", "svc");
+    const wt = initWorkingTree("svc-wt");
+
+    const { injectWorkspaceContext, INJECT_MARKER } = await import(
+      "../src/daemon/context.js"
+    );
+    injectWorkspaceContext(repo, wt, 1, "codex", { home });
+
+    // Codex discovers AGENTS.md hierarchically and has no @import — the content
+    // is COPIED in-tree, not symlinked/imported like the Claude path.
+    const agents = path.join(wt, "AGENTS.md");
+    expect(fs.existsSync(agents)).toBe(true);
+    const body = fs.readFileSync(agents, "utf8");
+    expect(body).toContain(INJECT_MARKER);
+    expect(body).toContain("WORKSPACE RULES");
+    // The Claude symlink/import artifacts must NOT be created for Codex.
+    expect(fs.existsSync(path.join(wt, ".claude", "CLAUDE.md"))).toBe(false);
+    expect(fs.existsSync(path.join(wt, ".claude", "cc-workspace"))).toBe(false);
+    // Nothing injected shows up as a change a worker could commit.
+    expect(git(wt, "status", "--porcelain")).toBe("");
+  });
+
+  it("concatenates multiple ancestor workspace files into AGENTS.md", async () => {
+    write(path.join(home, "projects", "nylas", "CLAUDE.md"), "NEAR RULES\n");
+    write(path.join(home, "projects", "CLAUDE.md"), "FAR RULES\n");
+    const repo = path.join(home, "projects", "nylas", "svc");
+    const wt = initWorkingTree("svc-wt");
+
+    const { injectWorkspaceContext } = await import("../src/daemon/context.js");
+    injectWorkspaceContext(repo, wt, 1, "codex", { home });
+
+    const body = fs.readFileSync(path.join(wt, "AGENTS.md"), "utf8");
+    expect(body).toContain("NEAR RULES");
+    expect(body).toContain("FAR RULES");
+    expect(git(wt, "status", "--porcelain")).toBe("");
+  });
+
+  it("does NOT clobber a repo's own committed AGENTS.md", async () => {
+    write(path.join(home, "projects", "nylas", "CLAUDE.md"), "ws\n");
+    const repo = path.join(home, "projects", "nylas", "svc");
+    const wt = initWorkingTree("svc-wt");
+    const repoAgents = path.join(wt, "AGENTS.md");
+    fs.writeFileSync(repoAgents, "REPO OWN AGENTS\n");
+    git(wt, "add", "-A");
+    git(wt, "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-m", "add agents");
+
+    const { injectWorkspaceContext } = await import("../src/daemon/context.js");
+    injectWorkspaceContext(repo, wt, 1, "codex", { home });
+
+    // The repo's committed AGENTS.md is left untouched; nothing to commit.
+    expect(fs.readFileSync(repoAgents, "utf8")).toBe("REPO OWN AGENTS\n");
+    expect(git(wt, "status", "--porcelain")).toBe("");
+  });
+
+  it("does nothing when there is no workspace file to import", async () => {
+    const repo = path.join(home, "projects", "nylas", "svc");
+    const wt = initWorkingTree("svc-wt");
+
+    const { injectWorkspaceContext } = await import("../src/daemon/context.js");
+    injectWorkspaceContext(repo, wt, 1, "codex", { home });
+
+    expect(fs.existsSync(path.join(wt, "AGENTS.md"))).toBe(false);
     expect(git(wt, "status", "--porcelain")).toBe("");
   });
 });

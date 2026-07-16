@@ -4,6 +4,7 @@ import path from "node:path";
 import { worktreesDir } from "../config.js";
 import { logEvent } from "../db/events.js";
 import { injectWorkspaceContext } from "./context.js";
+import { type AgentProvider } from "../providers.js";
 
 export function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
@@ -97,6 +98,7 @@ export function branchForTask(taskId: number): string {
 export function createWorktree(
   repo: string,
   taskId: number,
+  provider: AgentProvider = "claude",
 ): { dir: string; branch: string } {
   const repoName = path.basename(repo);
   const dir = path.join(worktreesDir(), `${repoName}-task-${taskId}`);
@@ -105,7 +107,7 @@ export function createWorktree(
   if (fs.existsSync(dir)) {
     // Already set up (respawn case) — still refresh injected context so a
     // resumed worker picks up any workspace-file changes since it was created.
-    injectWorkspaceContext(repo, dir, taskId);
+    injectWorkspaceContext(repo, dir, taskId, provider);
     return { dir, branch };
   }
   fs.mkdirSync(worktreesDir(), { recursive: true });
@@ -122,7 +124,7 @@ export function createWorktree(
       git(repo, "worktree", "add", dir, "-b", branch);
     }
   }
-  injectWorkspaceContext(repo, dir, taskId);
+  injectWorkspaceContext(repo, dir, taskId, provider);
   return { dir, branch };
 }
 
@@ -215,18 +217,19 @@ export function createReviewWorktree(
   taskId: number,
   branch: string,
   openPr: boolean,
+  provider: AgentProvider = "claude",
 ): string {
   const dir = reviewWorktreeDir(repo, taskId);
   const target = resolveReviewTarget(repo, branch, taskId, openPr);
   if (fs.existsSync(dir)) {
     git(dir, "checkout", "--detach", target);
-    injectWorkspaceContext(repo, dir, taskId);
+    injectWorkspaceContext(repo, dir, taskId, provider);
     return dir;
   }
   fs.mkdirSync(worktreesDir(), { recursive: true });
   git(repo, "worktree", "add", "--detach", dir, target);
   // Reviewers benefit from the same workspace context as workers.
-  injectWorkspaceContext(repo, dir, taskId);
+  injectWorkspaceContext(repo, dir, taskId, provider);
   return dir;
 }
 

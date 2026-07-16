@@ -5,6 +5,7 @@ import path from "node:path";
 import { contextRoots } from "../config.js";
 import { resolveWorkspaceImports } from "../lib/context-roots.js";
 import { logEvent } from "../db/events.js";
+import { type AgentProvider } from "../providers.js";
 
 /**
  * Injecting workspace-level CLAUDE.md context into worker/reviewer worktrees.
@@ -168,6 +169,7 @@ export function injectWorkspaceContext(
   repo: string,
   worktreeDir: string,
   taskId: number,
+  provider: AgentProvider = "claude",
   opts?: InjectOptions,
 ): void {
   try {
@@ -178,6 +180,14 @@ export function injectWorkspaceContext(
       exists: fs.existsSync,
     });
     if (imports.length === 0) return; // nothing above this repo to import
+
+    // Codex discovers AGENTS.md hierarchically and has no `@import` — and the
+    // worktree lives outside the workspace ancestor tree, so discovery never
+    // reaches the workspace file. It needs the content materialized in-tree.
+    if (provider === "codex") {
+      injectCodexContext(repo, worktreeDir, taskId, imports);
+      return;
+    }
 
     const slot = pickSlot(worktreeDir);
     if (!slot) {
@@ -209,4 +219,58 @@ export function injectWorkspaceContext(
       payload: { error: String(err) },
     });
   }
+}
+
+/** Worktree-root slot Codex discovers by walking up from its cwd. */
+const CODEX_SLOT = "AGENTS.md";
+
+/**
+ * Codex path: materialize the workspace context into a worktree-root AGENTS.md.
+ * Codex cannot follow Claude's live `@import` symlink trick, so this is a COPY
+ * — it refreshes on the next spawn/resume rather than propagating live. We only
+ * take the slot when the repo hasn't committed its own AGENTS.md (never clobber
+ * it; log a loud skip instead), and git-exclude ours so a worker never commits
+ * it. `imports` are absolute paths to the workspace context file(s) discovered
+ * above the repo (the same set Claude imports).
+ */
+function injectCodexContext(
+  repo: string,
+  worktreeDir: string,
+  taskId: number,
+  imports: string[],
+): void {
+  const abs = path.join(worktreeDir, CODEX_SLOT);
+  if (fs.existsSync(abs) && !isOurs(abs)) {
+    logEvent("worktree.context_inject_skipped", {
+      taskId,
+      payload: { reason: "agents-md-occupied", provider: "codex", imports },
+    });
+    return;
+  }
+  const header = [
+    `${INJECT_MARKER} — managed by the commandcenter platform, do not edit.`,
+    `This is a git worktree of ${repo}, which runs outside the repo's real`,
+    "parent directories, so the workspace-level context file(s) above the repo",
+    "are copied in below for Codex (which discovers AGENTS.md hierarchically but",
+    "cannot import external paths live). Edit the SOURCE workspace files; this",
+    "copy refreshes on the next spawn/resume. This file is git-excluded, never",
+    "committed.",
+    "",
+  ].join("\n");
+  const sections = imports.map((p) => {
+    let body = "";
+    try {
+      body = fs.readFileSync(p, "utf8").trim();
+    } catch {
+      body = "(workspace file unreadable at inject time)";
+    }
+    return `<!-- workspace context: ${p} -->\n${body}`;
+  });
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, `${header}\n${sections.join("\n\n")}\n`);
+  addGitExclude(worktreeDir, [excludePattern(CODEX_SLOT)]);
+  logEvent("worktree.context_injected", {
+    taskId,
+    payload: { slot: CODEX_SLOT, provider: "codex", imports },
+  });
 }

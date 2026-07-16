@@ -368,7 +368,7 @@ export function spawnWorker(
     const workspace =
       task.workspace_kind === "scratch"
         ? { dir: validateScratchWorkspace(task.repo), branch: null }
-        : createWorktree(task.repo, taskId);
+        : createWorktree(task.repo, taskId, provider);
     const { dir, branch } = workspace;
 
     // Agent row first: its id is baked into the generated hook + MCP configs.
