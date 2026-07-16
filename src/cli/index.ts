@@ -838,7 +838,7 @@ program
 program
   .command("main")
   .description("spawn the orchestrator main agent")
-  .option("-m, --model <model>", "model (default: fable, or CC_MAIN_MODEL)")
+  .option("-m, --model <model>", "model (default: opus, or CC_MAIN_MODEL; Fable is an opt-in, see PR #31)")
   .action(async (opts) => {
     const a = await api<Agent>("POST", "/api/main", { model: opts.model });
     console.log(`main agent a${a.id} spawned in ${a.tmux_target} (${a.model})`);
