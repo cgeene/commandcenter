@@ -1,7 +1,13 @@
 import { execFile } from "node:child_process";
 import { listAgents } from "../db/agents.js";
 import { logEvent } from "../db/events.js";
-import { getTask, tasksNeedingPrSync, updateTask, type Task } from "../db/tasks.js";
+import {
+  getTask,
+  tasksNeedingPrReconcile,
+  tasksNeedingPrSync,
+  updateTask,
+  type Task,
+} from "../db/tasks.js";
 import { notify } from "./notify.js";
 import { MAX_REVIEW_CYCLES } from "./review.js";
 import { resumeAgent } from "./resume.js";
@@ -427,7 +433,47 @@ export function recordSyncFailure(taskId: number, error: string): void {
   }
 }
 
+/**
+ * Reconcile terminal PR consequences from cached state — the belt to
+ * recordSyncSuccess/applyPrState's suspenders. Those are two separate writes
+ * (record pr_state, then apply the consequence), and a daemon crash/restart
+ * between them strands the task: pr_state is terminal — so it drops out of
+ * tasksNeedingPrSync — yet its consequence (auto-complete on merge, block on
+ * close) never fired (task #97, observed 2026-07-16). This pass re-derives the
+ * consequence from the cached terminal state on EVERY pass, so a missed
+ * transition self-heals on the next one instead of being lost forever.
+ *
+ * applyPrState is idempotent: once the transition lands the task is no longer in
+ * 'review', so its `task.status !== "review"` guard turns a re-run into a no-op.
+ * That's what makes running this unconditionally every pass safe. We synthesize
+ * a minimal PrState from the cached lifecycle state — applyPrState reads only
+ * pr.state on the MERGED/CLOSED paths — so no gh round-trip is needed to heal.
+ */
+export async function reconcileTerminalPrs(): Promise<void> {
+  for (const task of tasksNeedingPrReconcile(MAX_REVIEW_CYCLES)) {
+    const state: PrState["state"] = task.pr_state === "merged" ? "MERGED" : "CLOSED";
+    try {
+      await applyPrState(task.id, { state, reviewDecision: null, comments: [] });
+    } catch (err) {
+      logEvent("pr.reconcile_error", {
+        taskId: task.id,
+        payload: {
+          error: err instanceof Error ? err.message : String(err),
+          pr_state: task.pr_state,
+        },
+      });
+    }
+  }
+}
+
 export async function prSyncPass(): Promise<void> {
+  // Belt (task #97): re-apply any terminal PR consequence a prior pass recorded
+  // but never got to act on — e.g. a daemon restart in the window between
+  // recording pr_state and applying the consequence. State-based, so it heals
+  // regardless of whether this process ever observed the transition delta. Runs
+  // first so a stranded task recovers even if the gh poll below errors out.
+  await reconcileTerminalPrs();
+
   // Every task with a live (non-terminal) PR, regardless of task status. This
   // deliberately includes done/cancelled tasks: their PR badge must track the
   // real GitHub state, and a task can be marked done while its PR is still

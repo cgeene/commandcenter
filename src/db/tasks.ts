@@ -160,6 +160,40 @@ export function tasksNeedingPrSync(): Task[] {
     .all() as Task[];
 }
 
+/**
+ * Tasks whose PR reached a terminal state (merged/closed) but whose lifecycle
+ * consequence was never applied — they are still in 'review'. This is the
+ * STATE-based candidate set for reconciliation (task #97): recording pr_state
+ * and applying the consequence (auto-complete on merge, block on close) are
+ * separate steps, and a daemon crash/restart between them strands the task. A
+ * terminal pr_state drops the task out of tasksNeedingPrSync, so the normal
+ * delta-driven poll never revisits it — only this query does. Because it keys
+ * off current state (not an observed transition), a missed consequence
+ * self-heals on the next pass.
+ *
+ * The merged case mirrors applyPrState's guard exactly, so every returned task
+ * actually transitions: it excludes the deliberate-human-merge-of-a-rejected-PR
+ * override (reject verdict or exhausted review cycles), which applyPrState
+ * intentionally parks in 'review' for a human. Re-selecting those every pass
+ * would spam pr.merged; they are parked, not stranded. Closed PRs always block
+ * regardless of verdict, so no such exclusion applies there.
+ */
+export function tasksNeedingPrReconcile(maxReviewCycles: number): Task[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM tasks
+       WHERE status = 'review' AND pr_url IS NOT NULL AND open_pr != 0
+         AND (
+           pr_state = 'closed'
+           OR (pr_state = 'merged'
+               AND (review_verdict IS NULL OR review_verdict != 'reject')
+               AND review_cycles < @maxReviewCycles)
+         )
+       ORDER BY id ASC`,
+    )
+    .all({ maxReviewCycles }) as Task[];
+}
+
 /** Open tasks waiting on `taskId` via blocked_by. A cancelled blocker never
  *  becomes 'done', so these stay stuck unless the human re-points them. */
 export function openDependents(taskId: number): Task[] {
