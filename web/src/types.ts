@@ -190,13 +190,58 @@ export interface ParsedPane {
   raw: string;
 }
 
+export interface SchedulerConfig {
+  enabled: boolean;
+  max_concurrent: number;
+  daily_spawn_limit: number;
+  stall_minutes: number;
+  active_hours: { start: number; end: number } | null;
+  auto_review: boolean;
+  escalate_minutes: number;
+  read_only_extra_allow: string[];
+  attention_stale_minutes: number;
+  reap_after_minutes: number;
+}
+
 export interface SchedulerInfo {
-  config: {
-    enabled: boolean;
-    max_concurrent: number;
-    daily_spawn_limit: number;
-    stall_minutes: number;
-    active_hours: { start: number; end: number } | null;
-  };
+  config: SchedulerConfig;
   status: { live_workers: number; spawns_today: number };
+}
+
+/** Runtime settings surfaced by the Settings tab (GET /api/settings).
+ *  `stored` holds explicit overrides (null = unset → env/default fallback);
+ *  `effective` is the resolved value actually in use. The ntfy token is a
+ *  secret — only its presence (`ntfy_token_set`) ever crosses the boundary. */
+export interface AppSettings {
+  agents: {
+    stored: {
+      default_main_model: string | null;
+      default_worker_provider: AgentProvider | null;
+      default_reviewer_provider: AgentProvider | null;
+      reviewer_variety: boolean | null;
+    };
+    effective: {
+      default_main_model: string;
+      default_worker_provider: AgentProvider;
+      default_reviewer_provider: AgentProvider | null;
+      reviewer_variety: boolean;
+    };
+  };
+  workspace: {
+    stored: {
+      worktrees_dir: string | null;
+      main_workspace_dir: string | null;
+    };
+    effective: {
+      worktrees_dir: string;
+      main_workspace_dir: string;
+    };
+  };
+  notifications: {
+    stored: { ntfy_url: string | null };
+    ntfy_token_set: boolean;
+    effective: { ntfy_url: string | null };
+  };
+  model_choices: string[];
+  provider_choices: AgentProvider[];
 }

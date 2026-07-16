@@ -465,3 +465,55 @@ dd { word-break: break-all; }
 .markdown th { background: var(--panel); }
 .markdown img { max-width: 100%; }
 .token-note { font-size: 11px; }
+
+/* Settings tab */
+.settings-view {
+  padding: 16px; display: flex; flex-direction: column; gap: 16px;
+  max-width: 860px; width: 100%; margin: 0 auto;
+}
+.settings-section {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 12px;
+}
+.settings-section h2 {
+  font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em;
+}
+.settings-section > p { margin-bottom: 2px; }
+.settings-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px 20px;
+}
+.setting-row { display: flex; flex-direction: column; gap: 5px; }
+.setting-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.setting-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.setting-hint { font-size: 11px; line-height: 1.35; }
+.settings-view input[type="number"],
+.settings-view input[type="text"],
+.settings-view input[type="password"],
+.settings-view select,
+.settings-view textarea {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 8px; font-size: 13px; width: 100%;
+  font-family: inherit;
+}
+.settings-view textarea { resize: vertical; }
+.setting-check {
+  display: flex; align-items: center; gap: 7px; font-size: 13px;
+  text-transform: none; letter-spacing: 0; color: var(--fg);
+}
+.setting-check input { width: auto; }
+.setting-inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.setting-inline input[type="number"] { width: 72px; }
+.setting-inline input[type="password"] { flex: 1; min-width: 160px; }
+.settings-actions { display: flex; justify-content: flex-end; }
+.apply-badge {
+  font-size: 9px; text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border);
+  color: var(--muted); white-space: nowrap;
+}
+.apply-immediate { color: var(--green); border-color: #238636; }
+.apply-next-spawn { color: var(--yellow); border-color: #9e6a03; }
+.apply-restart { color: var(--red); border-color: #da3633; }

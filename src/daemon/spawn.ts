@@ -1,5 +1,4 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {
   baseUrl,
@@ -7,11 +6,14 @@ import {
   codexBin,
   codexHome,
   codexProfile,
-  defaultMainModel,
-  defaultReviewerProvider,
   promptsDir,
-  reviewerVarietyEnabled,
 } from "../config.js";
+import {
+  resolveMainModel,
+  resolveMainWorkspaceDir,
+  resolveReviewerProviderPin,
+  resolveReviewerVariety,
+} from "../db/settings.js";
 import {
   createAgent,
   getAgent,
@@ -317,7 +319,7 @@ function resolveReviewerModel(task: Task, override?: string): string {
  * policy — the always-available direction — so it can't strand a review.
  */
 function resolveReviewerProvider(task: Task, override?: string): AgentProvider {
-  const pinned = override ?? defaultReviewerProvider();
+  const pinned = override ?? resolveReviewerProviderPin();
   if (pinned) {
     try {
       return parseAgentProvider(pinned, "claude");
@@ -325,7 +327,7 @@ function resolveReviewerProvider(task: Task, override?: string): AgentProvider {
       return "claude";
     }
   }
-  if (reviewerVarietyEnabled()) {
+  if (resolveReviewerVariety()) {
     return task.worker_provider === "codex" ? "claude" : "codex";
   }
   return "claude";
@@ -656,7 +658,7 @@ export function spawnMain(model?: string): Agent {
     );
   }
 
-  const resolvedModel = model ?? defaultMainModel();
+  const resolvedModel = model ?? resolveMainModel();
   const agent = createAgent({
     kind: "main",
     provider: "claude",
@@ -677,7 +679,7 @@ export function spawnMain(model?: string): Agent {
 
   const target = newWindow(
     "main",
-    os.homedir(),
+    resolveMainWorkspaceDir(),
     buildClaudeCmd({ model: resolvedModel, settingsFile, mcpFile, promptFile }),
   );
   // Do not report the orchestrator as working until its SessionStart hook
