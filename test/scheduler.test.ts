@@ -396,6 +396,80 @@ describe("watchdog auto-reap", () => {
     watchdog(reapDeps(killed, "2026-07-03T11:00:00.000Z"));
     expect(killed).toEqual([]);
   });
+
+  // --- early-reap: approved, awaiting human merge ---
+
+  /** An in-review task whose internal review APPROVED and whose PR is ready,
+   *  with a finished (idle) worker that has been silent past the grace. */
+  async function approvedReadyWorker(
+    setupFns: Awaited<ReturnType<typeof setup>>,
+    overrides: Record<string, unknown> = {},
+  ) {
+    const { createTask, updateTask, createAgent, updateAgent } = setupFns;
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const a = createAgent({ kind: "worker", state: "idle", task_id: task.id, tmux_target: "cc:@9" });
+    updateTask(task.id, {
+      status: "review",
+      agent_id: a.id,
+      review_verdict: "approve",
+      pr_is_draft: 0,
+      ...overrides,
+    });
+    updateAgent(a.id, { last_event_at: "2026-07-03T10:00:00.000Z" });
+    return a.id;
+  }
+
+  it("early-reaps an approved worker whose PR has flipped ready, after the grace", async () => {
+    const fns = await setup();
+    const id = await approvedReadyWorker(fns);
+    const killed: number[] = [];
+    fns.watchdog(reapDeps(killed, "2026-07-03T10:20:00.000Z")); // 20m > 10m grace
+    expect(killed).toEqual([id]);
+    const reaped = fns.listEvents().find((e) => e.kind === "agent.reaped");
+    expect(JSON.parse(reaped?.payload ?? "{}").reason).toBe("approved_awaiting_merge");
+  });
+
+  it("early-reaps an approved no-PR task's worker", async () => {
+    const fns = await setup();
+    const id = await approvedReadyWorker(fns, { open_pr: 0, pr_is_draft: null });
+    const killed: number[] = [];
+    fns.watchdog(reapDeps(killed, "2026-07-03T10:20:00.000Z"));
+    expect(killed).toEqual([id]);
+  });
+
+  it("does NOT early-reap while the PR is still a draft (internal review pending)", async () => {
+    const fns = await setup();
+    await approvedReadyWorker(fns, { pr_is_draft: 1 });
+    const killed: number[] = [];
+    fns.watchdog(reapDeps(killed, "2026-07-03T11:00:00.000Z"));
+    expect(killed).toEqual([]);
+  });
+
+  it("does NOT early-reap a rejected or unreviewed in-review worker (a fix round may resume it live)", async () => {
+    const fns = await setup();
+    await approvedReadyWorker(fns, { review_verdict: "reject" });
+    await approvedReadyWorker(fns, { review_verdict: null });
+    const killed: number[] = [];
+    fns.watchdog(reapDeps(killed, "2026-07-03T11:00:00.000Z"));
+    expect(killed).toEqual([]);
+  });
+
+  it("never early-reaps a worker that is still mid-turn (not idle)", async () => {
+    const fns = await setup();
+    const id = await approvedReadyWorker(fns);
+    fns.updateAgent(id, { state: "working" }); // resumed / still working
+    const killed: number[] = [];
+    fns.watchdog(reapDeps(killed, "2026-07-03T11:00:00.000Z"));
+    expect(killed).toEqual([]);
+  });
+
+  it("does NOT early-reap before the grace period elapses", async () => {
+    const fns = await setup();
+    await approvedReadyWorker(fns);
+    const killed: number[] = [];
+    fns.watchdog(reapDeps(killed, "2026-07-03T10:05:00.000Z")); // 5m < 10m grace
+    expect(killed).toEqual([]);
+  });
 });
 
 describe("scheduler capacity_blocked visibility", () => {
