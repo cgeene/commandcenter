@@ -445,6 +445,141 @@ describe("tasksNeedingPrSync (candidate selection + backfill)", () => {
   });
 });
 
+describe("reconcileTerminalPrs (task #97: state-based auto-complete recovery)", () => {
+  it("completes a review/approve task whose PR was recorded merged but never acted on (crash mid-sync)", async () => {
+    const { reconcileTerminalPrs } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task } = await setupPrTask();
+    // Simulate the dying daemon: pr_state committed, status never advanced —
+    // exactly the stranded state observed live on 2026-07-16 (task #89).
+    updateTask(task.id, { review_verdict: "approve", pr_state: "merged" });
+    await reconcileTerminalPrs();
+    expect(getTask(task.id)?.status).toBe("done");
+    expect(listEvents(10).map((e) => e.kind)).toContain("task.autocompleted");
+  });
+
+  it("completes a stranded merged task with no recorded verdict", async () => {
+    const { reconcileTerminalPrs } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { task } = await setupPrTask();
+    updateTask(task.id, { pr_state: "merged" }); // verdict null
+    await reconcileTerminalPrs();
+    expect(getTask(task.id)?.status).toBe("done");
+  });
+
+  it("blocks a review task whose PR was recorded closed but never acted on", async () => {
+    const { reconcileTerminalPrs } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { task } = await setupPrTask();
+    updateTask(task.id, { pr_state: "closed" });
+    await reconcileTerminalPrs();
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("blocked");
+    expect(t.review_notes).toContain("closed without merging");
+  });
+
+  it("is idempotent — a second pass never re-fires the consequence", async () => {
+    const { reconcileTerminalPrs } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task } = await setupPrTask();
+    updateTask(task.id, { review_verdict: "approve", pr_state: "merged" });
+    await reconcileTerminalPrs();
+    await reconcileTerminalPrs();
+    const completed = listEvents(20)
+      .map((e) => e.kind)
+      .filter((k) => k === "task.autocompleted");
+    expect(completed).toHaveLength(1);
+    expect(getTask(task.id)?.status).toBe("done");
+  });
+
+  it("leaves a deliberately-merged rejected PR parked in review, with no every-pass spam", async () => {
+    const { reconcileTerminalPrs } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task } = await setupPrTask();
+    updateTask(task.id, { review_verdict: "reject", pr_state: "merged" });
+    await reconcileTerminalPrs();
+    await reconcileTerminalPrs();
+    expect(getTask(task.id)?.status).toBe("review"); // parked for a human
+    const kinds = listEvents(20).map((e) => e.kind);
+    expect(kinds).not.toContain("task.autocompleted");
+    expect(kinds).not.toContain("pr.merged"); // never re-selected -> no spam
+  });
+
+  it("prSyncPass self-heals a stranded merged task without polling gh", async () => {
+    // A terminal pr_state is excluded from tasksNeedingPrSync, so no gh call is
+    // attempted — the recovery comes purely from the reconciliation pass.
+    const { prSyncPass } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task } = await setupPrTask();
+    updateTask(task.id, { review_verdict: "approve", pr_state: "merged" });
+    await prSyncPass();
+    expect(getTask(task.id)?.status).toBe("done");
+    expect(listEvents(10).map((e) => e.kind)).not.toContain("pr.sync_error");
+  });
+});
+
+describe("tasksNeedingPrReconcile (task #97 candidate selection)", () => {
+  async function mkTask(over: Record<string, unknown> = {}) {
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    updateTask(task.id, {
+      pr_url: "https://github.com/x/y/pull/1",
+      ...over,
+    });
+    return task.id;
+  }
+
+  it("selects a review task with a terminal pr_state (merged or closed)", async () => {
+    const { tasksNeedingPrReconcile } = await import("../src/db/tasks.js");
+    const { MAX_REVIEW_CYCLES } = await import("../src/daemon/review.js");
+    const merged = await mkTask({ status: "review", pr_state: "merged", review_verdict: "approve" });
+    const closed = await mkTask({ status: "review", pr_state: "closed" });
+    const ids = tasksNeedingPrReconcile(MAX_REVIEW_CYCLES).map((t) => t.id);
+    expect(ids).toContain(merged);
+    expect(ids).toContain(closed);
+  });
+
+  it("excludes a merged PR parked on a reject verdict or exhausted cycles", async () => {
+    const { tasksNeedingPrReconcile } = await import("../src/db/tasks.js");
+    const { MAX_REVIEW_CYCLES } = await import("../src/daemon/review.js");
+    const rejected = await mkTask({ status: "review", pr_state: "merged", review_verdict: "reject" });
+    const burned = await mkTask({
+      status: "review",
+      pr_state: "merged",
+      review_cycles: MAX_REVIEW_CYCLES,
+    });
+    // a closed PR always blocks regardless of verdict, so a reject verdict must
+    // NOT exclude it from reconciliation
+    const closedRejected = await mkTask({
+      status: "review",
+      pr_state: "closed",
+      review_verdict: "reject",
+    });
+    const ids = tasksNeedingPrReconcile(MAX_REVIEW_CYCLES).map((t) => t.id);
+    expect(ids).not.toContain(rejected);
+    expect(ids).not.toContain(burned);
+    expect(ids).toContain(closedRejected);
+  });
+
+  it("ignores non-review tasks, open PRs, un-synced PRs, and branch-only tasks", async () => {
+    const { tasksNeedingPrReconcile } = await import("../src/db/tasks.js");
+    const { MAX_REVIEW_CYCLES } = await import("../src/daemon/review.js");
+    const doneMerged = await mkTask({ status: "done", pr_state: "merged" }); // already transitioned
+    const openReview = await mkTask({ status: "review", pr_state: "open" });
+    const unsynced = await mkTask({ status: "review", pr_state: null });
+    const branchOnly = await mkTask({ status: "review", pr_state: "merged", open_pr: 0 });
+    const ids = tasksNeedingPrReconcile(MAX_REVIEW_CYCLES).map((t) => t.id);
+    expect(ids).not.toContain(doneMerged);
+    expect(ids).not.toContain(openReview);
+    expect(ids).not.toContain(unsynced);
+    expect(ids).not.toContain(branchOnly);
+  });
+});
+
 describe("computeCheckRollup", () => {
   it("empty rollup -> none", async () => {
     const { computeCheckRollup } = await import("../src/daemon/prsync.js");
