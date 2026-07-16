@@ -92,6 +92,23 @@ export function defaultMainModel(): string {
   return process.env.CC_MAIN_MODEL?.trim() || "opus";
 }
 
+/** Optional pinned reviewer provider (CC_REVIEWER_PROVIDER). Undefined means
+ *  "no explicit pin" — the reviewer-provider resolver then applies the
+ *  model-variety policy (when enabled) or defaults to Claude. */
+export function defaultReviewerProvider(): string | undefined {
+  const value = process.env.CC_REVIEWER_PROVIDER?.trim();
+  return value || undefined;
+}
+
+/** Whether the scheduler's auto-review should pick the OPPOSITE provider from
+ *  the worker (cross-model adversarial review). Opt-in because the platform
+ *  cannot safely auto-detect that both providers are configured — enabling it
+ *  asserts Codex is set up; otherwise reviewers stay Claude (unchanged). */
+export function reviewerVarietyEnabled(): boolean {
+  const value = process.env.CC_REVIEWER_VARIETY?.trim().toLowerCase() ?? "";
+  return ["1", "true", "on", "yes"].includes(value);
+}
+
 export function tmuxSession(): string {
   return process.env.CC_TMUX_SESSION ?? "cc";
 }

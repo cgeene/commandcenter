@@ -487,8 +487,21 @@ export function buildApp(): Hono {
 
   app.post("/api/tasks/:id/reviewer", async (c) => {
     const id = Number(c.req.param("id"));
-    const body = (await c.req.json().catch(() => ({}))) as { model?: string };
-    return c.json(spawnReviewer(id, body.model), 201);
+    const body = z
+      .object({
+        model: modelIdentifierSchema.optional(),
+        provider: providerSchema.optional(),
+        reasoning_effort: reasoningEffortSchema.optional(),
+      })
+      .parse(await c.req.json().catch(() => ({})));
+    return c.json(
+      spawnReviewer(id, {
+        model: body.model,
+        provider: body.provider,
+        reasoningEffort: body.reasoning_effort,
+      }),
+      201,
+    );
   });
 
   app.post("/api/tasks/:id/verdict", async (c) => {

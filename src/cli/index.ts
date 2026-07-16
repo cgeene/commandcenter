@@ -198,15 +198,22 @@ program
   .description("spawn an independent adversarial reviewer for a task in review")
   .option(
     "-m, --model <model>",
-    "Claude reviewer model (override; otherwise CC_REVIEWER_MODEL, the Claude task model, or opus)",
+    "reviewer model override (a slug matching the reviewer provider; else CC_REVIEWER_MODEL / the Claude task model / opus for Claude)",
   )
+  .option(
+    "-p, --provider <provider>",
+    "reviewer provider (claude|codex) for cross-model review; defaults to Claude or the CC_REVIEWER_PROVIDER / variety policy",
+  )
+  .option("-e, --effort <effort>", "Codex reviewer reasoning effort")
   .action(async (taskId: string, opts) => {
     const { agent: a } = await api<{ agent: Agent }>(
       "POST",
       `/api/tasks/${taskId}/reviewer`,
-      { model: opts.model },
+      { model: opts.model, provider: opts.provider, reasoning_effort: opts.effort },
     );
-    console.log(`reviewer a${a.id} spawned in ${a.tmux_target}${a.model ? ` (${a.model})` : ""}`);
+    console.log(
+      `reviewer a${a.id} spawned in ${a.tmux_target} (${a.provider}${a.model ? ` ${a.model}` : ""})`,
+    );
     console.log(`watch with: agp agent peek ${a.id}`);
   });
 

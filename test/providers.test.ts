@@ -280,6 +280,38 @@ describe("Codex runtime isolation", () => {
     ).toBe("opus");
   });
 
+  it("selects the reviewer provider by override, pin, variety policy, then Claude", async () => {
+    const prevProvider = process.env.CC_REVIEWER_PROVIDER;
+    const prevVariety = process.env.CC_REVIEWER_VARIETY;
+    delete process.env.CC_REVIEWER_PROVIDER;
+    delete process.env.CC_REVIEWER_VARIETY;
+    const { _resolveReviewerProviderForTest } = await import("../src/daemon/spawn.js");
+    const claudeTask = { worker_provider: "claude" } as never;
+    const codexTask = { worker_provider: "codex" } as never;
+    try {
+      // Default: reviewers stay Claude (nothing changes unless asked).
+      expect(_resolveReviewerProviderForTest(claudeTask)).toBe("claude");
+      expect(_resolveReviewerProviderForTest(codexTask)).toBe("claude");
+      // Explicit override wins; an invalid value falls back to Claude.
+      expect(_resolveReviewerProviderForTest(claudeTask, "codex")).toBe("codex");
+      expect(_resolveReviewerProviderForTest(codexTask, "bogus")).toBe("claude");
+      // CC_REVIEWER_PROVIDER pin.
+      process.env.CC_REVIEWER_PROVIDER = "codex";
+      expect(_resolveReviewerProviderForTest(claudeTask)).toBe("codex");
+      delete process.env.CC_REVIEWER_PROVIDER;
+      // Variety policy: opposite of the worker; a Codex worker always yields a
+      // Claude reviewer (the always-available direction).
+      process.env.CC_REVIEWER_VARIETY = "1";
+      expect(_resolveReviewerProviderForTest(claudeTask)).toBe("codex");
+      expect(_resolveReviewerProviderForTest(codexTask)).toBe("claude");
+    } finally {
+      if (prevProvider === undefined) delete process.env.CC_REVIEWER_PROVIDER;
+      else process.env.CC_REVIEWER_PROVIDER = prevProvider;
+      if (prevVariety === undefined) delete process.env.CC_REVIEWER_VARIETY;
+      else process.env.CC_REVIEWER_VARIETY = prevVariety;
+    }
+  });
+
   it("records Codex session ownership, transcript path, and permission waits", async () => {
     const { createTask, updateTask, getTask } = await import("../src/db/tasks.js");
     const { createAgent, getAgent } = await import("../src/db/agents.js");

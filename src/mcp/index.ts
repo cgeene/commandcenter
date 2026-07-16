@@ -552,14 +552,22 @@ if (ROLE === "main") {
     "spawn_reviewer",
     {
       description:
-        "Spawn an independent Claude adversarial reviewer for a task in review. It gets the task prompt + diff in a fresh context (never the worker's conversation), tries to reject the work, and submits approve/reject with notes. Existing Claude tasks preserve their reviewer model behavior; Codex model slugs are never passed to Claude. Rejection feedback flows back automatically; 2 rejected cycles block the task for the human.",
+        "Spawn an independent adversarial reviewer for a task in review. It gets the task prompt + diff in a fresh context (never the worker's conversation), tries to reject the work, and submits approve/reject with notes. Reviewer provider defaults to Claude; set provider to run a cross-model reviewer (e.g. a Codex reviewer on a Claude-authored diff, or vice-versa) — pass a model slug matching that provider. Existing Claude tasks preserve their reviewer model behavior; a Claude reviewer is never given a Codex model slug. Rejection feedback flows back automatically; 2 rejected cycles block the task for the human.",
       inputSchema: {
         task_id: z.number().int(),
         model: z.string().optional(),
+        provider: z.enum(["claude", "codex"]).optional(),
+        reasoning_effort: z.string().optional(),
       },
     },
-    async ({ task_id, model }) =>
-      asText(await call("POST", `/api/tasks/${task_id}/reviewer`, { model })),
+    async ({ task_id, model, provider, reasoning_effort }) =>
+      asText(
+        await call("POST", `/api/tasks/${task_id}/reviewer`, {
+          model,
+          provider,
+          reasoning_effort,
+        }),
+      ),
   );
 
   server.registerTool(

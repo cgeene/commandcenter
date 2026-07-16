@@ -8,7 +8,9 @@ import {
   codexHome,
   codexProfile,
   defaultMainModel,
+  defaultReviewerProvider,
   promptsDir,
+  reviewerVarietyEnabled,
 } from "../config.js";
 import {
   createAgent,
@@ -233,6 +235,7 @@ function buildClaudeCmd(opts: {
 function buildCodexCmd(opts: {
   agentId: number;
   taskId: number;
+  role?: "worker" | "reviewer";
   model?: string;
   reasoningEffort: ReasoningEffort;
   workspaceKind: Task["workspace_kind"];
@@ -242,7 +245,7 @@ function buildCodexCmd(opts: {
   const env = [
     ["CODEX_HOME", codexHome()],
     ["CC_URL", baseUrl()],
-    ["CC_ROLE", "worker"],
+    ["CC_ROLE", opts.role ?? "worker"],
     ["CC_AGENT_ID", String(opts.agentId)],
     ["CC_TASK_ID", String(opts.taskId)],
     ["CC_WORKSPACE_KIND", opts.workspaceKind],
@@ -301,8 +304,36 @@ function resolveReviewerModel(task: Task, override?: string): string {
   );
 }
 
+/**
+ * Choose the reviewer's provider. Precedence:
+ *   1. explicit per-review override (API/MCP/CLI),
+ *   2. CC_REVIEWER_PROVIDER pin,
+ *   3. the model-variety policy — the OPPOSITE provider from the worker so a
+ *      Claude diff is judged by Codex and vice-versa — but only when variety is
+ *      enabled (CC_REVIEWER_VARIETY), which asserts both providers are set up,
+ *   4. Claude (today's default; nothing changes unless asked).
+ * Any invalid value falls back to Claude so a misconfiguration never blocks
+ * review. A Codex worker always yields a Claude reviewer under the variety
+ * policy — the always-available direction — so it can't strand a review.
+ */
+function resolveReviewerProvider(task: Task, override?: string): AgentProvider {
+  const pinned = override ?? defaultReviewerProvider();
+  if (pinned) {
+    try {
+      return parseAgentProvider(pinned, "claude");
+    } catch {
+      return "claude";
+    }
+  }
+  if (reviewerVarietyEnabled()) {
+    return task.worker_provider === "codex" ? "claude" : "codex";
+  }
+  return "claude";
+}
+
 export const _resumableSessionForTest = resumableSession;
 export const _resolveReviewerModelForTest = resolveReviewerModel;
+export const _resolveReviewerProviderForTest = resolveReviewerProvider;
 
 export function spawnWorker(
   taskId: number,
@@ -494,9 +525,20 @@ export function spawnWorker(
  * detached worktree so it can run code without touching the worker's tree;
  * file-editing tools denied so it can only judge, not fix.
  */
+export interface ReviewerSpawnOptions {
+  /** Override the reviewer model (Claude slug for a Claude reviewer, Codex slug
+   *  for a Codex reviewer). */
+  model?: string;
+  /** Override the reviewer provider ("claude" | "codex"). See
+   *  resolveReviewerProvider for the default policy. */
+  provider?: string;
+  /** Codex reviewer reasoning effort (ignored for a Claude reviewer). */
+  reasoningEffort?: ReasoningEffort;
+}
+
 export function spawnReviewer(
   taskId: number,
-  modelOverride?: string,
+  opts?: ReviewerSpawnOptions,
 ): { agent: Agent; task: Task } {
   const task = getTask(taskId);
   if (!task) throw new Error(`task ${taskId} not found`);
@@ -514,37 +556,86 @@ export function spawnReviewer(
     throw new Error(`task ${taskId} already has live reviewer a${existing.id}`);
   }
 
-  const model = resolveReviewerModel(task, modelOverride);
-  const dir = createReviewWorktree(task.repo, taskId, task.branch, task.open_pr !== 0);
+  const provider = resolveReviewerProvider(task, opts?.provider);
+  // A Claude reviewer resolves a Claude model (override / CC_REVIEWER_MODEL /
+  // the Claude task model / opus). A Codex reviewer takes only an explicit
+  // model override (CC_REVIEWER_MODEL is a Claude slug, never fed to Codex) and
+  // otherwise runs Codex's default.
+  const model =
+    provider === "claude"
+      ? resolveReviewerModel(task, opts?.model)
+      : opts?.model;
+  const reasoningEffort =
+    provider === "codex"
+      ? reasoningEffortForProvider("codex", opts?.reasoningEffort)
+      : undefined;
+  const dir = createReviewWorktree(
+    task.repo,
+    taskId,
+    task.branch,
+    task.open_pr !== 0,
+    provider,
+  );
   const agent = createAgent({
     kind: "reviewer",
-    provider: "claude",
+    provider,
     model,
+    reasoning_effort: reasoningEffort ?? undefined,
     state: "spawning",
     task_id: taskId,
   });
 
   const tag = `task-${taskId}-review`;
-  const settingsFile = writeSettingsFile(tag, agent.id, {
-    allow: buildReviewerAllow(task),
-    deny: ["Edit", "Write", "NotebookEdit", "Bash(git commit*)", "Bash(git push*)"],
-  });
-  const mcpFile = writeMcpConfigFile(tag, {
-    CC_ROLE: "reviewer",
-    CC_AGENT_ID: String(agent.id),
-    CC_TASK_ID: String(taskId),
-  });
-  updateAgent(agent.id, { runtime_config_path: settingsFile });
-
   fs.mkdirSync(promptsDir(), { recursive: true });
   const promptFile = path.join(promptsDir(), `${tag}.md`);
   fs.writeFileSync(promptFile, buildReviewerPrompt(task));
 
-  const target = newWindow(
-    `r${taskId}`,
-    dir,
-    buildClaudeCmd({ model, settingsFile, mcpFile, promptFile }),
-  );
+  let command: string;
+  let runtimeConfigPath: string;
+  let reviewerEnvironment: Record<string, string> | undefined;
+  if (provider === "claude") {
+    const settingsFile = writeSettingsFile(tag, agent.id, {
+      allow: buildReviewerAllow(task),
+      deny: ["Edit", "Write", "NotebookEdit", "Bash(git commit*)", "Bash(git push*)"],
+    });
+    const mcpFile = writeMcpConfigFile(tag, {
+      CC_ROLE: "reviewer",
+      CC_AGENT_ID: String(agent.id),
+      CC_TASK_ID: String(taskId),
+    });
+    runtimeConfigPath = settingsFile;
+    command = buildClaudeCmd({ model, settingsFile, mcpFile, promptFile });
+  } else {
+    // Codex reviewer: same isolated CODEX_HOME profile/hooks/policy as a Codex
+    // worker (workspace-write / on-request / network_access=false; push+merge
+    // denied by codex-policy). Its detached worktree is throwaway, so the
+    // Claude reviewer's Edit/Write deny is unnecessary. Role is baked as
+    // "reviewer" so the cc MCP scopes to the reviewer toolset.
+    const config = writeCodexConfig();
+    runtimeConfigPath = config.profileFile;
+    const requiredMcpEnv = config.inheritedMcpEnvVars ?? [];
+    const missingMcpEnv = requiredMcpEnv.filter(
+      (name) => !process.env[name]?.trim(),
+    );
+    if (missingMcpEnv.length > 0) {
+      throw new Error(`Codex MCP environment is missing: ${missingMcpEnv.join(", ")}`);
+    }
+    reviewerEnvironment = Object.fromEntries(
+      requiredMcpEnv.map((name) => [name, process.env[name]!]),
+    );
+    command = buildCodexCmd({
+      agentId: agent.id,
+      taskId,
+      role: "reviewer",
+      model,
+      reasoningEffort: reasoningEffort!,
+      workspaceKind: "repo",
+      promptFile,
+    });
+  }
+  updateAgent(agent.id, { runtime_config_path: runtimeConfigPath });
+
+  const target = newWindow(`r${taskId}`, dir, command, reviewerEnvironment);
   // SessionStart is the readiness handshake, just as it is for workers.
   // Keeping the reviewer in spawning lets the watchdog surface a provider
   // trust prompt instead of claiming the reviewer is already healthy.
@@ -552,7 +643,7 @@ export function spawnReviewer(
   logEvent("reviewer.spawned", {
     agentId: agent.id,
     taskId,
-    payload: { target, model, worktree: dir },
+    payload: { target, provider, model, reasoning_effort: reasoningEffort, worktree: dir },
   });
   return { agent: getAgent(agent.id)!, task: getTask(taskId)! };
 }

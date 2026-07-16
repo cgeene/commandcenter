@@ -27,9 +27,10 @@ commandcenter has two kinds of configuration:
 | `CC_CODEX_MCP_SOURCE_HOME` | unset | Optional trusted normal Codex home whose explicit and plugin-provided MCP transports are mirrored into the isolated home; no auth/session/hook/trust state is copied. |
 | `CC_WORKER_PROVIDER` | `claude` | Default provider for newly created tasks and crons (`claude` or `codex`). |
 | `CC_TMUX_SESSION` | `cc` | tmux session name that hosts agent windows. |
-| `CC_MAIN_MODEL` | `fable` | Default Claude model for the main orchestrator (`agp main`). |
-| `CC_MAIN_WORKSPACE` | `$CC_DATA_DIR/main-workspace` | Absolute, empty mode-`0700` cwd used by the Claude main orchestrator, keeping its trust boundary away from the user's home directory. Populated directories and symlinks fail closed. |
-| `CC_REVIEWER_MODEL` | unset | Claude reviewer override; otherwise preserve a Claude task model or use `opus` when reviewing Codex-worker output. |
+| `CC_MAIN_MODEL` | `opus` | Default Claude model for the main orchestrator (`agp main`). |
+| `CC_REVIEWER_MODEL` | unset | Claude reviewer model override; otherwise preserve a Claude task model or use `opus` when reviewing Codex-worker output. Never applied to a Codex reviewer. |
+| `CC_REVIEWER_PROVIDER` | unset | Pin the reviewer provider (`claude` or `codex`). Overrides the variety policy; invalid values fall back to `claude`. |
+| `CC_REVIEWER_VARIETY` | unset | When truthy (`1`/`true`/`on`/`yes`), auto-review picks the *opposite* provider from the worker (cross-model review: a Claude diff judged by Codex and vice-versa). Opt-in — enabling it asserts Codex is configured; otherwise reviewers stay Claude. A Codex worker always yields a Claude reviewer (the always-available direction). |
 | `CC_NTFY_URL` | unset | ntfy topic URL (e.g. `https://ntfy.sh/<topic>`). Unset disables push notifications. |
 | `CC_NTFY_TOKEN` | unset | ntfy auth token for a self-hosted or access-protected topic. |
 | `CC_CLAUDE_PROJECTS` | `~/.claude/projects` | Where Claude Code stores session transcripts — read for token accounting and `--resume`. |

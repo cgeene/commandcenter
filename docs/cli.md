@@ -23,9 +23,12 @@ agp <group> <command> [options]
 ## `agp review <taskId>`
 
 Spawn an independent adversarial reviewer for a task in `review`. `-m/--model`
-overrides the Claude reviewer model (defaults to `CC_REVIEWER_MODEL`, then the
-task model for an existing Claude workflow, otherwise `opus`; a Codex model is
-never passed to Claude). Watch it with
+overrides the reviewer model (a slug matching the reviewer provider; for Claude
+it defaults to `CC_REVIEWER_MODEL`, then the task model for an existing Claude
+workflow, otherwise `opus`; a Codex model is never passed to Claude).
+`-p/--provider <claude|codex>` runs a cross-model reviewer (otherwise the default
+is Claude, or the `CC_REVIEWER_PROVIDER` / `CC_REVIEWER_VARIETY` policy), and
+`-e/--effort` sets a Codex reviewer's reasoning effort. Watch it with
 `agp agent peek <id>`.
 
 ## `agp agent` — workers
