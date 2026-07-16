@@ -80,7 +80,7 @@ describe("provider model API", () => {
       expect(await providers.json()).toEqual({
         default_worker_provider: "codex",
         main_provider: "claude",
-        default_main_model: "fable",
+        default_main_model: "opus",
       });
 
       const models = await app.request("/api/providers/claude/models");

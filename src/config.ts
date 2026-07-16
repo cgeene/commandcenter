@@ -42,16 +42,6 @@ export function promptsDir(): string {
   return path.join(dataDir(), "prompts");
 }
 
-/**
- * Empty, Command Center-owned cwd for the Claude orchestrator. Keeping the
- * main agent out of the user's home directory narrows Claude's one-time
- * workspace-trust decision to a directory that contains no user projects or
- * credentials.
- */
-export function mainWorkspaceDir(): string {
-  return process.env.CC_MAIN_WORKSPACE ?? path.join(dataDir(), "main-workspace");
-}
-
 /** Root of the internal long-term doc store — plain markdown + sidecar files
  *  under <root>/<project>/<slug>.md so they can be read/grepped directly. */
 export function docsDir(): string {
@@ -95,9 +85,11 @@ export function defaultWorkerProvider(): AgentProvider {
   return parseAgentProvider(process.env.CC_WORKER_PROVIDER, "claude");
 }
 
-/** Claude model used by the orchestrator unless a spawn explicitly overrides it. */
+/** Claude model used by the orchestrator unless a spawn explicitly overrides it.
+ *  Defaults to opus (the current production orchestrator model); adopting Fable
+ *  for orchestration is deferred to a separate, deliberate change. */
 export function defaultMainModel(): string {
-  return process.env.CC_MAIN_MODEL?.trim() || "fable";
+  return process.env.CC_MAIN_MODEL?.trim() || "opus";
 }
 
 export function tmuxSession(): string {

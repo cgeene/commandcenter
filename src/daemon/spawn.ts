@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import {
   baseUrl,
@@ -7,7 +8,6 @@ import {
   codexHome,
   codexProfile,
   defaultMainModel,
-  mainWorkspaceDir,
   promptsDir,
 } from "../config.js";
 import {
@@ -304,23 +304,6 @@ function resolveReviewerModel(task: Task, override?: string): string {
 export const _resumableSessionForTest = resumableSession;
 export const _resolveReviewerModelForTest = resolveReviewerModel;
 
-function prepareMainWorkspace(): string {
-  const workspace = mainWorkspaceDir();
-  if (!path.isAbsolute(workspace)) {
-    throw new Error("main workspace must be an absolute path");
-  }
-  fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
-  const workspaceStat = fs.lstatSync(workspace);
-  if (!workspaceStat.isDirectory() || workspaceStat.isSymbolicLink()) {
-    throw new Error("main workspace must be a real directory");
-  }
-  if (fs.readdirSync(workspace).length > 0) {
-    throw new Error("main workspace must be empty");
-  }
-  fs.chmodSync(workspace, 0o700);
-  return workspace;
-}
-
 export function spawnWorker(
   taskId: number,
   modelOverride?: string,
@@ -583,9 +566,6 @@ export function spawnMain(model?: string): Agent {
   }
 
   const resolvedModel = model ?? defaultMainModel();
-  // Validate the trust boundary before creating the DB row so a bad override
-  // cannot strand an unstartable "live" main agent.
-  const workspace = prepareMainWorkspace();
   const agent = createAgent({
     kind: "main",
     provider: "claude",
@@ -593,11 +573,7 @@ export function spawnMain(model?: string): Agent {
     state: "spawning",
   });
 
-  const settingsFile = writeSettingsFile("main", agent.id, {
-    // The orchestrator manages the queue through cc MCP; it never needs to
-    // edit files or execute shell commands in its workspace.
-    deny: ["Edit", "Write", "NotebookEdit", "Bash"],
-  });
+  const settingsFile = writeSettingsFile("main", agent.id);
   const mcpFile = writeMcpConfigFile("main", {
     CC_ROLE: "main",
     CC_AGENT_ID: String(agent.id),
@@ -610,7 +586,7 @@ export function spawnMain(model?: string): Agent {
 
   const target = newWindow(
     "main",
-    workspace,
+    os.homedir(),
     buildClaudeCmd({ model: resolvedModel, settingsFile, mcpFile, promptFile }),
   );
   // Do not report the orchestrator as working until its SessionStart hook

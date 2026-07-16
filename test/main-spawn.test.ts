@@ -38,37 +38,27 @@ afterEach(async () => {
 });
 
 describe("main orchestrator spawn", () => {
-  it("uses a private dedicated workspace and waits for SessionStart", async () => {
+  it("defaults to opus, runs in $HOME, and waits for SessionStart", async () => {
+    // The Codex landing keeps main's current orchestrator behavior: opus model,
+    // cwd = $HOME, and no extra deny list. The Fable-model switch + workspace
+    // isolation + Edit/Write/Bash lock-down (from the codex branch's f55e0e9)
+    // are intentionally split out into a separate, deliberate change.
     const { spawnMain } = await import("../src/daemon/spawn.js");
-    const { mainWorkspaceDir } = await import("../src/config.js");
 
-    const main = spawnMain("fable");
-    const workspace = mainWorkspaceDir();
+    const main = spawnMain();
 
     expect(main).toMatchObject({
       kind: "main",
       provider: "claude",
-      model: "fable",
+      model: "opus",
       state: "spawning",
       tmux_target: "cc:@7",
     });
     expect(newWindow).toHaveBeenCalledWith(
       "main",
-      workspace,
+      os.homedir(),
       expect.any(String),
     );
-    expect(fs.statSync(workspace).mode & 0o777).toBe(0o700);
-    expect(workspace.startsWith(tmpDir + path.sep)).toBe(true);
-    expect(workspace).not.toBe(os.homedir());
-    const settings = JSON.parse(
-      fs.readFileSync(path.join(tmpDir, "settings", "main.json"), "utf8"),
-    ) as { permissions: { deny: string[] } };
-    expect(settings.permissions.deny).toEqual([
-      "Edit",
-      "Write",
-      "NotebookEdit",
-      "Bash",
-    ]);
   });
 
   it("can kill a live split-brain process even when its DB row says dead", async () => {
@@ -86,18 +76,5 @@ describe("main orchestrator spawn", () => {
     expect(killAgent(agent.id).state).toBe("dead");
     expect(killWindow).toHaveBeenCalledWith("cc:@9");
     expect(listEvents(10).map((event) => event.kind)).toContain("agent.killed");
-  });
-
-  it("fails closed on a populated main workspace without stranding an agent", async () => {
-    const { spawnMain } = await import("../src/daemon/spawn.js");
-    const { listAgents } = await import("../src/db/agents.js");
-    const workspace = path.join(tmpDir, "populated-main");
-    fs.mkdirSync(workspace);
-    fs.writeFileSync(path.join(workspace, "CLAUDE.md"), "untrusted override");
-    process.env.CC_MAIN_WORKSPACE = workspace;
-
-    expect(() => spawnMain("fable")).toThrow("main workspace must be empty");
-    expect(listAgents({ live: true })).toHaveLength(0);
-    expect(newWindow).not.toHaveBeenCalled();
   });
 });
