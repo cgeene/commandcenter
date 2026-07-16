@@ -9,7 +9,9 @@ The initial Codex integration uses the interactive Codex CLI inside the existing
 ## Safety and compatibility rules
 
 - Keep `claude` as the migration default until the Codex path passes the full regression suite.
-- Run Codex workers with `workspace-write` and `on-request`; never use `danger-full-access`, `--yolo`, or approval bypasses.
+- Run Codex workers with `workspace-write`, `on-request`, and Codex auto-review;
+  never use `danger-full-access`, `--yolo`, or approval bypasses. Auto-review
+  changes the reviewer, not the sandbox boundary.
 - Keep main-agent and reviewer providers on Claude. Preserve a Claude task's
   reviewer-model behavior unless `CC_REVIEWER_MODEL` or a manual override is
   supplied; never pass a Codex model slug to a Claude reviewer.
@@ -17,8 +19,17 @@ The initial Codex integration uses the interactive Codex CLI inside the existing
 - Preserve transcript auditing for both providers. Parse Codex JSONL
   defensively, validate it under the isolated sessions directory, and skip
   unknown records because its format is not a stable API.
-- Generate Command Center's Codex configuration under its own `CODEX_HOME`; do not rewrite the user's normal Codex configuration.
+- Generate Command Center's Codex configuration under its own `CODEX_HOME`; do
+  not rewrite the user's normal Codex configuration. Optional MCP inheritance
+  may read explicit MCP tables and flatten plugin-provided MCP transports, but
+  must not enable source plugins or share auth, session, history, hook, trust,
+  model, or sandbox state.
 - Require a one-time explicit trust review for Command Center's static Codex lifecycle hooks.
+- Route explicit interactive tasks through Claude main before worker spawn.
+  Repository selection is server allow-listed; portfolio parents decompose into
+  isolated repository children; investigation tasks use Command Center-owned
+  non-Git scratch directories. Existing tasks, crons, and legacy API calls keep
+  the historical direct dispatch default.
 
 ## Implementation checklist
 

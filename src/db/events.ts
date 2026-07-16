@@ -96,6 +96,23 @@ export function latestTaskEventId(
   return row?.id;
 }
 
+/** Full most-recent task event for orchestration ownership/audit checks. */
+export function latestTaskEvent(
+  taskId: number,
+  kinds: string[],
+): Pick<Event, "id" | "ts" | "kind" | "agent_id" | "payload"> | undefined {
+  const marks = kinds.map(() => "?").join(",");
+  return getDb()
+    .prepare(
+      `SELECT id, ts, kind, agent_id, payload FROM events
+       WHERE task_id = ? AND kind IN (${marks})
+       ORDER BY id DESC LIMIT 1`,
+    )
+    .get(taskId, ...kinds) as
+    | Pick<Event, "id" | "ts" | "kind" | "agent_id" | "payload">
+    | undefined;
+}
+
 /** Events of `kind` since UTC midnight — used for the daily spawn budget. */
 export function countEventsToday(kind: string): number {
   const row = getDb()

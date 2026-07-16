@@ -33,7 +33,14 @@ async function main(): Promise<void> {
 
   const agentId = safeAgentId();
   const base = process.env.CC_URL ?? "http://127.0.0.1:4711";
-  const decision = codexPermissionDecision(payload, process.env.CC_TASK_ID);
+  const workspaceKind = process.env.CC_WORKSPACE_KIND;
+  const decision = codexPermissionDecision(
+    payload,
+    process.env.CC_TASK_ID,
+    workspaceKind === "repo" || workspaceKind === "portfolio" || workspaceKind === "scratch"
+      ? workspaceKind
+      : undefined,
+  );
   if (agentId) {
     try {
       await fetch(`${base}/api/hooks/agent/${agentId}`, {

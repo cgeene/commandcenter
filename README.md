@@ -8,9 +8,10 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
 commandcenter turns a queue of tasks into work done by autonomous Claude Code or
-Codex workers. A long-running daemon owns a SQLite task queue and spawns each task into
-its **own git worktree and tmux window**, so agents run in parallel without
-stepping on each other. Finished work is proofed by an **independent adversarial
+Codex workers. A long-running daemon owns a SQLite task queue. Claude main studies
+each interactive request first, then dispatches repository work into an isolated
+**git worktree and tmux window** or investigations into a private non-Git scratch
+workspace. Finished code is proofed by an **independent adversarial
 reviewer** before you ever see it, pushed as a normal GitHub PR, and surfaced on
 a **live web dashboard** with a "Needs You" panel that tells you the one thing
 only a human can do next. Agents share a **platform memory** of hard-won lessons
@@ -38,8 +39,11 @@ their respective configured services.
 
 ## What it is
 
-You file tasks (a title, a prompt, a target repo, optionally a `verify_cmd`).
-The daemon claims a ready task, cuts a fresh branch and git worktree from the
+You file tasks (a title, a prompt, a workspace, optionally a `verify_cmd`). New
+dashboard, CLI, and MCP submissions go to the Claude main orchestrator before a
+worker exists. Main checks the scope and dispatches one repository worker, one
+non-Git investigation worker, or a set of isolated per-repository child tasks.
+For repository work, the daemon cuts a fresh branch and git worktree from the
 repo's origin default branch, opens a tmux window, and launches an interactive
 provider session scoped to that worktree with an MCP toolset. The worker does
 the work, commits, pushes its branch, and opens a
@@ -56,7 +60,7 @@ The primitives:
 | **`agentd`** | The daemon. Owns the SQLite queue, a localhost REST API + WebSocket, the tmux/worktree lifecycle, the scheduler, PR sync, and serves the dashboard. |
 | **`agp`** | CLI client for the daemon (`agp task add`, `agp agent spawn`, …). |
 | **`cc-mcp`** | MCP server exposing the platform to agents (scoped per role). |
-| **Workers** | Claude Code or Codex sessions, one per task, each in `agent/task-N` worktree + branch. |
+| **Workers** | Claude Code or Codex sessions, one per executable task, in either an `agent/task-N` worktree + branch or a private scratch directory. |
 | **Reviewers** | Independent read-only `claude` sessions that adversarially proof a branch. |
 | **Main agent** | An orchestrator `claude` session that triages the queue and manages workers. |
 | **Dashboard** | React SPA served by the daemon: board, PRs, tokens, live terminals. |
@@ -101,13 +105,17 @@ The primitives:
                                           │  main               │
                                           └─────────────────────┘
 
-   Each task ── git worktree ($CC_DATA_DIR/worktrees) on branch agent/task-N
+   Repo task ── git worktree ($CC_DATA_DIR/worktrees) on branch agent/task-N
              └─ pushed to origin ─▶ GitHub PR ─▶ (PR sync) ─▶ task follows the PR
+   Investigation task ── private non-Git directory ($CC_DATA_DIR/scratch)
 ```
 
-**Data flow, end to end:** the scheduler (or you) claims a `queued` task with an
-atomic SQLite `UPDATE` → `spawn` creates the worktree + tmux window + generated
-`--settings`/`--mcp-config` and launches `claude` → the worker does the work and
+**Data flow, end to end:** an interactive task is validated against the configured
+workspace catalog and delivered to Claude main → main reads the full task and
+either spawns it or decomposes an all-repositories parent into scoped children →
+an atomic SQLite `UPDATE` claims each executable task → `spawn` creates the
+worktree or validates the private scratch directory, opens a tmux window, writes
+generated runtime config, and launches Claude Code or Codex → the worker does the work and
 talks back through **MCP tools** (state changes) and **hooks** (lifecycle
 events `curl`ed to the API) → on `Stop` the daemon runs `verify_cmd` in the
 worktree → pass sends the task to `review`, where the reviewer proofs it → the
@@ -143,6 +151,19 @@ npm run build:all   # backend → dist/, dashboard → web/dist/
 npm link            # puts `agentd`, `agp`, `cc-mcp` on your PATH
 ```
 
+Configure the parent folder(s) the new-task repository picker may expose. This
+is a daemon setting, so put it in the shell/launchd environment that starts
+`agentd`:
+
+```sh
+export CC_REPO_ROOTS="$HOME/Documents/git"
+# multiple roots use the platform path delimiter (":" on macOS/Linux)
+```
+
+Discovery is read-only, bounded, does not follow symlinks, and returns only Git
+roots beneath this allow-list. A submitted path is canonicalized and checked
+again on the server; the browser is never trusted to enforce the boundary.
+
 That is the complete installation for an all-Claude deployment. Codex is
 optional. Only run the following if you want Codex workers:
 
@@ -152,6 +173,31 @@ agp codex setup
 agp codex doctor
 ```
 
+By default, that dedicated Codex home contains only Command Center's `cc` MCP.
+To give Codex workers the same MCP servers and plugin-provided MCPs as a trusted
+normal Codex installation, opt in from the daemon environment:
+
+```sh
+export CC_CODEX_MCP_SOURCE_HOME="$HOME/.codex"
+```
+
+This does **not** switch workers to your normal `CODEX_HOME`. Before each Codex
+worker starts, Command Center mirrors only explicit `mcp_servers` tables into
+its mode-`0600` isolated base config. MCPs supplied by plugins are flattened
+into ordinary MCP transport entries instead of enabling those plugins. Plugin
+skills/apps, auth state, sessions, history, hooks, project trust, model defaults,
+sandbox settings, and other personal state stay isolated; the Command Center
+profile remains the higher-precedence safety layer.
+
+MCP credentials must be supplied as environment variables named by the MCP
+configuration. Flattened plugin MCPs prompt for write-capable tools. Command
+Center rejects static HTTP authorization headers and inline secret/token fields,
+forwards only declared variable names into the individual Codex pane, and
+refuses to spawn a worker when a required variable is missing. Because
+inherited MCPs may reach GitHub or internal systems, enable
+this only for a Codex home and repositories you trust. Unset
+`CC_CODEX_MCP_SOURCE_HOME` to retain the original `cc`-only behavior.
+
 On the first Claude-main launch, the dashboard may show a one-time folder-trust
 prompt. It applies only to the empty, mode-`0700`
 `$CC_DATA_DIR/main-workspace`, not to your home directory. Likewise, the first
@@ -160,6 +206,12 @@ project-local config, hooks, or exec policies can load. Command Center surfaces
 both prompts in the browser, but intentionally does not let one model approve a
 provider trust boundary for another. After trust is established, routine worker
 approval prompts are delegated to the Claude main agent first.
+
+Codex investigation workspaces are the exception: Command Center creates each
+one itself with mode `0700` and adds trust for that exact task directory to its
+isolated Codex config before launch. It never trusts the scratch parent or a
+general temporary directory. A Claude Code scratch worker may still require its
+normal one-time folder-trust decision; no trust or permission bypass is used.
 
 > The MCP server is loaded from `dist/mcp/index.js`, so agents need a build.
 > Re-run `npm run build:all` (or `agp upgrade`) after changing source.
@@ -207,10 +259,12 @@ with the provider that owns its recorded session; changing provider starts a
 fresh provider context while preserving the task branch and worktree. Command
 Center rejects provider changes while that task still has a live agent.
 
-Whichever worker provider is selected, the surrounding workflow is unchanged:
-one task branch and worktree, lifecycle hooks, transcript auditing, verification,
-commit and push boundaries, an independent Claude review, and a human-controlled
-merge.
+Whichever worker provider is selected, repository work keeps the surrounding
+workflow: one task branch and worktree, lifecycle hooks, transcript auditing,
+verification, commit and push boundaries, an independent Claude review, and a
+human-controlled merge. Investigation tasks intentionally have no Git branch,
+PR, or branch reviewer; Claude main validates their transcript, evidence, saved
+docs, and optional verification command instead.
 
 ### Start the daemon
 
@@ -244,23 +298,28 @@ has no auth of its own.
 ### File your first task and watch it run
 
 ```sh
-# 1. file a task
+# 1. start Claude main once; it owns interactive task triage
+agp main
+
+# 2. file a main-orchestrated repository task
 agp task add "Fix the flaky retry test" \
-  --repo ~/projects/foo --provider codex -v "npm test" \
+  --workspace repo --repo ~/Documents/git/foo --provider codex -v "npm test" \
   -p "tests/retry.test.ts is flaky because of a real timer. Fix it properly."
 
 agp task ls                       # queue overview
 
-# 2. spawn a worker (omit --provider to use the task/provider default)
-agp agent spawn --task 1
+# 3. Claude main studies the request and spawns the worker
 agp agent ls
-agp agent peek 1                  # see its terminal without attaching
-agp attach 1                      # interact; detach with Ctrl-b d
+agp agent peek <worker-agent-id>  # see its terminal without attaching
+agp attach <worker-agent-id>      # interact; detach with Ctrl-b d
 
-# 3. when it reaches review, proof it and follow the PR
+# 4. when it reaches review, proof it and follow the PR
 agp review 1                      # spawn an adversarial reviewer
 agp task diff 1                   # what actually changed on the branch
 ```
+
+`agp agent spawn --task N` remains available for legacy/direct tasks and manual
+recovery, but it is not the normal path for a newly submitted interactive task.
 
 On the dashboard, the worker appears in the agent grid with a live terminal; when
 it needs you (a permission prompt, a question) or finishes, it shows up in the
@@ -268,12 +327,12 @@ it needs you (a permission prompt, a question) or finishes, it shows up in the
 in GitHub — PR sync marks the task `done`, reaps the agent, and cleans up the
 worktree.
 
-Prefer autonomy? Spawn the orchestrator and turn on the scheduler:
+Crons and legacy API clients keep their historical direct-scheduler behavior.
+The scheduler never bypasses Claude main for a new explicit workspace task:
 
 ```sh
-agp main                          # spawn the orchestrator agent
-agp attach 2                      # "work through the queue"
-agp scheduler on                  # claim & spawn ready tasks automatically
+agp attach <main-agent-id>        # inspect/steer the orchestrator
+agp scheduler on                  # direct legacy/cron tasks only
 ```
 
 Full CLI reference: [`docs/cli.md`](docs/cli.md).
@@ -284,8 +343,9 @@ Full CLI reference: [`docs/cli.md`](docs/cli.md).
 
 ### Tasks & the queue
 
-A task carries a `title`, `prompt`, `repo`, `priority` (lower runs first;
-default `2`), worker provider/model, Codex `reasoning_effort` (default `high`),
+A task carries a `title`, `prompt`, `workspace_kind`, canonical `repo`/root,
+`dispatch_mode`, optional `parent_task_id`, `priority` (lower runs first; default
+`2`), worker provider/model, Codex `reasoning_effort` (default `high`),
 an optional `verify_cmd`, and an optional `blocked_by` (another task id — it
 won't become ready until its blocker is `done`). `open_pr` (default on) controls
 whether a worker opens a PR or leaves the branch as the deliverable.
@@ -302,13 +362,21 @@ atomic SQLite `UPDATE`, so two agents can never take the same task. `open_pr`,
 `pr_url`, `review_verdict`, `review_notes`, `review_cycles`, and `tokens_used`
 all live on the task record.
 
+Interactive workspace modes:
+
+| Workspace | Main-agent behavior | Worker boundary |
+|---|---|---|
+| **Repository** | Confirms the selected repository, then spawns one worker. | Dedicated branch and Git worktree. |
+| **All repositories** | Inspects the catalog, creates affected-repository child tasks, preserves the selected provider/model/effort, then spawns the children. The parent itself is never spawned. | One independent task/worktree per affected repository; the broad root is never write-enabled. |
+| **Investigation** | Spawns one evidence-gathering worker and reviews its transcript/result. | Server-created mode-`0700`, non-Git scratch directory retained for a bounded audit window. |
+
 ### Workers, reviewers & the adversarial review loop
 
 A **worker** is an interactive Claude Code or Codex session for one task in a
 dedicated worktree. Codex workers use `workspace-write` plus `on-request`
-approval plus exec rules and a hook policy that auto-approves only their exact
-task-branch push while denying other pushes and PR merges; Claude workers retain the existing
-generated permission settings.
+approval routed through Codex auto-review, plus exec rules and a hook policy
+that auto-approves only their exact task-branch push while denying other pushes
+and PR merges; Claude workers retain the existing generated permission settings.
 When a worker moves a
 task to `review` with commits on its branch, an independent **reviewer** proofs
 it. The reviewer is a *fresh* session in its own detached worktree at the task's
@@ -359,14 +427,16 @@ An ordered, self-healing action queue derived live from tasks/agents/events —
 the only thing persisted is your dismissals. Item kinds: `merge_pr` /
 `merge_and_apply` (approved work awaiting your merge), `decision` (a task blocked
 after the review loop gave up), `escalation` (a live worker still waiting after
-you were paged), and `stale_waiting` (an agent parked in `waiting_input` past
-`attention_stale_minutes`). A situation that re-triggers gets a new key, so it
+you were paged), `stale_waiting` (an agent parked in `waiting_input` past
+`attention_stale_minutes`), and `orchestration` (an explicit task is queued while
+Claude main is unavailable). A situation that re-triggers gets a new key, so it
 resurfaces even if you dismissed the earlier instance.
 
 ### Crons & the scheduler
 
 - **Scheduler** — off by default (`agp scheduler on|off`, or the dashboard kill
-  switch). Every 30s it claims ready tasks up to `max_concurrent`, bounded by a
+  switch). Every 30s it claims ready direct/cron tasks up to `max_concurrent`,
+  bounded by a
   `daily_spawn_limit` and an optional `active_hours` window. A watchdog runs
   every 60s: a worker whose tmux window vanished is reaped (task requeued once,
   failed on the second vanish); a worker silent past `stall_minutes` is flagged
@@ -402,12 +472,16 @@ All config is either an environment variable read at call time or a value in the
 |---|---|---|
 | `CC_DATA_DIR` | `~/.commandcenter` | DB, worktrees, prompts, generated settings/mcp files |
 | `CC_DOCS_DIR` | `$CC_DATA_DIR/docs` | Internal doc store root |
+| `CC_REPO_ROOTS` | unset | Path-delimited allow-list used by the repository picker and main-agent catalog |
+| `CC_SCRATCH_DIR` | `$CC_DATA_DIR/scratch` | Command Center-owned investigation workspaces |
+| `CC_SCRATCH_RETENTION_DAYS` | `7` | Retain terminal/orphaned scratch workspaces for 1–90 days before daily cleanup |
 | `CC_PORT` | `4711` | Daemon port (localhost only) |
 | `CC_URL` | `http://127.0.0.1:$CC_PORT` | Base URL agents/hooks use to reach the daemon |
 | `CC_CLAUDE_BIN` | `claude` | Worker/reviewer/main binary (override for testing) |
 | `CC_CODEX_BIN` | `codex` | Codex worker binary |
 | `CC_CODEX_HOME` | `$CC_DATA_DIR/codex` | Isolated Codex profile, login, trust, and sessions |
 | `CC_CODEX_PROFILE` | `commandcenter` | Generated Codex profile name |
+| `CC_CODEX_MCP_SOURCE_HOME` | unset | Trusted normal Codex home whose MCP transports may be mirrored into the isolated worker home |
 | `CC_WORKER_PROVIDER` | `claude` | Default provider for new tasks/crons |
 | `CC_TMUX_SESSION` | `cc` | tmux session name |
 | `CC_MAIN_MODEL` | `fable` | Default Claude model for the main orchestrator (`agp main`) |
@@ -452,7 +526,9 @@ about, on your own machine.
   branch and open a PR; everything else falls to a normal permission prompt.
   Reviewers additionally deny Edit/Write/commit/push. Codex workers use an
   isolated profile with `workspace-write`, network disabled in the sandbox, and
-  `on-request` escalation plus a fail-closed push policy; no approval or hook-trust bypass is used. The read-only allowlist is
+  `on-request` escalation reviewed automatically by a separate Codex reviewer,
+  plus a fail-closed push policy. Auto-review does not expand the sandbox, and no
+  approval or hook-trust bypass is used. The read-only allowlist is
   an explicit, auditable list in [`src/daemon/permissions.ts`](src/daemon/permissions.ts).
 - **Trust stays human; routine approval is orchestrated.** Provider
   repository/folder trust enables project-local hooks and policy, so it is

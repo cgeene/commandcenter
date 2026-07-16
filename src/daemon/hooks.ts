@@ -19,6 +19,7 @@ import { providerSessionTokens } from "./transcript.js";
 import { capturePane, windowExists } from "./tmux.js";
 import { WAIT_HOOK_EVENTS } from "./waiting.js";
 import { codexPermissionDecision } from "../codex-policy.js";
+import { delegatePendingTaskToMain } from "./orchestration.js";
 
 export interface HookPayload {
   hook_event_name?: string;
@@ -181,7 +182,7 @@ async function delegateToMain(
 
 /** Once the orchestrator clears its own startup trust screen, hand it the
  * oldest outstanding worker/reviewer wait that occurred while it was down. */
-async function delegateExistingWait(main: Agent): Promise<void> {
+async function delegateExistingWait(main: Agent): Promise<boolean> {
   const candidates = listAgents({ live: true }).filter((candidate) => {
     if (candidate.kind === "main" || candidate.state !== "waiting_input") {
       return false;
@@ -220,9 +221,9 @@ async function delegateExistingWait(main: Agent): Promise<void> {
         // The startup event check above still keeps known trust waits human-only.
       }
     }
-    await delegateToMain(waiting, main);
-    return;
+    if (await delegateToMain(waiting, main)) return true;
   }
+  return false;
 }
 
 /**
@@ -279,7 +280,8 @@ export async function handleHookEvent(
         await new Promise((resolve) => setTimeout(resolve, 300));
         const main = getAgent(agentId);
         if (main && ["working", "idle"].includes(main.state)) {
-          await delegateExistingWait(main);
+          const delegatedWait = await delegateExistingWait(main);
+          if (!delegatedWait) await delegatePendingTaskToMain(main);
         }
       }
       break;
@@ -291,6 +293,7 @@ export async function handleHookEvent(
           ? codexPermissionDecision(
               body,
               agent.task_id ? String(agent.task_id) : undefined,
+              agent.task_id ? getTask(agent.task_id)?.workspace_kind : undefined,
             )
           : undefined;
       if (policyDecision) {
@@ -329,7 +332,10 @@ export async function handleHookEvent(
           if (disposition === "idle") {
             updateAgent(agentId, { state: "idle" });
             const main = getAgent(agentId);
-            if (main) await delegateExistingWait(main);
+            if (main) {
+              const delegatedWait = await delegateExistingWait(main);
+              if (!delegatedWait) await delegatePendingTaskToMain(main);
+            }
             break;
           }
         }

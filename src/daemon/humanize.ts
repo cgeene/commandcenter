@@ -51,6 +51,9 @@ const TEMPLATES: Record<string, Template> = {
   "task.requeued": (e, p) =>
     `Requeued ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
   "task.recovered": (e) => `Recovered ${taskRef(e)} after a false window-loss signal`,
+  "task.awaiting_main": (e) => `${taskRef(e)} is waiting for Claude main to triage it`,
+  "task.delegated_to_main": (e) => `Sent ${taskRef(e)} to Claude main for triage`,
+  "task.delegation_failed": () => `Main-agent task delivery will be retried`,
 
   // --- review ---
   "review.approved": (e, p) =>
@@ -109,6 +112,9 @@ const TEMPLATES: Record<string, Template> = {
   "scheduler.spawn_error": (e, p) =>
     `Scheduler failed to spawn for ${taskRef(e)}: ${clip(p.error, 80)}`,
   "scheduler.budget_reached": () => `Daily spawn budget reached`,
+  "scratch.pruned": (_e, p) =>
+    `Removed ${str(p.count) || "expired"} expired scratch workspace${Number(p.count) === 1 ? "" : "s"}`,
+  "scratch.prune_failed": () => `Scratch workspace retention cleanup failed`,
   "cron.fired": (e, p) =>
     `Ran cron ${str(p.name) || `#${str(p.cron_id)}`} → ${taskRef(e)}`,
   "cron.skipped": (e, p) =>

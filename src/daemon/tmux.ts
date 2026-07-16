@@ -16,16 +16,43 @@ export function ensureSession(): void {
   }
 }
 
+function tmuxEnvironmentArgs(environment?: Record<string, string>): string[] {
+  if (!environment) return [];
+  const entries = Object.entries(environment).sort(([left], [right]) =>
+    left.localeCompare(right),
+  );
+  if (entries.length > 64) {
+    throw new Error("too many pane-scoped environment variables");
+  }
+  return entries.flatMap(([name, value]) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name)) {
+      throw new Error("invalid pane-scoped environment variable name");
+    }
+    if (value.includes("\0") || Buffer.byteLength(value, "utf8") > 64 * 1024) {
+      throw new Error(`invalid pane-scoped environment value for ${name}`);
+    }
+    return ["-e", `${name}=${value}`];
+  });
+}
+
+export const _tmuxEnvironmentArgsForTest = tmuxEnvironmentArgs;
+
 /**
  * Create a detached window running `command` (a shell string) with cwd.
  * Returns a stable tmux target (session:window_id, e.g. "cc:@3") —
  * window IDs don't shift when other windows close, unlike indexes.
  */
-export function newWindow(name: string, cwd: string, command: string): string {
+export function newWindow(
+  name: string,
+  cwd: string,
+  command: string,
+  environment?: Record<string, string>,
+): string {
   ensureSession();
   const target = tmux(
     "new-window",
     "-d",
+    ...tmuxEnvironmentArgs(environment),
     "-t",
     tmuxSession(),
     "-n",

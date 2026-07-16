@@ -46,6 +46,12 @@ task
   .option("-p, --prompt <prompt>", "task prompt (defaults to title)")
   .option("-f, --prompt-file <file>", "read prompt from a file")
   .option("-r, --repo <path>", "target repo (default: current git repo)")
+  .option(
+    "-w, --workspace <kind>",
+    "workspace kind: repo|portfolio|scratch",
+    "repo",
+  )
+  .option("--repo-root <path>", "configured root for a portfolio task")
   .option("-m, --model <model>", "provider-specific worker model slug")
   .option("-e, --effort <effort>", "Codex reasoning effort (default: high)")
   .option("--provider <provider>", "worker provider (claude|codex)")
@@ -53,14 +59,24 @@ task
   .option("-b, --blocked-by <taskId>", "task that must be done first")
   .option("-v, --verify <cmd>", "verification command run in the worktree")
   .action(async (title: string, opts) => {
-    const repo = opts.repo ?? gitToplevel(process.cwd());
+    const workspace = String(opts.workspace);
+    if (!["repo", "portfolio", "scratch"].includes(workspace)) {
+      throw new Error("workspace must be repo, portfolio, or scratch");
+    }
+    const repo = workspace === "repo"
+      ? (opts.repo ?? gitToplevel(process.cwd()))
+      : undefined;
     const prompt = opts.promptFile
       ? fs.readFileSync(opts.promptFile, "utf8")
       : (opts.prompt ?? title);
     const t = await api<Task>("POST", "/api/tasks", {
       title,
       prompt,
-      repo,
+      workspace_kind: workspace,
+      ...(repo ? { repo } : {}),
+      ...(workspace === "portfolio"
+        ? { repo_root: opts.repoRoot ?? opts.repo }
+        : {}),
       model: opts.model,
       reasoning_effort: opts.effort,
       worker_provider: opts.provider,
@@ -68,7 +84,7 @@ task
       blocked_by: opts.blockedBy ? Number(opts.blockedBy) : undefined,
       verify_cmd: opts.verify,
     });
-    console.log(`task #${t.id} queued: ${t.title}`);
+    console.log(`task #${t.id} queued for Claude main: ${t.title}`);
   });
 
 task
@@ -600,10 +616,24 @@ codex
   .command("setup")
   .description("write Command Center's dedicated Codex profile and lifecycle hooks")
   .action(() => {
-    const files = writeCodexConfig();
+    let files: ReturnType<typeof writeCodexConfig>;
+    try {
+      files = writeCodexConfig();
+    } catch (error) {
+      console.error(
+        `Codex setup failed: ${error instanceof Error ? error.message : "invalid configuration"}`,
+      );
+      process.exitCode = 1;
+      return;
+    }
     console.log(`Codex profile written: ${files.profileFile}`);
     console.log(`Codex hooks written:   ${files.hooksFile}`);
     console.log(`Codex rules written:   ${files.rulesFile}`);
+    if (files.inheritedMcpNames.length > 0) {
+      console.log(
+        `Inherited MCP servers:  ${files.inheritedMcpNames.join(", ")}`,
+      );
+    }
     const escapedHome = files.home.replaceAll("'", `'\\''`);
     console.log("Authenticate this isolated Codex home once (it does not copy your normal credentials):");
     console.log(`  CODEX_HOME='${escapedHome}' ${codexBin()} login`);
@@ -649,7 +679,12 @@ codex
             tool_name: "Bash",
             tool_input: { command },
           }),
-          env: { ...process.env, CC_AGENT_ID: "", CC_TASK_ID: "7" },
+          env: {
+            ...process.env,
+            CC_AGENT_ID: "",
+            CC_TASK_ID: "7",
+            CC_WORKSPACE_KIND: "repo",
+          },
           timeout: 5_000,
         });
       const hookCheck = runHook(

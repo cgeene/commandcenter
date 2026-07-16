@@ -48,7 +48,7 @@ server.registerTool(
   "add_task",
   {
     description:
-      "Add a task to the queue. Workers: use this to file follow-up work you notice but should not do yourself.",
+      "Add a main-orchestrated task to the queue. For portfolio decomposition, create repo children with parent_task_id. Workers: use this only to file follow-up work you should not do yourself.",
     inputSchema: {
       title: z.string(),
       prompt: z.string(),
@@ -56,6 +56,20 @@ server.registerTool(
         .string()
         .optional()
         .describe("absolute repo path; workers default to their own task's repo"),
+      repo_root: z
+        .string()
+        .optional()
+        .describe("configured repository root for an all-repositories task"),
+      workspace_kind: z
+        .enum(["repo", "portfolio", "scratch"])
+        .optional()
+        .describe("repo (default), portfolio/all repositories, or non-Git scratch"),
+      parent_task_id: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("portfolio parent task when creating a per-repository child"),
       model: z.string().optional(),
       reasoning_effort: z
         .enum(REASONING_EFFORTS)
@@ -75,12 +89,31 @@ server.registerTool(
   },
   async (args) => {
     let repo = args.repo;
-    if (!repo && MY_TASK_ID) {
-      const mine = await call<{ repo: string }>("GET", `/api/tasks/${MY_TASK_ID}`);
-      repo = mine.repo;
+    let workspaceKind = args.workspace_kind;
+    if (!workspaceKind && !repo && MY_TASK_ID) {
+      const mine = await call<{ repo: string; workspace_kind: string }>(
+        "GET",
+        `/api/tasks/${MY_TASK_ID}`,
+      );
+      workspaceKind = mine.workspace_kind === "scratch" ? "scratch" : "repo";
+      if (workspaceKind === "repo") repo = mine.repo;
     }
-    if (!repo) throw new Error("repo is required");
-    return asText(await call("POST", "/api/tasks", { ...args, repo }));
+    workspaceKind ??= "repo";
+    if (!repo && MY_TASK_ID && workspaceKind === "repo") {
+      const mine = await call<{ repo: string; workspace_kind: string }>(
+        "GET",
+        `/api/tasks/${MY_TASK_ID}`,
+      );
+      if (mine.workspace_kind === "repo") repo = mine.repo;
+    }
+    if (workspaceKind === "repo" && !repo) throw new Error("repo is required");
+    return asText(
+      await call("POST", "/api/tasks", {
+        ...args,
+        repo,
+        workspace_kind: workspaceKind ?? "repo",
+      }),
+    );
   },
 );
 
@@ -316,11 +349,42 @@ if (ROLE === "main") {
       inputSchema: {
         status: z.string().optional(),
         ready: z.boolean().optional(),
+        dispatch_mode: z.enum(["direct", "orchestrated"]).optional(),
       },
     },
-    async ({ status, ready }) => {
-      const qs = ready ? "?ready=true" : status ? `?status=${status}` : "";
+    async ({ status, ready, dispatch_mode }) => {
+      const params = new URLSearchParams();
+      if (ready) params.set("ready", "true");
+      else if (status) params.set("status", status);
+      if (dispatch_mode) params.set("dispatch_mode", dispatch_mode);
+      const qs = params.size > 0 ? `?${params.toString()}` : "";
       return asText(await call("GET", `/api/tasks${qs}`));
+    },
+  );
+
+  server.registerTool(
+    "list_repositories",
+    {
+      description:
+        "List the server-validated repository catalog and configured roots. Use this to scope all-repositories tasks before creating isolated child tasks.",
+      inputSchema: {
+        query: z.string().max(200).optional(),
+      },
+    },
+    async ({ query }) => {
+      const catalog = await call<{
+        roots: unknown[];
+        repositories: Array<{ name: string; relative_path: string; path: string }>;
+      }>("GET", "/api/workspaces");
+      const needle = query?.trim().toLowerCase();
+      return asText({
+        ...catalog,
+        repositories: needle
+          ? catalog.repositories.filter((repo) =>
+              `${repo.name} ${repo.relative_path}`.toLowerCase().includes(needle),
+            )
+          : catalog.repositories,
+      });
     },
   );
 
@@ -348,6 +412,10 @@ if (ROLE === "main") {
           .optional()
           .describe("Codex-only reasoning effort"),
         worker_provider: z.enum(["claude", "codex"]).optional(),
+        repo: z
+          .string()
+          .optional()
+          .describe("new allow-listed Git root; kill the prior worker first"),
         prompt: z.string().optional(),
         verify_cmd: z.string().optional(),
         result_summary: z.string().optional(),
@@ -392,7 +460,7 @@ if (ROLE === "main") {
     "spawn_worker",
     {
       description:
-        "Spawn a Claude Code or Codex worker for a task in its own git worktree + tmux window. Provider, model, and Codex reasoning effort default to the task. A previous session resumes only when it belongs to the same provider (pass fresh=true to force a clean start).",
+        "Spawn a Claude Code or Codex worker in the task's isolated repository worktree or scratch workspace. Portfolio parents cannot be spawned. Provider, model, and Codex reasoning effort default to the task. A previous session resumes only when it belongs to the same provider (pass fresh=true to force a clean start).",
       inputSchema: {
         task_id: z.number().int(),
         provider: z.enum(["claude", "codex"]).optional(),

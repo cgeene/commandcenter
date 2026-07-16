@@ -5,11 +5,19 @@ import {
   type ReasoningEffort,
 } from "../reasoning.js";
 
+export const WORKSPACE_KINDS = ["repo", "portfolio", "scratch"] as const;
+export type WorkspaceKind = (typeof WORKSPACE_KINDS)[number];
+export const DISPATCH_MODES = ["direct", "orchestrated"] as const;
+export type DispatchMode = (typeof DISPATCH_MODES)[number];
+
 export interface Task {
   id: number;
   title: string;
   prompt: string;
   repo: string;
+  workspace_kind: WorkspaceKind;
+  dispatch_mode: DispatchMode;
+  parent_task_id: number | null;
   status: TaskStatus;
   priority: number;
   worker_provider: AgentProvider;
@@ -43,6 +51,9 @@ export interface NewTask {
   title: string;
   prompt: string;
   repo: string;
+  workspace_kind?: WorkspaceKind;
+  dispatch_mode?: DispatchMode;
+  parent_task_id?: number;
   priority?: number;
   worker_provider?: AgentProvider;
   model?: string;
@@ -58,13 +69,16 @@ export function createTask(t: NewTask): Task {
   const workerProvider = parseAgentProvider(t.worker_provider, "claude");
   const info = db
     .prepare(
-      `INSERT INTO tasks (title, prompt, repo, priority, worker_provider, model, reasoning_effort, blocked_by, verify_cmd, cron_id, open_pr)
-       VALUES (@title, @prompt, @repo, @priority, @worker_provider, @model, @reasoning_effort, @blocked_by, @verify_cmd, @cron_id, @open_pr)`,
+      `INSERT INTO tasks (title, prompt, repo, workspace_kind, dispatch_mode, parent_task_id, priority, worker_provider, model, reasoning_effort, blocked_by, verify_cmd, cron_id, open_pr)
+       VALUES (@title, @prompt, @repo, @workspace_kind, @dispatch_mode, @parent_task_id, @priority, @worker_provider, @model, @reasoning_effort, @blocked_by, @verify_cmd, @cron_id, @open_pr)`,
     )
     .run({
       title: t.title,
       prompt: t.prompt,
       repo: t.repo,
+      workspace_kind: t.workspace_kind ?? "repo",
+      dispatch_mode: t.dispatch_mode ?? "direct",
+      parent_task_id: t.parent_task_id ?? null,
       priority: t.priority ?? 2,
       worker_provider: workerProvider,
       model: t.model ?? null,
@@ -105,15 +119,22 @@ export function listTasks(status?: TaskStatus): Task[] {
 }
 
 /** Tasks that are queued and whose blocker (if any) is done. */
-export function readyTasks(): Task[] {
+export function readyTasks(dispatchMode?: DispatchMode): Task[] {
   return getDb()
     .prepare(
       `SELECT t.* FROM tasks t
        LEFT JOIN tasks b ON t.blocked_by = b.id
        WHERE t.status = 'queued' AND (t.blocked_by IS NULL OR b.status = 'done')
+         AND (@dispatch_mode IS NULL OR t.dispatch_mode = @dispatch_mode)
        ORDER BY t.priority ASC, t.id ASC`,
     )
-    .all() as Task[];
+    .all({ dispatch_mode: dispatchMode ?? null }) as Task[];
+}
+
+export function childTasks(parentTaskId: number): Task[] {
+  return getDb()
+    .prepare("SELECT * FROM tasks WHERE parent_task_id = ? ORDER BY priority ASC, id ASC")
+    .all(parentTaskId) as Task[];
 }
 
 /**
@@ -169,6 +190,7 @@ export function claimTask(id: number, agentId?: number): Task | undefined {
 const UPDATABLE = new Set([
   "title",
   "prompt",
+  "repo",
   "status",
   "priority",
   "worker_provider",
@@ -193,6 +215,9 @@ const UPDATABLE = new Set([
   "pr_sync_fails",
   "open_pr",
   "tokens_used",
+  "workspace_kind",
+  "dispatch_mode",
+  "parent_task_id",
 ]);
 
 export function updateTask(
@@ -209,6 +234,18 @@ export function updateTask(
   }
   if (fields.session_provider !== undefined && fields.session_provider !== null) {
     parseAgentProvider(fields.session_provider);
+  }
+  if (
+    fields.workspace_kind !== undefined &&
+    !WORKSPACE_KINDS.includes(fields.workspace_kind)
+  ) {
+    throw new Error(`invalid workspace kind: ${fields.workspace_kind}`);
+  }
+  if (
+    fields.dispatch_mode !== undefined &&
+    !DISPATCH_MODES.includes(fields.dispatch_mode)
+  ) {
+    throw new Error(`invalid dispatch mode: ${fields.dispatch_mode}`);
   }
   const sets = keys.map((k) => `${k} = @${k}`).join(", ");
   getDb()

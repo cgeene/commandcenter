@@ -272,6 +272,17 @@ dd { word-break: break-all; }
   font-family: inherit;
 }
 .modal .row { display: flex; gap: 10px; }
+.workspace-picker {
+  display: flex; flex-direction: column; gap: 8px; padding: 10px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+}
+.workspace-picker label { display: flex; flex-direction: column; gap: 4px; }
+.workspace-picker label > span {
+  color: var(--muted); font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.workspace-help { color: var(--muted); font-size: 12px; line-height: 1.4; }
+.workspace-error { color: var(--red); font-size: 12px; }
 
 @media (max-width: 700px) {
   .events { display: none; }

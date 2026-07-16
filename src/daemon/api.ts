@@ -41,11 +41,15 @@ import { getSchedulerConfig, setSchedulerConfig } from "../db/settings.js";
 import { dismissAttention } from "../db/attention.js";
 import {
   claimTask,
+  childTasks,
   createTask,
+  DISPATCH_MODES,
   getTask,
   listTasks,
   readyTasks,
   updateTask,
+  WORKSPACE_KINDS,
+  type Task,
 } from "../db/tasks.js";
 import { handleHookEvent, resetAutoNudgeCount, type HookPayload } from "./hooks.js";
 import { handleVerdict, taskDiff } from "./review.js";
@@ -65,9 +69,23 @@ import {
   REASONING_EFFORTS,
 } from "../reasoning.js";
 import { providerModels } from "./provider-models.js";
+import { delegateTaskToMain } from "./orchestration.js";
+import {
+  allocateScratchWorkspace,
+  removeScratchWorkspace,
+  repositoryRoots,
+  resolveAllowedRepository,
+  resolvePortfolioChildRepository,
+  resolvePortfolioRoot,
+  validateScratchWorkspace,
+  WorkspaceValidationError,
+  workspaceCatalog,
+} from "./workspaces.js";
 
 const providerSchema = z.enum(AGENT_PROVIDERS);
 const reasoningEffortSchema = z.enum(REASONING_EFFORTS);
+const workspaceKindSchema = z.enum(WORKSPACE_KINDS);
+const dispatchModeSchema = z.enum(DISPATCH_MODES);
 const modelIdentifierSchema = z
   .string()
   .trim()
@@ -92,29 +110,33 @@ const hookPayloadSchema = z
   .passthrough();
 
 const newTaskSchema = z.object({
-  title: z.string().min(1),
-  prompt: z.string().min(1),
-  repo: z.string().min(1),
+  title: z.string().trim().min(1).max(200),
+  prompt: z.string().min(1).max(100_000),
+  repo: z.string().min(1).max(4096).optional(),
+  repo_root: z.string().min(1).max(4096).optional(),
+  workspace_kind: workspaceKindSchema.optional(),
+  parent_task_id: z.number().int().positive().optional(),
   priority: z.number().int().min(0).max(4).optional(),
   worker_provider: providerSchema.optional(),
-  model: z.string().optional(),
+  model: modelIdentifierSchema.optional(),
   reasoning_effort: reasoningEffortSchema.optional(),
-  blocked_by: z.number().int().optional(),
-  verify_cmd: z.string().optional(),
+  blocked_by: z.number().int().positive().optional(),
+  verify_cmd: z.string().max(4096).optional(),
   open_pr: z.boolean().optional(),
 });
 
 const updateTaskSchema = z.object({
-  title: z.string().min(1).optional(),
-  prompt: z.string().min(1).optional(),
+  title: z.string().trim().min(1).max(200).optional(),
+  prompt: z.string().min(1).max(100_000).optional(),
+  repo: z.string().min(1).max(4096).optional(),
   status: z.enum(TASK_STATUSES as [TaskStatus, ...TaskStatus[]]).optional(),
   priority: z.number().int().min(0).max(4).optional(),
   worker_provider: providerSchema.optional(),
-  model: z.string().nullable().optional(),
+  model: modelIdentifierSchema.nullable().optional(),
   reasoning_effort: reasoningEffortSchema.nullable().optional(),
-  blocked_by: z.number().int().nullable().optional(),
-  verify_cmd: z.string().nullable().optional(),
-  result_summary: z.string().nullable().optional(),
+  blocked_by: z.number().int().positive().nullable().optional(),
+  verify_cmd: z.string().max(4096).nullable().optional(),
+  result_summary: z.string().max(100_000).nullable().optional(),
   pr_url: z.string().url().nullable().optional(),
   open_pr: z.boolean().optional(),
 });
@@ -140,6 +162,8 @@ export function buildApp(): Hono {
     }),
   );
 
+  app.get("/api/workspaces", (c) => c.json(workspaceCatalog()));
+
   app.get("/api/providers/:provider/models", async (c) => {
     const parsed = providerSchema.safeParse(c.req.param("provider"));
     if (!parsed.success) return c.json({ error: "invalid provider" }, 400);
@@ -157,22 +181,141 @@ export function buildApp(): Hono {
 
   app.get("/api/tasks", (c) => {
     const status = c.req.query("status") as TaskStatus | undefined;
-    if (c.req.query("ready") === "true") return c.json(readyTasks());
-    return c.json(listTasks(status));
+    const dispatchResult = dispatchModeSchema.safeParse(c.req.query("dispatch_mode"));
+    const dispatchMode = dispatchResult.success ? dispatchResult.data : undefined;
+    if (c.req.query("dispatch_mode") && !dispatchResult.success) {
+      return c.json({ error: "invalid dispatch mode" }, 400);
+    }
+    const tasks = c.req.query("ready") === "true"
+      ? readyTasks(dispatchMode)
+      : listTasks(status).filter(
+          (task) => !dispatchMode || task.dispatch_mode === dispatchMode,
+        );
+    return c.json(tasks);
   });
 
   app.post("/api/tasks", async (c) => {
     const body = newTaskSchema.parse(await c.req.json());
-    const workerProvider = body.worker_provider ?? defaultWorkerProvider();
-    if (workerProvider === "claude" && body.reasoning_effort !== undefined) {
+    const explicitWorkspace = body.workspace_kind !== undefined;
+    const workspaceKind = body.workspace_kind ?? "repo";
+    if (workspaceKind === "repo" && !body.repo) {
+      return c.json({ error: "repository is required" }, 400);
+    }
+    if (workspaceKind === "scratch" && (body.repo || body.repo_root)) {
+      return c.json({ error: "scratch workspace paths are server-managed" }, 400);
+    }
+    if (workspaceKind === "portfolio" && body.repo && body.repo_root) {
+      return c.json({ error: "select one repository root" }, 400);
+    }
+    if (workspaceKind === "repo" && body.repo_root) {
+      return c.json({ error: "repo_root is only valid for all-repositories tasks" }, 400);
+    }
+    if (workspaceKind !== "repo" && body.open_pr === true) {
+      return c.json({ error: "non-repository tasks cannot open pull requests" }, 400);
+    }
+    const parent = body.parent_task_id !== undefined
+      ? getTask(body.parent_task_id)
+      : undefined;
+    if (body.parent_task_id !== undefined) {
+      if (!parent || parent.workspace_kind !== "portfolio") {
+        return c.json({ error: "parent task must be an all-repositories task" }, 400);
+      }
+      if (workspaceKind !== "repo") {
+        return c.json({ error: "all-repositories children must be repository tasks" }, 400);
+      }
+    }
+    const workerProvider =
+      body.worker_provider ?? parent?.worker_provider ?? defaultWorkerProvider();
+    const inheritedModel =
+      parent?.worker_provider === workerProvider ? parent.model ?? undefined : undefined;
+    const inheritedReasoningEffort =
+      parent?.worker_provider === "codex" && workerProvider === "codex"
+        ? parent.reasoning_effort ?? undefined
+        : undefined;
+    const model = body.model ?? inheritedModel;
+    const reasoningEffort = body.reasoning_effort ?? inheritedReasoningEffort;
+    if (workerProvider === "claude" && reasoningEffort !== undefined) {
       return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
     }
-    const task = createTask({
-      ...body,
-      worker_provider: workerProvider,
+
+    let allocatedScratch: string | undefined;
+    let repo: string;
+    let task: Task;
+    try {
+      if (workspaceKind === "scratch") {
+        allocatedScratch = allocateScratchWorkspace();
+        repo = allocatedScratch;
+      } else if (workspaceKind === "portfolio") {
+        repo = resolvePortfolioRoot(body.repo_root ?? body.repo);
+      } else {
+        // A configured root list is always enforced. When it is absent, keep
+        // the historical absolute-path behavior so an existing/cloud install
+        // can upgrade before opting into the catalog and portfolio workflow.
+        if (repositoryRoots().length > 0) {
+          repo = parent
+            ? resolvePortfolioChildRepository(body.repo!, parent.repo)
+            : resolveAllowedRepository(body.repo!);
+        } else {
+          if (!path.isAbsolute(body.repo!) || body.repo!.includes("\0")) {
+            return c.json({ error: "repository must be an absolute path" }, 400);
+          }
+          repo = path.normalize(body.repo!);
+        }
+      }
+      if (
+        parent &&
+        childTasks(parent.id).some((candidate) => candidate.repo === repo)
+      ) {
+        if (allocatedScratch) removeScratchWorkspace(allocatedScratch);
+        return c.json(
+          { error: "a child task already exists for this repository" },
+          409,
+        );
+      }
+      task = createTask({
+        title: body.title,
+        prompt: body.prompt,
+        repo,
+        workspace_kind: workspaceKind,
+        // New explicit workspace submissions are always studied by Claude
+        // main. Omitted workspace_kind is the compatibility path for older
+        // clients and existing cloud workflows.
+        dispatch_mode: explicitWorkspace ? "orchestrated" : "direct",
+        parent_task_id: body.parent_task_id,
+        priority: body.priority ?? parent?.priority,
+        worker_provider: workerProvider,
+        model,
+        reasoning_effort: reasoningEffort,
+        blocked_by: body.blocked_by,
+        verify_cmd: body.verify_cmd,
+        open_pr: workspaceKind === "repo" ? body.open_pr : false,
+      });
+    } catch (error) {
+      if (allocatedScratch) {
+        try {
+          removeScratchWorkspace(allocatedScratch);
+        } catch {
+          // Best effort: retention cleanup will reap an orphan later.
+        }
+      }
+      throw error;
+    }
+    logEvent("task.created", {
+      taskId: task.id,
+      payload: {
+        workspace_kind: task.workspace_kind,
+        dispatch_mode: task.dispatch_mode,
+        parent_task_id: task.parent_task_id,
+      },
     });
-    logEvent("task.created", { taskId: task.id });
-    return c.json(task, 201);
+    if (task.dispatch_mode === "orchestrated" && task.parent_task_id === null) {
+      try {
+        await delegateTaskToMain(task.id);
+      } catch {
+        logEvent("task.awaiting_main", { taskId: task.id });
+      }
+    }
+    return c.json(getTask(task.id), 201);
   });
 
   app.get("/api/tasks/:id", (c) => {
@@ -188,6 +331,20 @@ export function buildApp(): Hono {
     const nextProvider = body.worker_provider ?? before.worker_provider;
     if (nextProvider === "claude" && body.reasoning_effort != null) {
       return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
+    }
+    if (body.open_pr === true && before.workspace_kind !== "repo") {
+      return c.json({ error: "non-repository tasks cannot open pull requests" }, 400);
+    }
+    if (body.repo !== undefined) {
+      if (before.workspace_kind !== "repo") {
+        return c.json({ error: "only repository tasks can change repositories" }, 400);
+      }
+      if (before.agent_id) {
+        const active = getAgent(before.agent_id);
+        if (active && active.state !== "dead") {
+          return c.json({ error: "repository cannot change while the task has a live agent" }, 409);
+        }
+      }
     }
     if (
       body.worker_provider !== undefined &&
@@ -206,6 +363,65 @@ export function buildApp(): Hono {
     // sent it, so an explicit `undefined` never gets bound as a SQL param
     // (that binds NULL against a NOT NULL column — see the crons.enabled bug).
     const patch: Record<string, unknown> = { ...body };
+    if (body.status === "queued" && before.workspace_kind === "scratch") {
+      try {
+        validateScratchWorkspace(before.repo);
+      } catch (error) {
+        if (!(error instanceof WorkspaceValidationError)) throw error;
+        if (before.agent_id) {
+          const active = getAgent(before.agent_id);
+          if (active && active.state !== "dead") {
+            return c.json(
+              { error: "kill the live scratch worker before recreating its workspace" },
+              409,
+            );
+          }
+        }
+        patch.repo = allocateScratchWorkspace();
+        patch.worktree = null;
+      }
+    }
+    if (body.repo !== undefined) {
+      if (repositoryRoots().length > 0) {
+        if (before.parent_task_id !== null) {
+          const portfolioParent = getTask(before.parent_task_id);
+          if (!portfolioParent || portfolioParent.workspace_kind !== "portfolio") {
+            return c.json({ error: "portfolio parent is unavailable" }, 409);
+          }
+          const nextRepo = resolvePortfolioChildRepository(
+            body.repo,
+            portfolioParent.repo,
+          );
+          if (
+            childTasks(portfolioParent.id).some(
+              (candidate) => candidate.id !== before.id && candidate.repo === nextRepo,
+            )
+          ) {
+            return c.json(
+              { error: "a child task already exists for this repository" },
+              409,
+            );
+          }
+          patch.repo = nextRepo;
+        } else {
+          patch.repo = resolveAllowedRepository(body.repo);
+        }
+      } else {
+        // A portfolio child was created under an explicit root boundary. If
+        // that allow-list later disappears, fail closed instead of silently
+        // degrading its update into the legacy arbitrary-path behavior.
+        if (before.parent_task_id !== null) {
+          return c.json(
+            { error: "repository roots must be configured to move a portfolio child" },
+            409,
+          );
+        }
+        if (!path.isAbsolute(body.repo) || body.repo.includes("\0")) {
+          return c.json({ error: "repository must be an absolute path" }, 400);
+        }
+        patch.repo = path.normalize(body.repo);
+      }
+    }
     if (
       body.worker_provider !== undefined &&
       body.worker_provider !== before.worker_provider &&
@@ -232,7 +448,34 @@ export function buildApp(): Hono {
         payload: { from: before.status, to: body.status },
       });
     }
+    if (
+      task?.status === "queued" &&
+      task.dispatch_mode === "orchestrated" &&
+      task.parent_task_id === null
+    ) {
+      try {
+        await delegateTaskToMain(task.id);
+      } catch {
+        logEvent("task.awaiting_main", { taskId: task.id });
+      }
+    }
     return c.json(task);
+  });
+
+  app.post("/api/tasks/:id/delegate", async (c) => {
+    const id = Number(c.req.param("id"));
+    const task = getTask(id);
+    if (!task) return c.json({ error: "not found" }, 404);
+    if (task.dispatch_mode !== "orchestrated" || task.status !== "queued") {
+      return c.json({ error: "task is not awaiting main-agent triage" }, 409);
+    }
+    if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
+      return c.json({ error: "task blockers are not done" }, 409);
+    }
+    if (!(await delegateTaskToMain(id))) {
+      return c.json({ error: "main agent is unavailable" }, 409);
+    }
+    return c.json({ ok: true });
   });
 
   app.get("/api/tasks/:id/diff", (c) => {
@@ -798,7 +1041,12 @@ export function buildApp(): Hono {
     if (err instanceof z.ZodError) {
       return c.json({ error: "validation", issues: err.issues }, 400);
     }
-    return c.json({ error: err.message }, 500);
+    if (err instanceof WorkspaceValidationError) {
+      return c.json({ error: err.message }, 400);
+    }
+    // Do not expose stack traces, local paths, command output, or provider
+    // details through the browser/API boundary.
+    return c.json({ error: "internal error" }, 500);
   });
 
   return app;

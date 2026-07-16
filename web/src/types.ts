@@ -10,6 +10,8 @@ export type TaskStatus =
 
 export type AgentProvider = "claude" | "codex";
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export type WorkspaceKind = "repo" | "portfolio" | "scratch";
+export type DispatchMode = "direct" | "orchestrated";
 
 export interface ProviderModel {
   slug: string;
@@ -23,6 +25,9 @@ export interface Task {
   title: string;
   prompt: string;
   repo: string;
+  workspace_kind: WorkspaceKind;
+  dispatch_mode: DispatchMode;
+  parent_task_id: number | null;
   status: TaskStatus;
   priority: number;
   worker_provider: AgentProvider;
@@ -137,7 +142,19 @@ export type AttentionKind =
   | "merge_and_apply"
   | "decision"
   | "escalation"
-  | "stale_waiting";
+  | "stale_waiting"
+  | "orchestration";
+
+export interface WorkspaceCatalog {
+  roots: Array<{ path: string; label: string }>;
+  repositories: Array<{
+    path: string;
+    name: string;
+    relative_path: string;
+    root: string;
+  }>;
+  scratch_retention_days: number;
+}
 
 export interface AttentionItem {
   id: string;

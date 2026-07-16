@@ -25,6 +25,8 @@ import {
 } from "./tmux.js";
 import { versionInfo } from "./version.js";
 import { WAIT_HOOK_EVENTS } from "./waiting.js";
+import { pruneScratchWorkspaces } from "./workspaces.js";
+import { delegatePendingTaskToLiveMain } from "./orchestration.js";
 
 export interface SchedulerDeps {
   spawn: (taskId: number) => void;
@@ -53,6 +55,7 @@ const defaultDeps: SchedulerDeps = {
 // module state for edge-triggered behavior (reset via _resetSchedulerState)
 let lastInWindow: boolean | null = null;
 let budgetNotifiedDay: string | null = null;
+let lastScratchPruneDay: string | null = null;
 let tmuxObservationUnavailable = false;
 const missingWindowChecks = new Map<number, number>();
 const SESSION_START_TIMEOUT_MS = 90_000;
@@ -62,6 +65,7 @@ const WATCHDOG_INTERVAL_MS = 10_000;
 export function _resetSchedulerState(): void {
   lastInWindow = null;
   budgetNotifiedDay = null;
+  lastScratchPruneDay = null;
   tmuxObservationUnavailable = false;
   missingWindowChecks.clear();
 }
@@ -114,6 +118,20 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
   const cfg = getSchedulerConfig();
   const now = deps.now();
 
+  const pruneDay = now.toISOString().slice(0, 10);
+  if (lastScratchPruneDay !== pruneDay) {
+    lastScratchPruneDay = pruneDay;
+    try {
+      const removed = pruneScratchWorkspaces(listTasks(), now);
+      if (removed.length > 0) {
+        logEvent("scratch.pruned", { payload: { count: removed.length } });
+      }
+    } catch {
+      // Retention is best-effort and must never stop task scheduling.
+      logEvent("scratch.prune_failed");
+    }
+  }
+
   fireDueCrons(now);
   const inWin = cfg.active_hours ? inActiveWindow(cfg.active_hours, now) : true;
 
@@ -136,7 +154,9 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
     countEventsToday("scheduler.spawned") +
     countEventsToday("reviewer.auto_spawned");
 
-  for (const task of readyTasks()) {
+  // Human/UI tasks are main-orchestrated. Only explicit compatibility/cron
+  // tasks retain the historical direct scheduler path.
+  for (const task of readyTasks("direct")) {
     if (capacity <= 0) break;
     if (spawnsToday >= cfg.daily_spawn_limit) {
       const day = now.toISOString().slice(0, 10);
@@ -456,6 +476,13 @@ function sendWindowReport(): void {
 }
 
 export function startScheduler(): void {
+  const runOrchestrationRecovery = () => {
+    void delegatePendingTaskToLiveMain().catch(() => {
+      // Delivery is best-effort here; the task remains queued and the next
+      // sweep, main lifecycle hook, or manual notify button retries it.
+      logEvent("task.delegation_failed");
+    });
+  };
   const runWatchdog = () => {
     try {
       watchdog();
@@ -468,6 +495,7 @@ export function startScheduler(): void {
   // full minute would leave a still-running provider session orphaned after a
   // daemon restart or transient tmux observation failure.
   runWatchdog();
+  runOrchestrationRecovery();
   setInterval(() => {
     try {
       tick();
@@ -476,6 +504,7 @@ export function startScheduler(): void {
     }
   }, 30_000);
   setInterval(runWatchdog, WATCHDOG_INTERVAL_MS);
+  setInterval(runOrchestrationRecovery, WATCHDOG_INTERVAL_MS);
   console.log(
     `scheduler: ${getSchedulerConfig().enabled ? "ENABLED" : "disabled"} (toggle: agp scheduler on|off)`,
   );

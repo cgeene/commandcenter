@@ -19,7 +19,8 @@ export type AttentionKind =
   | "merge_and_apply"
   | "decision"
   | "escalation"
-  | "stale_waiting";
+  | "stale_waiting"
+  | "orchestration";
 
 export type Severity = "red" | "orange" | "yellow";
 
@@ -76,6 +77,38 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
     if (dismissed.has(item.id)) return;
     items.push({ ...item, age_ms: Math.max(0, nowMs - Date.parse(item.created_at)) });
   };
+
+  // An orchestrated task must never silently fall back to the direct
+  // scheduler. If Claude main is absent or blocked on its own input, make the
+  // queue ownership visible to the human.
+  const tasksById = new Map(tasks.map((task) => [task.id, task]));
+  const pendingOrchestration = tasks.filter((task) => {
+    if (task.status !== "queued" || task.dispatch_mode !== "orchestrated") {
+      return false;
+    }
+    return task.blocked_by === null || tasksById.get(task.blocked_by)?.status === "done";
+  });
+  const main = agents.find((agent) => agent.kind === "main");
+  const mainAvailable = main && ["working", "idle"].includes(main.state);
+  if (pendingOrchestration.length > 0 && !mainAvailable) {
+    const ordered = [...pendingOrchestration].sort((a, b) => a.id - b.id);
+    const oldest = ordered[0];
+    const newest = ordered[ordered.length - 1];
+    push({
+      id: `orchestration:${newest.id}:${main?.id ?? "none"}`,
+      kind: "orchestration",
+      title: main
+        ? `Unblock Claude main — ${pendingOrchestration.length} task${pendingOrchestration.length === 1 ? "" : "s"} awaiting triage`
+        : `Start Claude main — ${pendingOrchestration.length} task${pendingOrchestration.length === 1 ? "" : "s"} awaiting triage`,
+      context: `Oldest: #${oldest.id} ${oldest.title}`,
+      severity: "yellow",
+      urgent: false,
+      task_id: oldest.id,
+      agent_id: main?.id ?? null,
+      pr_url: null,
+      created_at: oldest.created_at,
+    });
+  }
 
   // --- merge_pr / merge_and_apply: approved work waiting on a human merge ---
   for (const t of tasks) {

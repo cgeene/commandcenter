@@ -4,7 +4,13 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeSanitize from "rehype-sanitize";
 import { api } from "./api";
-import { blockedByChain, groupByProject, isActive, isArchived, projectOf } from "../../src/lib/board";
+import {
+  blockedByChain,
+  groupByProject,
+  isActive,
+  isArchived,
+  projectOfTask,
+} from "../../src/lib/board";
 import { openPanel, type Panel } from "../../src/lib/panel";
 import { parseFrontmatter } from "../../src/lib/frontmatter";
 import { Terminal } from "./Terminal";
@@ -22,6 +28,8 @@ import type {
   SchedulerInfo,
   Task,
   TranscriptEntry,
+  WorkspaceCatalog,
+  WorkspaceKind,
 } from "./types";
 
 /** Dashboard tabs — add an entry here + a render branch in App to grow the dashboard. */
@@ -492,13 +500,22 @@ function TaskCard({
 }) {
   const chain = blockedByChain(task, byId);
   const summary = firstLine(task.result_summary);
+  const statusLabel =
+    task.status === "queued" && task.dispatch_mode === "orchestrated"
+      ? "awaiting main"
+      : task.status;
   return (
     <div className={`card ${task.status}`} onClick={() => onSelect(task)}>
       <div className="card-title">
         #{task.id} {task.title}
       </div>
       <div className="chips">
-        <span className={`chip ${task.status}`}>{task.status}</span>
+        <span className={`chip ${task.status}`}>{statusLabel}</span>
+        {task.workspace_kind !== "repo" && (
+          <span className="chip">
+            {task.workspace_kind === "portfolio" ? "all repositories" : "investigation"}
+          </span>
+        )}
         {task.review_verdict === "approve" && (
           <span className="chip approved">✓ approved</span>
         )}
@@ -636,7 +653,7 @@ function ArchiveView({
     visible: (t) =>
       isArchived(t.status) &&
       (q === "" ||
-        projectOf(t.repo).toLowerCase().includes(q) ||
+        projectOfTask(t).toLowerCase().includes(q) ||
         t.title.toLowerCase().includes(q)),
   });
   const archivedCount = tasks.filter((t) => isArchived(t.status)).length;
@@ -837,6 +854,7 @@ const KIND_ICON: Record<AttentionItem["kind"], string> = {
   decision: "⚖",
   escalation: "⛔",
   stale_waiting: "⏳",
+  orchestration: "◈",
 };
 
 /**
@@ -1205,8 +1223,24 @@ function TaskPanel({
       <div className="panel-body">
         <pre className="prompt">{task.prompt}</pre>
         <dl>
-          <dt>repo</dt>
+          <dt>workspace</dt>
+          <dd>
+            {task.workspace_kind === "portfolio"
+              ? "all repositories"
+              : task.workspace_kind === "scratch"
+                ? "investigation scratch"
+                : "repository"}
+          </dd>
+          <dt>{task.workspace_kind === "portfolio" ? "root" : "path"}</dt>
           <dd>{task.repo}</dd>
+          {task.parent_task_id && (
+            <>
+              <dt>parent</dt>
+              <dd>#{task.parent_task_id}</dd>
+            </>
+          )}
+          <dt>dispatch</dt>
+          <dd>{task.dispatch_mode === "orchestrated" ? "Claude main" : "direct scheduler"}</dd>
           <dt>worker</dt>
           <dd>
             {task.worker_provider}
@@ -1255,7 +1289,9 @@ function TaskPanel({
           )}
         </dl>
         <div className="actions">
-          {["queued", "claimed"].includes(task.status) && (
+          {["queued", "claimed"].includes(task.status) &&
+            task.dispatch_mode === "direct" &&
+            task.workspace_kind !== "portfolio" && (
             <button
               className="primary"
               onClick={() =>
@@ -1263,6 +1299,16 @@ function TaskPanel({
               }
             >
               ▶ spawn worker
+            </button>
+          )}
+          {task.status === "queued" && task.dispatch_mode === "orchestrated" && (
+            <button
+              className="primary"
+              onClick={() =>
+                onAction(() => api("POST", `/api/tasks/${task.id}/delegate`, {}))
+              }
+            >
+              notify Claude main
             </button>
           )}
           {task.agent_id && (
@@ -1304,7 +1350,12 @@ function TaskPanel({
             <button
               className="danger"
               onClick={() => {
-                if (!confirm(`Cancel task #${task.id}? Live agents are killed; the branch survives.`)) return;
+                const retained = task.workspace_kind === "repo"
+                  ? "the branch survives"
+                  : task.workspace_kind === "scratch"
+                    ? "scratch files are retained until cleanup"
+                    : "existing child tasks are not cancelled automatically";
+                if (!confirm(`Cancel task #${task.id}? Live agents are killed; ${retained}.`)) return;
                 void onAction(() => api("POST", `/api/tasks/${task.id}/cancel`, {}));
               }}
             >
@@ -1475,6 +1526,12 @@ function NewTaskForm({
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [repo, setRepo] = useState("");
+  const [workspaceKind, setWorkspaceKind] = useState<WorkspaceKind>("repo");
+  const [repoRoot, setRepoRoot] = useState("");
+  const [workspaceCatalog, setWorkspaceCatalog] =
+    useState<WorkspaceCatalog | null>(null);
+  const [workspacesLoading, setWorkspacesLoading] = useState(true);
+  const [workspacesError, setWorkspacesError] = useState("");
   const [modelChoice, setModelChoice] = useState("");
   const [customModel, setCustomModel] = useState("");
   const [models, setModels] = useState<ProviderModel[]>([]);
@@ -1485,6 +1542,27 @@ function NewTaskForm({
   const [provider, setProvider] = useState<"" | "claude" | "codex">("");
   const [verify, setVerify] = useState("");
   const [priority, setPriority] = useState(2);
+
+  useEffect(() => {
+    let cancelled = false;
+    setWorkspacesLoading(true);
+    void api<WorkspaceCatalog>("GET", "/api/workspaces")
+      .then((catalog) => {
+        if (cancelled) return;
+        setWorkspaceCatalog(catalog);
+        setRepoRoot((current) => current || catalog.roots[0]?.path || "");
+        setWorkspacesError("");
+      })
+      .catch(() => {
+        if (!cancelled) setWorkspacesError("repository catalog unavailable");
+      })
+      .finally(() => {
+        if (!cancelled) setWorkspacesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -1574,16 +1652,106 @@ function NewTaskForm({
           autoFocus
         />
         <textarea
-          placeholder="prompt — what should the worker do?"
+          placeholder="prompt — what should be accomplished?"
           rows={6}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
         />
-        <input
-          placeholder="repo (absolute path)"
-          value={repo}
-          onChange={(e) => setRepo(e.target.value)}
-        />
+        <div className="workspace-picker">
+          <label>
+            <span>Workspace</span>
+            <select
+              aria-label="workspace type"
+              value={workspaceKind}
+              onChange={(e) => setWorkspaceKind(e.target.value as WorkspaceKind)}
+            >
+              <option value="repo">Repository</option>
+              <option
+                value="portfolio"
+                disabled={!workspacesLoading && workspaceCatalog?.roots.length === 0}
+              >
+                All repositories — Claude scopes it
+              </option>
+              <option value="scratch">Investigation — empty scratch workspace</option>
+            </select>
+          </label>
+
+          {workspaceKind === "repo" &&
+            !workspacesLoading &&
+            workspaceCatalog?.roots.length === 0 && (
+            <label>
+              <span>Repository</span>
+              <input
+                aria-label="repository path"
+                placeholder="repo (absolute path)"
+                value={repo}
+                onChange={(e) => setRepo(e.target.value)}
+              />
+            </label>
+          )}
+
+          {workspaceKind === "repo" &&
+            (workspacesLoading || (workspaceCatalog?.roots.length ?? 0) > 0) && (
+            <label>
+              <span>Repository</span>
+              <select
+                aria-label="repository"
+                value={repo}
+                onChange={(e) => setRepo(e.target.value)}
+                disabled={workspacesLoading || !workspaceCatalog?.repositories.length}
+              >
+                <option value="">
+                  {workspacesLoading
+                    ? "loading repositories…"
+                    : workspaceCatalog?.repositories.length
+                      ? "select a repository…"
+                      : "no repositories configured"}
+                </option>
+                {workspaceCatalog?.repositories.map((entry) => (
+                  <option key={entry.path} value={entry.path}>
+                    {workspaceCatalog.roots.length > 1
+                      ? `${entry.root.split("/").pop()} / `
+                      : ""}
+                    {entry.relative_path}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+
+          {workspaceKind === "portfolio" && (
+            <label>
+              <span>Repository root</span>
+              <select
+                aria-label="repository root"
+                value={repoRoot}
+                onChange={(e) => setRepoRoot(e.target.value)}
+                disabled={workspacesLoading || !workspaceCatalog?.roots.length}
+              >
+                <option value="">
+                  {workspacesLoading ? "loading roots…" : "select a root…"}
+                </option>
+                {workspaceCatalog?.roots.map((root) => (
+                  <option key={root.path} value={root.path}>
+                    {root.label} — {root.path}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+
+          <div className="workspace-help">
+            {workspaceKind === "repo" && workspaceCatalog?.roots.length === 0 &&
+              "No repository allow-list is configured, so this deployment uses the legacy absolute-path workflow."}
+            {workspaceKind === "repo" && workspaceCatalog?.roots.length !== 0 &&
+              "Claude main studies the task, then starts one worker in an isolated Git worktree."}
+            {workspaceKind === "portfolio" &&
+              "Claude main identifies every affected repository and creates isolated child tasks. The root is never given to a write-capable worker."}
+            {workspaceKind === "scratch" &&
+              `Command Center creates a private, non-Git workspace and retains it for ${workspaceCatalog?.scratch_retention_days ?? 7} days after completion.`}
+          </div>
+          {workspacesError && <div className="workspace-error">{workspacesError}</div>}
+        </div>
         <div className="row">
           <select
             value={provider}
@@ -1657,12 +1825,20 @@ function NewTaskForm({
         <div className="actions">
           <button
             className="primary"
-            disabled={!title || !repo}
+            disabled={
+              !title ||
+              workspacesLoading ||
+              !!workspacesError ||
+              (workspaceKind === "repo" && !repo) ||
+              (workspaceKind === "portfolio" && !repoRoot)
+            }
             onClick={() =>
               onCreate({
                 title,
                 prompt: prompt || title,
-                repo,
+                workspace_kind: workspaceKind,
+                ...(workspaceKind === "repo" ? { repo } : {}),
+                ...(workspaceKind === "portfolio" ? { repo_root: repoRoot } : {}),
                 worker_provider: provider || undefined,
                 model: selectedModel || undefined,
                 reasoning_effort:

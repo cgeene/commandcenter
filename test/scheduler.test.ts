@@ -78,6 +78,22 @@ describe("scheduler tick", () => {
     expect(spawned).toEqual([t1.id, t2.id]);
   });
 
+  it("never bypasses Claude main for orchestrated tasks", async () => {
+    const { createTask } = await import("../src/db/tasks.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { tick } = await import("../src/daemon/scheduler.js");
+    setSchedulerConfig({ enabled: true, max_concurrent: 3 });
+    createTask({
+      title: "human task",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+    });
+    const { spawned, deps: d } = deps();
+    tick(d);
+    expect(spawned).toEqual([]);
+  });
+
   it("stops at the daily spawn budget", async () => {
     const { createTask } = await import("../src/db/tasks.js");
     const { setSchedulerConfig } = await import("../src/db/settings.js");

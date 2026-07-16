@@ -74,7 +74,14 @@ describe("provider metadata", () => {
         (column) => column.name,
       );
     expect(names("tasks")).toEqual(
-      expect.arrayContaining(["worker_provider", "session_provider", "reasoning_effort"]),
+      expect.arrayContaining([
+        "worker_provider",
+        "session_provider",
+        "reasoning_effort",
+        "workspace_kind",
+        "dispatch_mode",
+        "parent_task_id",
+      ]),
     );
     expect(names("agents")).toEqual(
       expect.arrayContaining([
@@ -220,6 +227,7 @@ describe("Codex runtime isolation", () => {
       taskId: 9,
       model: "gpt-codex",
       reasoningEffort: "ultra",
+      workspaceKind: "repo",
       promptFile: "/tmp/prompt.md",
       resumeSession: "session-123",
     });
@@ -378,40 +386,60 @@ describe("Codex worker permission policy", () => {
       tool_input: { command },
     });
     expect(
-      codexPermissionDecision(payload("git push -u origin agent/task-12"), "12")
+      codexPermissionDecision(payload("git push -u origin agent/task-12"), "12", "repo")
         ?.behavior,
     ).toBe("allow");
     expect(
-      codexPermissionDecision(payload("git push origin agent/task-12:main"), "12")
+      codexPermissionDecision(payload("git push origin agent/task-12:main"), "12", "repo")
         ?.behavior,
     ).toBe("deny");
     expect(
-      codexPermissionDecision(payload("git push --force origin main"), "12")?.behavior,
+      codexPermissionDecision(payload("git push --force origin main"), "12", "repo")?.behavior,
     ).toBe("deny");
-    expect(codexPermissionDecision(payload("gh pr merge 44"), "12")?.behavior).toBe(
+    expect(codexPermissionDecision(payload("gh pr merge 44"), "12", "repo")?.behavior).toBe(
       "deny",
     );
-    expect(codexPermissionDecision(payload("npm test"), "12")).toBeUndefined();
+    expect(codexPermissionDecision(payload("npm test"), "12", "repo")).toBeUndefined();
     expect(
-      codexPermissionDecision(payload("env git push origin main", "PreToolUse"), "12")
+      codexPermissionDecision(payload("env git push origin main", "PreToolUse"), "12", "repo")
         ?.behavior,
     ).toBe("deny");
     expect(
       codexPermissionDecision(
         payload("git push origin agent/task-12", "PreToolUse"),
         "12",
+        "repo",
       )?.behavior,
     ).toBe("allow");
+    expect(
+      codexPermissionDecision(
+        payload("git push origin agent/task-12"),
+        "12",
+        "scratch",
+      )?.behavior,
+    ).toBe("deny");
   });
 });
 
 describe("Codex profile generation", () => {
+  it("auto-reviews approval requests without weakening the worker sandbox", async () => {
+    const { _codexApprovalConfigForTest } = await import(
+      "../src/daemon/genconfig.js"
+    );
+    expect(_codexApprovalConfigForTest()).toEqual([
+      'approval_policy = "on-request"',
+      'approvals_reviewer = "auto_review"',
+      'sandbox_mode = "workspace-write"',
+    ]);
+  });
+
   it("preserves Codex-managed trust state while replacing generated settings", async () => {
     const { _mergeCodexProfileForTest } = await import(
       "../src/daemon/genconfig.js"
     );
     const generated = [
       'approval_policy = "on-request"',
+      'approvals_reviewer = "auto_review"',
       "[features]",
       "hooks = true",
       "[mcp_servers.cc]",
@@ -434,6 +462,8 @@ describe("Codex profile generation", () => {
 
     const merged = _mergeCodexProfileForTest(generated, existing);
     expect(merged).toContain('command = "/new/node"');
+    expect(merged).toContain('approvals_reviewer = "auto_review"');
+    expect(merged).not.toContain('approval_policy = "never"');
     expect(merged).not.toContain('command = "/old/node"');
     expect(merged).toContain('[projects."/tmp/repo"]');
     expect(merged).toContain('trusted_hash = "sha256:abc"');

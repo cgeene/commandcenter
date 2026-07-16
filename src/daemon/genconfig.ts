@@ -7,6 +7,11 @@ import {
   codexProfile,
   dataDir,
 } from "../config.js";
+import {
+  syncCodexMcpAccess,
+  syncCodexScratchTrust,
+} from "./codex-mcp.js";
+import { listScratchWorkspaces } from "./workspaces.js";
 
 /**
  * Per-agent generated Claude Code config. Each worker gets its own settings
@@ -120,7 +125,20 @@ export interface CodexConfigFiles {
   profileFile: string;
   hooksFile: string;
   rulesFile: string;
+  inheritedMcpNames: string[];
+  inheritedMcpEnvVars: string[];
 }
+
+const CODEX_APPROVAL_CONFIG = [
+  'approval_policy = "on-request"',
+  'approvals_reviewer = "auto_review"',
+  'sandbox_mode = "workspace-write"',
+] as const;
+
+/** Test-only: the approval boundary is security-sensitive and must stay explicit. */
+export const _codexApprovalConfigForTest = (): string[] => [
+  ...CODEX_APPROVAL_CONFIG,
+];
 
 /**
  * Generate a dedicated Codex home for Command Center. The hook definition is
@@ -130,13 +148,12 @@ export interface CodexConfigFiles {
 export function writeCodexConfig(): CodexConfigFiles {
   const home = codexHome();
   const profile = codexProfile();
-  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
-  fs.chmodSync(home, 0o700);
+  const inheritedMcp = syncCodexMcpAccess();
+  syncCodexScratchTrust(listScratchWorkspaces());
 
   const profileFile = path.join(home, `${profile}.config.toml`);
   const profileToml = [
-    'approval_policy = "on-request"',
-    'sandbox_mode = "workspace-write"',
+    ...CODEX_APPROVAL_CONFIG,
     "",
     "[sandbox_workspace_write]",
     "network_access = false",
@@ -218,5 +235,13 @@ export function writeCodexConfig(): CodexConfigFiles {
   );
   fs.chmodSync(rulesFile, 0o600);
 
-  return { home, profile, profileFile, hooksFile, rulesFile };
+  return {
+    home,
+    profile,
+    profileFile,
+    hooksFile,
+    rulesFile,
+    inheritedMcpNames: inheritedMcp.serverNames,
+    inheritedMcpEnvVars: inheritedMcp.requiredEnvVars,
+  };
 }

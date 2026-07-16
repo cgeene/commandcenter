@@ -51,6 +51,52 @@ async function backdate(table: "tasks" | "agents", id: number, col: string, minu
 }
 
 describe("deriveAttention — kinds", () => {
+  it("surfaces orchestrated tasks when Claude main is unavailable", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({
+      title: "needs triage",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+    });
+    const items = deriveAttention({ isPrOpen: allOpen });
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: "orchestration",
+      task_id: task.id,
+      severity: "yellow",
+    });
+  });
+
+  it("does not page the human when Claude main owns the orchestration queue", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    createTask({
+      title: "owned",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+    });
+    createAgent({ kind: "main", state: "idle", tmux_target: "cc:@main" });
+    expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
+  });
+
+  it("does not page for an orchestrated task whose blocker is still open", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const blocker = createTask({ title: "first", prompt: "x", repo: "/r" });
+    createTask({
+      title: "wait for first",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+      blocked_by: blocker.id,
+    });
+    expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
+  });
+
   it("merge_pr for an approved task with an open PR", async () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     const t = await approvedPrTask();

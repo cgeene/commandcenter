@@ -150,6 +150,24 @@ describe("spawn.ts allow-list builders", () => {
     const allow = _buildWorkerAllowForTest("agent/task-1");
     expect(allow).toContain("mcp__claude_ai_Linear__getIssue*");
   });
+
+  it("denies Git publishing for non-Git scratch workers", async () => {
+    const { _buildWorkerDenyForTest } = await import("../src/daemon/spawn.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const scratch = createTask({
+      title: "investigate",
+      prompt: "x",
+      repo: "/tmp/scratch",
+      workspace_kind: "scratch",
+      open_pr: false,
+    });
+    const repo = createTask({ title: "implement", prompt: "x", repo: "/r" });
+
+    expect(_buildWorkerDenyForTest(scratch)).toEqual(
+      expect.arrayContaining(["Bash(git push*)", "Bash(gh pr create*)"]),
+    );
+    expect(_buildWorkerDenyForTest(repo)).toBeUndefined();
+  });
 });
 
 describe("readOnlyProfileAllow", () => {

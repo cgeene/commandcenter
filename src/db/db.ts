@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   title          TEXT NOT NULL,
   prompt         TEXT NOT NULL,
   repo           TEXT NOT NULL,
+  workspace_kind TEXT NOT NULL DEFAULT 'repo',
+  dispatch_mode  TEXT NOT NULL DEFAULT 'direct',
+  parent_task_id INTEGER REFERENCES tasks(id),
   status         TEXT NOT NULL DEFAULT 'queued',
   priority       INTEGER NOT NULL DEFAULT 2,
   worker_provider TEXT NOT NULL DEFAULT 'claude',
@@ -222,6 +225,18 @@ function migrate(db: Database.Database): void {
   if (!cols.includes("reasoning_effort")) {
     db.exec("ALTER TABLE tasks ADD COLUMN reasoning_effort TEXT");
   }
+  if (!cols.includes("workspace_kind")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN workspace_kind TEXT NOT NULL DEFAULT 'repo'");
+  }
+  if (!cols.includes("dispatch_mode")) {
+    // Existing queued tasks retain the historical direct-scheduler behavior.
+    db.exec("ALTER TABLE tasks ADD COLUMN dispatch_mode TEXT NOT NULL DEFAULT 'direct'");
+  }
+  if (!cols.includes("parent_task_id")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN parent_task_id INTEGER REFERENCES tasks(id)");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_dispatch ON tasks(dispatch_mode, status)");
   const agentCols = (db.prepare("PRAGMA table_info(agents)").all() as { name: string }[]).map(
     (c) => c.name,
   );
