@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { worktreesDir } from "../config.js";
+import { resolveWorktreesDir } from "../db/settings.js";
 import { logEvent } from "../db/events.js";
 import { injectWorkspaceContext } from "./context.js";
 import { type AgentProvider } from "../providers.js";
@@ -101,7 +101,7 @@ export function createWorktree(
   provider: AgentProvider = "claude",
 ): { dir: string; branch: string } {
   const repoName = path.basename(repo);
-  const dir = path.join(worktreesDir(), `${repoName}-task-${taskId}`);
+  const dir = path.join(resolveWorktreesDir(), `${repoName}-task-${taskId}`);
   const branch = branchForTask(taskId);
 
   if (fs.existsSync(dir)) {
@@ -110,7 +110,7 @@ export function createWorktree(
     injectWorkspaceContext(repo, dir, taskId, provider);
     return { dir, branch };
   }
-  fs.mkdirSync(worktreesDir(), { recursive: true });
+  fs.mkdirSync(resolveWorktreesDir(), { recursive: true });
 
   const branchExists =
     git(repo, "branch", "--list", branch).trim().length > 0;
@@ -129,7 +129,7 @@ export function createWorktree(
 }
 
 export function reviewWorktreeDir(repo: string, taskId: number): string {
-  return path.join(worktreesDir(), `${path.basename(repo)}-task-${taskId}-review`);
+  return path.join(resolveWorktreesDir(), `${path.basename(repo)}-task-${taskId}-review`);
 }
 
 /**
@@ -226,7 +226,7 @@ export function createReviewWorktree(
     injectWorkspaceContext(repo, dir, taskId, provider);
     return dir;
   }
-  fs.mkdirSync(worktreesDir(), { recursive: true });
+  fs.mkdirSync(resolveWorktreesDir(), { recursive: true });
   git(repo, "worktree", "add", "--detach", dir, target);
   // Reviewers benefit from the same workspace context as workers.
   injectWorkspaceContext(repo, dir, taskId, provider);

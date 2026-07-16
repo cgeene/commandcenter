@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import {
@@ -8,8 +9,6 @@ import {
   codexHome,
   codexProfile,
   dataDir,
-  defaultMainModel,
-  defaultWorkerProvider,
 } from "../config.js";
 import { TASK_STATUSES, type TaskStatus } from "../db/db.js";
 import { getAgent, listAgents } from "../db/agents.js";
@@ -37,7 +36,24 @@ import {
   saveDoc,
   searchDocs,
 } from "../db/docs.js";
-import { getSchedulerConfig, setSchedulerConfig } from "../db/settings.js";
+import {
+  getAgentSettings,
+  getNotificationSettings,
+  getSchedulerConfig,
+  getWorkspaceSettings,
+  resolveMainModel,
+  resolveMainWorkspaceDir,
+  resolveNtfyToken,
+  resolveNtfyUrl,
+  resolveReviewerProviderPin,
+  resolveReviewerVariety,
+  resolveWorkerProvider,
+  resolveWorktreesDir,
+  setAgentSettings,
+  setNotificationSettings,
+  setSchedulerConfig,
+  setWorkspaceSettings,
+} from "../db/settings.js";
 import { dismissAttention } from "../db/attention.js";
 import {
   claimTask,
@@ -68,7 +84,7 @@ import {
   DEFAULT_CODEX_REASONING_EFFORT,
   REASONING_EFFORTS,
 } from "../reasoning.js";
-import { providerModels } from "./provider-models.js";
+import { CLAUDE_MODEL_SLUGS, providerModels } from "./provider-models.js";
 import { delegateTaskToMain } from "./orchestration.js";
 import {
   allocateScratchWorkspace,
@@ -156,9 +172,9 @@ export function buildApp(): Hono {
 
   app.get("/api/providers", (c) =>
     c.json({
-      default_worker_provider: defaultWorkerProvider(),
+      default_worker_provider: resolveWorkerProvider(),
       main_provider: "claude" as const,
-      default_main_model: defaultMainModel(),
+      default_main_model: resolveMainModel(),
     }),
   );
 
@@ -225,7 +241,7 @@ export function buildApp(): Hono {
       }
     }
     const workerProvider =
-      body.worker_provider ?? parent?.worker_provider ?? defaultWorkerProvider();
+      body.worker_provider ?? parent?.worker_provider ?? resolveWorkerProvider();
     const inheritedModel =
       parent?.worker_provider === workerProvider ? parent.model ?? undefined : undefined;
     const inheritedReasoningEffort =
@@ -821,7 +837,7 @@ export function buildApp(): Hono {
 
   app.post("/api/crons", async (c) => {
     const body = newCronSchema.parse(await c.req.json());
-    const workerProvider = body.worker_provider ?? defaultWorkerProvider();
+    const workerProvider = body.worker_provider ?? resolveWorkerProvider();
     if (workerProvider === "claude" && body.reasoning_effort !== undefined) {
       return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
     }
@@ -1045,6 +1061,174 @@ export function buildApp(): Hono {
     const config = setSchedulerConfig(patch);
     logEvent("scheduler.config", { payload: patch });
     return c.json({ config });
+  });
+
+  /* -------------------------------------------------------------- *
+   * Runtime settings (agents / workspace / notifications).          *
+   * Server-side validation is the trust boundary: paths must be     *
+   * absolute + existing directories, models come from the allow-    *
+   * list, providers from the fixed set. GET never returns a secret. *
+   * -------------------------------------------------------------- */
+
+  // An absolute path to an existing directory, or null to clear the override.
+  // Blank/whitespace is normalized to null (clear). No emptiness rejection and
+  // no deny-list — the workspace dir is a free CHOICE of cwd, by design.
+  const dirOverrideSchema = z
+    .string()
+    .nullable()
+    .optional()
+    .transform((v) => {
+      if (v == null) return v;
+      const trimmed = v.trim();
+      return trimmed.length === 0 ? null : trimmed;
+    })
+    .superRefine((v, ctx) => {
+      if (v == null) return;
+      if (!path.isAbsolute(v)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "path must be absolute" });
+        return;
+      }
+      let isDir = false;
+      try {
+        isDir = fs.statSync(v).isDirectory();
+      } catch {
+        isDir = false;
+      }
+      if (!isDir) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "path must be an existing directory" });
+      }
+    });
+
+  const providerOverrideSchema = z.enum(AGENT_PROVIDERS).nullable().optional();
+
+  const agentSettingsPatchSchema = z.object({
+    default_main_model: z
+      .string()
+      .nullable()
+      .optional()
+      .superRefine((v, ctx) => {
+        if (v == null) return;
+        if (!CLAUDE_MODEL_SLUGS.includes(v)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `model must be one of: ${CLAUDE_MODEL_SLUGS.join(", ")}`,
+          });
+        }
+      }),
+    default_worker_provider: providerOverrideSchema,
+    default_reviewer_provider: providerOverrideSchema,
+    reviewer_variety: z.boolean().nullable().optional(),
+  });
+
+  const workspaceSettingsPatchSchema = z.object({
+    worktrees_dir: dirOverrideSchema,
+    main_workspace_dir: dirOverrideSchema,
+  });
+
+  // ntfy URL must be an http(s) URL when set; blank/null clears it. The token
+  // is write-only: set it with any non-blank string, clear it with ""/null.
+  // It is NEVER echoed back (see GET /api/settings).
+  const notificationSettingsPatchSchema = z.object({
+    ntfy_url: z
+      .string()
+      .nullable()
+      .optional()
+      .transform((v) => {
+        if (v == null) return v;
+        const trimmed = v.trim();
+        return trimmed.length === 0 ? null : trimmed;
+      })
+      .superRefine((v, ctx) => {
+        if (v == null) return;
+        try {
+          const parsed = new URL(v);
+          if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: "URL must be http(s)" });
+          }
+        } catch {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, message: "invalid URL" });
+        }
+      }),
+    ntfy_token: z
+      .string()
+      .nullable()
+      .optional()
+      .transform((v) => {
+        if (v == null) return v;
+        const trimmed = v.trim();
+        return trimmed.length === 0 ? null : trimmed;
+      }),
+  });
+
+  app.get("/api/settings", (c) => {
+    const agents = getAgentSettings();
+    const workspace = getWorkspaceSettings();
+    const notifications = getNotificationSettings();
+    return c.json({
+      agents: {
+        stored: agents,
+        effective: {
+          default_main_model: resolveMainModel(),
+          default_worker_provider: resolveWorkerProvider(),
+          default_reviewer_provider: resolveReviewerProviderPin() ?? null,
+          reviewer_variety: resolveReviewerVariety(),
+        },
+      },
+      workspace: {
+        stored: workspace,
+        effective: {
+          worktrees_dir: resolveWorktreesDir(),
+          main_workspace_dir: resolveMainWorkspaceDir(),
+        },
+      },
+      notifications: {
+        // Secret token is never serialized — only its presence.
+        stored: { ntfy_url: notifications.ntfy_url },
+        ntfy_token_set: Boolean(resolveNtfyToken()),
+        effective: { ntfy_url: resolveNtfyUrl() ?? null },
+      },
+      model_choices: CLAUDE_MODEL_SLUGS,
+      provider_choices: AGENT_PROVIDERS,
+    });
+  });
+
+  app.patch("/api/settings/agents", async (c) => {
+    const patch = agentSettingsPatchSchema.parse(await c.req.json());
+    const agents = setAgentSettings(patch);
+    logEvent("settings.config", { payload: { group: "agents", patch } });
+    return c.json({ agents });
+  });
+
+  app.patch("/api/settings/workspace", async (c) => {
+    const patch = workspaceSettingsPatchSchema.parse(await c.req.json());
+    const workspace = setWorkspaceSettings(patch);
+    logEvent("settings.config", { payload: { group: "workspace", patch } });
+    return c.json({ workspace });
+  });
+
+  app.patch("/api/settings/notifications", async (c) => {
+    const patch = notificationSettingsPatchSchema.parse(await c.req.json());
+    setNotificationSettings(patch);
+    // Never echo the token (or its replacement) back — return presence only,
+    // mirroring GET so the client can update its masked field state.
+    const notifications = getNotificationSettings();
+    logEvent("settings.config", {
+      payload: {
+        group: "notifications",
+        // Log intent without the secret value: whether the token was changed.
+        patch: {
+          ntfy_url: patch.ntfy_url ?? null,
+          ntfy_token_changed: patch.ntfy_token !== undefined,
+        },
+      },
+    });
+    return c.json({
+      notifications: {
+        stored: { ntfy_url: notifications.ntfy_url },
+        ntfy_token_set: Boolean(resolveNtfyToken()),
+        effective: { ntfy_url: resolveNtfyUrl() ?? null },
+      },
+    });
   });
 
   app.get("/api/transcript/:sessionId", async (c) => {

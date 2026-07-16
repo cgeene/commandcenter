@@ -6,7 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
-import type { CSSProperties } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeSanitize from "rehype-sanitize";
@@ -24,6 +24,7 @@ import { softenLineBreaks } from "../../src/lib/markdown";
 import { Terminal } from "./Terminal";
 import type {
   Agent,
+  AppSettings,
   AttentionItem,
   CronJob,
   Doc,
@@ -33,6 +34,7 @@ import type {
   ParsedPane,
   ProviderModel,
   ReasoningEffort,
+  SchedulerConfig,
   SchedulerInfo,
   Task,
   TranscriptEntry,
@@ -47,6 +49,7 @@ const TABS = [
   { id: "docs", label: "docs" },
   { id: "tokens", label: "tokens" },
   { id: "archive", label: "archive" },
+  { id: "settings", label: "settings" },
 ] as const;
 type TabId = (typeof TABS)[number]["id"];
 
@@ -336,6 +339,8 @@ export function App() {
       {tab === "prs" && <PrsView tasks={tasks} onSelect={(t) => openTask(t.id)} />}
 
       {tab === "docs" && <DocsView />}
+
+      {tab === "settings" && <SettingsView />}
 
       {tab === "archive" && <ArchiveView tasks={tasks} onSelect={(t) => openTask(t.id)} />}
 
@@ -755,6 +760,612 @@ function CollapsibleMarkdown({
 
 function basename(p: string): string {
   return p.split(/[/\\]/).pop() ?? p;
+}
+
+/* ------------------------------------------------------------------ *
+ * Settings tab                                                        *
+ * ------------------------------------------------------------------ */
+
+/** When a saved setting takes effect. The daemon reads most settings at their
+ *  natural point (a scheduler tick, the next spawn, the next notify call), so
+ *  changes rarely need a restart — but the badge tells the operator exactly
+ *  when to expect each change to bite. */
+type ApplyWhen = "immediate" | "next-spawn" | "restart";
+
+const APPLY_LABEL: Record<ApplyWhen, string> = {
+  immediate: "applies immediately",
+  "next-spawn": "applies to next spawn",
+  restart: "needs daemon restart",
+};
+
+function ApplyBadge({ when }: { when: ApplyWhen }) {
+  return <span className={`apply-badge apply-${when}`}>{APPLY_LABEL[when]}</span>;
+}
+
+function SettingRow({
+  label,
+  when,
+  hint,
+  children,
+}: {
+  label: string;
+  when: ApplyWhen;
+  hint?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="setting-row">
+      <div className="setting-head">
+        <span className="setting-label">{label}</span>
+        <ApplyBadge when={when} />
+      </div>
+      {children}
+      {hint && <span className="setting-hint muted">{hint}</span>}
+    </div>
+  );
+}
+
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+function SchedulerSection({
+  info,
+  onSaved,
+  onError,
+}: {
+  info: SchedulerInfo;
+  onSaved: () => void;
+  onError: (m: string) => void;
+}) {
+  const [draft, setDraft] = useState<SchedulerConfig>(info.config);
+  const [saving, setSaving] = useState(false);
+  const set = <K extends keyof SchedulerConfig>(k: K, v: SchedulerConfig[K]) =>
+    setDraft((d) => ({ ...d, [k]: v }));
+
+  const save = async () => {
+    setSaving(true);
+    onError("");
+    try {
+      await api("PATCH", "/api/scheduler", {
+        max_concurrent: draft.max_concurrent,
+        daily_spawn_limit: draft.daily_spawn_limit,
+        stall_minutes: draft.stall_minutes,
+        active_hours: draft.active_hours,
+        auto_review: draft.auto_review,
+        escalate_minutes: draft.escalate_minutes,
+        reap_after_minutes: draft.reap_after_minutes,
+        attention_stale_minutes: draft.attention_stale_minutes,
+        read_only_extra_allow: draft.read_only_extra_allow,
+      });
+      onSaved();
+    } catch (e) {
+      onError(errMsg(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const hours = draft.active_hours;
+
+  return (
+    <section className="settings-section">
+      <h2>Scheduler</h2>
+      <p className="muted">
+        The autonomous scheduler reads these on every tick, so edits take hold
+        right away. Toggle the master switch from the header ▶/■ control.
+      </p>
+      <div className="settings-grid">
+        <SettingRow label="Max concurrent workers" when="immediate">
+          <input
+            type="number"
+            min={1}
+            max={10}
+            value={draft.max_concurrent}
+            onChange={(e) => set("max_concurrent", Number(e.target.value))}
+          />
+        </SettingRow>
+        <SettingRow label="Daily spawn limit" when="immediate">
+          <input
+            type="number"
+            min={1}
+            max={200}
+            value={draft.daily_spawn_limit}
+            onChange={(e) => set("daily_spawn_limit", Number(e.target.value))}
+          />
+        </SettingRow>
+        <SettingRow
+          label="Stall threshold (min)"
+          when="immediate"
+          hint="No hook event for this long → a working agent is marked stalled."
+        >
+          <input
+            type="number"
+            min={2}
+            max={240}
+            value={draft.stall_minutes}
+            onChange={(e) => set("stall_minutes", Number(e.target.value))}
+          />
+        </SettingRow>
+        <SettingRow label="Escalate to human (min)" when="immediate">
+          <input
+            type="number"
+            min={1}
+            max={120}
+            value={draft.escalate_minutes}
+            onChange={(e) => set("escalate_minutes", Number(e.target.value))}
+          />
+        </SettingRow>
+        <SettingRow
+          label="Reap terminal worker (min)"
+          when="immediate"
+          hint="Idle grace before a done/cancelled worker's window is reaped."
+        >
+          <input
+            type="number"
+            min={1}
+            max={240}
+            value={draft.reap_after_minutes}
+            onChange={(e) => set("reap_after_minutes", Number(e.target.value))}
+          />
+        </SettingRow>
+        <SettingRow label="Attention stale (min)" when="immediate">
+          <input
+            type="number"
+            min={1}
+            max={240}
+            value={draft.attention_stale_minutes}
+            onChange={(e) =>
+              set("attention_stale_minutes", Number(e.target.value))
+            }
+          />
+        </SettingRow>
+      </div>
+
+      <SettingRow label="Auto-review" when="immediate">
+        <label className="setting-check">
+          <input
+            type="checkbox"
+            checked={draft.auto_review}
+            onChange={(e) => set("auto_review", e.target.checked)}
+          />
+          Spawn an adversarial reviewer when a task reaches review
+        </label>
+      </SettingRow>
+
+      <SettingRow
+        label="Active hours"
+        when="immediate"
+        hint="Only auto-spawn inside this local-time window. start > end wraps overnight (e.g. 22 → 6)."
+      >
+        <label className="setting-check">
+          <input
+            type="checkbox"
+            checked={hours !== null}
+            onChange={(e) =>
+              set("active_hours", e.target.checked ? { start: 9, end: 17 } : null)
+            }
+          />
+          Restrict auto-spawn to a time window
+        </label>
+        {hours !== null && (
+          <div className="setting-inline">
+            <span className="muted">from</span>
+            <input
+              type="number"
+              min={0}
+              max={23}
+              value={hours.start}
+              onChange={(e) =>
+                set("active_hours", { ...hours, start: Number(e.target.value) })
+              }
+            />
+            <span className="muted">to</span>
+            <input
+              type="number"
+              min={0}
+              max={23}
+              value={hours.end}
+              onChange={(e) =>
+                set("active_hours", { ...hours, end: Number(e.target.value) })
+              }
+            />
+          </div>
+        )}
+      </SettingRow>
+
+      <SettingRow
+        label="Extra read-only allow patterns"
+        when="next-spawn"
+        hint="One permission pattern per line, appended to worker/reviewer read-only profiles. Never put state-changing patterns here."
+      >
+        <textarea
+          rows={3}
+          value={draft.read_only_extra_allow.join("\n")}
+          onChange={(e) =>
+            set(
+              "read_only_extra_allow",
+              e.target.value
+                .split("\n")
+                .map((s) => s.trim())
+                .filter(Boolean),
+            )
+          }
+        />
+      </SettingRow>
+
+      <div className="settings-actions">
+        <button className="primary" disabled={saving} onClick={save}>
+          {saving ? "saving…" : "save scheduler"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function AgentsSection({
+  settings,
+  onSaved,
+  onError,
+}: {
+  settings: AppSettings;
+  onSaved: () => void;
+  onError: (m: string) => void;
+}) {
+  const { stored, effective } = settings.agents;
+  const [mainModel, setMainModel] = useState(stored.default_main_model ?? "");
+  const [workerProvider, setWorkerProvider] = useState(
+    stored.default_worker_provider ?? "",
+  );
+  const [reviewerProvider, setReviewerProvider] = useState(
+    stored.default_reviewer_provider ?? "",
+  );
+  const [variety, setVariety] = useState(
+    stored.reviewer_variety === null ? "" : String(stored.reviewer_variety),
+  );
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    setSaving(true);
+    onError("");
+    try {
+      await api("PATCH", "/api/settings/agents", {
+        default_main_model: mainModel || null,
+        default_worker_provider: workerProvider || null,
+        default_reviewer_provider: reviewerProvider || null,
+        reviewer_variety: variety === "" ? null : variety === "true",
+      });
+      onSaved();
+    } catch (e) {
+      onError(errMsg(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>Agents</h2>
+      <p className="muted">
+        Defaults for newly spawned agents. Leaving a field on “default” falls
+        back to the env var, then the built-in default (setting &gt; env &gt;
+        default). Live agents are unaffected.
+      </p>
+      <div className="settings-grid">
+        <SettingRow
+          label="Default main-agent model"
+          when="next-spawn"
+          hint={`Overrides CC_MAIN_MODEL at spawnMain time. In use now: ${effective.default_main_model}.`}
+        >
+          <select
+            value={mainModel}
+            onChange={(e) => setMainModel(e.target.value)}
+          >
+            <option value="">default ({effective.default_main_model})</option>
+            {settings.model_choices.map((slug) => (
+              <option key={slug} value={slug}>
+                {slug}
+              </option>
+            ))}
+          </select>
+        </SettingRow>
+
+        <SettingRow
+          label="Default worker provider"
+          when="next-spawn"
+          hint={`Overrides CC_WORKER_PROVIDER. In use now: ${effective.default_worker_provider}.`}
+        >
+          <select
+            value={workerProvider}
+            onChange={(e) => setWorkerProvider(e.target.value)}
+          >
+            <option value="">
+              default ({effective.default_worker_provider})
+            </option>
+            {settings.provider_choices.map((p) => (
+              <option key={p} value={p}>
+                {p}
+              </option>
+            ))}
+          </select>
+        </SettingRow>
+
+        <SettingRow
+          label="Reviewer provider pin"
+          when="next-spawn"
+          hint="Overrides CC_REVIEWER_PROVIDER. “no pin” lets the variety policy (or Claude) decide."
+        >
+          <select
+            value={reviewerProvider}
+            onChange={(e) => setReviewerProvider(e.target.value)}
+          >
+            <option value="">
+              no pin
+              {effective.default_reviewer_provider
+                ? ` (env pins ${effective.default_reviewer_provider})`
+                : ""}
+            </option>
+            {settings.provider_choices.map((p) => (
+              <option key={p} value={p}>
+                {p}
+              </option>
+            ))}
+          </select>
+        </SettingRow>
+
+        <SettingRow
+          label="Cross-model review variety"
+          when="next-spawn"
+          hint={`Reviewer takes the OPPOSITE provider from the worker. Asserts both providers are set up. In use now: ${effective.reviewer_variety ? "on" : "off"}.`}
+        >
+          <select value={variety} onChange={(e) => setVariety(e.target.value)}>
+            <option value="">
+              default ({effective.reviewer_variety ? "on" : "off"})
+            </option>
+            <option value="true">on</option>
+            <option value="false">off</option>
+          </select>
+        </SettingRow>
+      </div>
+      <div className="settings-actions">
+        <button className="primary" disabled={saving} onClick={save}>
+          {saving ? "saving…" : "save agents"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function WorkspaceSection({
+  settings,
+  onSaved,
+  onError,
+}: {
+  settings: AppSettings;
+  onSaved: () => void;
+  onError: (m: string) => void;
+}) {
+  const { stored, effective } = settings.workspace;
+  const [worktreesDir, setWorktreesDir] = useState(stored.worktrees_dir ?? "");
+  const [mainDir, setMainDir] = useState(stored.main_workspace_dir ?? "");
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    setSaving(true);
+    onError("");
+    try {
+      await api("PATCH", "/api/settings/workspace", {
+        worktrees_dir: worktreesDir.trim() || null,
+        main_workspace_dir: mainDir.trim() || null,
+      });
+      onSaved();
+    } catch (e) {
+      onError(errMsg(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>Workspace</h2>
+      <p className="muted">
+        Absolute paths to existing directories; leave blank to use the default.
+        The main-agent cwd is a free choice — no lockdown, no deny-list.
+      </p>
+      <SettingRow
+        label="Worktrees base directory"
+        when="next-spawn"
+        hint={`Where each worker's git worktree is created. In use now: ${effective.worktrees_dir}`}
+      >
+        <input
+          type="text"
+          placeholder={effective.worktrees_dir}
+          value={worktreesDir}
+          onChange={(e) => setWorktreesDir(e.target.value)}
+        />
+      </SettingRow>
+      <SettingRow
+        label="Main agent working directory"
+        when="next-spawn"
+        hint={`The cwd the main orchestrator's terminal opens in. Default is $HOME. In use now: ${effective.main_workspace_dir}`}
+      >
+        <input
+          type="text"
+          placeholder={effective.main_workspace_dir}
+          value={mainDir}
+          onChange={(e) => setMainDir(e.target.value)}
+        />
+      </SettingRow>
+      <div className="settings-actions">
+        <button className="primary" disabled={saving} onClick={save}>
+          {saving ? "saving…" : "save workspace"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function NotificationsSection({
+  settings,
+  onSaved,
+  onError,
+}: {
+  settings: AppSettings;
+  onSaved: () => void;
+  onError: (m: string) => void;
+}) {
+  const { stored, effective, ntfy_token_set } = settings.notifications;
+  const [url, setUrl] = useState(stored.ntfy_url ?? "");
+  const [tokenInput, setTokenInput] = useState("");
+  const [clearToken, setClearToken] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    setSaving(true);
+    onError("");
+    try {
+      const body: Record<string, unknown> = {
+        ntfy_url: url.trim() || null,
+      };
+      // Only touch the token when the operator explicitly set or cleared it —
+      // omitting it leaves the stored secret untouched.
+      if (clearToken) body.ntfy_token = null;
+      else if (tokenInput.trim()) body.ntfy_token = tokenInput;
+      await api("PATCH", "/api/settings/notifications", body);
+      setTokenInput("");
+      setClearToken(false);
+      onSaved();
+    } catch (e) {
+      onError(errMsg(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>Notifications</h2>
+      <p className="muted">
+        Push alerts via ntfy (escalations, pages). Overrides CC_NTFY_URL /
+        CC_NTFY_TOKEN and applies on the next notification.
+      </p>
+      <SettingRow
+        label="ntfy topic URL"
+        when="immediate"
+        hint={
+          effective.ntfy_url
+            ? `In use now: ${effective.ntfy_url}`
+            : "No URL configured — push is disabled."
+        }
+      >
+        <input
+          type="text"
+          placeholder="https://ntfy.sh/your-topic"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+        />
+      </SettingRow>
+      <SettingRow
+        label="ntfy auth token"
+        when="immediate"
+        hint="The stored token is never shown. Type a new value to replace it, or clear it."
+      >
+        <div className="setting-inline">
+          <span className={`chip ${ntfy_token_set ? "approved" : ""}`}>
+            {ntfy_token_set ? "token set" : "token unset"}
+          </span>
+          <input
+            type="password"
+            autoComplete="new-password"
+            placeholder={ntfy_token_set ? "replace token…" : "set token…"}
+            value={clearToken ? "" : tokenInput}
+            disabled={clearToken}
+            onChange={(e) => setTokenInput(e.target.value)}
+          />
+          {ntfy_token_set && (
+            <label className="setting-check">
+              <input
+                type="checkbox"
+                checked={clearToken}
+                onChange={(e) => setClearToken(e.target.checked)}
+              />
+              clear
+            </label>
+          )}
+        </div>
+      </SettingRow>
+      <div className="settings-actions">
+        <button className="primary" disabled={saving} onClick={save}>
+          {saving ? "saving…" : "save notifications"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function SettingsView() {
+  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [scheduler, setScheduler] = useState<SchedulerInfo | null>(null);
+  const [error, setError] = useState<string>("");
+  const [loaded, setLoaded] = useState(false);
+
+  const load = useCallback(() => {
+    setError("");
+    void Promise.all([
+      api<AppSettings>("GET", "/api/settings"),
+      api<SchedulerInfo>("GET", "/api/scheduler"),
+    ])
+      .then(([s, sched]) => {
+        setSettings(s);
+        setScheduler(sched);
+      })
+      .catch((e) => setError(errMsg(e)))
+      .finally(() => setLoaded(true));
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  return (
+    <main className="settings-view">
+      {error && <div className="error">{error}</div>}
+      {!loaded && !error && <span className="muted">loading settings…</span>}
+      {scheduler && (
+        // key on the fetched config so a save+refetch re-seeds each section's
+        // local draft from the server's canonical values.
+        <SchedulerSection
+          key={JSON.stringify(scheduler.config)}
+          info={scheduler}
+          onSaved={load}
+          onError={setError}
+        />
+      )}
+      {settings && (
+        <>
+          <AgentsSection
+            key={`a${JSON.stringify(settings.agents.stored)}`}
+            settings={settings}
+            onSaved={load}
+            onError={setError}
+          />
+          <WorkspaceSection
+            key={`w${JSON.stringify(settings.workspace.stored)}`}
+            settings={settings}
+            onSaved={load}
+            onError={setError}
+          />
+          <NotificationsSection
+            key={`n${JSON.stringify(settings.notifications)}`}
+            settings={settings}
+            onSaved={load}
+            onError={setError}
+          />
+        </>
+      )}
+    </main>
+  );
 }
 
 /**

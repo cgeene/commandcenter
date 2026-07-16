@@ -42,6 +42,12 @@ const CLAUDE_MODELS: ProviderModel[] = [
   },
 ];
 
+/** Slugs of the built-in Claude catalog — the allow-list the Settings API
+ *  validates a chosen default main-agent model against. */
+export const CLAUDE_MODEL_SLUGS: readonly string[] = CLAUDE_MODELS.map(
+  (m) => m.slug,
+);
+
 let codexCache: { expires: number; models: ProviderModel[] } | undefined;
 
 /** Parse only visible, bounded catalog fields; never relay model instructions
