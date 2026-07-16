@@ -49,8 +49,9 @@ Attach to an agent's tmux window interactively (detach with `Ctrl-b d`). Uses
 
 ## `agp main`
 
-Spawn the Claude orchestrator main agent. `-m/--model` (default `fable`, or
-`CC_MAIN_MODEL`). One live main agent at a time. Dashboard/CLI/MCP task creation
+Spawn the Claude orchestrator main agent. `-m/--model` (default `opus`, or
+`CC_MAIN_MODEL`; Fable is an opt-in via `CC_MAIN_MODEL=fable` / `--model fable`,
+see PR #31). One live main agent at a time. Dashboard/CLI/MCP task creation
 uses an explicit workspace and is delivered here before any worker is spawned.
 
 ## `agp scheduler` — autonomous control
