@@ -224,7 +224,8 @@ export function buildApp(): Hono {
     const lines = Number(c.req.query("lines") ?? 60);
     return c.json({
       target: agent.tmux_target,
-      ...parsePane(capturePane(agent.tmux_target, lines)),
+      // Styled capture so the parser can drop dim ghost-text suggestions.
+      ...parsePane(capturePane(agent.tmux_target, lines, { escapes: true })),
     });
   });
 
