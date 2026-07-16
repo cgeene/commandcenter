@@ -596,7 +596,9 @@ export function buildApp(): Hono {
       return c.json({ error: "no live tmux window" }, 409);
     }
     const lines = Number(c.req.query("lines") ?? 60);
-    const raw = capturePane(agent.tmux_target, lines);
+    // Styled capture so the parser can drop dim ghost-text (Claude) / rotating
+    // suggestions (Codex); provider selects the right parsing path.
+    const raw = capturePane(agent.tmux_target, lines, { escapes: true });
     return c.json({ target: agent.tmux_target, ...parsePane(raw, agent.provider) });
   });
 

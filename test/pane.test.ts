@@ -322,6 +322,111 @@ describe("parsePane", () => {
 });
 
 /**
+ * The fixtures below reproduce, byte for byte, what `tmux capture-pane -e`
+ * returns for a Claude Code (v2.1.209) composer captured live from real
+ * daemon workers on 2026-07-14. That version frames the composer between two
+ * full-width `─` rules with a bare "❯" input line — no side box — and paints
+ * its ghost-text prompt suggestions dim (SGR 2) while real typed input stays
+ * default-styled. Escape/NBSP bytes are assembled from char codes at runtime
+ * so the source file itself holds no raw control bytes.
+ *
+ * Captured samples the constants below mirror exactly:
+ *   ghost: "\x1b[39m❯\xa0\x1b[2mping @caleb on PR #16 …\x1b[0m"
+ *   real:  "\x1b[39m❯\xa0please double check with the security team first"
+ *   empty: "\x1b[39m❯\xa0"
+ *   rule:  "\x1b[38;5;244m────…" (U+2500)
+ */
+const NBSP = String.fromCharCode(0xa0);
+const DIM = `${ESC}[2m`; // SGR 2 — ghost text
+const RESET = `${ESC}[0m`;
+const DEFFG = `${ESC}[39m`; // default foreground — real input
+const RULE = `${ESC}[38;5;244m${"─".repeat(100)}`;
+
+/** Build a rule-framed styled composer capture around one "❯" marker line. */
+function composer(markerLine: string, continuation: string[] = []): string {
+  return [
+    "⏺ Anything else before I merge?",
+    "",
+    RULE,
+    markerLine,
+    ...continuation,
+    RULE,
+    "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents",
+  ].join("\n");
+}
+
+describe("parsePane — ghost-text vs real input in the rule-framed composer", () => {
+  it("(a) treats a dim ghost-text suggestion as NOT unsubmitted input", () => {
+    const parsed = parsePane(
+      composer(`${DEFFG}❯${NBSP}${DIM}ping @caleb on PR #16 for the neutral-root name${RESET}`),
+    );
+    expect(parsed.unsubmitted_input).toBeNull();
+  });
+
+  it("(b) treats default-styled typed text as unsubmitted input (anti-clobber)", () => {
+    const parsed = parsePane(
+      composer(`${DEFFG}❯${NBSP}please double check with the security team first`),
+    );
+    expect(parsed.unsubmitted_input).toBe(
+      "please double check with the security team first",
+    );
+  });
+
+  it("(c) keeps only the real part when a ghost continuation trails real text", () => {
+    const parsed = parsePane(
+      composer(`${DEFFG}❯${NBSP}wait for me${DIM} to confirm the rollout first${RESET}`),
+    );
+    expect(parsed.unsubmitted_input).toBe("wait for me");
+  });
+
+  it("(d) reports null for an empty composer", () => {
+    const parsed = parsePane(composer(`${DEFFG}❯${NBSP}`));
+    expect(parsed.unsubmitted_input).toBeNull();
+  });
+
+  it("(coexist) ghost-text stripping (Claude) and Codex menu parsing survive together", () => {
+    // Claude path: a dim ghost-text suggestion is not treated as a human draft
+    // (the mid-draft delegation gate depends on this).
+    const claude = parsePane(
+      composer(`${DEFFG}❯${NBSP}${DIM}ping @caleb before merging${RESET}`),
+      "claude",
+    );
+    expect(claude.unsubmitted_input).toBeNull();
+    expect(claude.pending_permission).toBeNull();
+
+    // Codex path: the plain selection menu still parses under the same
+    // (post-#30) parser, so cross-provider parsing coexists.
+    const codex = parsePane(
+      [
+        "Allow running this command?",
+        "",
+        "› 1. Yes",
+        "  2. No",
+        "",
+        "Press enter to confirm or esc to go back",
+      ].join("\n"),
+      "codex",
+    );
+    expect(codex.pending_permission?.options).toEqual([
+      { n: 1, label: "Yes" },
+      { n: 2, label: "No" },
+    ]);
+  });
+
+  it("keeps real typed text that wraps across two physical lines", () => {
+    const parsed = parsePane(
+      composer(`${DEFFG}❯${NBSP}this is a very long line of typed but unsubmitted`, [
+        `${DEFFG}  text that keeps going onto a second physical line`,
+      ]),
+    );
+    expect(parsed.unsubmitted_input).toBe(
+      "this is a very long line of typed but unsubmitted " +
+        "text that keeps going onto a second physical line",
+    );
+  });
+});
+
+/**
  * Fixtures above spell out box-drawing chars as readable placeholder tokens
  * (CORNER_TL, PIPE, CURSOR, …) so they're easy to eyeball and diff — this
  * swaps them for the real Unicode glyphs Claude Code's TUI renders before
