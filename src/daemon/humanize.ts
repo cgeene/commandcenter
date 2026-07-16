@@ -52,6 +52,10 @@ const TEMPLATES: Record<string, Template> = {
     `Requeued ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
   "task.autocompleted": (e, p) =>
     `Auto-completed ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
+  "task.recovered": (e) => `Recovered ${taskRef(e)} after a false window-loss signal`,
+  "task.awaiting_main": (e) => `${taskRef(e)} is waiting for Claude main to triage it`,
+  "task.delegated_to_main": (e) => `Sent ${taskRef(e)} to Claude main for triage`,
+  "task.delegation_failed": () => `Main-agent task delivery will be retried`,
 
   // --- review ---
   "review.approved": (e, p) =>
@@ -98,6 +102,11 @@ const TEMPLATES: Record<string, Template> = {
   "agent.reaped": (e, p) =>
     `Reaped ${worker(e)} — ${taskRef(e)} finished${p.task_status ? ` (${str(p.task_status)})` : ""}, freeing its slot`,
   "agent.vanished": (e) => `${worker(e)} vanished`,
+  "agent.window_missing": (e) =>
+    `${agentRef(e)} window missing once — awaiting confirmation`,
+  "agent.recovered": (e) => `${agentRef(e)} recovered while its process was still live`,
+  "agent.startup_permission": (e, p) =>
+    `${agentRef(e)} needs ${p.trust ? "one-time trust review" : "startup approval"}`,
   "agent.sent": (e) => `Sent input to ${worker(e)}`,
   "agent.send_failed": (e) => `Failed to send input to ${worker(e)}`,
   "agent.input_submitted": (e) => `Submitted ${worker(e)}'s pending input`,
@@ -127,6 +136,9 @@ const TEMPLATES: Record<string, Template> = {
     const max = Number(p.max_concurrent) || 0;
     return `Scheduler stalled — ${live}/${max} worker slots taken while tasks wait`;
   },
+  "scratch.pruned": (_e, p) =>
+    `Removed ${str(p.count) || "expired"} expired scratch workspace${Number(p.count) === 1 ? "" : "s"}`,
+  "scratch.prune_failed": () => `Scratch workspace retention cleanup failed`,
   "cron.fired": (e, p) =>
     `Ran cron ${str(p.name) || `#${str(p.cron_id)}`} → ${taskRef(e)}`,
   "cron.skipped": (e, p) =>
@@ -158,6 +170,8 @@ const TEMPLATES: Record<string, Template> = {
   "main.escalated": (_e, p) => `Main agent escalated: ${clip(p.title, 80)}`,
   "attention.dismissed": () => `Dismissed a "needs you" item`,
   "scheduler.config": () => `Scheduler settings changed`,
+  "watchdog.tmux_unavailable": () => `tmux health observation unavailable — no agents changed`,
+  "watchdog.tmux_recovered": () => `tmux health observation recovered`,
   "daemon.stale": () => `Daemon is running stale code`,
 };
 

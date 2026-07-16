@@ -2,13 +2,20 @@
  * Parse a tmux pane tail into the structured shape the dashboard needs to
  * show a waiting_input agent's prompt without opening its terminal.
  *
- * Claude Code's TUI renders tool-permission prompts and the input line
+ * Claude Code and Codex render tool-permission prompts and the input line
  * inside fixed-width boxes bordered with a pipe character on both sides of
  * every content row and rounded-corner caps top/bottom. That border is the
  * load-bearing signal here: it's what lets a genuine permission menu be told
  * apart from a worker's assistant text merely *quoting* one in prose (plain
  * text has no border, so it can't match).
+ *
+ * Current Codex renders its menus without a box. For that provider we require
+ * both its `› N.` cursor row and its nearby "Press enter to confirm" footer;
+ * the pair is the equivalent load-bearing signal and avoids treating quoted
+ * option text as a live prompt.
  */
+
+import type { AgentProvider } from "../providers.js";
 
 // Built via RegExp() from \u-escapes (rather than a literal regex) so the
 // source file never contains a raw ESC/BEL byte.
@@ -83,6 +90,11 @@ const MENU_CURSOR_RE = /^❯\s*\d{1,2}[.)]\s+\S/;
 // The input-line prompt marker, with whatever's been typed (if anything).
 const INPUT_LINE_RE = /^❯\s?(.*)$/;
 const CHROME_RE = /^(esc to interrupt|\? for shortcuts|ctrl-c to exit)/i;
+const CODEX_CURSOR_RE = /^[›❯]\s*(\d{1,2})[.)]\s+(.*)$/;
+const CODEX_OPTION_RE = /^(?:[›❯]\s*)?(\d{1,2})[.)]\s+(.*)$/;
+const PLAIN_CONFIRM_RE =
+  /(?:press )?enter to (?:confirm|continue)\b|esc to cancel.*(?:tab to amend|ctrl\+e to explain)/i;
+const CODEX_INPUT_RE = /^[›❯](?:\s(.*))?$/;
 
 interface Unwrapped {
   bordered: boolean;
@@ -129,6 +141,44 @@ function parsePermission(lines: string[]): PendingPermission | null {
   }
 
   return options.length > 0 ? { question, options } : null;
+}
+
+function parsePlainPermission(lines: string[]): PendingPermission | null {
+  const trimmed = lines.map((line) => line.trim());
+  const optStart = trimmed.findIndex((line) => CODEX_CURSOR_RE.test(line));
+  if (optStart === -1) return null;
+
+  // A cursor-shaped line can appear in quoted prose. Codex's real selection
+  // screen also carries this footer, so require it close to the options.
+  if (!trimmed.slice(optStart + 1, optStart + 16).some((line) => PLAIN_CONFIRM_RE.test(line))) {
+    return null;
+  }
+
+  const options: PaneOption[] = [];
+  for (let i = optStart; i < trimmed.length; i++) {
+    const line = trimmed[i];
+    if (!line || PLAIN_CONFIRM_RE.test(line)) break;
+    const match = CODEX_OPTION_RE.exec(line);
+    if (match) {
+      options.push({ n: Number(match[1]), label: match[2].trim() });
+    } else if (options.length > 0) {
+      options[options.length - 1].label += ` ${line}`;
+    } else {
+      break;
+    }
+  }
+  if (options.length === 0) return null;
+
+  // Codex normally separates the explanatory question from the options by a
+  // blank line. Walk to the closest non-empty block rather than requiring it
+  // to be directly adjacent.
+  let i = optStart - 1;
+  while (i >= 0 && trimmed[i] === "") i--;
+  const questionLines: string[] = [];
+  for (; i >= 0 && trimmed[i] !== "" && questionLines.length < 8; i--) {
+    questionLines.unshift(trimmed[i].replace(/^[•■⚠]\s*/, ""));
+  }
+  return { question: questionLines.join(" "), options };
 }
 
 // A full-width horizontal rule (U+2500). Current Claude Code versions frame
@@ -222,6 +272,47 @@ function parseBoxComposer(lines: string[]): string | null {
   return parts.length > 0 ? parts.join(" ") : null;
 }
 
+function findCodexInput(
+  lines: string[],
+  ansiLines: string[],
+): { index: number; text: string } | null {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const match = CODEX_INPUT_RE.exec(lines[i].trim());
+    if (!match || /^\d{1,2}[.)]\s/.test(match[1] ?? "")) continue;
+    const marker = ansiLines[i]?.search(/[›❯]/) ?? -1;
+    const styledInput = marker >= 0 ? ansiLines[i].slice(marker + 1) : "";
+    // Codex's rotating suggestions are dim (`SGR 2`) after the prompt marker;
+    // they are placeholders, not text waiting to be submitted.
+    const text = /\u001b\[2m/.test(styledInput) ? "" : (match[1] ?? "").trim();
+    return { index: i, text };
+  }
+  return null;
+}
+
+function parseCodexQuestion(lines: string[], inputIndex: number): string | null {
+  let i = inputIndex - 1;
+  while (i >= 0 && lines[i].trim() === "") i--;
+  const nearest = lines[i]?.trim().replace(/^[•■⚠◦]\s*/, "") ?? "";
+  if (/^(?:Working|Worked for)\b/i.test(nearest)) return null;
+  const collected: string[] = [];
+  for (; i >= 0 && collected.length < 20; i--) {
+    const text = lines[i].trim();
+    if (!text || CHROME_RE.test(text) || PLAIN_CONFIRM_RE.test(text)) {
+      if (collected.length > 0) break;
+      continue;
+    }
+    // Status/footer chrome is below the input in normal panes, but ignore it
+    // defensively if a narrow terminal has caused an unusual redraw.
+    const normalized = text.replace(/^[•■⚠◦]\s*/, "");
+    if (/^(?:gpt-|model:|directory:|tokens?\b|Working\b|Worked for\b)/i.test(normalized)) {
+      continue;
+    }
+    collected.unshift(normalized);
+  }
+  const question = collected.join("\n").trim();
+  return question || null;
+}
+
 /** The agent's last assistant text before the (empty or not) input box. */
 function parseQuestion(lines: string[]): string | null {
   let boxTop = -1;
@@ -246,21 +337,37 @@ function parseQuestion(lines: string[]): string | null {
   return question.length > 0 ? question : null;
 }
 
-export function parsePane(rawTail: string): ParsedPane {
+export function parsePane(
+  rawTail: string,
+  provider: AgentProvider = "claude",
+): ParsedPane {
   // `rawTail` may or may not carry ANSI escapes: the pane parser is fed a
-  // `capture-pane -e` (styled) capture so ghost text can be told from real
-  // input, but plain captures (and test fixtures) still work — stripAnsi and
-  // the dim check both no-op on escape-free text.
-  const styledLines = rawTail.replace(/\r/g, "").split("\n");
+  // `capture-pane -e` (styled) capture so Claude ghost text can be told from
+  // real input (see visibleNonGhost), but plain captures (and test fixtures)
+  // still work — stripAnsi and the dim check both no-op on escape-free text.
   const clean = stripAnsi(rawTail).replace(/\r/g, "");
   const raw = clean.length > MAX_RAW_CHARS ? clean.slice(-MAX_RAW_CHARS) : clean;
   const lines = clean.split("\n");
+  const ansiLines = rawTail.replace(/\r/g, "").split("\n");
 
-  const pending_permission = parsePermission(lines);
+  const pending_permission =
+    provider === "codex"
+      ? parsePlainPermission(lines)
+      : parsePermission(lines) ?? parsePlainPermission(lines);
+  const codexInput = provider === "codex" ? findCodexInput(lines, ansiLines) : null;
+  // Claude: reject dim ghost-text suggestions (styled lines) so an idle
+  // composer's autosuggestion is not mistaken for real typed input (#30).
+  // Codex: its own input scan already distinguishes real input.
   const unsubmitted_input = pending_permission
     ? null
-    : parseUnsubmittedInput(styledLines, lines);
-  const pending_question = pending_permission ? null : parseQuestion(lines);
+    : provider === "codex"
+      ? codexInput?.text || null
+      : parseUnsubmittedInput(ansiLines, lines);
+  const pending_question = pending_permission
+    ? null
+    : provider === "codex" && codexInput
+      ? parseCodexQuestion(lines, codexInput.index)
+      : parseQuestion(lines);
 
   return { pending_permission, pending_question, unsubmitted_input, raw };
 }

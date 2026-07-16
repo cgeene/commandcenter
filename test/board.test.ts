@@ -40,6 +40,19 @@ describe("groupByProject", () => {
     expect(uk.done).toBe(1);
     expect(uk.total).toBe(2);
   });
+
+  it("groups portfolio and scratch tasks by their semantic workspace", () => {
+    const groups = groupByProject([
+      t({ id: 1, repo: "/repos", workspace_kind: "portfolio" }),
+      t({ id: 2, repo: "/scratch/task-ABC123", workspace_kind: "scratch" }),
+      t({ id: 3, repo: "/scratch/task-XYZ789", workspace_kind: "scratch" }),
+    ]);
+    expect(groups.map((group) => group.project)).toEqual([
+      "all repositories",
+      "investigations",
+    ]);
+    expect(groups[1].tasks.map((task) => task.id)).toEqual([2, 3]);
+  });
 });
 
 describe("isArchived / isActive", () => {

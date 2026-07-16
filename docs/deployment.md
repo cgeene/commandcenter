@@ -39,9 +39,10 @@ bracketed values:
 
 - `[YOU]` — your macOS username
 - `[/ABSOLUTE/PATH/TO/commandcenter]` — the repo checkout
-- the `PATH` entry must include the directories holding `node`, `claude`, `gh`,
-  `tmux`, and `git` — launchd starts with a minimal `PATH`, so agents will fail
-  to find these tools unless you spell it out (check with `which node claude gh tmux git`).
+- the `PATH` entry must include the directories holding `node`, `claude`,
+  `codex`, `gh`, `tmux`, and `git` — launchd starts with a minimal `PATH`, so
+  agents will fail to find these tools unless you spell it out (check with
+  `which node claude codex gh tmux git`).
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -67,6 +68,9 @@ bracketed values:
     <string>/opt/homebrew/bin:/usr/local/bin:/Users/[YOU]/.local/bin:/usr/bin:/bin</string>
     <!-- optional overrides:
     <key>CC_NTFY_URL</key><string>https://ntfy.sh/your-secret-topic</string>
+    <key>CC_WORKER_PROVIDER</key><string>codex</string>
+    <key>CC_REPO_ROOTS</key><string>/Users/[YOU]/Documents/git</string>
+    <key>CC_CODEX_MCP_SOURCE_HOME</key><string>/Users/[YOU]/.codex</string>
     -->
   </dict>
 
@@ -85,6 +89,21 @@ bracketed values:
 
 > `/usr/local/bin/node` is the Intel-Homebrew / nodejs.org path; on Apple Silicon
 > Homebrew it's `/opt/homebrew/bin/node`. Use the output of `which node`.
+
+`CC_CODEX_MCP_SOURCE_HOME` is optional. When set, Codex workers inherit explicit
+MCP tables; plugin-provided MCPs are converted to isolated MCP transport entries
+without enabling the source plugins. Auth, sessions, history, hooks, plugin
+skills/apps, and trust state remain under `$CC_DATA_DIR/codex`. Every
+environment variable referenced by an enabled inherited MCP must also be
+present in the daemon environment. Supply those through a credential manager
+or a protected launcher rather than writing tokens directly into this plist.
+Without this setting, Codex workers receive only Command Center's `cc` MCP.
+
+`CC_REPO_ROOTS` enables the dashboard repository picker and constrains explicit
+interactive tasks to canonical Git roots beneath the configured directory. For
+multiple roots, separate paths with `:` on macOS/Linux. The broad root is used
+only for read-only discovery and portfolio planning; write-capable workers
+receive one selected repository worktree, never the root itself.
 
 ### 3. Load it
 

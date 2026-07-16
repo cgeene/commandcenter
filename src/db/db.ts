@@ -37,14 +37,20 @@ CREATE TABLE IF NOT EXISTS tasks (
   title          TEXT NOT NULL,
   prompt         TEXT NOT NULL,
   repo           TEXT NOT NULL,
+  workspace_kind TEXT NOT NULL DEFAULT 'repo',
+  dispatch_mode  TEXT NOT NULL DEFAULT 'direct',
+  parent_task_id INTEGER REFERENCES tasks(id),
   status         TEXT NOT NULL DEFAULT 'queued',
   priority       INTEGER NOT NULL DEFAULT 2,
+  worker_provider TEXT NOT NULL DEFAULT 'claude',
   model          TEXT,
+  reasoning_effort TEXT,
   blocked_by     INTEGER REFERENCES tasks(id),
   agent_id       INTEGER,
   worktree       TEXT,
   branch         TEXT,
   session_id     TEXT,
+  session_provider TEXT,
   verify_cmd     TEXT,
   result_summary TEXT,
   review_verdict TEXT,
@@ -67,11 +73,15 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS agents (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   kind          TEXT NOT NULL DEFAULT 'worker',
+  provider      TEXT NOT NULL DEFAULT 'claude',
   model         TEXT,
+  reasoning_effort TEXT,
   state         TEXT NOT NULL DEFAULT 'spawning',
   task_id       INTEGER REFERENCES tasks(id),
   tmux_target   TEXT,
   session_id    TEXT,
+  transcript_path TEXT,
+  runtime_config_path TEXT,
   last_event_at TEXT,
   spawned_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -157,7 +167,9 @@ CREATE TABLE IF NOT EXISTS crons (
   title       TEXT NOT NULL,
   prompt      TEXT NOT NULL,
   repo        TEXT NOT NULL,
+  worker_provider TEXT NOT NULL DEFAULT 'claude',
   model       TEXT,
+  reasoning_effort TEXT,
   priority    INTEGER NOT NULL DEFAULT 2,
   verify_cmd  TEXT,
   enabled     INTEGER NOT NULL DEFAULT 1,
@@ -230,6 +242,51 @@ function migrate(db: Database.Database): void {
   // trigger (see prsync.applyPrState).
   if (!cols.includes("human_approved_at")) {
     db.exec("ALTER TABLE tasks ADD COLUMN human_approved_at TEXT");
+  }
+  if (!cols.includes("worker_provider")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN worker_provider TEXT NOT NULL DEFAULT 'claude'");
+  }
+  if (!cols.includes("session_provider")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN session_provider TEXT");
+  }
+  if (!cols.includes("reasoning_effort")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN reasoning_effort TEXT");
+  }
+  if (!cols.includes("workspace_kind")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN workspace_kind TEXT NOT NULL DEFAULT 'repo'");
+  }
+  if (!cols.includes("dispatch_mode")) {
+    // Existing queued tasks retain the historical direct-scheduler behavior.
+    db.exec("ALTER TABLE tasks ADD COLUMN dispatch_mode TEXT NOT NULL DEFAULT 'direct'");
+  }
+  if (!cols.includes("parent_task_id")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN parent_task_id INTEGER REFERENCES tasks(id)");
+  }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_dispatch ON tasks(dispatch_mode, status)");
+  const agentCols = (db.prepare("PRAGMA table_info(agents)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!agentCols.includes("provider")) {
+    db.exec("ALTER TABLE agents ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'");
+  }
+  if (!agentCols.includes("transcript_path")) {
+    db.exec("ALTER TABLE agents ADD COLUMN transcript_path TEXT");
+  }
+  if (!agentCols.includes("runtime_config_path")) {
+    db.exec("ALTER TABLE agents ADD COLUMN runtime_config_path TEXT");
+  }
+  if (!agentCols.includes("reasoning_effort")) {
+    db.exec("ALTER TABLE agents ADD COLUMN reasoning_effort TEXT");
+  }
+  const cronCols = (db.prepare("PRAGMA table_info(crons)").all() as { name: string }[]).map(
+    (c) => c.name,
+  );
+  if (!cronCols.includes("worker_provider")) {
+    db.exec("ALTER TABLE crons ADD COLUMN worker_provider TEXT NOT NULL DEFAULT 'claude'");
+  }
+  if (!cronCols.includes("reasoning_effort")) {
+    db.exec("ALTER TABLE crons ADD COLUMN reasoning_effort TEXT");
   }
   const memCols = (db.prepare("PRAGMA table_info(memories)").all() as { name: string }[]).map(
     (c) => c.name,

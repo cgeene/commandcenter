@@ -1,18 +1,34 @@
 import { getDb, type TaskStatus, TASK_STATUSES } from "./db.js";
+import { parseAgentProvider, type AgentProvider } from "../providers.js";
+import {
+  reasoningEffortForProvider,
+  type ReasoningEffort,
+} from "../reasoning.js";
+
+export const WORKSPACE_KINDS = ["repo", "portfolio", "scratch"] as const;
+export type WorkspaceKind = (typeof WORKSPACE_KINDS)[number];
+export const DISPATCH_MODES = ["direct", "orchestrated"] as const;
+export type DispatchMode = (typeof DISPATCH_MODES)[number];
 
 export interface Task {
   id: number;
   title: string;
   prompt: string;
   repo: string;
+  workspace_kind: WorkspaceKind;
+  dispatch_mode: DispatchMode;
+  parent_task_id: number | null;
   status: TaskStatus;
   priority: number;
+  worker_provider: AgentProvider;
   model: string | null;
+  reasoning_effort: ReasoningEffort | null;
   blocked_by: number | null;
   agent_id: number | null;
   worktree: string | null;
   branch: string | null;
   session_id: string | null;
+  session_provider: AgentProvider | null;
   verify_cmd: string | null;
   result_summary: string | null;
   review_verdict: string | null;
@@ -37,8 +53,13 @@ export interface NewTask {
   title: string;
   prompt: string;
   repo: string;
+  workspace_kind?: WorkspaceKind;
+  dispatch_mode?: DispatchMode;
+  parent_task_id?: number;
   priority?: number;
+  worker_provider?: AgentProvider;
   model?: string;
+  reasoning_effort?: ReasoningEffort;
   blocked_by?: number;
   verify_cmd?: string;
   cron_id?: number;
@@ -47,17 +68,23 @@ export interface NewTask {
 
 export function createTask(t: NewTask): Task {
   const db = getDb();
+  const workerProvider = parseAgentProvider(t.worker_provider, "claude");
   const info = db
     .prepare(
-      `INSERT INTO tasks (title, prompt, repo, priority, model, blocked_by, verify_cmd, cron_id, open_pr)
-       VALUES (@title, @prompt, @repo, @priority, @model, @blocked_by, @verify_cmd, @cron_id, @open_pr)`,
+      `INSERT INTO tasks (title, prompt, repo, workspace_kind, dispatch_mode, parent_task_id, priority, worker_provider, model, reasoning_effort, blocked_by, verify_cmd, cron_id, open_pr)
+       VALUES (@title, @prompt, @repo, @workspace_kind, @dispatch_mode, @parent_task_id, @priority, @worker_provider, @model, @reasoning_effort, @blocked_by, @verify_cmd, @cron_id, @open_pr)`,
     )
     .run({
       title: t.title,
       prompt: t.prompt,
       repo: t.repo,
+      workspace_kind: t.workspace_kind ?? "repo",
+      dispatch_mode: t.dispatch_mode ?? "direct",
+      parent_task_id: t.parent_task_id ?? null,
       priority: t.priority ?? 2,
+      worker_provider: workerProvider,
       model: t.model ?? null,
+      reasoning_effort: reasoningEffortForProvider(workerProvider, t.reasoning_effort),
       blocked_by: t.blocked_by ?? null,
       verify_cmd: t.verify_cmd ?? null,
       cron_id: t.cron_id ?? null,
@@ -94,15 +121,22 @@ export function listTasks(status?: TaskStatus): Task[] {
 }
 
 /** Tasks that are queued and whose blocker (if any) is done. */
-export function readyTasks(): Task[] {
+export function readyTasks(dispatchMode?: DispatchMode): Task[] {
   return getDb()
     .prepare(
       `SELECT t.* FROM tasks t
        LEFT JOIN tasks b ON t.blocked_by = b.id
        WHERE t.status = 'queued' AND (t.blocked_by IS NULL OR b.status = 'done')
+         AND (@dispatch_mode IS NULL OR t.dispatch_mode = @dispatch_mode)
        ORDER BY t.priority ASC, t.id ASC`,
     )
-    .all() as Task[];
+    .all({ dispatch_mode: dispatchMode ?? null }) as Task[];
+}
+
+export function childTasks(parentTaskId: number): Task[] {
+  return getDb()
+    .prepare("SELECT * FROM tasks WHERE parent_task_id = ? ORDER BY priority ASC, id ASC")
+    .all(parentTaskId) as Task[];
 }
 
 /**
@@ -158,14 +192,18 @@ export function claimTask(id: number, agentId?: number): Task | undefined {
 const UPDATABLE = new Set([
   "title",
   "prompt",
+  "repo",
   "status",
   "priority",
+  "worker_provider",
   "model",
+  "reasoning_effort",
   "blocked_by",
   "agent_id",
   "worktree",
   "branch",
   "session_id",
+  "session_provider",
   "verify_cmd",
   "result_summary",
   "review_verdict",
@@ -181,6 +219,9 @@ const UPDATABLE = new Set([
   "pr_sync_fails",
   "open_pr",
   "tokens_used",
+  "workspace_kind",
+  "dispatch_mode",
+  "parent_task_id",
 ]);
 
 export function updateTask(
@@ -191,6 +232,24 @@ export function updateTask(
   if (keys.length === 0) return getTask(id);
   if (fields.status && !TASK_STATUSES.includes(fields.status)) {
     throw new Error(`invalid status: ${fields.status}`);
+  }
+  if (fields.worker_provider !== undefined) {
+    parseAgentProvider(fields.worker_provider);
+  }
+  if (fields.session_provider !== undefined && fields.session_provider !== null) {
+    parseAgentProvider(fields.session_provider);
+  }
+  if (
+    fields.workspace_kind !== undefined &&
+    !WORKSPACE_KINDS.includes(fields.workspace_kind)
+  ) {
+    throw new Error(`invalid workspace kind: ${fields.workspace_kind}`);
+  }
+  if (
+    fields.dispatch_mode !== undefined &&
+    !DISPATCH_MODES.includes(fields.dispatch_mode)
+  ) {
+    throw new Error(`invalid dispatch mode: ${fields.dispatch_mode}`);
   }
   const sets = keys.map((k) => `${k} = @${k}`).join(", ");
   getDb()

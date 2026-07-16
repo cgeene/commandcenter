@@ -35,6 +35,13 @@ header h1 { font-size: 16px; font-weight: 600; }
 .spacer { flex: 1; }
 .muted { color: var(--muted); font-size: 12px; }
 
+.main-spawn { display: flex; align-items: center; gap: 6px; }
+.main-spawn select, .main-spawn input {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 7px; font-size: 12px; max-width: 260px;
+}
+.main-spawn input { width: 150px; }
+
 button {
   background: #21262d; color: var(--fg); border: 1px solid var(--border);
   border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer;
@@ -299,6 +306,17 @@ dd { word-break: break-all; }
   font-family: inherit;
 }
 .modal .row { display: flex; gap: 10px; }
+.workspace-picker {
+  display: flex; flex-direction: column; gap: 8px; padding: 10px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+}
+.workspace-picker label { display: flex; flex-direction: column; gap: 4px; }
+.workspace-picker label > span {
+  color: var(--muted); font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.workspace-help { color: var(--muted); font-size: 12px; line-height: 1.4; }
+.workspace-error { color: var(--red); font-size: 12px; }
 
 @media (max-width: 700px) {
   .events { display: none; }

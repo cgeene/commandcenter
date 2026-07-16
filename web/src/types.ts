@@ -8,19 +8,37 @@ export type TaskStatus =
   | "failed"
   | "cancelled";
 
+export type AgentProvider = "claude" | "codex";
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export type WorkspaceKind = "repo" | "portfolio" | "scratch";
+export type DispatchMode = "direct" | "orchestrated";
+
+export interface ProviderModel {
+  slug: string;
+  display_name: string;
+  description: string;
+  reasoning_levels: Array<{ effort: ReasoningEffort; description: string }>;
+}
+
 export interface Task {
   id: number;
   title: string;
   prompt: string;
   repo: string;
+  workspace_kind: WorkspaceKind;
+  dispatch_mode: DispatchMode;
+  parent_task_id: number | null;
   status: TaskStatus;
   priority: number;
+  worker_provider: AgentProvider;
   model: string | null;
+  reasoning_effort: ReasoningEffort | null;
   blocked_by: number | null;
   agent_id: number | null;
   worktree: string | null;
   branch: string | null;
   session_id: string | null;
+  session_provider: AgentProvider | null;
   verify_cmd: string | null;
   result_summary: string | null;
   review_verdict: string | null;
@@ -42,11 +60,15 @@ export interface Task {
 export interface Agent {
   id: number;
   kind: "main" | "worker" | "reviewer";
+  provider: AgentProvider;
   model: string | null;
+  reasoning_effort: ReasoningEffort | null;
   state: string;
   task_id: number | null;
   tmux_target: string | null;
   session_id: string | null;
+  transcript_path: string | null;
+  runtime_config_path: string | null;
   last_event_at: string | null;
   spawned_at: string;
 }
@@ -106,7 +128,9 @@ export interface CronJob {
   title: string;
   prompt: string;
   repo: string;
+  worker_provider: AgentProvider;
   model: string | null;
+  reasoning_effort: ReasoningEffort | null;
   priority: number;
   verify_cmd: string | null;
   enabled: number;
@@ -120,7 +144,19 @@ export type AttentionKind =
   | "decision"
   | "escalation"
   | "stale_waiting"
-  | "scheduler_stalled";
+  | "scheduler_stalled"
+  | "orchestration";
+
+export interface WorkspaceCatalog {
+  roots: Array<{ path: string; label: string }>;
+  repositories: Array<{
+    path: string;
+    name: string;
+    relative_path: string;
+    root: string;
+  }>;
+  scratch_retention_days: number;
+}
 
 export interface AttentionItem {
   id: string;

@@ -51,6 +51,52 @@ async function backdate(table: "tasks" | "agents", id: number, col: string, minu
 }
 
 describe("deriveAttention — kinds", () => {
+  it("surfaces orchestrated tasks when Claude main is unavailable", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({
+      title: "needs triage",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+    });
+    const items = deriveAttention({ isPrOpen: allOpen });
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: "orchestration",
+      task_id: task.id,
+      severity: "yellow",
+    });
+  });
+
+  it("does not page the human when Claude main owns the orchestration queue", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    createTask({
+      title: "owned",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+    });
+    createAgent({ kind: "main", state: "idle", tmux_target: "cc:@main" });
+    expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
+  });
+
+  it("does not page for an orchestrated task whose blocker is still open", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const blocker = createTask({ title: "first", prompt: "x", repo: "/r" });
+    createTask({
+      title: "wait for first",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+      blocked_by: blocker.id,
+    });
+    expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
+  });
+
   it("merge_pr for an approved task with an open PR", async () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     const t = await approvedPrTask();
@@ -170,6 +216,51 @@ describe("deriveAttention — kinds", () => {
     expect(items).toHaveLength(1);
     expect(items[0].kind).toBe("stale_waiting");
     expect(items[0].severity).toBe("yellow");
+  });
+
+  it("stale_waiting includes Codex permission waits", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { getDb } = await import("../src/db/db.js");
+    const a = createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "waiting_input",
+    });
+    logEvent("hook.permissionrequest", { agentId: a.id });
+    getDb()
+      .prepare("UPDATE events SET ts = ? WHERE kind = 'hook.permissionrequest'")
+      .run(new Date(Date.now() - 15 * 60_000).toISOString());
+
+    const items = deriveAttention({ isPrOpen: allOpen });
+    expect(items).toHaveLength(1);
+    expect(items[0].kind).toBe("stale_waiting");
+    expect(items[0].agent_id).toBe(a.id);
+  });
+
+  it("stale_waiting includes provider startup trust waits", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { getDb } = await import("../src/db/db.js");
+    const a = createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "waiting_input",
+    });
+    logEvent("agent.startup_permission", {
+      agentId: a.id,
+      payload: { trust: true },
+    });
+    getDb()
+      .prepare("UPDATE events SET ts = ? WHERE kind = 'agent.startup_permission'")
+      .run(new Date(Date.now() - 15 * 60_000).toISOString());
+
+    const items = deriveAttention({ isPrOpen: allOpen });
+    expect(items).toHaveLength(1);
+    expect(items[0].kind).toBe("stale_waiting");
+    expect(items[0].agent_id).toBe(a.id);
   });
 
   it("an escalated wait is reported once, as escalation not stale_waiting", async () => {

@@ -38,6 +38,24 @@ describe("crons", () => {
     expect(new Date(c.next_run_at!).getTime()).toBeGreaterThan(Date.now());
   });
 
+  it("defaults Codex cron tasks to high reasoning and preserves overrides", async () => {
+    const { createCron, updateCron } = await import("../src/db/crons.js");
+    const { listTasks } = await import("../src/db/tasks.js");
+    const { fireDueCrons } = await import("../src/daemon/scheduler.js");
+    const c = createCron({
+      ...TEMPLATE,
+      worker_provider: "codex",
+      reasoning_effort: "ultra",
+    });
+    expect(c.reasoning_effort).toBe("ultra");
+    updateCron(c.id, { next_run_at: "2020-01-01T00:00:00.000Z" });
+    fireDueCrons(new Date());
+    expect(listTasks()[0]).toMatchObject({
+      worker_provider: "codex",
+      reasoning_effort: "ultra",
+    });
+  });
+
   it("fires due crons: enqueues a task and advances next_run_at", async () => {
     const { createCron, updateCron, getCron } = await import("../src/db/crons.js");
     const { listTasks } = await import("../src/db/tasks.js");

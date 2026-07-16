@@ -68,14 +68,16 @@ export function latestAgentEventTs(
 export function latestAgentEvent(
   agentId: number,
   kinds: string[],
-): { id: number; ts: string } | undefined {
+): Pick<Event, "id" | "ts" | "kind" | "payload"> | undefined {
   const marks = kinds.map(() => "?").join(",");
   return getDb()
     .prepare(
-      `SELECT id, ts FROM events WHERE agent_id = ? AND kind IN (${marks})
+      `SELECT id, ts, kind, payload FROM events WHERE agent_id = ? AND kind IN (${marks})
        ORDER BY id DESC LIMIT 1`,
     )
-    .get(agentId, ...kinds) as { id: number; ts: string } | undefined;
+    .get(agentId, ...kinds) as
+    | Pick<Event, "id" | "ts" | "kind" | "payload">
+    | undefined;
 }
 
 /** Id of the task's most recent event of any of `kinds`. Ids order events
@@ -116,6 +118,23 @@ export function earliestEventTsAfter(
     )
     .get(kind, afterTs ?? "") as { ts: string } | undefined;
   return row?.ts;
+}
+
+/** Full most-recent task event for orchestration ownership/audit checks. */
+export function latestTaskEvent(
+  taskId: number,
+  kinds: string[],
+): Pick<Event, "id" | "ts" | "kind" | "agent_id" | "payload"> | undefined {
+  const marks = kinds.map(() => "?").join(",");
+  return getDb()
+    .prepare(
+      `SELECT id, ts, kind, agent_id, payload FROM events
+       WHERE task_id = ? AND kind IN (${marks})
+       ORDER BY id DESC LIMIT 1`,
+    )
+    .get(taskId, ...kinds) as
+    | Pick<Event, "id" | "ts" | "kind" | "agent_id" | "payload">
+    | undefined;
 }
 
 /** Events of `kind` since UTC midnight — used for the daily spawn budget. */

@@ -4,6 +4,123 @@ import { parsePane } from "../src/daemon/pane.js";
 const ESC = String.fromCharCode(27);
 
 describe("parsePane", () => {
+  it("parses an unboxed Codex selection menu only with its confirmation footer", () => {
+    const raw = [
+      "Hooks need review",
+      "3 hooks are new or changed.",
+      "Hooks can run outside the sandbox after you trust them.",
+      "",
+      "› 1. Review hooks",
+      "  2. Trust all and continue",
+      "  3. Continue without trusting (hooks won't run)",
+      "",
+      "Press enter to confirm or esc to go back",
+    ].join("\n");
+
+    expect(parsePane(raw, "codex").pending_permission).toEqual({
+      question:
+        "Hooks need review 3 hooks are new or changed. Hooks can run outside the sandbox after you trust them.",
+      options: [
+        { n: 1, label: "Review hooks" },
+        { n: 2, label: "Trust all and continue" },
+        { n: 3, label: "Continue without trusting (hooks won't run)" },
+      ],
+    });
+  });
+
+  it("does not parse quoted Codex options without live-menu chrome", () => {
+    const raw = [
+      "• The terminal previously showed:",
+      "› 1. Yes",
+      "  2. No",
+      "",
+      "›",
+    ].join("\n");
+
+    expect(parsePane(raw, "codex").pending_permission).toBeNull();
+  });
+
+  it("parses the Codex project-trust menu's continue footer", () => {
+    const raw = [
+      "Do you trust the contents of this directory? Working with untrusted contents",
+      "comes with higher risk of prompt injection.",
+      "",
+      "› 1. Yes, continue",
+      "  2. No, quit",
+      "",
+      "Press enter to continue",
+    ].join("\n");
+
+    expect(parsePane(raw, "codex").pending_permission).toEqual({
+      question:
+        "Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt injection.",
+      options: [
+        { n: 1, label: "Yes, continue" },
+        { n: 2, label: "No, quit" },
+      ],
+    });
+  });
+
+  it("parses the current unboxed Claude folder-trust menu", () => {
+    const raw = [
+      "Quick safety check: Is this a project you created or one you trust?",
+      "",
+      "Security guide",
+      "",
+      "❯ 1. Yes, I trust this folder",
+      "  2. No, exit",
+      "",
+      "Enter to confirm · Esc to cancel",
+    ].join("\n");
+
+    expect(parsePane(raw, "claude").pending_permission).toEqual({
+      question: "Security guide",
+      options: [
+        { n: 1, label: "Yes, I trust this folder" },
+        { n: 2, label: "No, exit" },
+      ],
+    });
+  });
+
+  it("parses the current unboxed Claude command-approval menu", () => {
+    const raw = [
+      "This command requires approval",
+      "",
+      "Do you want to proceed?",
+      "❯ 1. Yes",
+      "  2. Yes, and don't ask again for this command",
+      "  3. No",
+      "",
+      "Esc to cancel · Tab to amend · ctrl+e to explain",
+    ].join("\n");
+
+    expect(parsePane(raw, "claude").pending_permission).toEqual({
+      question: "Do you want to proceed?",
+      options: [
+        { n: 1, label: "Yes" },
+        { n: 2, label: "Yes, and don't ask again for this command" },
+        { n: 3, label: "No" },
+      ],
+    });
+  });
+
+  it("ignores Codex's dim input placeholder while the agent is working", () => {
+    const raw = [
+      "• I am checking the change now.",
+      "",
+      `• ${ESC}[2mWorking${ESC}[0m ${ESC}[2m(7s • esc to interrupt)${ESC}[0m`,
+      "",
+      `${ESC}[1m›${ESC}[0m ${ESC}[2mRun /review on my current changes${ESC}[0m`,
+      "",
+      "  gpt-5.6-sol default · /tmp/worktree",
+    ].join("\n");
+
+    const parsed = parsePane(raw, "codex");
+    expect(parsed.pending_permission).toBeNull();
+    expect(parsed.pending_question).toBeNull();
+    expect(parsed.unsubmitted_input).toBeNull();
+  });
+
   it("parses a permission menu whose options wrap at pane width", () => {
     const raw = [
       "Some earlier output scrolled off the top.",
@@ -265,6 +382,35 @@ describe("parsePane — ghost-text vs real input in the rule-framed composer", (
   it("(d) reports null for an empty composer", () => {
     const parsed = parsePane(composer(`${DEFFG}❯${NBSP}`));
     expect(parsed.unsubmitted_input).toBeNull();
+  });
+
+  it("(coexist) ghost-text stripping (Claude) and Codex menu parsing survive together", () => {
+    // Claude path: a dim ghost-text suggestion is not treated as a human draft
+    // (the mid-draft delegation gate depends on this).
+    const claude = parsePane(
+      composer(`${DEFFG}❯${NBSP}${DIM}ping @caleb before merging${RESET}`),
+      "claude",
+    );
+    expect(claude.unsubmitted_input).toBeNull();
+    expect(claude.pending_permission).toBeNull();
+
+    // Codex path: the plain selection menu still parses under the same
+    // (post-#30) parser, so cross-provider parsing coexists.
+    const codex = parsePane(
+      [
+        "Allow running this command?",
+        "",
+        "› 1. Yes",
+        "  2. No",
+        "",
+        "Press enter to confirm or esc to go back",
+      ].join("\n"),
+      "codex",
+    );
+    expect(codex.pending_permission?.options).toEqual([
+      { n: 1, label: "Yes" },
+      { n: 2, label: "No" },
+    ]);
   });
 
   it("keeps real typed text that wraps across two physical lines", () => {

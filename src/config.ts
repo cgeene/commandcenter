@@ -1,6 +1,7 @@
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseAgentProvider, type AgentProvider } from "./providers.js";
 
 // Resolved at call time (not import time) so tests can point CC_DATA_DIR
 // at a temp dir before touching the DB.
@@ -14,6 +15,27 @@ export function dbPath(): string {
 
 export function worktreesDir(): string {
   return path.join(dataDir(), "worktrees");
+}
+
+/** Command Center-owned, non-Git workspaces for investigation-only tasks. */
+export function scratchWorkspacesDir(): string {
+  return process.env.CC_SCRATCH_DIR ?? path.join(dataDir(), "scratch");
+}
+
+/** Colon-separated allow-list of roots the repository picker may expose. */
+export function configuredRepoRoots(): string[] {
+  const raw = (process.env.CC_REPO_ROOTS ?? process.env.CC_REPO_ROOT ?? "").trim();
+  if (!raw) return [];
+  return raw
+    .split(path.delimiter)
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
+
+/** Finished scratch workspaces are retained briefly for audit/resume. */
+export function scratchRetentionDays(): number {
+  const parsed = Number(process.env.CC_SCRATCH_RETENTION_DAYS ?? 7);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 90 ? parsed : 7;
 }
 
 export function promptsDir(): string {
@@ -36,6 +58,55 @@ export function baseUrl(): string {
 
 export function claudeBin(): string {
   return process.env.CC_CLAUDE_BIN ?? "claude";
+}
+
+export function codexBin(): string {
+  return process.env.CC_CODEX_BIN ?? "codex";
+}
+
+/** Command Center owns this Codex config root and never rewrites ~/.codex. */
+export function codexHome(): string {
+  return process.env.CC_CODEX_HOME ?? path.join(dataDir(), "codex");
+}
+
+/** Optional normal Codex home whose MCP/plugin configuration is mirrored into
+ * Command Center's isolated home. State, auth, history, and sessions are never
+ * inherited. */
+export function codexMcpSourceHome(): string | undefined {
+  const value = process.env.CC_CODEX_MCP_SOURCE_HOME?.trim();
+  return value || undefined;
+}
+
+export function codexProfile(): string {
+  return process.env.CC_CODEX_PROFILE ?? "commandcenter";
+}
+
+export function defaultWorkerProvider(): AgentProvider {
+  return parseAgentProvider(process.env.CC_WORKER_PROVIDER, "claude");
+}
+
+/** Claude model used by the orchestrator unless a spawn explicitly overrides it.
+ *  Defaults to opus (the current production orchestrator model); adopting Fable
+ *  for orchestration is deferred to a separate, deliberate change. */
+export function defaultMainModel(): string {
+  return process.env.CC_MAIN_MODEL?.trim() || "opus";
+}
+
+/** Optional pinned reviewer provider (CC_REVIEWER_PROVIDER). Undefined means
+ *  "no explicit pin" — the reviewer-provider resolver then applies the
+ *  model-variety policy (when enabled) or defaults to Claude. */
+export function defaultReviewerProvider(): string | undefined {
+  const value = process.env.CC_REVIEWER_PROVIDER?.trim();
+  return value || undefined;
+}
+
+/** Whether the scheduler's auto-review should pick the OPPOSITE provider from
+ *  the worker (cross-model adversarial review). Opt-in because the platform
+ *  cannot safely auto-detect that both providers are configured — enabling it
+ *  asserts Codex is set up; otherwise reviewers stay Claude (unchanged). */
+export function reviewerVarietyEnabled(): boolean {
+  const value = process.env.CC_REVIEWER_VARIETY?.trim().toLowerCase() ?? "";
+  return ["1", "true", "on", "yes"].includes(value);
 }
 
 export function tmuxSession(): string {

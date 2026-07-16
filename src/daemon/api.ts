@@ -1,5 +1,16 @@
 import { Hono } from "hono";
+import path from "node:path";
 import { z } from "zod";
+import {
+  baseUrl,
+  claudeBin,
+  codexBin,
+  codexHome,
+  codexProfile,
+  dataDir,
+  defaultMainModel,
+  defaultWorkerProvider,
+} from "../config.js";
 import { TASK_STATUSES, type TaskStatus } from "../db/db.js";
 import { getAgent, listAgents } from "../db/agents.js";
 import {
@@ -30,11 +41,15 @@ import { getSchedulerConfig, setSchedulerConfig } from "../db/settings.js";
 import { dismissAttention } from "../db/attention.js";
 import {
   claimTask,
+  childTasks,
   createTask,
+  DISPATCH_MODES,
   getTask,
   listTasks,
   readyTasks,
   updateTask,
+  WORKSPACE_KINDS,
+  type Task,
 } from "../db/tasks.js";
 import { handleHookEvent, resetAutoNudgeCount, type HookPayload } from "./hooks.js";
 import { handleVerdict, taskDiff } from "./review.js";
@@ -48,34 +63,89 @@ import {
 import { resumeAgent, submitPending } from "./resume.js";
 import { capturePane, clearInputLine, windowExists } from "./tmux.js";
 import { parsePane } from "./pane.js";
+import { AGENT_PROVIDERS } from "../providers.js";
+import {
+  DEFAULT_CODEX_REASONING_EFFORT,
+  REASONING_EFFORTS,
+} from "../reasoning.js";
+import { providerModels } from "./provider-models.js";
+import { delegateTaskToMain } from "./orchestration.js";
+import {
+  allocateScratchWorkspace,
+  removeScratchWorkspace,
+  repositoryRoots,
+  resolveAllowedRepository,
+  resolvePortfolioChildRepository,
+  resolvePortfolioRoot,
+  validateScratchWorkspace,
+  WorkspaceValidationError,
+  workspaceCatalog,
+} from "./workspaces.js";
+
+const providerSchema = z.enum(AGENT_PROVIDERS);
+const reasoningEffortSchema = z.enum(REASONING_EFFORTS);
+const workspaceKindSchema = z.enum(WORKSPACE_KINDS);
+const dispatchModeSchema = z.enum(DISPATCH_MODES);
+const modelIdentifierSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(512)
+  .regex(/^[a-z0-9._:/@-]+$/i, "invalid model identifier");
+const hookPayloadSchema = z
+  .object({
+    hook_event_name: z.string().min(1).max(64).optional(),
+    session_id: z.string().min(1).max(128).optional(),
+    transcript_path: z.string().min(1).max(4096).nullable().optional(),
+    notification_type: z
+      .string()
+      .min(1)
+      .max(64)
+      .regex(/^[a-z_]+$/)
+      .optional(),
+    tool_name: z.string().min(1).max(256).optional(),
+    tool_input: z.record(z.string(), z.unknown()).optional(),
+    message: z.string().max(20_000).optional(),
+  })
+  .passthrough();
 
 const newTaskSchema = z.object({
-  title: z.string().min(1),
-  prompt: z.string().min(1),
-  repo: z.string().min(1),
+  title: z.string().trim().min(1).max(200),
+  prompt: z.string().min(1).max(100_000),
+  repo: z.string().min(1).max(4096).optional(),
+  repo_root: z.string().min(1).max(4096).optional(),
+  workspace_kind: workspaceKindSchema.optional(),
+  parent_task_id: z.number().int().positive().optional(),
   priority: z.number().int().min(0).max(4).optional(),
-  model: z.string().optional(),
-  blocked_by: z.number().int().optional(),
-  verify_cmd: z.string().optional(),
+  worker_provider: providerSchema.optional(),
+  model: modelIdentifierSchema.optional(),
+  reasoning_effort: reasoningEffortSchema.optional(),
+  blocked_by: z.number().int().positive().optional(),
+  verify_cmd: z.string().max(4096).optional(),
   open_pr: z.boolean().optional(),
 });
 
 const updateTaskSchema = z.object({
-  title: z.string().min(1).optional(),
-  prompt: z.string().min(1).optional(),
+  title: z.string().trim().min(1).max(200).optional(),
+  prompt: z.string().min(1).max(100_000).optional(),
+  repo: z.string().min(1).max(4096).optional(),
   status: z.enum(TASK_STATUSES as [TaskStatus, ...TaskStatus[]]).optional(),
   priority: z.number().int().min(0).max(4).optional(),
-  model: z.string().nullable().optional(),
-  blocked_by: z.number().int().nullable().optional(),
-  verify_cmd: z.string().nullable().optional(),
-  result_summary: z.string().nullable().optional(),
+  worker_provider: providerSchema.optional(),
+  model: modelIdentifierSchema.nullable().optional(),
+  reasoning_effort: reasoningEffortSchema.nullable().optional(),
+  blocked_by: z.number().int().positive().nullable().optional(),
+  verify_cmd: z.string().max(4096).nullable().optional(),
+  result_summary: z.string().max(100_000).nullable().optional(),
   pr_url: z.string().url().nullable().optional(),
   open_pr: z.boolean().optional(),
 });
 
 const spawnSchema = z.object({
   task_id: z.number().int(),
+  provider: providerSchema.optional(),
   model: z.string().optional(),
+  reasoning_effort: reasoningEffortSchema.optional(),
   fresh: z.boolean().optional(),
 });
 
@@ -84,6 +154,26 @@ export function buildApp(): Hono {
 
   app.get("/healthz", (c) => c.json({ ok: true }));
 
+  app.get("/api/providers", (c) =>
+    c.json({
+      default_worker_provider: defaultWorkerProvider(),
+      main_provider: "claude" as const,
+      default_main_model: defaultMainModel(),
+    }),
+  );
+
+  app.get("/api/workspaces", (c) => c.json(workspaceCatalog()));
+
+  app.get("/api/providers/:provider/models", async (c) => {
+    const parsed = providerSchema.safeParse(c.req.param("provider"));
+    if (!parsed.success) return c.json({ error: "invalid provider" }, 400);
+    try {
+      return c.json({ provider: parsed.data, models: await providerModels(parsed.data) });
+    } catch {
+      return c.json({ error: "model catalog unavailable" }, 503);
+    }
+  });
+
   app.get("/api/version", async (c) => {
     const { versionInfo } = await import("./version.js");
     return c.json(versionInfo());
@@ -91,15 +181,141 @@ export function buildApp(): Hono {
 
   app.get("/api/tasks", (c) => {
     const status = c.req.query("status") as TaskStatus | undefined;
-    if (c.req.query("ready") === "true") return c.json(readyTasks());
-    return c.json(listTasks(status));
+    const dispatchResult = dispatchModeSchema.safeParse(c.req.query("dispatch_mode"));
+    const dispatchMode = dispatchResult.success ? dispatchResult.data : undefined;
+    if (c.req.query("dispatch_mode") && !dispatchResult.success) {
+      return c.json({ error: "invalid dispatch mode" }, 400);
+    }
+    const tasks = c.req.query("ready") === "true"
+      ? readyTasks(dispatchMode)
+      : listTasks(status).filter(
+          (task) => !dispatchMode || task.dispatch_mode === dispatchMode,
+        );
+    return c.json(tasks);
   });
 
   app.post("/api/tasks", async (c) => {
     const body = newTaskSchema.parse(await c.req.json());
-    const task = createTask(body);
-    logEvent("task.created", { taskId: task.id });
-    return c.json(task, 201);
+    const explicitWorkspace = body.workspace_kind !== undefined;
+    const workspaceKind = body.workspace_kind ?? "repo";
+    if (workspaceKind === "repo" && !body.repo) {
+      return c.json({ error: "repository is required" }, 400);
+    }
+    if (workspaceKind === "scratch" && (body.repo || body.repo_root)) {
+      return c.json({ error: "scratch workspace paths are server-managed" }, 400);
+    }
+    if (workspaceKind === "portfolio" && body.repo && body.repo_root) {
+      return c.json({ error: "select one repository root" }, 400);
+    }
+    if (workspaceKind === "repo" && body.repo_root) {
+      return c.json({ error: "repo_root is only valid for all-repositories tasks" }, 400);
+    }
+    if (workspaceKind !== "repo" && body.open_pr === true) {
+      return c.json({ error: "non-repository tasks cannot open pull requests" }, 400);
+    }
+    const parent = body.parent_task_id !== undefined
+      ? getTask(body.parent_task_id)
+      : undefined;
+    if (body.parent_task_id !== undefined) {
+      if (!parent || parent.workspace_kind !== "portfolio") {
+        return c.json({ error: "parent task must be an all-repositories task" }, 400);
+      }
+      if (workspaceKind !== "repo") {
+        return c.json({ error: "all-repositories children must be repository tasks" }, 400);
+      }
+    }
+    const workerProvider =
+      body.worker_provider ?? parent?.worker_provider ?? defaultWorkerProvider();
+    const inheritedModel =
+      parent?.worker_provider === workerProvider ? parent.model ?? undefined : undefined;
+    const inheritedReasoningEffort =
+      parent?.worker_provider === "codex" && workerProvider === "codex"
+        ? parent.reasoning_effort ?? undefined
+        : undefined;
+    const model = body.model ?? inheritedModel;
+    const reasoningEffort = body.reasoning_effort ?? inheritedReasoningEffort;
+    if (workerProvider === "claude" && reasoningEffort !== undefined) {
+      return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
+    }
+
+    let allocatedScratch: string | undefined;
+    let repo: string;
+    let task: Task;
+    try {
+      if (workspaceKind === "scratch") {
+        allocatedScratch = allocateScratchWorkspace();
+        repo = allocatedScratch;
+      } else if (workspaceKind === "portfolio") {
+        repo = resolvePortfolioRoot(body.repo_root ?? body.repo);
+      } else {
+        // A configured root list is always enforced. When it is absent, keep
+        // the historical absolute-path behavior so an existing/cloud install
+        // can upgrade before opting into the catalog and portfolio workflow.
+        if (repositoryRoots().length > 0) {
+          repo = parent
+            ? resolvePortfolioChildRepository(body.repo!, parent.repo)
+            : resolveAllowedRepository(body.repo!);
+        } else {
+          if (!path.isAbsolute(body.repo!) || body.repo!.includes("\0")) {
+            return c.json({ error: "repository must be an absolute path" }, 400);
+          }
+          repo = path.normalize(body.repo!);
+        }
+      }
+      if (
+        parent &&
+        childTasks(parent.id).some((candidate) => candidate.repo === repo)
+      ) {
+        if (allocatedScratch) removeScratchWorkspace(allocatedScratch);
+        return c.json(
+          { error: "a child task already exists for this repository" },
+          409,
+        );
+      }
+      task = createTask({
+        title: body.title,
+        prompt: body.prompt,
+        repo,
+        workspace_kind: workspaceKind,
+        // New explicit workspace submissions are always studied by Claude
+        // main. Omitted workspace_kind is the compatibility path for older
+        // clients and existing cloud workflows.
+        dispatch_mode: explicitWorkspace ? "orchestrated" : "direct",
+        parent_task_id: body.parent_task_id,
+        priority: body.priority ?? parent?.priority,
+        worker_provider: workerProvider,
+        model,
+        reasoning_effort: reasoningEffort,
+        blocked_by: body.blocked_by,
+        verify_cmd: body.verify_cmd,
+        open_pr: workspaceKind === "repo" ? body.open_pr : false,
+      });
+    } catch (error) {
+      if (allocatedScratch) {
+        try {
+          removeScratchWorkspace(allocatedScratch);
+        } catch {
+          // Best effort: retention cleanup will reap an orphan later.
+        }
+      }
+      throw error;
+    }
+    logEvent("task.created", {
+      taskId: task.id,
+      payload: {
+        workspace_kind: task.workspace_kind,
+        dispatch_mode: task.dispatch_mode,
+        parent_task_id: task.parent_task_id,
+      },
+    });
+    if (task.dispatch_mode === "orchestrated" && task.parent_task_id === null) {
+      try {
+        await delegateTaskToMain(task.id);
+      } catch {
+        logEvent("task.awaiting_main", { taskId: task.id });
+      }
+    }
+    return c.json(getTask(task.id), 201);
   });
 
   app.get("/api/tasks/:id", (c) => {
@@ -112,10 +328,118 @@ export function buildApp(): Hono {
     if (!getTask(id)) return c.json({ error: "not found" }, 404);
     const body = updateTaskSchema.parse(await c.req.json());
     const before = getTask(id)!;
+    const nextProvider = body.worker_provider ?? before.worker_provider;
+    if (nextProvider === "claude" && body.reasoning_effort != null) {
+      return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
+    }
+    if (body.open_pr === true && before.workspace_kind !== "repo") {
+      return c.json({ error: "non-repository tasks cannot open pull requests" }, 400);
+    }
+    if (body.repo !== undefined) {
+      if (before.workspace_kind !== "repo") {
+        return c.json({ error: "only repository tasks can change repositories" }, 400);
+      }
+      if (before.agent_id) {
+        const active = getAgent(before.agent_id);
+        if (active && active.state !== "dead") {
+          return c.json({ error: "repository cannot change while the task has a live agent" }, 409);
+        }
+      }
+    }
+    if (
+      body.worker_provider !== undefined &&
+      body.worker_provider !== before.worker_provider &&
+      before.agent_id
+    ) {
+      const active = getAgent(before.agent_id);
+      if (active && active.state !== "dead") {
+        return c.json(
+          { error: "worker provider cannot change while the task has a live agent" },
+          409,
+        );
+      }
+    }
     // body.open_pr is a boolean (or absent); only present when the caller
     // sent it, so an explicit `undefined` never gets bound as a SQL param
     // (that binds NULL against a NOT NULL column — see the crons.enabled bug).
     const patch: Record<string, unknown> = { ...body };
+    if (body.status === "queued" && before.workspace_kind === "scratch") {
+      try {
+        validateScratchWorkspace(before.repo);
+      } catch (error) {
+        if (!(error instanceof WorkspaceValidationError)) throw error;
+        if (before.agent_id) {
+          const active = getAgent(before.agent_id);
+          if (active && active.state !== "dead") {
+            return c.json(
+              { error: "kill the live scratch worker before recreating its workspace" },
+              409,
+            );
+          }
+        }
+        patch.repo = allocateScratchWorkspace();
+        patch.worktree = null;
+      }
+    }
+    if (body.repo !== undefined) {
+      if (repositoryRoots().length > 0) {
+        if (before.parent_task_id !== null) {
+          const portfolioParent = getTask(before.parent_task_id);
+          if (!portfolioParent || portfolioParent.workspace_kind !== "portfolio") {
+            return c.json({ error: "portfolio parent is unavailable" }, 409);
+          }
+          const nextRepo = resolvePortfolioChildRepository(
+            body.repo,
+            portfolioParent.repo,
+          );
+          if (
+            childTasks(portfolioParent.id).some(
+              (candidate) => candidate.id !== before.id && candidate.repo === nextRepo,
+            )
+          ) {
+            return c.json(
+              { error: "a child task already exists for this repository" },
+              409,
+            );
+          }
+          patch.repo = nextRepo;
+        } else {
+          patch.repo = resolveAllowedRepository(body.repo);
+        }
+      } else {
+        // A portfolio child was created under an explicit root boundary. If
+        // that allow-list later disappears, fail closed instead of silently
+        // degrading its update into the legacy arbitrary-path behavior.
+        if (before.parent_task_id !== null) {
+          return c.json(
+            { error: "repository roots must be configured to move a portfolio child" },
+            409,
+          );
+        }
+        if (!path.isAbsolute(body.repo) || body.repo.includes("\0")) {
+          return c.json({ error: "repository must be an absolute path" }, 400);
+        }
+        patch.repo = path.normalize(body.repo);
+      }
+    }
+    if (
+      body.worker_provider !== undefined &&
+      body.worker_provider !== before.worker_provider &&
+      body.model === undefined
+    ) {
+      patch.model = null;
+    }
+    if (body.reasoning_effort === null) {
+      patch.reasoning_effort =
+        nextProvider === "codex" ? DEFAULT_CODEX_REASONING_EFFORT : null;
+    } else if (
+      body.worker_provider !== undefined &&
+      body.worker_provider !== before.worker_provider &&
+      body.reasoning_effort === undefined
+    ) {
+      patch.reasoning_effort =
+        nextProvider === "codex" ? DEFAULT_CODEX_REASONING_EFFORT : null;
+    }
     if (body.open_pr !== undefined) patch.open_pr = body.open_pr ? 1 : 0;
     const task = updateTask(id, patch as Parameters<typeof updateTask>[1]);
     if (body.status && body.status !== before.status) {
@@ -124,7 +448,34 @@ export function buildApp(): Hono {
         payload: { from: before.status, to: body.status },
       });
     }
+    if (
+      task?.status === "queued" &&
+      task.dispatch_mode === "orchestrated" &&
+      task.parent_task_id === null
+    ) {
+      try {
+        await delegateTaskToMain(task.id);
+      } catch {
+        logEvent("task.awaiting_main", { taskId: task.id });
+      }
+    }
     return c.json(task);
+  });
+
+  app.post("/api/tasks/:id/delegate", async (c) => {
+    const id = Number(c.req.param("id"));
+    const task = getTask(id);
+    if (!task) return c.json({ error: "not found" }, 404);
+    if (task.dispatch_mode !== "orchestrated" || task.status !== "queued") {
+      return c.json({ error: "task is not awaiting main-agent triage" }, 409);
+    }
+    if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
+      return c.json({ error: "task blockers are not done" }, 409);
+    }
+    if (!(await delegateTaskToMain(id))) {
+      return c.json({ error: "main agent is unavailable" }, 409);
+    }
+    return c.json({ ok: true });
   });
 
   app.get("/api/tasks/:id/diff", (c) => {
@@ -136,8 +487,21 @@ export function buildApp(): Hono {
 
   app.post("/api/tasks/:id/reviewer", async (c) => {
     const id = Number(c.req.param("id"));
-    const body = (await c.req.json().catch(() => ({}))) as { model?: string };
-    return c.json(spawnReviewer(id, body.model), 201);
+    const body = z
+      .object({
+        model: modelIdentifierSchema.optional(),
+        provider: providerSchema.optional(),
+        reasoning_effort: reasoningEffortSchema.optional(),
+      })
+      .parse(await c.req.json().catch(() => ({})));
+    return c.json(
+      spawnReviewer(id, {
+        model: body.model,
+        provider: body.provider,
+        reasoningEffort: body.reasoning_effort,
+      }),
+      201,
+    );
   });
 
   app.post("/api/tasks/:id/verdict", async (c) => {
@@ -180,7 +544,17 @@ export function buildApp(): Hono {
 
   app.post("/api/agents", async (c) => {
     const body = spawnSchema.parse(await c.req.json());
-    const result = spawnWorker(body.task_id, body.model, { fresh: body.fresh });
+    const task = getTask(body.task_id);
+    if (!task) return c.json({ error: "not found" }, 404);
+    const provider = body.provider ?? task.worker_provider;
+    if (provider === "claude" && body.reasoning_effort !== undefined) {
+      return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
+    }
+    const result = spawnWorker(body.task_id, body.model, {
+      fresh: body.fresh,
+      provider: body.provider,
+      reasoningEffort: body.reasoning_effort,
+    });
     return c.json(result, 201);
   });
 
@@ -222,11 +596,10 @@ export function buildApp(): Hono {
       return c.json({ error: "no live tmux window" }, 409);
     }
     const lines = Number(c.req.query("lines") ?? 60);
-    return c.json({
-      target: agent.tmux_target,
-      // Styled capture so the parser can drop dim ghost-text suggestions.
-      ...parsePane(capturePane(agent.tmux_target, lines, { escapes: true })),
-    });
+    // Styled capture so the parser can drop dim ghost-text (Claude) / rotating
+    // suggestions (Codex); provider selects the right parsing path.
+    const raw = capturePane(agent.tmux_target, lines, { escapes: true });
+    return c.json({ target: agent.tmux_target, ...parsePane(raw, agent.provider) });
   });
 
   app.post("/api/agents/:id/send", async (c) => {
@@ -274,14 +647,88 @@ export function buildApp(): Hono {
       return c.json({ error: "agent has no recorded session yet" }, 409);
     }
     const limit = Number(c.req.query("limit") ?? 200);
-    const { readTranscript } = await import("./transcript.js");
-    const entries = readTranscript(agent.session_id, limit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500) {
+      return c.json({ error: "limit must be an integer from 1 to 500" }, 400);
+    }
+    const { readProviderTranscript } = await import("./transcript.js");
+    const entries = readProviderTranscript(
+      agent.provider,
+      agent.session_id,
+      agent.transcript_path,
+      limit,
+    );
     if (!entries) return c.json({ error: "transcript not found" }, 404);
-    return c.json({ agent_id: agent.id, session_id: agent.session_id, entries });
+    return c.json({
+      agent_id: agent.id,
+      provider: agent.provider,
+      session_id: agent.session_id,
+      entries,
+    });
+  });
+
+  app.get("/api/agents/:id/session", (c) => {
+    const agent = getAgent(Number(c.req.param("id")));
+    if (!agent) return c.json({ error: "not found" }, 404);
+    if (!agent.session_id) {
+      return c.json({ error: "agent has no recorded session yet" }, 409);
+    }
+    const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
+    const taskIdEnv = agent.task_id
+      ? ` CC_TASK_ID=${quote(String(agent.task_id))}`
+      : "";
+    const command =
+      agent.provider === "codex"
+        ? [
+            `CC_URL=${quote(baseUrl())}`,
+            `CC_ROLE=${quote(agent.kind)}`,
+            `CC_AGENT_ID=${quote(String(agent.id))}${taskIdEnv}`,
+            `CODEX_HOME=${quote(codexHome())}`,
+            quote(codexBin()),
+            "--profile",
+            quote(codexProfile()),
+            ...(agent.model ? ["--model", quote(agent.model)] : []),
+            ...(agent.reasoning_effort
+              ? [
+                  "--config",
+                  quote(`model_reasoning_effort="${agent.reasoning_effort}"`),
+                ]
+              : []),
+            "resume",
+            quote(agent.session_id),
+          ].join(" ")
+        : (() => {
+            const tag =
+              agent.kind === "main"
+                ? "main"
+                : `task-${agent.task_id}${agent.kind === "reviewer" ? "-review" : ""}`;
+            const mcpFile = path.join(dataDir(), "mcp", `${tag}.json`);
+            return [
+              quote(claudeBin()),
+              "--resume",
+              quote(agent.session_id),
+              ...(agent.runtime_config_path
+                ? ["--settings", quote(agent.runtime_config_path)]
+                : []),
+              "--mcp-config",
+              quote(mcpFile),
+            ].join(" ");
+          })();
+    return c.json({
+      agent_id: agent.id,
+      provider: agent.provider,
+      model: agent.model,
+      reasoning_effort: agent.reasoning_effort,
+      session_id: agent.session_id,
+      transcript_path: agent.transcript_path,
+      cwd: agent.task_id ? getTask(agent.task_id)?.worktree ?? null : null,
+      resume_command: command,
+    });
   });
 
   app.post("/api/main", async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { model?: string };
+    const body = z
+      .object({ model: modelIdentifierSchema.optional() })
+      .parse(await c.req.json().catch(() => ({})));
     return c.json(spawnMain(body.model), 201);
   });
 
@@ -305,12 +752,13 @@ export function buildApp(): Hono {
     return c.json({ ok: true });
   });
 
-  // Claude Code hooks POST their stdin JSON here (see genconfig.ts).
+  // Provider lifecycle hooks POST their stdin JSON here (see genconfig.ts).
   // Respond immediately — verification can take minutes and the hook's curl
   // has a 5s timeout; the transition runs in the background.
   app.post("/api/hooks/agent/:id", async (c) => {
     const id = Number(c.req.param("id"));
-    const body = (await c.req.json().catch(() => ({}))) as HookPayload;
+    if (!Number.isInteger(id) || id < 1) return c.json({ error: "invalid agent id" }, 400);
+    const body = hookPayloadSchema.parse(await c.req.json().catch(() => ({}))) as HookPayload;
     void handleHookEvent(id, body).catch((err) =>
       logEvent("hook.error", { agentId: id, payload: { error: String(err) } }),
     );
@@ -347,8 +795,10 @@ export function buildApp(): Hono {
     schedule: z.string().min(1),
     prompt: z.string().min(1),
     repo: z.string().min(1),
+    worker_provider: providerSchema.optional(),
     title: z.string().optional(),
     model: z.string().optional(),
+    reasoning_effort: reasoningEffortSchema.optional(),
     priority: z.number().int().min(0).max(4).optional(),
     verify_cmd: z.string().optional(),
     enabled: z.boolean().optional(),
@@ -359,7 +809,9 @@ export function buildApp(): Hono {
     title: z.string().optional(),
     prompt: z.string().optional(),
     repo: z.string().optional(),
+    worker_provider: providerSchema.optional(),
     model: z.string().nullable().optional(),
+    reasoning_effort: reasoningEffortSchema.nullable().optional(),
     priority: z.number().int().min(0).max(4).optional(),
     verify_cmd: z.string().nullable().optional(),
     enabled: z.boolean().optional(),
@@ -369,17 +821,43 @@ export function buildApp(): Hono {
 
   app.post("/api/crons", async (c) => {
     const body = newCronSchema.parse(await c.req.json());
-    const cron = createCron(body); // throws on invalid schedule -> 500 w/ message
+    const workerProvider = body.worker_provider ?? defaultWorkerProvider();
+    if (workerProvider === "claude" && body.reasoning_effort !== undefined) {
+      return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
+    }
+    const cron = createCron({
+      ...body,
+      worker_provider: workerProvider,
+    }); // throws on invalid schedule -> 500 w/ message
     logEvent("cron.created", { payload: { cron_id: cron.id, name: cron.name } });
     return c.json(cron, 201);
   });
 
   app.patch("/api/crons/:id", async (c) => {
     const id = Number(c.req.param("id"));
-    if (!getCron(id)) return c.json({ error: "not found" }, 404);
+    const before = getCron(id);
+    if (!before) return c.json({ error: "not found" }, 404);
     const body = cronPatchSchema.parse(await c.req.json());
+    const nextProvider = body.worker_provider ?? before.worker_provider;
+    if (nextProvider === "claude" && body.reasoning_effort != null) {
+      return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
+    }
     const cron = updateCron(id, {
       ...body,
+      ...(body.worker_provider !== undefined &&
+      body.worker_provider !== before.worker_provider &&
+      body.model === undefined
+        ? { model: null }
+        : {}),
+      ...(body.reasoning_effort === null ||
+      (body.worker_provider !== undefined &&
+        body.worker_provider !== before.worker_provider &&
+        body.reasoning_effort === undefined)
+        ? {
+            reasoning_effort:
+              nextProvider === "codex" ? DEFAULT_CODEX_REASONING_EFFORT : null,
+          }
+        : {}),
       enabled: body.enabled === undefined ? undefined : body.enabled ? 1 : 0,
     } as Parameters<typeof updateCron>[1]);
     logEvent("cron.updated", { payload: { cron_id: id, patch: body } });
@@ -401,7 +879,9 @@ export function buildApp(): Hono {
       title: cron.title,
       prompt: cron.prompt,
       repo: cron.repo,
+      worker_provider: cron.worker_provider,
       model: cron.model ?? undefined,
+      reasoning_effort: cron.reasoning_effort ?? undefined,
       priority: cron.priority,
       verify_cmd: cron.verify_cmd ?? undefined,
       cron_id: cron.id,
@@ -572,17 +1052,24 @@ export function buildApp(): Hono {
     if (!/^[0-9a-f-]{8,64}$/i.test(sessionId)) {
       return c.json({ error: "invalid session id" }, 400);
     }
-    const { readTranscript } = await import("./transcript.js");
-    const entries = readTranscript(sessionId);
+    const providerResult = providerSchema.safeParse(c.req.query("provider") ?? "claude");
+    if (!providerResult.success) return c.json({ error: "invalid provider" }, 400);
+    const { readProviderTranscript } = await import("./transcript.js");
+    const entries = readProviderTranscript(providerResult.data, sessionId);
     if (!entries) return c.json({ error: "transcript not found" }, 404);
-    return c.json({ session_id: sessionId, entries });
+    return c.json({ provider: providerResult.data, session_id: sessionId, entries });
   });
 
   app.onError((err, c) => {
     if (err instanceof z.ZodError) {
       return c.json({ error: "validation", issues: err.issues }, 400);
     }
-    return c.json({ error: err.message }, 500);
+    if (err instanceof WorkspaceValidationError) {
+      return c.json({ error: err.message }, 400);
+    }
+    // Do not expose stack traces, local paths, command output, or provider
+    // details through the browser/API boundary.
+    return c.json({ error: "internal error" }, 500);
   });
 
   return app;

@@ -1,10 +1,23 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeSanitize from "rehype-sanitize";
 import { api } from "./api";
-import { blockedByChain, groupByProject, isActive, isArchived, projectOf } from "../../src/lib/board";
+import {
+  blockedByChain,
+  groupByProject,
+  isActive,
+  isArchived,
+  projectOfTask,
+} from "../../src/lib/board";
 import { openPanel, type Panel } from "../../src/lib/panel";
 import { parseFrontmatter } from "../../src/lib/frontmatter";
 import { softenLineBreaks } from "../../src/lib/markdown";
@@ -18,9 +31,13 @@ import type {
   Event,
   Memory,
   ParsedPane,
+  ProviderModel,
+  ReasoningEffort,
   SchedulerInfo,
   Task,
   TranscriptEntry,
+  WorkspaceCatalog,
+  WorkspaceKind,
 } from "./types";
 
 /** Dashboard tabs — add an entry here + a render branch in App to grow the dashboard. */
@@ -32,6 +49,22 @@ const TABS = [
   { id: "archive", label: "archive" },
 ] as const;
 type TabId = (typeof TABS)[number]["id"];
+
+const ALL_REASONING_LEVELS: Array<{
+  effort: ReasoningEffort;
+  description: string;
+}> = [
+  { effort: "low", description: "Fast responses with lighter reasoning" },
+  { effort: "medium", description: "Balanced speed and reasoning depth" },
+  { effort: "high", description: "Default; greater depth for complex work" },
+  { effort: "xhigh", description: "Extra-high depth for difficult multi-step work" },
+  { effort: "max", description: "Maximum depth for the hardest problems" },
+  { effort: "ultra", description: "Maximum reasoning with automatic delegation" },
+];
+
+const BASE_REASONING_LEVELS = ALL_REASONING_LEVELS.filter((level) =>
+  ["low", "medium", "high", "xhigh"].includes(level.effort),
+);
 
 /** A task-linked PR still awaiting action — merged/closed ones auto-clear. */
 function isOpenPr(t: Task): boolean {
@@ -126,8 +159,11 @@ export function App() {
   const openTask = (id: number) => setPanel((cur) => openPanel(cur, { kind: "task", id }));
   const openTerminal = (agentId: number) =>
     setPanel((cur) => openPanel(cur, { kind: "terminal", agentId }));
-  const openTranscript = async (sessionId: string) => {
-    const r = await api<{ entries: TranscriptEntry[] }>("GET", `/api/transcript/${sessionId}`);
+  const openTranscript = async (sessionId: string, provider: "claude" | "codex") => {
+    const r = await api<{ entries: TranscriptEntry[] }>(
+      "GET",
+      `/api/transcript/${sessionId}?provider=${provider}`,
+    );
     setTranscript(r.entries);
     setPanel((cur) => openPanel(cur, { kind: "transcript", sessionId }));
   };
@@ -257,9 +293,11 @@ export function App() {
           </button>
         )}
         {!liveMain && (
-          <button onClick={() => act(() => api("POST", "/api/main", {}))}>
-            ▶ spawn main agent
-          </button>
+          <MainAgentSpawn
+            onSpawn={(model) =>
+              act(() => api("POST", "/api/main", model ? { model } : {}))
+            }
+          />
         )}
         <button onClick={() => setShowCrons(true)}>crons</button>
         <button onClick={() => setShowMemory(true)}>memory</button>
@@ -437,13 +475,22 @@ function TaskCard({
 }) {
   const chain = blockedByChain(task, byId);
   const summary = firstLine(task.result_summary);
+  const statusLabel =
+    task.status === "queued" && task.dispatch_mode === "orchestrated"
+      ? "awaiting main"
+      : task.status;
   return (
     <div className={`card ${task.status}`} onClick={() => onSelect(task)}>
       <div className="card-title">
         #{task.id} {task.title}
       </div>
       <div className="chips">
-        <span className={`chip ${task.status}`}>{task.status}</span>
+        <span className={`chip ${task.status}`}>{statusLabel}</span>
+        {task.workspace_kind !== "repo" && (
+          <span className="chip">
+            {task.workspace_kind === "portfolio" ? "all repositories" : "investigation"}
+          </span>
+        )}
         {task.review_verdict === "approve" && (
           <span className="chip approved">✓ approved</span>
         )}
@@ -451,6 +498,8 @@ function TaskCard({
           <span className="chip bad">✗ changes</span>
         )}
         {task.model && <span className="chip">{task.model}</span>}
+        {task.reasoning_effort && <span className="chip">{task.reasoning_effort}</span>}
+        <span className="chip">{task.worker_provider}</span>
         {task.agent_id && <span className="chip agent-chip">a{task.agent_id}</span>}
       </div>
       {summary && <div className="card-summary">{summary}</div>}
@@ -587,7 +636,7 @@ function ArchiveView({
     visible: (t) =>
       isArchived(t.status) &&
       (q === "" ||
-        projectOf(t.repo).toLowerCase().includes(q) ||
+        projectOfTask(t).toLowerCase().includes(q) ||
         t.title.toLowerCase().includes(q)),
   });
   const archivedCount = tasks.filter((t) => isArchived(t.status)).length;
@@ -849,6 +898,7 @@ const KIND_ICON: Record<AttentionItem["kind"], string> = {
   escalation: "⛔",
   stale_waiting: "⏳",
   scheduler_stalled: "🚦",
+  orchestration: "◈",
 };
 
 /**
@@ -1029,7 +1079,8 @@ function AgentEntry({
         />
         <b>{label}</b>
         <span className="muted agent-state">
-          {agent.state} · {agent.model ?? "?"}
+          {agent.state} · {agent.provider} · {agent.model ?? "default"}
+          {agent.reasoning_effort ? ` · ${agent.reasoning_effort}` : ""}
         </span>
         {waiting && <span className="waiting-badge">waiting</span>}
         {waiting && (
@@ -1271,6 +1322,79 @@ function TokensView({
   );
 }
 
+function MainAgentSpawn({
+  onSpawn,
+}: {
+  onSpawn: (model?: string) => Promise<void>;
+}) {
+  const [models, setModels] = useState<ProviderModel[]>([]);
+  const [defaultModel, setDefaultModel] = useState<string | null>(null);
+  const [modelChoice, setModelChoice] = useState("");
+  const [customModel, setCustomModel] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    void api<{ default_main_model?: string }>("GET", "/api/providers")
+      .then((metadata) => {
+        if (!cancelled && metadata.default_main_model) {
+          setDefaultModel(metadata.default_main_model);
+        }
+      })
+      .catch(() => {});
+    void api<{ models: ProviderModel[] }>("GET", "/api/providers/claude/models")
+      .then((catalog) => {
+        if (!cancelled) setModels(catalog.models);
+      })
+      .catch(() => {
+        // The configured default and custom escape hatch still work without a catalog.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const selectedModel =
+    modelChoice === "__custom__" ? customModel.trim() : modelChoice;
+
+  return (
+    <div className="main-spawn">
+      <select
+        aria-label="main agent model"
+        value={modelChoice}
+        onChange={(e) => {
+          setModelChoice(e.target.value);
+          if (e.target.value !== "__custom__") setCustomModel("");
+        }}
+      >
+        <option value="">
+          Claude {defaultModel ? `${defaultModel} (default)` : "configured default"}
+        </option>
+        {models.filter((model) => model.slug !== defaultModel).map((model) => (
+          <option key={model.slug} value={model.slug}>
+            {model.display_name}
+            {model.description ? ` — ${model.description}` : ""}
+          </option>
+        ))}
+        <option value="__custom__">custom Claude model…</option>
+      </select>
+      {modelChoice === "__custom__" && (
+        <input
+          aria-label="custom main agent model"
+          placeholder="Claude model slug"
+          value={customModel}
+          onChange={(e) => setCustomModel(e.target.value)}
+        />
+      )}
+      <button
+        disabled={modelChoice === "__custom__" && !selectedModel}
+        onClick={() => onSpawn(selectedModel || undefined)}
+      >
+        ▶ spawn main agent
+      </button>
+    </div>
+  );
+}
+
 function TaskPanel({
   task,
   onClose,
@@ -1282,7 +1406,7 @@ function TaskPanel({
   onClose: () => void;
   onAction: (fn: () => Promise<unknown>) => Promise<void>;
   onTerminal: (agentId: number) => void;
-  onTranscript: (sessionId: string) => Promise<void>;
+  onTranscript: (sessionId: string, provider: "claude" | "codex") => Promise<void>;
 }) {
   return (
     <div className="drawer">
@@ -1300,8 +1424,30 @@ function TaskPanel({
           <CollapsibleMarkdown content={task.prompt} looseLineBreaks />
         </div>
         <dl>
-          <dt>repo</dt>
+          <dt>workspace</dt>
+          <dd>
+            {task.workspace_kind === "portfolio"
+              ? "all repositories"
+              : task.workspace_kind === "scratch"
+                ? "investigation scratch"
+                : "repository"}
+          </dd>
+          <dt>{task.workspace_kind === "portfolio" ? "root" : "path"}</dt>
           <dd>{task.repo}</dd>
+          {task.parent_task_id && (
+            <>
+              <dt>parent</dt>
+              <dd>#{task.parent_task_id}</dd>
+            </>
+          )}
+          <dt>dispatch</dt>
+          <dd>{task.dispatch_mode === "orchestrated" ? "Claude main" : "direct scheduler"}</dd>
+          <dt>worker</dt>
+          <dd>
+            {task.worker_provider}
+            {task.model ? ` · ${task.model}` : " · default model"}
+            {task.reasoning_effort ? ` · ${task.reasoning_effort}` : ""}
+          </dd>
           {task.branch && (
             <>
               <dt>branch</dt>
@@ -1350,7 +1496,9 @@ function TaskPanel({
           </>
         )}
         <div className="actions">
-          {["queued", "claimed"].includes(task.status) && (
+          {["queued", "claimed"].includes(task.status) &&
+            task.dispatch_mode === "direct" &&
+            task.workspace_kind !== "portfolio" && (
             <button
               className="primary"
               onClick={() =>
@@ -1360,11 +1508,25 @@ function TaskPanel({
               ▶ spawn worker
             </button>
           )}
+          {task.status === "queued" && task.dispatch_mode === "orchestrated" && (
+            <button
+              className="primary"
+              onClick={() =>
+                onAction(() => api("POST", `/api/tasks/${task.id}/delegate`, {}))
+              }
+            >
+              notify Claude main
+            </button>
+          )}
           {task.agent_id && (
             <button onClick={() => onTerminal(task.agent_id!)}>terminal</button>
           )}
           {task.session_id && (
-            <button onClick={() => onTranscript(task.session_id!)}>
+            <button
+              onClick={() =>
+                onTranscript(task.session_id!, task.session_provider ?? "claude")
+              }
+            >
               transcript
             </button>
           )}
@@ -1395,7 +1557,12 @@ function TaskPanel({
             <button
               className="danger"
               onClick={() => {
-                if (!confirm(`Cancel task #${task.id}? Live agents are killed; the branch survives.`)) return;
+                const retained = task.workspace_kind === "repo"
+                  ? "the branch survives"
+                  : task.workspace_kind === "scratch"
+                    ? "scratch files are retained until cleanup"
+                    : "existing child tasks are not cancelled automatically";
+                if (!confirm(`Cancel task #${task.id}? Live agents are killed; ${retained}.`)) return;
                 void onAction(() => api("POST", `/api/tasks/${task.id}/cancel`, {}));
               }}
             >
@@ -1464,7 +1631,9 @@ function CronsDrawer({ onClose }: { onClose: () => void }) {
             <div className="muted">
               {c.enabled ? `next ${c.next_run_at?.slice(0, 16) ?? "?"}` : "disabled"}
               {c.last_run_at ? ` · last ${c.last_run_at.slice(0, 16)}` : " · never run"}
-              {c.model ? ` · ${c.model}` : ""} · {c.repo.split("/").pop()}
+              {` · ${c.worker_provider}`}
+              {c.model ? ` · ${c.model}` : ""}
+              {c.reasoning_effort ? ` · ${c.reasoning_effort}` : ""} · {c.repo.split("/").pop()}
             </div>
             <div>{c.title}</div>
           </div>
@@ -1564,9 +1733,120 @@ function NewTaskForm({
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
   const [repo, setRepo] = useState("");
-  const [model, setModel] = useState("");
+  const [workspaceKind, setWorkspaceKind] = useState<WorkspaceKind>("repo");
+  const [repoRoot, setRepoRoot] = useState("");
+  const [workspaceCatalog, setWorkspaceCatalog] =
+    useState<WorkspaceCatalog | null>(null);
+  const [workspacesLoading, setWorkspacesLoading] = useState(true);
+  const [workspacesError, setWorkspacesError] = useState("");
+  const [modelChoice, setModelChoice] = useState("");
+  const [customModel, setCustomModel] = useState("");
+  const [models, setModels] = useState<ProviderModel[]>([]);
+  const [reasoningEffort, setReasoningEffort] =
+    useState<ReasoningEffort>("high");
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsUnavailable, setModelsUnavailable] = useState(false);
+  const [provider, setProvider] = useState<"" | "claude" | "codex">("");
   const [verify, setVerify] = useState("");
   const [priority, setPriority] = useState(2);
+
+  useEffect(() => {
+    let cancelled = false;
+    setWorkspacesLoading(true);
+    void api<WorkspaceCatalog>("GET", "/api/workspaces")
+      .then((catalog) => {
+        if (cancelled) return;
+        setWorkspaceCatalog(catalog);
+        setRepoRoot((current) => current || catalog.roots[0]?.path || "");
+        setWorkspacesError("");
+      })
+      .catch(() => {
+        if (!cancelled) setWorkspacesError("repository catalog unavailable");
+      })
+      .finally(() => {
+        if (!cancelled) setWorkspacesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void api<{ default_worker_provider: "claude" | "codex" }>(
+      "GET",
+      "/api/providers",
+    )
+      .then((result) => {
+        if (!cancelled) {
+          setProvider((current) => current || result.default_worker_provider);
+        }
+      })
+      .catch(() => {
+        // Older daemons do not expose provider metadata; keep system default.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!provider) {
+      setModels([]);
+      return;
+    }
+    let cancelled = false;
+    setModelsLoading(true);
+    setModelsUnavailable(false);
+    void api<{ models: ProviderModel[] }>("GET", `/api/providers/${provider}/models`)
+      .then((result) => {
+        if (!cancelled) setModels(result.models);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setModels([]);
+          setModelsUnavailable(true);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setModelsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [provider]);
+
+  const selectedModel =
+    modelChoice === "__custom__" ? customModel.trim() : modelChoice;
+  const selectedCatalogModel = models.find((model) => model.slug === selectedModel);
+  const availableReasoningLevels = useMemo(() => {
+    if (provider !== "codex") return [];
+    if (modelChoice === "__custom__") return ALL_REASONING_LEVELS;
+    if (selectedCatalogModel?.reasoning_levels.length) {
+      return selectedCatalogModel.reasoning_levels;
+    }
+    if (modelChoice) return BASE_REASONING_LEVELS;
+    if (models.length === 0) return BASE_REASONING_LEVELS;
+    const common = ALL_REASONING_LEVELS.filter((level) =>
+      models.every((model) =>
+        model.reasoning_levels.some((candidate) => candidate.effort === level.effort),
+      ),
+    );
+    return common.length > 0 ? common : BASE_REASONING_LEVELS;
+  }, [provider, modelChoice, selectedCatalogModel, models]);
+  const effectiveReasoningEffort = availableReasoningLevels.some(
+    (level) => level.effort === reasoningEffort,
+  )
+    ? reasoningEffort
+    : (availableReasoningLevels.find((level) => level.effort === "high")?.effort ??
+      availableReasoningLevels[0]?.effort ??
+      "high");
+
+  useEffect(() => {
+    if (provider === "codex" && effectiveReasoningEffort !== reasoningEffort) {
+      setReasoningEffort(effectiveReasoningEffort);
+    }
+  }, [provider, reasoningEffort, effectiveReasoningEffort]);
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -1579,23 +1859,160 @@ function NewTaskForm({
           autoFocus
         />
         <textarea
-          placeholder="prompt — what should the worker do?"
+          placeholder="prompt — what should be accomplished?"
           rows={6}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
         />
-        <input
-          placeholder="repo (absolute path)"
-          value={repo}
-          onChange={(e) => setRepo(e.target.value)}
-        />
+        <div className="workspace-picker">
+          <label>
+            <span>Workspace</span>
+            <select
+              aria-label="workspace type"
+              value={workspaceKind}
+              onChange={(e) => setWorkspaceKind(e.target.value as WorkspaceKind)}
+            >
+              <option value="repo">Repository</option>
+              <option
+                value="portfolio"
+                disabled={!workspacesLoading && workspaceCatalog?.roots.length === 0}
+              >
+                All repositories — Claude scopes it
+              </option>
+              <option value="scratch">Investigation — empty scratch workspace</option>
+            </select>
+          </label>
+
+          {workspaceKind === "repo" &&
+            !workspacesLoading &&
+            workspaceCatalog?.roots.length === 0 && (
+            <label>
+              <span>Repository</span>
+              <input
+                aria-label="repository path"
+                placeholder="repo (absolute path)"
+                value={repo}
+                onChange={(e) => setRepo(e.target.value)}
+              />
+            </label>
+          )}
+
+          {workspaceKind === "repo" &&
+            (workspacesLoading || (workspaceCatalog?.roots.length ?? 0) > 0) && (
+            <label>
+              <span>Repository</span>
+              <select
+                aria-label="repository"
+                value={repo}
+                onChange={(e) => setRepo(e.target.value)}
+                disabled={workspacesLoading || !workspaceCatalog?.repositories.length}
+              >
+                <option value="">
+                  {workspacesLoading
+                    ? "loading repositories…"
+                    : workspaceCatalog?.repositories.length
+                      ? "select a repository…"
+                      : "no repositories configured"}
+                </option>
+                {workspaceCatalog?.repositories.map((entry) => (
+                  <option key={entry.path} value={entry.path}>
+                    {workspaceCatalog.roots.length > 1
+                      ? `${entry.root.split("/").pop()} / `
+                      : ""}
+                    {entry.relative_path}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+
+          {workspaceKind === "portfolio" && (
+            <label>
+              <span>Repository root</span>
+              <select
+                aria-label="repository root"
+                value={repoRoot}
+                onChange={(e) => setRepoRoot(e.target.value)}
+                disabled={workspacesLoading || !workspaceCatalog?.roots.length}
+              >
+                <option value="">
+                  {workspacesLoading ? "loading roots…" : "select a root…"}
+                </option>
+                {workspaceCatalog?.roots.map((root) => (
+                  <option key={root.path} value={root.path}>
+                    {root.label} — {root.path}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+
+          <div className="workspace-help">
+            {workspaceKind === "repo" && workspaceCatalog?.roots.length === 0 &&
+              "No repository allow-list is configured, so this deployment uses the legacy absolute-path workflow."}
+            {workspaceKind === "repo" && workspaceCatalog?.roots.length !== 0 &&
+              "Claude main studies the task, then starts one worker in an isolated Git worktree."}
+            {workspaceKind === "portfolio" &&
+              "Claude main identifies every affected repository and creates isolated child tasks. The root is never given to a write-capable worker."}
+            {workspaceKind === "scratch" &&
+              `Command Center creates a private, non-Git workspace and retains it for ${workspaceCatalog?.scratch_retention_days ?? 7} days after completion.`}
+          </div>
+          {workspacesError && <div className="workspace-error">{workspacesError}</div>}
+        </div>
         <div className="row">
-          <select value={model} onChange={(e) => setModel(e.target.value)}>
-            <option value="">model (worker default)</option>
-            <option value="haiku">haiku</option>
-            <option value="sonnet">sonnet</option>
-            <option value="opus">opus</option>
+          <select
+            value={provider}
+            onChange={(e) => {
+              setProvider(e.target.value as "" | "claude" | "codex");
+              setModelChoice("");
+              setCustomModel("");
+              setReasoningEffort("high");
+            }}
+          >
+            <option value="">provider (system default)</option>
+            <option value="claude">Claude Code</option>
+            <option value="codex">Codex</option>
           </select>
+          <select
+            value={modelChoice}
+            onChange={(e) => setModelChoice(e.target.value)}
+          >
+            <option value="">model (provider default)</option>
+            {modelsLoading && <option disabled>loading models…</option>}
+            {models.map((option) => (
+              <option key={option.slug} value={option.slug}>
+                {option.display_name}
+                {option.description ? ` — ${option.description}` : ""}
+              </option>
+            ))}
+            <option value="__custom__">
+              {modelsUnavailable ? "model catalog unavailable — type model…" : "custom model…"}
+            </option>
+          </select>
+          {modelChoice === "__custom__" && (
+            <input
+              placeholder="provider model slug"
+              value={customModel}
+              onChange={(e) => setCustomModel(e.target.value)}
+            />
+          )}
+          {provider === "codex" && (
+            <select
+              aria-label="Codex reasoning effort"
+              value={effectiveReasoningEffort}
+              onChange={(e) => setReasoningEffort(e.target.value as ReasoningEffort)}
+            >
+              {availableReasoningLevels.map((level) => (
+                <option key={level.effort} value={level.effort}>
+                  {level.effort === "xhigh"
+                    ? "Extra High"
+                    : level.effort[0].toUpperCase() + level.effort.slice(1)}
+                  {level.effort === "high" ? " (default)" : ""}
+                  {level.description ? ` — ${level.description}` : ""}
+                </option>
+              ))}
+            </select>
+          )}
           <select
             value={priority}
             onChange={(e) => setPriority(Number(e.target.value))}
@@ -1615,13 +2032,24 @@ function NewTaskForm({
         <div className="actions">
           <button
             className="primary"
-            disabled={!title || !repo}
+            disabled={
+              !title ||
+              workspacesLoading ||
+              !!workspacesError ||
+              (workspaceKind === "repo" && !repo) ||
+              (workspaceKind === "portfolio" && !repoRoot)
+            }
             onClick={() =>
               onCreate({
                 title,
                 prompt: prompt || title,
-                repo,
-                model: model || undefined,
+                workspace_kind: workspaceKind,
+                ...(workspaceKind === "repo" ? { repo } : {}),
+                ...(workspaceKind === "portfolio" ? { repo_root: repoRoot } : {}),
+                worker_provider: provider || undefined,
+                model: selectedModel || undefined,
+                reasoning_effort:
+                  provider === "codex" ? effectiveReasoningEffort : undefined,
                 priority,
                 verify_cmd: verify || undefined,
               })

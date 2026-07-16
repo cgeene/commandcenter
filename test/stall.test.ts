@@ -113,4 +113,20 @@ describe("detectTransientApiError", () => {
   it("returns null on an empty pane", () => {
     expect(detectTransientApiError("")).toBeNull();
   });
+
+  it("detects a terminal Codex transport failure including wrapped detail", () => {
+    expect(
+      detectTransientApiError(
+        "working output\n\n■ stream disconnected before completion:\nconnection closed",
+      ),
+    ).toMatch(/stream disconnected.*connection closed/i);
+  });
+
+  it("does not treat quoted Codex error prose as a terminal transport failure", () => {
+    expect(
+      detectTransientApiError(
+        "The test fixture contains: ■ stream disconnected before completion",
+      ),
+    ).toBeNull();
+  });
 });
