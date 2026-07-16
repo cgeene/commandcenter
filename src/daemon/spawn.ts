@@ -547,10 +547,16 @@ export function spawnReviewer(
   if (task.status !== "review") {
     throw new Error(`task ${taskId} is ${task.status}; only tasks in review can be reviewed`);
   }
-  if (task.workspace_kind !== "repo") {
-    throw new Error(`task ${taskId} has no repository branch to review`);
+  if (task.workspace_kind === "portfolio") {
+    throw new Error(`task ${taskId} covers all repositories; it has no single tree to review`);
   }
-  if (!task.branch) throw new Error(`task ${taskId} has no branch to review`);
+  // A scratch task has no git branch — the reviewer validates its deliverable
+  // (saved docs, transcript, verify_cmd, files) from the workspace directory
+  // directly. A repo task is reviewed from a detached worktree at its branch.
+  const isScratch = task.workspace_kind === "scratch";
+  if (!isScratch && !task.branch) {
+    throw new Error(`task ${taskId} has no branch to review`);
+  }
   const existing = listAgents({ live: true }).find(
     (a) => a.kind === "reviewer" && a.task_id === taskId,
   );
@@ -571,13 +577,15 @@ export function spawnReviewer(
     provider === "codex"
       ? reasoningEffortForProvider("codex", opts?.reasoningEffort)
       : undefined;
-  const dir = createReviewWorktree(
-    task.repo,
-    taskId,
-    task.branch,
-    task.open_pr !== 0,
-    provider,
-  );
+  const dir = isScratch
+    ? validateScratchWorkspace(task.repo) // review the workspace dir read-only
+    : createReviewWorktree(
+        task.repo,
+        taskId,
+        task.branch!,
+        task.open_pr !== 0,
+        provider,
+      );
   const agent = createAgent({
     kind: "reviewer",
     provider,
@@ -631,7 +639,7 @@ export function spawnReviewer(
       role: "reviewer",
       model,
       reasoningEffort: reasoningEffort!,
-      workspaceKind: "repo",
+      workspaceKind: task.workspace_kind,
       promptFile,
     });
   }

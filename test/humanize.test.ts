@@ -31,6 +31,27 @@ describe("humanizeEvent", () => {
     expect(s).toBe(`Reviewer rejected #3: ${"x".repeat(80)}…`);
   });
 
+  it("review.round_started names the round and cap", () => {
+    const s = humanizeEvent(
+      ev({ kind: "review.round_started", task_id: 12, payload: JSON.stringify({ round: 2, max: 4 }) }),
+    );
+    expect(s).toBe("Started review round 2/4 for #12");
+  });
+
+  it("review.loop_exhausted names the round count", () => {
+    const s = humanizeEvent(
+      ev({ kind: "review.loop_exhausted", task_id: 8, payload: JSON.stringify({ rounds: 4, max: 4 }) }),
+    );
+    expect(s).toBe("#8 blocked — review loop exhausted after 4 rounds, human decision needed");
+  });
+
+  it("review.verdict_superseded names the superseding push", () => {
+    const s = humanizeEvent(
+      ev({ kind: "review.verdict_superseded", task_id: 5, payload: JSON.stringify({ new_head: "abcdef1234567890" }) }),
+    );
+    expect(s).toBe("#5's approval was superseded by a new push (abcdef123456…) — re-drafting and re-reviewing");
+  });
+
   it("agent.auto_nudged names the worker and the transient stall", () => {
     const s = humanizeEvent(
       ev({ kind: "agent.auto_nudged", agent_id: 22, payload: JSON.stringify({ error: "529 overloaded", attempt: 1 }) }),

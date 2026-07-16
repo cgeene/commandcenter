@@ -490,7 +490,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
   if (!task.verify_cmd || !task.worktree) {
     if (wasReview) {
       // Worker moved itself to review; nothing mechanical to run.
-      maybeAutoReview(task.id);
+      await maybeAutoReview(task.id);
       return;
     }
     // No verification gate, so the deliverable is the gate: a worker is only
@@ -506,7 +506,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
         fresh!.pr_url ? `${task.title}\n${fresh!.pr_url}` : task.title,
         { tags: "eyes" },
       );
-      maybeAutoReview(task.id);
+      await maybeAutoReview(task.id);
     } else {
       const prior = countTaskEvents(task.id, "task.stopped_incomplete");
       logEvent("task.stopped_incomplete", { taskId: task.id, agentId: agent.id });
@@ -555,7 +555,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
       `${task.title} — verify passed${current.pr_url ? `\n${current.pr_url}` : ""}`,
       { tags: "eyes,white_check_mark" },
     );
-    maybeAutoReview(task.id);
+    await maybeAutoReview(task.id);
     return;
   }
 

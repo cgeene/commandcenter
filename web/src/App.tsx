@@ -364,6 +364,7 @@ export function App() {
                     task={t}
                     byId={byId}
                     onSelect={(sel) => openTask(sel.id)}
+                    reviewMax={scheduler?.config.review_max_cycles ?? 4}
                   />
                 ))}
               </div>
@@ -473,10 +474,12 @@ function TaskCard({
   task,
   byId,
   onSelect,
+  reviewMax = 4,
 }: {
   task: Task;
   byId: Map<number, Task>;
   onSelect: (t: Task) => void;
+  reviewMax?: number;
 }) {
   const chain = blockedByChain(task, byId);
   const summary = firstLine(task.result_summary);
@@ -501,6 +504,11 @@ function TaskCard({
         )}
         {task.review_verdict === "reject" && (
           <span className="chip bad">✗ changes</span>
+        )}
+        {task.status === "review" && (
+          <span className="chip" title="automatic review⇄fix round (current/cap)">
+            review round {Math.min(task.review_cycles + 1, reviewMax)}/{reviewMax}
+          </span>
         )}
         {task.model && <span className="chip">{task.model}</span>}
         {task.reasoning_effort && <span className="chip">{task.reasoning_effort}</span>}
@@ -833,6 +841,7 @@ function SchedulerSection({
         stall_minutes: draft.stall_minutes,
         active_hours: draft.active_hours,
         auto_review: draft.auto_review,
+        review_max_cycles: draft.review_max_cycles,
         escalate_minutes: draft.escalate_minutes,
         reap_after_minutes: draft.reap_after_minutes,
         attention_stale_minutes: draft.attention_stale_minutes,
@@ -918,6 +927,19 @@ function SchedulerSection({
             onChange={(e) =>
               set("attention_stale_minutes", Number(e.target.value))
             }
+          />
+        </SettingRow>
+        <SettingRow
+          label="Max review rounds"
+          when="immediate"
+          hint="Automatic review⇄fix rounds before the loop blocks the task for a human decision."
+        >
+          <input
+            type="number"
+            min={1}
+            max={20}
+            value={draft.review_max_cycles}
+            onChange={(e) => set("review_max_cycles", Number(e.target.value))}
           />
         </SettingRow>
       </div>

@@ -22,8 +22,12 @@ export function buildReviewerPrompt(task: Task): string {
     task.result_summary ?? "(none set — that alone is suspicious)",
     "",
     "## Your setup",
-    `- You are in a read-only review worktree, detached at the tip of branch \`${task.branch}\`. File-editing tools are denied — you review, you do not fix.`,
-    "- Use get_task_diff for the full diff of the worker's branch, and read any file you need for context.",
+    task.workspace_kind === "scratch"
+      ? "- This is a SCRATCH investigation task — there is NO git branch or diff. You are read-only in the worker's private scratch workspace. Validate the deliverable through the worker's saved docs, the files left in this workspace, the verify command (if any), and any external evidence you can check yourself. get_task_diff does not apply here; do not call it."
+      : `- You are in a read-only review worktree, detached at the tip of branch \`${task.branch}\`. File-editing tools are denied — you review, you do not fix.`,
+    ...(task.workspace_kind === "scratch"
+      ? []
+      : ["- Use get_task_diff for the full diff of the worker's branch, and read any file you need for context."]),
     "- If this task's deliverable is research/discovery documentation, the worker was told to save it to the internal doc store (not the repo). Use list_docs and get_doc to read what it actually saved and verify the doc deliverable — a claimed doc that is missing, empty, or off-spec in the store is a defect.",
     task.open_pr === 0
       ? "- This task is BRANCH-ONLY by design: the worker was explicitly told NOT to open a PR — the branch itself is the deliverable. A missing PR is NOT a defect; do not reject for it. If the worker opened one anyway, that IS a scope violation — reject for it."

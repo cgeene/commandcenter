@@ -122,14 +122,31 @@ describe("handleVerdict", () => {
   it("reject at the cycle cap blocks the task for the human", async () => {
     const { handleVerdict } = await import("../src/daemon/review.js");
     const { getTask } = await import("../src/db/tasks.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
     const { listEvents } = await import("../src/db/events.js");
+    setSchedulerConfig({ review_max_cycles: 2 }); // cap at 2 for this case
     const { task } = await setupReviewTask({ review_cycles: 1 });
     await handleVerdict(task.id, 99, "reject", "still broken");
     const t = getTask(task.id)!;
     expect(t.status).toBe("blocked");
     expect(t.review_verdict).toBe("reject");
     expect(t.review_cycles).toBe(2);
-    expect(listEvents(10).map((e) => e.kind)).toContain("review.escalated");
+    // the loop-exhausted escalation replaces the old hard block-at-2
+    expect(listEvents(10).map((e) => e.kind)).toContain("review.loop_exhausted");
+  });
+
+  it("a 2nd rejection below the cap keeps the loop going instead of blocking", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    setSchedulerConfig({ review_max_cycles: 4 }); // default — a converging loop
+    const { task } = await setupReviewTask({ review_cycles: 1 });
+    // dead worker -> requeue with notes, NOT block (old behavior blocked here)
+    await handleVerdict(task.id, 99, "reject", "still needs work");
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("queued");
+    expect(t.review_cycles).toBe(2);
+    expect(t.review_verdict).toBeNull();
   });
 
   it("rejects a verdict for a task that is not in review", async () => {
@@ -269,7 +286,7 @@ describe("maybeAutoReview", () => {
     const { maybeAutoReview } = await import("../src/daemon/review.js");
     const { listEvents } = await import("../src/db/events.js");
     const { task } = await setupReviewTask(); // manually created, never scheduler-spawned
-    maybeAutoReview(task.id);
+    await maybeAutoReview(task.id);
     // No real repo/tmux in tests — the attempt surfaces as spawn_error,
     // which proves the gate opened.
     const kinds = listEvents(10).map((e) => e.kind);
@@ -290,7 +307,7 @@ describe("maybeAutoReview", () => {
     const { listEvents } = await import("../src/db/events.js");
     const task = createTask({ title: "t", prompt: "x", repo });
     updateTask(task.id, { status: "review", branch: "agent/task-x" });
-    maybeAutoReview(task.id);
+    await maybeAutoReview(task.id);
     const kinds = listEvents(10).map((e) => e.kind);
     expect(kinds).not.toContain("reviewer.spawned");
     expect(kinds).not.toContain("reviewer.spawn_error");
@@ -303,7 +320,7 @@ describe("maybeAutoReview", () => {
     setSchedulerConfig({ auto_review: false });
     const { task } = await setupReviewTask();
     logEvent("scheduler.spawned", { taskId: task.id });
-    maybeAutoReview(task.id);
+    await maybeAutoReview(task.id);
     expect(listEvents(10).map((e) => e.kind)).not.toContain("reviewer.spawn_error");
   });
 
@@ -315,19 +332,25 @@ describe("maybeAutoReview", () => {
     const { task } = await setupReviewTask();
     logEvent("scheduler.spawned", { taskId: task.id });
     logEvent("reviewer.auto_spawned", { taskId: 999 });
-    maybeAutoReview(task.id);
+    await maybeAutoReview(task.id);
     const kinds = listEvents(10).map((e) => e.kind);
     expect(kinds).toContain("reviewer.budget_skipped");
     expect(kinds).not.toContain("reviewer.spawn_error");
   });
 
-  it("gives up after the cycle cap", async () => {
+  it("gives up at the cycle cap — blocks + emits review.loop_exhausted", async () => {
     const { maybeAutoReview } = await import("../src/daemon/review.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { getTask } = await import("../src/db/tasks.js");
     const { logEvent, listEvents } = await import("../src/db/events.js");
+    setSchedulerConfig({ review_max_cycles: 2 });
     const { task } = await setupReviewTask({ review_cycles: 2 });
     logEvent("scheduler.spawned", { taskId: task.id });
-    maybeAutoReview(task.id);
-    expect(listEvents(10).map((e) => e.kind)).not.toContain("reviewer.spawn_error");
+    await maybeAutoReview(task.id);
+    const kinds = listEvents(10).map((e) => e.kind);
+    expect(kinds).not.toContain("reviewer.spawn_error"); // no reviewer spawned
+    expect(kinds).toContain("review.loop_exhausted");
+    expect(getTask(task.id)?.status).toBe("blocked");
   });
 });
 

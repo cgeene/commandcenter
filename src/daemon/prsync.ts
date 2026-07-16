@@ -9,7 +9,7 @@ import {
   type Task,
 } from "../db/tasks.js";
 import { notify } from "./notify.js";
-import { MAX_REVIEW_CYCLES } from "./review.js";
+import { reviewLoopSweep, reviewMaxCycles } from "./review.js";
 import { resumeAgent } from "./resume.js";
 import { killAgent } from "./spawn.js";
 import { git, removeWorktree } from "./worktree.js";
@@ -235,7 +235,7 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
     // blocked task is already excluded by the status !== "review" guard above;
     // this is the defensive check for a review-status task that still carries a
     // reject verdict.)
-    if (task.review_verdict === "reject" || task.review_cycles >= MAX_REVIEW_CYCLES) {
+    if (task.review_verdict === "reject" || task.review_cycles >= reviewMaxCycles()) {
       logEvent("pr.merged", {
         taskId,
         payload: { pr_url: task.pr_url, autocompleted: false },
@@ -450,7 +450,7 @@ export function recordSyncFailure(taskId: number, error: string): void {
  * pr.state on the MERGED/CLOSED paths — so no gh round-trip is needed to heal.
  */
 export async function reconcileTerminalPrs(): Promise<void> {
-  for (const task of tasksNeedingPrReconcile(MAX_REVIEW_CYCLES)) {
+  for (const task of tasksNeedingPrReconcile(reviewMaxCycles())) {
     const state: PrState["state"] = task.pr_state === "merged" ? "MERGED" : "CLOSED";
     try {
       await applyPrState(task.id, { state, reviewDecision: null, comments: [] });
@@ -491,6 +491,10 @@ export async function prSyncPass(): Promise<void> {
       recordSyncFailure(task.id, err instanceof Error ? err.message : String(err));
     }
   }
+  // Safety net for the auto-review loop: catch a stale approval (post-approval
+  // push with no clean worker Stop) or any review-status task the Stop-hook
+  // trigger missed. Each call is a no-op when there is nothing new to review.
+  await reviewLoopSweep();
 }
 
 export function startPrSync(): void {

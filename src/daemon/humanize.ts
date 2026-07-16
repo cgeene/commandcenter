@@ -64,6 +64,17 @@ const TEMPLATES: Record<string, Template> = {
     `Reviewer rejected ${taskRef(e)}${p.notes ? `: ${clip(p.notes, 80)}` : ""}`,
   "review.escalated": (e) =>
     `${taskRef(e)} escalated — too many rejected reviews`,
+  "review.round_started": (e, p) => {
+    const round = Number(p.round) || 0;
+    const max = Number(p.max) || 0;
+    return `Started review round ${round}${max ? `/${max}` : ""} for ${taskRef(e)}`;
+  },
+  "review.loop_exhausted": (e, p) => {
+    const rounds = Number(p.rounds) || 0;
+    return `${taskRef(e)} blocked — review loop exhausted after ${rounds} round${rounds === 1 ? "" : "s"}, human decision needed`;
+  },
+  "review.verdict_superseded": (e, p) =>
+    `${taskRef(e)}'s approval was superseded by a new push (${clip(p.new_head, 12)}) — re-drafting and re-reviewing`,
   "reviewer.auto_spawned": (e) => `Auto-spawned a reviewer for ${taskRef(e)}`,
   "reviewer.spawned": (e) => `Spawned a reviewer for ${taskRef(e)}`,
   "reviewer.budget_skipped": (e) =>

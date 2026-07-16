@@ -197,6 +197,7 @@ export interface SchedulerConfig {
   stall_minutes: number;
   active_hours: { start: number; end: number } | null;
   auto_review: boolean;
+  review_max_cycles: number;
   escalate_minutes: number;
   read_only_extra_allow: string[];
   attention_stale_minutes: number;
