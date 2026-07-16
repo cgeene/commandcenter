@@ -193,6 +193,66 @@ export function setNotificationSettings(
   return merged;
 }
 
+/**
+ * JIRA integration behavior (§6). Secrets (base URL, email, token) live in env
+ * only (src/config.ts jira*()) — NOTHING secret is ever stored here. This holds
+ * the master switch, the per-repo opt-in + project mapping, the creation
+ * classifier model, and the assignee mapping. Dormant in phase 1: stored/merged
+ * but not yet read by any sync engine.
+ */
+export interface JiraRepoConfig {
+  /** Opt-in per repo; default OFF. A repo mints tickets only once enabled. */
+  enabled: boolean;
+  /** Default (= deterministic fallback) JIRA project key, e.g. "EN". */
+  project: string;
+  /** Classifier allow-list of valid project keys; defaults to [project]. */
+  projects?: string[];
+  /** Classifier allow-list of issue type names, e.g. ["Task","Story","Bug"]; fallback "Task". */
+  issue_types?: string[];
+  /** Extra labels applied to created tickets (on top of "commandcenter"). */
+  labels?: string[];
+}
+
+export interface JiraConfig {
+  /** Master switch — default false (whole subsystem off until enabled). */
+  enabled: boolean;
+  /** Per-repo config, keyed by absolute repo path or "owner/name". Default OFF per repo. */
+  repos: Record<string, JiraRepoConfig>;
+  /** Ephemeral one-shot creation-classifier model (decision 7); a small model. */
+  classifier_model?: string;
+  /** Fallback assignee accountId when no per-identity mapping matches. */
+  default_assignee_account_id?: string;
+  /** identity → JIRA accountId mapping (§4.4). */
+  assignee_map?: Record<string, string>;
+}
+
+export const JIRA_CONFIG_DEFAULTS: JiraConfig = {
+  enabled: false,
+  repos: {},
+  classifier_model: "sonnet",
+};
+
+export function getJiraConfig(): JiraConfig {
+  return readGroup("jira", JIRA_CONFIG_DEFAULTS);
+}
+
+export function setJiraConfig(patch: Partial<JiraConfig>): JiraConfig {
+  const merged = { ...getJiraConfig(), ...patch };
+  setSetting("jira", JSON.stringify(merged));
+  return merged;
+}
+
+/** Absolute repo paths / "owner/name" keys that are JIRA-enabled right now.
+ *  The config-derived gate tasksNeedingJiraCreate() consumes. Empty (and thus
+ *  no candidates) whenever the master switch is off. */
+export function jiraEnabledRepos(): string[] {
+  const cfg = getJiraConfig();
+  if (!cfg.enabled) return [];
+  return Object.entries(cfg.repos)
+    .filter(([, r]) => r?.enabled)
+    .map(([repo]) => repo);
+}
+
 /* ---- resolvers: the DB > env > default read points ---- */
 
 function coerceProvider(value: unknown): AgentProvider | undefined {

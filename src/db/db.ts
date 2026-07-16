@@ -66,6 +66,12 @@ CREATE TABLE IF NOT EXISTS tasks (
   human_approved_at TEXT,
   pr_synced_at   TEXT,
   pr_sync_fails  INTEGER NOT NULL DEFAULT 0,
+  jira_key       TEXT,
+  jira_state     TEXT,
+  jira_status_category TEXT,
+  jira_synced_at TEXT,
+  jira_sync_fails INTEGER NOT NULL DEFAULT 0,
+  jira_project   TEXT,
   open_pr        INTEGER NOT NULL DEFAULT 1,
   tokens_used    INTEGER,
   created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -254,6 +260,20 @@ function migrate(db: Database.Database): void {
   // trigger (see prsync.applyPrState).
   if (!cols.includes("human_approved_at")) {
     db.exec("ALTER TABLE tasks ADD COLUMN human_approved_at TEXT");
+  }
+  // JIRA integration columns — mirror the pr_* quartet. jira_key is the
+  // first-class link (NULL = no ticket yet); jira_state/jira_status_category
+  // cache the workflow status + workflow-independent category so the dashboard
+  // reads columns instead of hitting the JIRA API on render; jira_synced_at /
+  // jira_sync_fails mirror pr_synced_at / pr_sync_fails; jira_project caches the
+  // resolved project key (and survives a per-task override). Dormant in phase 1.
+  if (!cols.includes("jira_key")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN jira_key TEXT");
+    db.exec("ALTER TABLE tasks ADD COLUMN jira_state TEXT");
+    db.exec("ALTER TABLE tasks ADD COLUMN jira_status_category TEXT");
+    db.exec("ALTER TABLE tasks ADD COLUMN jira_synced_at TEXT");
+    db.exec("ALTER TABLE tasks ADD COLUMN jira_sync_fails INTEGER NOT NULL DEFAULT 0");
+    db.exec("ALTER TABLE tasks ADD COLUMN jira_project TEXT");
   }
   if (!cols.includes("worker_provider")) {
     db.exec("ALTER TABLE tasks ADD COLUMN worker_provider TEXT NOT NULL DEFAULT 'claude'");
