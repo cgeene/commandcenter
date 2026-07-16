@@ -1,6 +1,7 @@
 import { getAgent, listAgents, type Agent } from "../db/agents.js";
 import { latestTaskEvent, logEvent } from "../db/events.js";
 import { getTask, readyTasks, type Task } from "../db/tasks.js";
+import { mainPromptClear } from "./notifqueue.js";
 import { resumeAgent } from "./resume.js";
 import { windowExists } from "./tmux.js";
 
@@ -34,6 +35,17 @@ export async function delegateTaskToMain(
   const main = availableMain(preferredMain);
   if (!main) {
     logEvent("task.awaiting_main", { taskId });
+    return false;
+  }
+  // Never merge the triage prompt into the human's mid-typed draft or fire it
+  // mid-turn: deliver only when the main is idle with a genuinely clear prompt.
+  // Otherwise leave the task queued — the main's idle/Stop hooks and the
+  // scheduler's periodic delegatePendingTaskToLiveMain retry it.
+  if (!main.tmux_target || main.state !== "idle" || !mainPromptClear(main.tmux_target)) {
+    logEvent("task.awaiting_main", {
+      taskId,
+      payload: { main_agent_id: main.id, reason: "main_prompt_busy" },
+    });
     return false;
   }
   const outcome = await resumeAgent(main.id, taskPrompt(task));
