@@ -1035,6 +1035,7 @@ export function buildApp(): Hono {
       .nullable()
       .optional(),
     auto_review: z.boolean().optional(),
+    review_max_cycles: z.number().int().min(1).max(20).optional(),
     escalate_minutes: z.number().int().min(1).max(120).optional(),
     read_only_extra_allow: z.array(z.string()).optional(),
     attention_stale_minutes: z.number().int().min(1).max(240).optional(),

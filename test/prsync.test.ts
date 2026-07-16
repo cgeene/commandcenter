@@ -107,9 +107,9 @@ describe("applyPrState", () => {
   it("never auto-completes a task that burned through its review cycles", async () => {
     const { applyPrState } = await import("../src/daemon/prsync.js");
     const { getTask, updateTask } = await import("../src/db/tasks.js");
-    const { MAX_REVIEW_CYCLES } = await import("../src/daemon/review.js");
+    const { reviewMaxCycles } = await import("../src/daemon/review.js");
     const { task } = await setupPrTask();
-    updateTask(task.id, { review_cycles: MAX_REVIEW_CYCLES });
+    updateTask(task.id, { review_cycles: reviewMaxCycles() });
     await applyPrState(task.id, open({ state: "MERGED" }));
     expect(getTask(task.id)?.status).toBe("review");
   });
@@ -535,22 +535,22 @@ describe("tasksNeedingPrReconcile (task #97 candidate selection)", () => {
 
   it("selects a review task with a terminal pr_state (merged or closed)", async () => {
     const { tasksNeedingPrReconcile } = await import("../src/db/tasks.js");
-    const { MAX_REVIEW_CYCLES } = await import("../src/daemon/review.js");
+    const { reviewMaxCycles } = await import("../src/daemon/review.js");
     const merged = await mkTask({ status: "review", pr_state: "merged", review_verdict: "approve" });
     const closed = await mkTask({ status: "review", pr_state: "closed" });
-    const ids = tasksNeedingPrReconcile(MAX_REVIEW_CYCLES).map((t) => t.id);
+    const ids = tasksNeedingPrReconcile(reviewMaxCycles()).map((t) => t.id);
     expect(ids).toContain(merged);
     expect(ids).toContain(closed);
   });
 
   it("excludes a merged PR parked on a reject verdict or exhausted cycles", async () => {
     const { tasksNeedingPrReconcile } = await import("../src/db/tasks.js");
-    const { MAX_REVIEW_CYCLES } = await import("../src/daemon/review.js");
+    const { reviewMaxCycles } = await import("../src/daemon/review.js");
     const rejected = await mkTask({ status: "review", pr_state: "merged", review_verdict: "reject" });
     const burned = await mkTask({
       status: "review",
       pr_state: "merged",
-      review_cycles: MAX_REVIEW_CYCLES,
+      review_cycles: reviewMaxCycles(),
     });
     // a closed PR always blocks regardless of verdict, so a reject verdict must
     // NOT exclude it from reconciliation
@@ -559,7 +559,7 @@ describe("tasksNeedingPrReconcile (task #97 candidate selection)", () => {
       pr_state: "closed",
       review_verdict: "reject",
     });
-    const ids = tasksNeedingPrReconcile(MAX_REVIEW_CYCLES).map((t) => t.id);
+    const ids = tasksNeedingPrReconcile(reviewMaxCycles()).map((t) => t.id);
     expect(ids).not.toContain(rejected);
     expect(ids).not.toContain(burned);
     expect(ids).toContain(closedRejected);
@@ -567,12 +567,12 @@ describe("tasksNeedingPrReconcile (task #97 candidate selection)", () => {
 
   it("ignores non-review tasks, open PRs, un-synced PRs, and branch-only tasks", async () => {
     const { tasksNeedingPrReconcile } = await import("../src/db/tasks.js");
-    const { MAX_REVIEW_CYCLES } = await import("../src/daemon/review.js");
+    const { reviewMaxCycles } = await import("../src/daemon/review.js");
     const doneMerged = await mkTask({ status: "done", pr_state: "merged" }); // already transitioned
     const openReview = await mkTask({ status: "review", pr_state: "open" });
     const unsynced = await mkTask({ status: "review", pr_state: null });
     const branchOnly = await mkTask({ status: "review", pr_state: "merged", open_pr: 0 });
-    const ids = tasksNeedingPrReconcile(MAX_REVIEW_CYCLES).map((t) => t.id);
+    const ids = tasksNeedingPrReconcile(reviewMaxCycles()).map((t) => t.id);
     expect(ids).not.toContain(doneMerged);
     expect(ids).not.toContain(openReview);
     expect(ids).not.toContain(unsynced);

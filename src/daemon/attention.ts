@@ -9,7 +9,7 @@ import {
 } from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { listTasks, readyTasks } from "../db/tasks.js";
-import { MAX_REVIEW_CYCLES } from "./review.js";
+import { reviewMaxCycles } from "./review.js";
 import { prStates } from "./prcache.js";
 import { WAIT_HOOK_EVENTS } from "./waiting.js";
 
@@ -150,14 +150,15 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
     });
   }
 
-  // --- decision: a task blocked after the reviewer/worker loop gave up ---
+  // --- decision: a task blocked after the review⇄fix loop was exhausted ---
+  const maxCycles = reviewMaxCycles();
   for (const t of tasks) {
-    if (t.status !== "blocked" || t.review_cycles < MAX_REVIEW_CYCLES) continue;
+    if (t.status !== "blocked" || t.review_cycles < maxCycles) continue;
     push({
       // review_cycles in the key: a later cycle re-raises a dismissed item
       id: `decision:${t.id}:${t.review_cycles}`,
       kind: "decision",
-      title: `Decision needed — #${t.id} ${t.title}`,
+      title: `Decision needed — #${t.id} ${t.title} (review loop exhausted after ${t.review_cycles} rounds)`,
       context: excerpt(t.review_notes ?? t.result_summary),
       severity: "orange",
       urgent: false,

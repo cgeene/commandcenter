@@ -34,6 +34,8 @@ export interface Task {
   review_verdict: string | null;
   review_notes: string | null;
   review_cycles: number;
+  review_head_sha: string | null; // branch HEAD SHA the last reviewer judged (NULL for scratch)
+  review_result_hash: string | null; // hash of result_summary at that reviewer's spawn
   pr_url: string | null;
   pr_feedback_at: string | null;
   pr_state: string | null; // open | merged | closed (lowercased gh state)
@@ -243,6 +245,8 @@ const UPDATABLE = new Set([
   "review_verdict",
   "review_notes",
   "review_cycles",
+  "review_head_sha",
+  "review_result_hash",
   "pr_url",
   "pr_feedback_at",
   "pr_state",

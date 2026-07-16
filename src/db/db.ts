@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   review_verdict TEXT,
   review_notes   TEXT,
   review_cycles  INTEGER NOT NULL DEFAULT 0,
+  review_head_sha TEXT,
+  review_result_hash TEXT,
   pr_url         TEXT,
   pr_feedback_at TEXT,
   pr_state       TEXT,
@@ -216,6 +218,16 @@ function migrate(db: Database.Database): void {
     db.exec("ALTER TABLE tasks ADD COLUMN review_verdict TEXT");
     db.exec("ALTER TABLE tasks ADD COLUMN review_notes TEXT");
     db.exec("ALTER TABLE tasks ADD COLUMN review_cycles INTEGER NOT NULL DEFAULT 0");
+  }
+  // review_head_sha: the branch HEAD SHA the last reviewer was spawned against
+  // (NULL for scratch/no-git tasks). review_result_hash: a hash of the
+  // result_summary at that spawn. Together they let the auto-review loop tell a
+  // genuine new round (new commit or changed summary) from an idle re-entry, and
+  // enforce the invariant "a PR is non-draft IFF its current HEAD was approved"
+  // — an approve verdict whose SHA no longer matches HEAD is stale.
+  if (!cols.includes("review_head_sha")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN review_head_sha TEXT");
+    db.exec("ALTER TABLE tasks ADD COLUMN review_result_hash TEXT");
   }
   if (!cols.includes("pr_url")) {
     db.exec("ALTER TABLE tasks ADD COLUMN pr_url TEXT");

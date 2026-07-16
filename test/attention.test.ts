@@ -151,9 +151,11 @@ describe("deriveAttention — kinds", () => {
     expect(items[0].kind).toBe("merge_pr");
   });
 
-  it("decision for a task blocked after >= MAX_REVIEW_CYCLES", async () => {
+  it("decision for a task blocked after >= review_max_cycles", async () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    setSchedulerConfig({ review_max_cycles: 2 });
     const t = createTask({ title: "hard call", prompt: "x", repo: "/r" });
     updateTask(t.id, {
       status: "blocked",
@@ -164,12 +166,15 @@ describe("deriveAttention — kinds", () => {
     expect(items).toHaveLength(1);
     expect(items[0].kind).toBe("decision");
     expect(items[0].id).toBe(`decision:${t.id}:2`);
+    expect(items[0].title).toContain("review loop exhausted after 2 rounds");
     expect(items[0].context).toContain("disagree");
   });
 
-  it("a blocked task with < MAX_REVIEW_CYCLES is not a decision", async () => {
+  it("a blocked task with < review_max_cycles is not a decision", async () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    setSchedulerConfig({ review_max_cycles: 2 });
     const t = createTask({ title: "t", prompt: "x", repo: "/r" });
     updateTask(t.id, { status: "blocked", review_cycles: 1 });
     expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
@@ -294,6 +299,8 @@ describe("deriveAttention — ordering", () => {
   it("sorts by severity desc then age desc", async () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    setSchedulerConfig({ review_max_cycles: 2 });
 
     // yellow merge_pr (newest)
     await approvedPrTask();
@@ -332,6 +339,8 @@ describe("deriveAttention — dismissal", () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     const { dismissAttention } = await import("../src/db/attention.js");
     const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    setSchedulerConfig({ review_max_cycles: 2 });
     const t = createTask({ title: "t", prompt: "x", repo: "/r" });
     updateTask(t.id, { status: "blocked", review_cycles: 2, review_notes: "n" });
     dismissAttention(`decision:${t.id}:2`);

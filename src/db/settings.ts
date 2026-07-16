@@ -24,6 +24,12 @@ export interface SchedulerConfig {
   active_hours: { start: number; end: number } | null;
   /** Auto-spawn an adversarial reviewer when a task reaches review. */
   auto_review: boolean;
+  /** Max automatic review⇄fix rounds before the loop escalates to the human.
+   *  A round is one reviewer verdict; the loop re-reviews after every worker
+   *  fix (and after a stale post-approval push) until a reviewer approves or
+   *  review_cycles reaches this cap, at which point the task is blocked with a
+   *  Needs-You item. */
+  review_max_cycles: number;
   /** Minutes a worker may sit in waiting_input (after the main agent was asked to unblock it) before the human is paged. */
   escalate_minutes: number;
   /** Extra read-only permission patterns appended to the baked-in READ_ONLY_PROFILE
@@ -47,6 +53,7 @@ export const SCHEDULER_DEFAULTS: SchedulerConfig = {
   stall_minutes: 15,
   active_hours: null,
   auto_review: true,
+  review_max_cycles: 4,
   escalate_minutes: 5,
   read_only_extra_allow: [],
   attention_stale_minutes: 10,
