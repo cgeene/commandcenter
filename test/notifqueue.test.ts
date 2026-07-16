@@ -11,6 +11,7 @@ const panes = new Map<string, string>();
 vi.mock("../src/daemon/tmux.js", () => ({
   windowExists: () => true,
   listWindowIds: () => [...panes.keys()],
+  listLiveWindowIds: () => [...panes.keys()],
   sendText: (...args: unknown[]) => sendText(...args),
   capturePane: (target: string) => panes.get(target) ?? "",
 }));
