@@ -23,6 +23,7 @@ import {
   type JiraTransition,
 } from "./jira.js";
 import { notify } from "./notify.js";
+import { enforcePrTitle } from "./prdraft.js";
 
 /**
  * JIRA sync engine — the deterministic sibling of prsync.ts. Owns ticket
@@ -420,7 +421,39 @@ async function jiraCreate(
   const fresh = getTask(task.id)!;
   const view = await client.getIssue(created.key);
   const after = await applyConsequence(client, fresh, view);
+  // Enforce the bracketed [KEY-N] PR title now that the key is persisted (§3.3
+  // step 4). A failure here throws to the create loop's catch → the sync-failure
+  // streak; the key is already recorded, so the retitle is retried by the
+  // reconciler on a later pass and the ticket is never re-created.
+  if (fresh.pr_url) await enforcePrTitle(fresh.pr_url, created.key);
   recordJiraSyncSuccess(task.id, after ?? view);
+}
+
+/* ------------------------------------------------------------------ *
+ * PR-title reconciler — heal a stale/missing [KEY-N] on later passes.  *
+ * ------------------------------------------------------------------ */
+
+/** Task statuses whose PR title is historical — not worth failing a pass to
+ *  retitle (the ticket is terminal or the work is abandoned). */
+const TITLE_TERMINAL_STATUS = new Set(["done", "cancelled", "failed"]);
+
+/**
+ * Re-enforce the [KEY-N] PR title for a ticketed task whose PR is still live.
+ * enforcePrTitle is idempotent (a correct title triggers no `gh pr edit`), so
+ * this is a no-op in the common case and only heals a title that drifted — e.g.
+ * the create-path retitle failed (its throw was recorded but the key persisted),
+ * or a human edited the title. A retitle failure throws to the sync loop's catch
+ * and accrues to the same jira_sync_fails streak; it never re-creates a ticket
+ * (jiraCreate is gated on jira_key IS NULL).
+ *
+ * Skipped once the PR is merged/closed or the task is terminal: at that point
+ * the title is historical and a gh hiccup shouldn't stall the pass.
+ */
+async function reconcilePrTitle(task: Task): Promise<void> {
+  if (!task.pr_url || !task.jira_key) return;
+  if (task.pr_state === "merged" || task.pr_state === "closed") return;
+  if (TITLE_TERMINAL_STATUS.has(task.status)) return;
+  await enforcePrTitle(task.pr_url, task.jira_key);
 }
 
 /* ------------------------------------------------------------------ *
@@ -465,6 +498,10 @@ export async function jiraSyncPass(): Promise<void> {
     try {
       const view = await client.getIssue(task.jira_key!);
       const after = await applyConsequence(client, task, view);
+      // Heal a drifted PR title (best-effort, idempotent). Shares the streak:
+      // a persistent retitle failure accrues to jira_sync_fails just like a
+      // JIRA-API failure, so recordJiraSyncSuccess runs only when BOTH succeed.
+      await reconcilePrTitle(task);
       recordJiraSyncSuccess(task.id, after ?? view);
     } catch (err) {
       recordJiraSyncFailure(

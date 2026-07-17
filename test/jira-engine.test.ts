@@ -33,6 +33,8 @@ afterEach(async () => {
   _resetJiraSyncState();
   const { _setClassifierRunner } = await import("../src/daemon/jiraclassify.js");
   _setClassifierRunner(null);
+  const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+  _setGhRunner(null);
   for (const k of ENV_KEYS) {
     if (savedEnv[k] === undefined) delete process.env[k];
     else process.env[k] = savedEnv[k];
@@ -164,6 +166,38 @@ async function useFake(fake: FakeJira) {
   const { JiraClient } = await import("../src/daemon/jira.js");
   const { _setJiraClient } = await import("../src/daemon/jirasync.js");
   _setJiraClient(new JiraClient({ runner: fake.runner, sleep: async () => {}, maxRetries: 0 }));
+  // Default in-memory `gh` so create/reconcile retitles never shell out. Tests
+  // that inspect titles install their own via useGh() AFTER useFake().
+  const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+  _setGhRunner(async (args) => (args[1] === "view" ? "feat: do X\n" : ""));
+}
+
+/* ---- In-memory fake `gh` for PR-title enforcement ---- */
+
+interface FakeGh {
+  /** prUrl → current PR title. */
+  titles: Map<string, string>;
+  /** Every `gh pr edit ... --title` call, in order. */
+  edits: string[][];
+  /** When true, every gh invocation throws (models a broken `gh`). */
+  fail?: boolean;
+}
+
+async function useGh(gh: FakeGh) {
+  const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+  _setGhRunner(async (args) => {
+    if (gh.fail) throw new Error("gh boom");
+    if (args[1] === "view") {
+      const url = args[2];
+      return `${gh.titles.get(url) ?? "feat: do X"}\n`;
+    }
+    if (args[1] === "edit") {
+      const [, , url, , title] = args;
+      gh.titles.set(url, title);
+      gh.edits.push(args);
+    }
+    return "";
+  });
 }
 
 describe("create path", () => {
@@ -215,6 +249,100 @@ describe("create path", () => {
     expect(after.jira_sync_fails).toBe(1); // the failure was recorded
     await jiraSyncPass();
     expect(fake.createCount).toBe(1); // still only ever created once
+  });
+});
+
+describe("PR-title enforcement (create → retitle + reconciler)", () => {
+  const URL = "https://github.com/o/r/pull/1";
+
+  it("retitles the PR to the bracketed [KEY-N] form after creating the ticket", async () => {
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const t = createTask({ title: "do X", prompt: "p", repo: "/repo" });
+    updateTask(t.id, { pr_url: URL, status: "review" });
+    await enableRepo("/repo");
+    await useFake(new FakeJira());
+    const gh: FakeGh = { titles: new Map([[URL, "feat: do X"]]), edits: [] };
+    await useGh(gh);
+
+    const { jiraSyncPass } = await import("../src/daemon/jirasync.js");
+    await jiraSyncPass();
+
+    expect(gh.titles.get(URL)).toBe("[EN-1] feat: do X");
+    expect(gh.edits.length).toBe(1);
+  });
+
+  it("a failing retitle records a sync failure but NEVER re-creates the ticket", async () => {
+    const { createTask, updateTask, getTask } = await import("../src/db/tasks.js");
+    const t = createTask({ title: "t", prompt: "p", repo: "/repo" });
+    updateTask(t.id, { pr_url: URL, status: "review" });
+    await enableRepo("/repo");
+    const fake = new FakeJira();
+    await useFake(fake);
+    await useGh({ titles: new Map(), edits: [], fail: true });
+
+    const { jiraSyncPass } = await import("../src/daemon/jirasync.js");
+    await jiraSyncPass(); // create + persist key OK; retitle throws
+    const afterFirst = getTask(t.id)!;
+    expect(afterFirst.jira_key).toBe("EN-1"); // key persisted before the retitle
+    expect(afterFirst.jira_sync_fails).toBe(1); // retitle failure recorded
+
+    await jiraSyncPass(); // reconciler retries the retitle (still failing)
+    expect(fake.createCount).toBe(1); // key already set → create path never re-entered
+    expect(getTask(t.id)!.jira_sync_fails).toBe(2); // streak accrues, no re-create
+  });
+
+  it("the reconciler heals a stale/wrong [KEY-N] title on a later pass, idempotently", async () => {
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const t = createTask({ title: "t", prompt: "p", repo: "/repo" });
+    updateTask(t.id, {
+      pr_url: URL,
+      jira_key: "EN-1",
+      jira_project: "EN",
+      jira_state: "in progress",
+      jira_status_category: "indeterminate",
+      status: "review",
+      pr_state: "open",
+    });
+    await enableRepo("/repo");
+    const fake = new FakeJira();
+    fake.seed("EN-1", "In Progress");
+    await useFake(fake);
+    // Title carries a WRONG key (e.g. left over from a prior ticket / human edit).
+    const gh: FakeGh = { titles: new Map([[URL, "[EN-999] feat: do X"]]), edits: [] };
+    await useGh(gh);
+
+    const { jiraSyncPass } = await import("../src/daemon/jirasync.js");
+    await jiraSyncPass();
+    expect(gh.titles.get(URL)).toBe("[EN-1] feat: do X"); // healed to the real key
+    expect(gh.edits.length).toBe(1);
+
+    await jiraSyncPass(); // now correct → no further edit (idempotent)
+    expect(gh.edits.length).toBe(1);
+  });
+
+  it("does not retitle a merged PR (historical title, never fails the pass)", async () => {
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const t = createTask({ title: "t", prompt: "p", repo: "/repo" });
+    updateTask(t.id, {
+      pr_url: URL,
+      jira_key: "EN-1",
+      jira_project: "EN",
+      jira_state: "in progress",
+      jira_status_category: "indeterminate",
+      status: "review",
+      pr_state: "merged",
+    });
+    await enableRepo("/repo");
+    const fake = new FakeJira();
+    fake.seed("EN-1", "In Progress");
+    await useFake(fake);
+    // gh is broken — proves the reconciler doesn't even call it for merged PRs.
+    await useGh({ titles: new Map(), edits: [], fail: true });
+
+    const { jiraSyncPass } = await import("../src/daemon/jirasync.js");
+    await jiraSyncPass();
+    const { getTask } = await import("../src/db/tasks.js");
+    expect(getTask(t.id)!.jira_sync_fails).toBe(0); // gh never invoked → no failure
   });
 });
 
