@@ -14,6 +14,9 @@ const ENV_KEYS = [
   "CC_REVIEWER_VARIETY",
   "CC_NTFY_URL",
   "CC_NTFY_TOKEN",
+  "CC_JIRA_TOKEN",
+  "CC_JIRA_EMAIL",
+  "CC_JIRA_BASE_URL",
 ] as const;
 let savedEnv: Record<string, string | undefined>;
 
@@ -211,6 +214,174 @@ describe("settings API validation", () => {
       body: JSON.stringify({ ntfy_url: "ftp://bad" }),
     });
     expect(res.status).toBe(400);
+  });
+});
+
+describe("JIRA settings", () => {
+  it("defaults to off, empty repos, and the sonnet classifier", async () => {
+    const settings = await import("../src/db/settings.js");
+    expect(settings.getJiraConfig()).toEqual({
+      enabled: false,
+      repos: {},
+      classifier_model: "sonnet",
+    });
+    // No enabled repos while the master switch is off.
+    expect(settings.jiraEnabledRepos()).toEqual([]);
+  });
+
+  it("round-trips a config and derives jiraEnabledRepos from the toggles", async () => {
+    const settings = await import("../src/db/settings.js");
+    settings.setJiraConfig({
+      enabled: true,
+      repos: {
+        "owner/on": { enabled: true, project: "EN" },
+        "owner/off": { enabled: false, project: "UN" },
+      },
+    });
+    // A second partial patch must merge at the top level, not clobber repos.
+    settings.setJiraConfig({ default_assignee_account_id: "acct-123" });
+    const cfg = settings.getJiraConfig();
+    expect(cfg.enabled).toBe(true);
+    expect(cfg.default_assignee_account_id).toBe("acct-123");
+    expect(Object.keys(cfg.repos)).toHaveLength(2);
+    // Only the enabled repo is a create candidate.
+    expect(settings.jiraEnabledRepos()).toEqual(["owner/on"]);
+  });
+
+  it("returns no enabled repos once the master switch is off", async () => {
+    const settings = await import("../src/db/settings.js");
+    settings.setJiraConfig({
+      enabled: false,
+      repos: { "owner/on": { enabled: true, project: "EN" } },
+    });
+    expect(settings.jiraEnabledRepos()).toEqual([]);
+  });
+
+  it("GET exposes token presence, never the token value", async () => {
+    const SECRET = "jira_tok_super_secret_9999";
+    process.env.CC_JIRA_TOKEN = SECRET;
+    process.env.CC_JIRA_EMAIL = "owner@example.com";
+    const { buildApp } = await import("../src/daemon/api.js");
+    const res = await buildApp().request("/api/settings");
+    const body = await res.text();
+    expect(body).not.toContain(SECRET);
+    const parsed = JSON.parse(body);
+    expect(parsed.jira.token_set).toBe(true);
+    expect(parsed.jira.email).toBe("owner@example.com");
+    expect(parsed.jira.stored).not.toHaveProperty("token");
+    expect(parsed.jira.stored).not.toHaveProperty("ntfy_token");
+  });
+
+  it("reports token unset when CC_JIRA_TOKEN is absent", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const parsed = await (await buildApp().request("/api/settings")).json();
+    expect(parsed.jira.token_set).toBe(false);
+  });
+
+  it("accepts a valid JIRA patch and round-trips via GET (default OFF per repo)", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const app = buildApp();
+    const res = await app.request("/api/settings/jira", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        enabled: true,
+        classifier_model: "haiku",
+        default_assignee_account_id: "acct-42",
+        repos: {
+          "acme/api": {
+            enabled: false,
+            project: "EN",
+            projects: ["EN", "UN"],
+            issue_types: ["Task", "Story"],
+            labels: ["backend"],
+          },
+        },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const get = await (await app.request("/api/settings")).json();
+    expect(get.jira.stored.enabled).toBe(true);
+    expect(get.jira.stored.classifier_model).toBe("haiku");
+    expect(get.jira.stored.default_assignee_account_id).toBe("acct-42");
+    // Per-repo opt-in defaults OFF even when the master switch is on.
+    expect(get.jira.stored.repos["acme/api"].enabled).toBe(false);
+    expect(get.jira.stored.repos["acme/api"].projects).toEqual(["EN", "UN"]);
+  });
+
+  it("rejects a project key that violates ^[A-Z][A-Z0-9]+$", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const res = await buildApp().request("/api/settings/jira", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repos: { "acme/api": { enabled: true, project: "en-lower" } },
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects a classifier model outside the allow-list", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const res = await buildApp().request("/api/settings/jira", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ classifier_model: "gpt-4" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects a repo key that is neither an existing path nor owner/name", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const res = await buildApp().request("/api/settings/jira", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repos: { "not a repo key": { enabled: true, project: "EN" } },
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects a relative path repo key that does not exist", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const res = await buildApp().request("/api/settings/jira", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repos: { [path.join(tmpDir, "nope")]: { enabled: true, project: "EN" } },
+      }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("accepts an absolute existing directory as a repo key", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const res = await buildApp().request("/api/settings/jira", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        repos: { [tmpDir]: { enabled: true, project: "EN" } },
+      }),
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("clears default_assignee_account_id when sent null", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const app = buildApp();
+    await app.request("/api/settings/jira", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ default_assignee_account_id: "acct-99" }),
+    });
+    await app.request("/api/settings/jira", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ default_assignee_account_id: null }),
+    });
+    const settings = await import("../src/db/settings.js");
+    expect(settings.getJiraConfig().default_assignee_account_id).toBeUndefined();
   });
 });
 
