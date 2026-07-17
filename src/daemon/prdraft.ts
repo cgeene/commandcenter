@@ -13,6 +13,36 @@ import { execFile } from "node:child_process";
 /** The prefix a worker prepends when the draft-create fallback path fires. */
 export const UNREVIEWED_PREFIX = "[UNREVIEWED] ";
 
+/**
+ * PR-title prefix ownership (two independent daemon writers touch a PR title):
+ *
+ *   [KEY-N] [UNREVIEWED] <base title>
+ *   └──┬──┘ └────┬─────┘
+ *   ticket-    markPrReady
+ *   retitle    (this file)
+ *   (enforcePrTitle)
+ *
+ * They operate on DISJOINT prefixes and must never fight:
+ *  - `enforcePrTitle` owns the `[KEY-N]` prefix. It re-normalizes the title to
+ *    the canonical order above, re-adding `[KEY-N]` and PRESERVING any
+ *    `[UNREVIEWED]` marker it finds — it never removes `[UNREVIEWED]`.
+ *  - `markPrReady` owns the `[UNREVIEWED]` prefix. It removes `[UNREVIEWED]`
+ *    (wherever it sits, even after a `[KEY-N]`) and PRESERVES any `[KEY-N]`.
+ *
+ * Because each writer only ever adds/removes its own prefix and leaves the
+ * other's intact, the two compose in either order and converge on the same
+ * final title.
+ */
+
+/** Matches an optional leading `[KEY-N]` bracket then an optional `[UNREVIEWED]`
+ *  bracket. Every group is optional, so `.exec` always matches (possibly empty)
+ *  — the doc's canonical strip regex (§3.3). */
+const TITLE_PREFIX_RE = /^(\[[A-Z][A-Z0-9]+-\d+\]\s*)?(\[UNREVIEWED\]\s*)?/;
+
+/** Strip a leading `[UNREVIEWED]` even when a `[KEY-N]` precedes it, keeping the
+ *  `[KEY-N]` (captured as $1). markPrReady's half of the disjoint ownership. */
+const UNREVIEWED_STRIP_RE = /^(\[[A-Z][A-Z0-9]+-\d+\]\s*)?\[UNREVIEWED\]\s*/;
+
 export type GhRunner = (args: string[]) => Promise<string>;
 
 function execGh(args: string[]): Promise<string> {
@@ -41,9 +71,40 @@ export async function markPrReady(prUrl: string): Promise<void> {
   const title = (
     await runGh(["pr", "view", prUrl, "--json", "title", "-q", ".title"])
   ).trim();
-  const stripped = title.replace(/^\[UNREVIEWED\]\s*/, "");
+  // Remove only the [UNREVIEWED] token; preserve a leading [KEY-N] ($1) that
+  // enforcePrTitle may have added, so the two writers don't clobber each other.
+  const stripped = title.replace(UNREVIEWED_STRIP_RE, "$1").trim();
   if (stripped !== title) {
     await runGh(["pr", "edit", prUrl, "--title", stripped]);
+  }
+}
+
+/**
+ * Enforce the Nylas bracketed `[KEY-N]` PR-title convention from the daemon,
+ * once a ticket exists for the task (§3.3 step 4). Idempotent: it strips any
+ * existing `[KEY-N]` prefix (and locates a following `[UNREVIEWED]` marker),
+ * then re-prepends `[KEY-N]`, keeping the `[UNREVIEWED]` marker in place. So:
+ *  - running it twice is a no-op,
+ *  - a wrong/stale `[KEY-N]` is corrected to the current key (the reconciler
+ *    heals stale titles on later passes),
+ *  - it never strips `[UNREVIEWED]` — that belongs to markPrReady.
+ *
+ * Only ever called for commandcenter-originated PRs (the daemon passes the
+ * task's own pr_url); it never touches other PRs in the repo. THROWS on gh
+ * failure so the caller records it against the jira sync-failure streak — a
+ * retitle failure is recoverable (the key is already persisted), so the sync
+ * pass retries on a later pass and never re-creates a ticket.
+ */
+export async function enforcePrTitle(prUrl: string, key: string): Promise<void> {
+  const current = (
+    await runGh(["pr", "view", prUrl, "--json", "title", "-q", ".title"])
+  ).trim();
+  const m = TITLE_PREFIX_RE.exec(current)!; // always matches (all groups optional)
+  const hadUnreviewed = Boolean(m[2]);
+  const base = current.slice(m[0].length);
+  const desired = `[${key}] ${hadUnreviewed ? UNREVIEWED_PREFIX : ""}${base}`;
+  if (desired !== current) {
+    await runGh(["pr", "edit", prUrl, "--title", desired]);
   }
 }
 
