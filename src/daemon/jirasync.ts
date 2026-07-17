@@ -260,6 +260,15 @@ async function applyConsequence(
   if (plan.kind === "willnotdo") {
     // Don't clobber a ticket a human already resolved.
     if (current.category === "done") return undefined;
+    // Already degraded this run — short-circuit at the TOP (mirror the
+    // closed-comment branch). A degraded ticket stays at its non-terminal status
+    // and keeps re-selecting from tasksNeedingJiraSync, so without this guard the
+    // failing "Will not do" POST would be re-attempted and jira.transition_failed
+    // re-logged (logEvent has no dedup) every pass, forever — the exact
+    // spam-every-2-min the escalate-once discipline forbids. The degrade is
+    // treated as a clean success (no streak), so this in-memory guard is what
+    // bounds it; across a daemon restart it re-degrades at most once.
+    if (commentedThisRun.has(task.id)) return undefined;
     const resolved = await resolveTransition(client, task.jira_project!, key, "Will not do");
     if (resolved) {
       try {
@@ -273,11 +282,10 @@ async function applyConsequence(
         // "Will not do" hasScreen:true (EN transition 71) — the POST can 400 on
         // a required screen field even though the transition WAS offered. Decision
         // 4 / §2.4 mandate degrading to a comment here, not crashing the pass.
-        // Fall through to the comment path below; we do NOT rethrow, so this
-        // degrade is a clean success (the human intent — cancellation — is
-        // recorded on the ticket). A genuinely stuck cancellation would be one
-        // where even the comment POST keeps failing, which DOES surface as a
-        // sync-failure streak via the caller.
+        // Fall through to the comment path below (logged/attempted at most once
+        // per run thanks to the guard above); we do NOT rethrow, so the degrade
+        // is a clean success (the human intent — cancellation — is recorded on
+        // the ticket via the comment).
         logEvent("jira.transition_failed", {
           taskId: task.id,
           payload: {
@@ -291,7 +299,6 @@ async function applyConsequence(
     // Reached when "Will not do" is either not offered from the current status OR
     // was offered but the POST failed (required screen field, missing state).
     // Both degrade to the same "task cancelled" comment — never crash the pass.
-    if (commentedThisRun.has(task.id)) return undefined;
     await client.addComment(
       key,
       buildCommentAdf("commandcenter: task cancelled in commandcenter."),

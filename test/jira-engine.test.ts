@@ -70,7 +70,8 @@ class FakeJira {
   issues = new Map<string, { name: string; category: string }>();
   comments = new Map<string, string[]>();
   createCount = 0;
-  transitionCount = 0;
+  transitionCount = 0; // successful transitions only
+  transitionAttempts = 0; // every POST /transitions, incl. ones that 400
   private seq = 0;
   private offered: string[];
   private getIssueError: boolean;
@@ -127,6 +128,7 @@ class FakeJira {
       return j(200, { transitions });
     }
     if (sub === "/transitions" && req.method === "POST") {
+      this.transitionAttempts++;
       const id = (req.body as { transition: { id: string } }).transition.id;
       const name = Object.keys(TARGET_ID).find((n) => TARGET_ID[n] === id);
       // hasScreen reject: the transition is offered but the POST 400s on a
@@ -309,7 +311,7 @@ describe("transition mapping (sync path)", () => {
     expect(fake.comments.get("EN-1")!.length).toBe(1); // degraded to comment
   });
 
-  it("task cancelled degrades to a comment when Will not do is OFFERED but the POST fails (hasScreen)", async () => {
+  it("task cancelled degrades to a comment when Will not do is OFFERED but the POST fails (hasScreen), exactly ONCE per run", async () => {
     const id = await seedTicket("cancelled");
     const { updateTask, getTask } = await import("../src/db/tasks.js");
     updateTask(id, { status: "cancelled" });
@@ -319,17 +321,23 @@ describe("transition mapping (sync path)", () => {
     fake.seed("EN-1", "In Progress");
     await useFake(fake);
     const { jiraSyncPass, SYNC_FAIL_THRESHOLD } = await import("../src/daemon/jirasync.js");
+    const { listEvents } = await import("../src/db/events.js");
 
-    // Run several passes: must degrade to ONE comment, never crash, and never
-    // build an unbounded failure streak (the 0→1 oscillation bug).
-    await jiraSyncPass();
-    await jiraSyncPass();
-    await jiraSyncPass();
-    await jiraSyncPass();
+    // Run WELL PAST the threshold: the degraded ticket stays at "In Progress"
+    // (non-terminal) so it keeps re-selecting from tasksNeedingJiraSync. The
+    // failing transition POST and its jira.transition_failed log must NOT recur
+    // every pass — that would be the spam-every-2-min the discipline forbids.
+    const passes = SYNC_FAIL_THRESHOLD + 5;
+    for (let i = 0; i < passes; i++) await jiraSyncPass();
 
     expect(fake.transitionCount).toBe(0); // transition never landed
+    expect(fake.transitionAttempts).toBe(1); // POST /transitions attempted at most once
     expect(fake.issues.get("EN-1")!.name).toBe("In Progress"); // status unchanged
     expect(fake.comments.get("EN-1")!.length).toBe(1); // exactly one degrade comment
+    // The degrade-only events fire at most once — no per-pass spam.
+    const events = listEvents(500);
+    expect(events.filter((e) => e.task_id === id && e.kind === "jira.transition_failed").length).toBe(1);
+    expect(events.filter((e) => e.task_id === id && e.kind === "jira.commented").length).toBe(1);
     // No hard sync-failure streak — the degrade path does NOT record a failure.
     const after = getTask(id)!;
     expect(after.jira_sync_fails).toBe(0);
