@@ -4,6 +4,7 @@ import {
   countAgentEvents,
   countTaskEvents,
   latestAgentEvent,
+  latestAgentEventTs,
   latestTaskEventId,
   logEvent,
 } from "../db/events.js";
@@ -60,6 +61,55 @@ export function resetAutoNudgeCount(agentId: number): void {
  *  this map does not — clear it between tests to avoid cross-test bleed. */
 export function __clearAutoNudgeCountsForTests(): void {
   autoNudgeCounts.clear();
+}
+
+/** Task statuses in which a finished worker's idle-prompt ping is pure noise:
+ *  "review" is handled by PR #36's automatic review⇄fix loop (reject
+ *  auto-resumes, approve→merge auto-completes+reaps), and a done/cancelled task
+ *  has nothing left to do — its worker is only awaiting the reaper. */
+const IDLE_SUPPRESS_STATUSES: readonly string[] = ["review", "done", "cancelled"];
+
+/** True once the worker's latest turn-boundary lifecycle event is its Stop
+ *  hook — i.e. it finished the turn and is not blocked mid-work on a
+ *  SessionStart handshake or a Codex PermissionRequest. `hook.notification`
+ *  (Claude's idle_prompt / permission signal) is deliberately excluded so this
+ *  reflects turn completion, not the notification we are currently handling. */
+function stopFiredForLatestTurn(agentId: number): boolean {
+  const latest = latestAgentEvent(agentId, [
+    "hook.stop",
+    "hook.sessionstart",
+    "hook.permissionrequest",
+  ]);
+  return latest?.kind === "hook.stop";
+}
+
+/** Re-delegation throttle for a repeated idle_prompt on the same finished turn.
+ *  Keyed on agent + last Stop timestamp so a genuinely new turn (new Stop) is
+ *  always fresh information and delegates. In-memory only — losing it on a
+ *  daemon restart just permits one extra delegation, the safe direction. */
+const IDLE_REDELEGATE_WINDOW_MS = 10 * 60_000;
+const idleRedelegateAt = new Map<number, { stopTs: string; at: number }>();
+
+/** Test-only: this map outlives the per-test in-memory db (see above). */
+export function __clearIdleRedelegateForTests(): void {
+  idleRedelegateAt.clear();
+}
+
+/** True when an identical idle_prompt for this agent+turn already delegated
+ *  within IDLE_REDELEGATE_WINDOW_MS; records the attempt otherwise. */
+function idleRedelegateThrottled(agentId: number): boolean {
+  const stopTs = latestAgentEventTs(agentId, ["hook.stop"]) ?? "";
+  const nowMs = Date.now();
+  const prev = idleRedelegateAt.get(agentId);
+  if (
+    prev &&
+    prev.stopTs === stopTs &&
+    nowMs - prev.at < IDLE_REDELEGATE_WINDOW_MS
+  ) {
+    return true;
+  }
+  idleRedelegateAt.set(agentId, { stopTs, at: nowMs });
+  return false;
 }
 
 interface StallCheck {
@@ -361,6 +411,45 @@ export async function handleHookEvent(
         break;
       }
 
+      // Claude re-emits a Notification with notification_type "idle_prompt"
+      // ("waiting for your input") once a worker finishes its turn and idles.
+      // Codex has no Notification hook, so this path is Claude-only — its
+      // genuine mid-work blocks arrive as PermissionRequest and are unaffected.
+      const isIdlePrompt =
+        event === "Notification" && body.notification_type === "idle_prompt";
+
+      // A finished WORKER whose task is already in review (or done/cancelled and
+      // merely awaiting the reaper) needs no human or main-agent action: PR
+      // #36's automatic review⇄fix loop resumes it on reject and
+      // completes+reaps it on approve→merge. Suppress the delegation and the
+      // watchdog escalation entirely (never entering waiting_input skips both),
+      // but only once its Stop hook confirms it actually finished this turn —
+      // a mid-work permission prompt would fail that check, and a fix round
+      // after a rejection moves the task back to in_progress so the status
+      // guard self-reverses. Still leave a low-key event for the feed.
+      //
+      // Scoped to kind==="worker": a REVIEWER shares the task_id (status
+      // "review"), so without this guard a Claude reviewer that Stops without a
+      // verdict and then idles would be silenced here — losing the very
+      // re-escalation path (idle → waiting_input → watchdog page) the task says
+      // reviewers must keep. Reviewers fall through to the normal wait path.
+      if (agent.kind === "worker" && isIdlePrompt) {
+        const task = agent.task_id ? getTask(agent.task_id) : undefined;
+        if (
+          task &&
+          IDLE_SUPPRESS_STATUSES.includes(task.status) &&
+          stopFiredForLatestTurn(agentId)
+        ) {
+          updateAgent(agentId, { state: "idle" });
+          logEvent("waiting.suppressed_in_review", {
+            agentId,
+            taskId: task.id,
+            payload: { task_status: task.status },
+          });
+          break;
+        }
+      }
+
       const wasAlreadyWaiting = agent.state === "waiting_input";
       let stallError: string | null = null;
       if (!wasAlreadyWaiting) {
@@ -374,6 +463,20 @@ export async function handleHookEvent(
       updateAgent(agentId, { state: "waiting_input" });
       // Repeat notification for the same wait: already delegated or paged.
       if (wasAlreadyWaiting) break;
+
+      // Safety net for any other noisy-idle class the suppression above does
+      // not cover (e.g. a worker that stopped without a result and idles on an
+      // in_progress task): an identical idle_prompt for the same finished turn
+      // should not re-delegate to the main more than once per throttle window.
+      // Worker-scoped like the suppression, so a reviewer keeps its exact prior
+      // delegation/escalation behavior.
+      if (agent.kind === "worker" && isIdlePrompt && idleRedelegateThrottled(agentId)) {
+        logEvent("waiting.idle_redelegate_throttled", {
+          agentId,
+          taskId: agent.task_id ?? undefined,
+        });
+        break;
+      }
 
       const fullMsg = stallError
         ? `${msg}\n\n(auto-recovery gave up after ${MAX_AUTO_NUDGES} attempts — last seen: ${stallError})`

@@ -130,6 +130,10 @@ const TEMPLATES: Record<string, Template> = {
   // --- waiting / delegation ---
   "waiting.escalated": (e) => `Escalated ${worker(e)} — still waiting for input`,
   "waiting.delegated": (e) => `Delegated ${worker(e)}'s question to the main agent`,
+  "waiting.suppressed_in_review": (e) =>
+    `${worker(e)} finished and idled — ${taskRef(e)} is in review, no ping needed`,
+  "waiting.idle_redelegate_throttled": (e) =>
+    `Skipped a repeat idle ping from ${worker(e)} — already delegated this turn`,
   "notification.queued": (e) =>
     `Held ${worker(e)}'s notification — main agent's prompt was busy`,
   "notification.flushed": (_e, p) => {

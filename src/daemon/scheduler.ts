@@ -502,12 +502,16 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
       }
     }
 
-    // silent too long while supposedly working -> stalled. "review" is
-    // included because resumed workers (PR feedback answered mid-review,
-    // input delivered via /send) can be working while the task shows
-    // review — without it, a resume that failed to unblock the agent
-    // would never be surfaced to anyone.
-    if (agent.kind === "worker" && agent.state === "working") {
+    // silent too long while supposedly working -> stalled. Covers workers AND
+    // reviewers (kind !== "main"): a frozen reviewer mid-review must surface
+    // too, and this is a different detector from the idle-in-review ping
+    // suppression (that keys on the idle_prompt hook + waiting_input; this
+    // keys on a "working" agent going silent). "review" is included because a
+    // resumed worker (PR feedback answered mid-review, input via /send) can be
+    // working while the task shows review, and a reviewer's task is review by
+    // definition — without it a resume/review that never unblocks would never
+    // be surfaced to anyone.
+    if (agent.kind !== "main" && agent.state === "working") {
       const last = Date.parse(agent.last_event_at ?? agent.spawned_at);
       if (nowMs - last > cfg.stall_minutes * 60_000) {
         const task = agent.task_id ? getTask(agent.task_id) : undefined;
@@ -515,8 +519,8 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
           updateAgent(agent.id, { state: "stalled" });
           logEvent("agent.stalled", { agentId: agent.id, taskId: task.id });
           notify(
-            `a${agent.id} stalled on task #${task.id}`,
-            `${task.title} — no activity for ${cfg.stall_minutes}m; peek or kill --requeue`,
+            `${agent.kind} a${agent.id} stalled on task #${task.id}`,
+            `${task.title} — no activity for ${cfg.stall_minutes}m; peek or kill`,
             { priority: "high", tags: "hourglass" },
           );
         }

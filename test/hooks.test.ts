@@ -37,8 +37,11 @@ beforeEach(async () => {
   paneContent = "";
   sendText.mockClear();
   sendText.mockImplementation(async () => {});
-  const { __clearAutoNudgeCountsForTests } = await import("../src/daemon/hooks.js");
+  const { __clearAutoNudgeCountsForTests, __clearIdleRedelegateForTests } = await import(
+    "../src/daemon/hooks.js"
+  );
   __clearAutoNudgeCountsForTests();
+  __clearIdleRedelegateForTests();
 });
 
 afterEach(async () => {
@@ -309,6 +312,156 @@ describe("hook events", () => {
     await handleHookEvent(agent.id, { hook_event_name: "Stop" });
     expect(getAgent(agent.id)?.state).toBe("dead");
     await handleHookEvent(9999, { hook_event_name: "Stop" }); // must not throw
+  });
+});
+
+describe("idle-prompt suppression for finished workers in review", () => {
+  async function liveIdleMain() {
+    const { createAgent } = await import("../src/db/agents.js");
+    return createAgent({ kind: "main", state: "idle", tmux_target: "cc:@2" });
+  }
+
+  const IDLE_PROMPT = {
+    hook_event_name: "Notification" as const,
+    notification_type: "idle_prompt",
+    message: "Claude is waiting for your input",
+  };
+
+  it("suppresses the idle ping when a finished worker's task is in review", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    paneContent = PROMPT_BOX; // main prompt clear, so a delegation WOULD send
+    await liveIdleMain();
+    const { task, agent } = await setup();
+    updateTask(task.id, { result_summary: "done" });
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // → review, hook.stop, idle
+    expect(getTask(task.id)?.status).toBe("review");
+
+    await handleHookEvent(agent.id, IDLE_PROMPT);
+
+    expect(getAgent(agent.id)?.state).toBe("idle"); // NOT waiting_input
+    expect(sendText).not.toHaveBeenCalled(); // never delegated to the main
+    const kinds = listEvents(30).map((e) => e.kind);
+    expect(kinds).toContain("waiting.suppressed_in_review");
+    expect(kinds).not.toContain("waiting.delegated");
+  });
+
+  it("suppresses the idle ping for a done task whose worker has not reaped yet", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, agent } = await setup();
+    updateTask(task.id, { result_summary: "done" });
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    updateTask(task.id, { status: "done" }); // e.g. PR merged, auto-completed
+
+    await handleHookEvent(agent.id, IDLE_PROMPT);
+
+    expect(getAgent(agent.id)?.state).toBe("idle");
+    const kinds = listEvents(30).map((e) => e.kind);
+    expect(kinds).toContain("waiting.suppressed_in_review");
+  });
+
+  it("does NOT suppress a permission-menu wait even when the task is in review", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, agent } = await setup();
+    updateTask(task.id, { result_summary: "done" });
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // → review
+    // A permission prompt is a different notification_type — worker is blocked
+    // mid-work, so it must still surface even though the task shows review.
+    await handleHookEvent(agent.id, {
+      hook_event_name: "Notification",
+      notification_type: "permission_prompt",
+      message: "Claude needs permission to run a command",
+    });
+
+    expect(getAgent(agent.id)?.state).toBe("waiting_input");
+    const kinds = listEvents(30).map((e) => e.kind);
+    expect(kinds).not.toContain("waiting.suppressed_in_review");
+  });
+
+  it("does NOT suppress an idle ping while the task is still in_progress", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { agent } = await setup(); // task stays in_progress
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // stopped_incomplete, idle
+    await handleHookEvent(agent.id, IDLE_PROMPT);
+
+    expect(getAgent(agent.id)?.state).toBe("waiting_input"); // genuinely idle-waiting
+    const kinds = listEvents(30).map((e) => e.kind);
+    expect(kinds).not.toContain("waiting.suppressed_in_review");
+  });
+
+  it("re-enables the ping after a rejection moves the task back to in_progress", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent, updateAgent } = await import("../src/db/agents.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, agent } = await setup();
+    updateTask(task.id, { result_summary: "done" });
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // → review
+    await handleHookEvent(agent.id, IDLE_PROMPT); // suppressed
+    expect(getAgent(agent.id)?.state).toBe("idle");
+
+    // Reject reopens the task; the worker resumes work on a fresh turn (its
+    // prior result is cleared until it re-submits).
+    updateTask(task.id, { status: "in_progress", review_verdict: null, result_summary: null });
+    updateAgent(agent.id, { state: "working" });
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // stopped_incomplete
+    expect(getTask(task.id)?.status).toBe("in_progress");
+    await handleHookEvent(agent.id, IDLE_PROMPT); // now NOT suppressed
+
+    expect(getAgent(agent.id)?.state).toBe("waiting_input");
+    const suppressed = listEvents(40).filter(
+      (e) => e.kind === "waiting.suppressed_in_review",
+    );
+    expect(suppressed).toHaveLength(1); // only the first, in-review occurrence
+  });
+
+  it("does NOT suppress a REVIEWER's idle ping in review (reviewers must keep escalating)", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    // A reviewer shares the task_id; its task is in review by definition.
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    updateTask(task.id, { status: "review" });
+    const reviewer = createAgent({ kind: "reviewer", state: "working", task_id: task.id });
+    await handleHookEvent(reviewer.id, { hook_event_name: "Stop" }); // no verdict → reviewerStopped
+    await handleHookEvent(reviewer.id, IDLE_PROMPT);
+
+    // Reviewer keeps the normal wait path (idle → waiting_input → escalation),
+    // never silenced by the worker-scoped suppression.
+    expect(getAgent(reviewer.id)?.state).toBe("waiting_input");
+    const kinds = listEvents(30).map((e) => e.kind);
+    expect(kinds).not.toContain("waiting.suppressed_in_review");
+  });
+
+  it("throttles a repeated idle re-delegation for the same finished turn", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { updateAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    paneContent = PROMPT_BOX; // main prompt clear → first idle_prompt delegates
+    await liveIdleMain();
+    const { agent } = await setup(); // task in_progress (not suppressed)
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // hook.stop, idle
+    await handleHookEvent(agent.id, IDLE_PROMPT); // delegate #1 + record dedupe stamp
+
+    // State churns back to idle without a new Stop (same turn); a fresh
+    // idle_prompt must not re-delegate within the throttle window.
+    updateAgent(agent.id, { state: "idle" });
+    await handleHookEvent(agent.id, IDLE_PROMPT); // throttled
+
+    const kinds = listEvents(40).map((e) => e.kind);
+    expect(kinds.filter((k) => k === "waiting.delegated")).toHaveLength(1);
+    expect(kinds).toContain("waiting.idle_redelegate_throttled");
   });
 });
 
