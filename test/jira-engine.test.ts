@@ -61,6 +61,9 @@ interface FakeOpts {
   offeredTargets?: string[];
   /** Make GET /issue fail (500) — to exercise create's key-persist-first. */
   getIssueError?: boolean;
+  /** Target status names whose POST /transitions returns 400 even though
+   *  GET /transitions offers them — models a hasScreen required-field reject. */
+  failTransitionTo?: string[];
 }
 
 class FakeJira {
@@ -71,10 +74,12 @@ class FakeJira {
   private seq = 0;
   private offered: string[];
   private getIssueError: boolean;
+  private failTransitionTo: string[];
 
   constructor(opts: FakeOpts = {}) {
     this.offered = opts.offeredTargets ?? ["In Progress", "Merged", "Done", "Will not do"];
     this.getIssueError = opts.getIssueError ?? false;
+    this.failTransitionTo = opts.failTransitionTo ?? [];
   }
 
   /** Seed an already-existing ticket at a given status. */
@@ -124,6 +129,11 @@ class FakeJira {
     if (sub === "/transitions" && req.method === "POST") {
       const id = (req.body as { transition: { id: string } }).transition.id;
       const name = Object.keys(TARGET_ID).find((n) => TARGET_ID[n] === id);
+      // hasScreen reject: the transition is offered but the POST 400s on a
+      // required screen field. The issue status does NOT change.
+      if (name && this.failTransitionTo.includes(name)) {
+        return j(400, { errorMessages: ["Field 'resolution' is required."] });
+      }
       if (name) {
         this.transitionCount++;
         this.issues.set(key, { name, category: CATEGORY[name.toLowerCase()] });
@@ -297,6 +307,33 @@ describe("transition mapping (sync path)", () => {
     await jiraSyncPass();
     expect(fake.transitionCount).toBe(0);
     expect(fake.comments.get("EN-1")!.length).toBe(1); // degraded to comment
+  });
+
+  it("task cancelled degrades to a comment when Will not do is OFFERED but the POST fails (hasScreen)", async () => {
+    const id = await seedTicket("cancelled");
+    const { updateTask, getTask } = await import("../src/db/tasks.js");
+    updateTask(id, { status: "cancelled" });
+    // "Will not do" IS offered by GET /transitions, but POST /transitions 400s —
+    // the required-screen-field case that the not-offered test can't reach.
+    const fake = new FakeJira({ failTransitionTo: ["Will not do"] });
+    fake.seed("EN-1", "In Progress");
+    await useFake(fake);
+    const { jiraSyncPass, SYNC_FAIL_THRESHOLD } = await import("../src/daemon/jirasync.js");
+
+    // Run several passes: must degrade to ONE comment, never crash, and never
+    // build an unbounded failure streak (the 0→1 oscillation bug).
+    await jiraSyncPass();
+    await jiraSyncPass();
+    await jiraSyncPass();
+    await jiraSyncPass();
+
+    expect(fake.transitionCount).toBe(0); // transition never landed
+    expect(fake.issues.get("EN-1")!.name).toBe("In Progress"); // status unchanged
+    expect(fake.comments.get("EN-1")!.length).toBe(1); // exactly one degrade comment
+    // No hard sync-failure streak — the degrade path does NOT record a failure.
+    const after = getTask(id)!;
+    expect(after.jira_sync_fails).toBe(0);
+    expect(after.jira_sync_fails).toBeLessThan(SYNC_FAIL_THRESHOLD);
   });
 
   it("don't-clobber: never moves backward/sideways — In Progress target no-ops when already there", async () => {

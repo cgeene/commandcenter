@@ -248,16 +248,38 @@ async function applyConsequence(
     if (current.category === "done") return;
     const resolved = await resolveTransition(client, task.jira_project!, key, "Will not do");
     if (resolved) {
-      await client.transitionIssue(key, resolved.id);
-      recordJiraSyncSuccess(task.id, { state: resolved.toName.toLowerCase(), category: resolved.toCategory });
-      logEvent("jira.transition", {
-        taskId: task.id,
-        payload: { jira_key: key, to: resolved.toName },
-      });
-      return;
+      try {
+        await client.transitionIssue(key, resolved.id);
+        recordJiraSyncSuccess(task.id, {
+          state: resolved.toName.toLowerCase(),
+          category: resolved.toCategory,
+        });
+        logEvent("jira.transition", {
+          taskId: task.id,
+          payload: { jira_key: key, to: resolved.toName },
+        });
+        return;
+      } catch (err) {
+        // "Will not do" hasScreen:true (EN transition 71) — the POST can 400 on
+        // a required screen field even though the transition WAS offered. Decision
+        // 4 / §2.4 mandate degrading to a comment here, not crashing the pass.
+        // Fall through to the comment path below; crucially we do NOT rethrow, so
+        // the per-task catch never records a hard sync failure — otherwise the
+        // streak would oscillate 0→1 every pass (getIssue resets it) and never
+        // reach SYNC_FAIL_THRESHOLD, silently stranding the ticket forever.
+        logEvent("jira.transition_failed", {
+          taskId: task.id,
+          payload: {
+            jira_key: key,
+            to: "Will not do",
+            error: err instanceof Error ? err.message : String(err),
+          },
+        });
+      }
     }
-    // Transition unavailable (e.g. required screen field, no by-name path):
-    // degrade to a comment, never crash the pass.
+    // Reached when "Will not do" is either not offered from the current status OR
+    // was offered but the POST failed (required screen field, missing state).
+    // Both degrade to the same "task cancelled" comment — never crash the pass.
     if (commentedThisRun.has(task.id)) return;
     await client.addComment(
       key,
@@ -266,7 +288,7 @@ async function applyConsequence(
     commentedThisRun.add(task.id);
     logEvent("jira.commented", {
       taskId: task.id,
-      payload: { jira_key: key, reason: "cancelled (transition unavailable)" },
+      payload: { jira_key: key, reason: "cancelled (will-not-do transition failed)" },
     });
     return;
   }
