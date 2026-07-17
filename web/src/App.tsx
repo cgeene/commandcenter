@@ -31,7 +31,9 @@ import type {
   Doc,
   DocWithContent,
   Event,
+  JiraConfig,
   JiraMeta,
+  JiraRepoConfig,
   Memory,
   ParsedPane,
   ProviderModel,
@@ -1397,9 +1399,304 @@ function NotificationsSection({
   );
 }
 
+/** Editable view of one per-repo JIRA row. Allow-lists are edited as comma-
+ *  separated text and parsed to arrays on save. */
+interface JiraRepoDraft {
+  key: string;
+  enabled: boolean;
+  project: string;
+  projects: string;
+  issue_types: string;
+  labels: string;
+}
+
+function csvToArr(s: string): string[] {
+  return s
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+function arrToCsv(a: string[] | undefined): string {
+  return (a ?? []).join(", ");
+}
+
+function toRepoDrafts(repos: Record<string, JiraRepoConfig>): JiraRepoDraft[] {
+  return Object.entries(repos).map(([key, r]) => ({
+    key,
+    enabled: r.enabled,
+    project: r.project ?? "",
+    projects: arrToCsv(r.projects),
+    issue_types: arrToCsv(r.issue_types),
+    labels: arrToCsv(r.labels),
+  }));
+}
+
+function JiraSection({
+  settings,
+  repoSuggestions,
+  onSaved,
+  onError,
+}: {
+  settings: AppSettings;
+  repoSuggestions: string[];
+  onSaved: () => void;
+  onError: (m: string) => void;
+}) {
+  const { stored, token_set, base_url } = settings.jira;
+  const [enabled, setEnabled] = useState(stored.enabled);
+  const [classifierModel, setClassifierModel] = useState(
+    stored.classifier_model ?? "sonnet",
+  );
+  const [assignee, setAssignee] = useState(
+    stored.default_assignee_account_id ?? "",
+  );
+  const [repos, setRepos] = useState<JiraRepoDraft[]>(
+    toRepoDrafts(stored.repos ?? {}),
+  );
+  const [newRepo, setNewRepo] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const setRepo = (i: number, patch: Partial<JiraRepoDraft>) =>
+    setRepos((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+
+  const addRepo = () => {
+    const key = newRepo.trim();
+    if (!key) return;
+    if (repos.some((r) => r.key === key)) {
+      onError(`repo "${key}" is already configured`);
+      return;
+    }
+    onError("");
+    setRepos((rs) => [
+      ...rs,
+      { key, enabled: false, project: "", projects: "", issue_types: "", labels: "" },
+    ]);
+    setNewRepo("");
+  };
+
+  const removeRepo = (i: number) =>
+    setRepos((rs) => rs.filter((_, j) => j !== i));
+
+  const save = async () => {
+    setSaving(true);
+    onError("");
+    try {
+      const reposOut: Record<string, JiraRepoConfig> = {};
+      for (const r of repos) {
+        const key = r.key.trim();
+        if (!key) continue;
+        const cfg: JiraRepoConfig = {
+          enabled: r.enabled,
+          project: r.project.trim().toUpperCase(),
+        };
+        const projects = csvToArr(r.projects).map((p) => p.toUpperCase());
+        if (projects.length) cfg.projects = projects;
+        const its = csvToArr(r.issue_types);
+        if (its.length) cfg.issue_types = its;
+        const labels = csvToArr(r.labels);
+        if (labels.length) cfg.labels = labels;
+        reposOut[key] = cfg;
+      }
+      // assignee_map is intentionally omitted — the top-level merge preserves any
+      // hand-edited map. default_assignee_account_id sends null to clear.
+      await api("PATCH", "/api/settings/jira", {
+        enabled,
+        repos: reposOut,
+        classifier_model: classifierModel,
+        default_assignee_account_id: assignee.trim() || null,
+      });
+      onSaved();
+    } catch (e) {
+      onError(errMsg(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Repos not yet configured — offered as add-suggestions.
+  const configured = new Set(repos.map((r) => r.key));
+  const suggestions = repoSuggestions.filter((s) => !configured.has(s));
+
+  return (
+    <section className="settings-section">
+      <h2>JIRA</h2>
+      <p className="muted">
+        commandcenter mints a JIRA ticket for a task iff it opens a PR, on
+        enabled repos only. JIRA config is read on every sync pass, so edits
+        apply immediately. Secrets stay in the environment: the API token, its
+        account email, and the base URL come from{" "}
+        <code>CC_JIRA_TOKEN</code> / <code>CC_JIRA_EMAIL</code> /{" "}
+        <code>CC_JIRA_BASE_URL</code> and are never set here.
+      </p>
+
+      {!token_set && (
+        <div className="banner banner-warn">
+          JIRA sync disabled: no token configured — set{" "}
+          <code>CC_JIRA_TOKEN</code> (and <code>CC_JIRA_EMAIL</code>) in the
+          daemon environment. Until then the whole subsystem is inert: no
+          tickets are created and nothing below takes effect.
+        </div>
+      )}
+
+      <SettingRow
+        label="Enable JIRA sync (master switch)"
+        when="immediate"
+        hint="Off = no tickets anywhere, regardless of per-repo settings. Default off."
+      >
+        <label className="setting-check">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
+          />
+          {enabled ? "enabled" : "disabled"}
+        </label>
+      </SettingRow>
+
+      <SettingRow
+        label="Classifier model"
+        when="immediate"
+        hint="Cheap model for the one-shot ticket classifier (project + issue type). Falls back to the per-repo default on any failure."
+      >
+        <select
+          value={classifierModel}
+          onChange={(e) => setClassifierModel(e.target.value)}
+        >
+          {settings.model_choices.map((slug) => (
+            <option key={slug} value={slug}>
+              {slug}
+            </option>
+          ))}
+        </select>
+      </SettingRow>
+
+      <SettingRow
+        label="Default assignee accountId"
+        when="immediate"
+        hint="JIRA accountId to assign created tickets to. Blank = create unassigned. Not an email."
+      >
+        <input
+          type="text"
+          placeholder="e.g. 5b10ac8d82e05b22cc7d4ef5"
+          value={assignee}
+          onChange={(e) => setAssignee(e.target.value)}
+        />
+      </SettingRow>
+
+      <div className="jira-repos">
+        <div className="setting-head">
+          <span className="setting-label">Per-repo configuration</span>
+          <ApplyBadge when="immediate" />
+        </div>
+        <span className="setting-hint muted">
+          Each repo is opt-in (default off) and maps to a default project key
+          (<code>^[A-Z][A-Z0-9]+$</code>, e.g. <code>EN</code>). Allow-lists
+          are comma-separated; the classifier picks within them, falling back to
+          the default project + <code>Task</code>.
+        </span>
+
+        {repos.length === 0 && (
+          <p className="muted">No repos configured yet.</p>
+        )}
+
+        {repos.map((r, i) => (
+          <div className="jira-repo-row" key={r.key}>
+            <div className="jira-repo-head">
+              <code className="jira-repo-key">{r.key}</code>
+              <label className="setting-check">
+                <input
+                  type="checkbox"
+                  checked={r.enabled}
+                  onChange={(e) => setRepo(i, { enabled: e.target.checked })}
+                />
+                {r.enabled ? "enabled" : "disabled"}
+              </label>
+              <button className="link-btn" onClick={() => removeRepo(i)}>
+                remove
+              </button>
+            </div>
+            <div className="jira-repo-fields">
+              <label>
+                Default project
+                <input
+                  type="text"
+                  placeholder="EN"
+                  value={r.project}
+                  onChange={(e) => setRepo(i, { project: e.target.value })}
+                />
+              </label>
+              <label>
+                Projects allow-list
+                <input
+                  type="text"
+                  placeholder="EN, UN, TW"
+                  value={r.projects}
+                  onChange={(e) => setRepo(i, { projects: e.target.value })}
+                />
+              </label>
+              <label>
+                Issue types allow-list
+                <input
+                  type="text"
+                  placeholder="Task, Story, Bug"
+                  value={r.issue_types}
+                  onChange={(e) => setRepo(i, { issue_types: e.target.value })}
+                />
+              </label>
+              <label>
+                Extra labels
+                <input
+                  type="text"
+                  placeholder="backend, from-commandcenter"
+                  value={r.labels}
+                  onChange={(e) => setRepo(i, { labels: e.target.value })}
+                />
+              </label>
+            </div>
+          </div>
+        ))}
+
+        <div className="setting-inline">
+          <input
+            type="text"
+            list="jira-repo-suggestions"
+            placeholder="add repo (absolute path or owner/name)"
+            value={newRepo}
+            onChange={(e) => setNewRepo(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                addRepo();
+              }
+            }}
+          />
+          <datalist id="jira-repo-suggestions">
+            {suggestions.map((s) => (
+              <option key={s} value={s} />
+            ))}
+          </datalist>
+          <button onClick={addRepo}>add repo</button>
+        </div>
+      </div>
+
+      <div className="settings-actions">
+        <span className="muted jira-endpoint">
+          {base_url}
+          {settings.jira.email ? ` · ${settings.jira.email}` : ""}
+        </span>
+        <button className="primary" disabled={saving} onClick={save}>
+          {saving ? "saving…" : "save JIRA"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function SettingsView() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [scheduler, setScheduler] = useState<SchedulerInfo | null>(null);
+  const [repoSuggestions, setRepoSuggestions] = useState<string[]>([]);
   const [error, setError] = useState<string>("");
   const [loaded, setLoaded] = useState(false);
 
@@ -1420,6 +1717,18 @@ function SettingsView() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Known repos, offered as JIRA per-repo add-suggestions. Best-effort — a
+  // failure just means no autocomplete, never a broken settings page.
+  useEffect(() => {
+    api<WorkspaceCatalog>("GET", "/api/workspaces")
+      .then((cat) => {
+        const paths = cat.repositories.map((r) => r.path);
+        const named = cat.repositories.map((r) => r.name);
+        setRepoSuggestions(Array.from(new Set([...paths, ...named])));
+      })
+      .catch(() => setRepoSuggestions([]));
+  }, []);
 
   return (
     <main className="settings-view">
@@ -1452,6 +1761,13 @@ function SettingsView() {
           <NotificationsSection
             key={`n${JSON.stringify(settings.notifications)}`}
             settings={settings}
+            onSaved={load}
+            onError={setError}
+          />
+          <JiraSection
+            key={`j${JSON.stringify(settings.jira.stored)}`}
+            settings={settings}
+            repoSuggestions={repoSuggestions}
             onSaved={load}
             onError={setError}
           />

@@ -255,6 +255,36 @@ export interface AppSettings {
     ntfy_token_set: boolean;
     effective: { ntfy_url: string | null };
   };
+  jira: {
+    stored: JiraConfig;
+    // Derived from CC_JIRA_TOKEN presence — the token value NEVER crosses the
+    // boundary. base_url/email are non-secret env config for the UI banner/links.
+    token_set: boolean;
+    base_url: string;
+    email: string | null;
+  };
   model_choices: string[];
   provider_choices: AgentProvider[];
+}
+
+/** Per-repo JIRA config (opt-in, default OFF). Mirrors the daemon JiraRepoConfig. */
+export interface JiraRepoConfig {
+  enabled: boolean;
+  /** Default (= deterministic fallback) project key, e.g. "EN". */
+  project: string;
+  /** Classifier allow-list of valid project keys; defaults to [project]. */
+  projects?: string[];
+  /** Classifier allow-list of issue type names; fallback "Task". */
+  issue_types?: string[];
+  /** Extra labels on created tickets (on top of "commandcenter"). */
+  labels?: string[];
+}
+
+/** JIRA behavior config (secrets are env-only, never here). Mirrors JiraConfig. */
+export interface JiraConfig {
+  enabled: boolean;
+  repos: Record<string, JiraRepoConfig>;
+  classifier_model?: string;
+  default_assignee_account_id?: string;
+  assignee_map?: Record<string, string>;
 }

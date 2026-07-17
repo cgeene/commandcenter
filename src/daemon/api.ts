@@ -10,6 +10,8 @@ import {
   codexProfile,
   dataDir,
   jiraBaseUrl,
+  jiraEmail,
+  jiraToken,
 } from "../config.js";
 import { TASK_STATUSES, type TaskStatus } from "../db/db.js";
 import { getAgent, listAgents } from "../db/agents.js";
@@ -39,6 +41,7 @@ import {
 } from "../db/docs.js";
 import {
   getAgentSettings,
+  getJiraConfig,
   getNotificationSettings,
   getSchedulerConfig,
   getWorkspaceSettings,
@@ -52,6 +55,7 @@ import {
   resolveWorkerProvider,
   resolveWorktreesDir,
   setAgentSettings,
+  setJiraConfig,
   setNotificationSettings,
   setSchedulerConfig,
   setWorkspaceSettings,
@@ -1172,10 +1176,93 @@ export function buildApp(): Hono {
       }),
   });
 
+  // JIRA behavior config (§6). SECRETS STAY OUT: the token, email, and base URL
+  // are env-only (src/config.ts) and this patch surface never accepts or returns
+  // the token. Everything here is behavior: the master switch, per-repo opt-in +
+  // project mapping, the classifier model, and the assignee mapping.
+  const projectKeySchema = z
+    .string()
+    .trim()
+    .regex(/^[A-Z][A-Z0-9]+$/, "project key must match ^[A-Z][A-Z0-9]+$");
+
+  const jiraRepoConfigSchema = z.object({
+    enabled: z.boolean(),
+    project: projectKeySchema,
+    projects: z.array(projectKeySchema).max(50).optional(),
+    issue_types: z.array(z.string().trim().min(1).max(60)).max(50).optional(),
+    labels: z.array(z.string().trim().min(1).max(60)).max(50).optional(),
+  });
+
+  // A repo key is either an absolute path to an existing directory or the
+  // "owner/name" GitHub short form. Validated per-key in a superRefine because
+  // record keys can't carry their own refinements.
+  const jiraReposSchema = z
+    .record(z.string(), jiraRepoConfigSchema)
+    .superRefine((repos, ctx) => {
+      for (const key of Object.keys(repos)) {
+        const trimmed = key.trim();
+        if (!trimmed) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, message: "repo key must not be blank", path: [key] });
+          continue;
+        }
+        if (path.isAbsolute(trimmed)) {
+          let isDir = false;
+          try {
+            isDir = fs.statSync(trimmed).isDirectory();
+          } catch {
+            isDir = false;
+          }
+          if (!isDir) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: "repo path must be an existing directory",
+              path: [key],
+            });
+          }
+        } else if (!/^[^/\s]+\/[^/\s]+$/.test(trimmed)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: "repo must be an absolute existing path or owner/name form",
+            path: [key],
+          });
+        }
+      }
+    });
+
+  const jiraConfigPatchSchema = z.object({
+    enabled: z.boolean().optional(),
+    repos: jiraReposSchema.optional(),
+    classifier_model: z
+      .string()
+      .optional()
+      .superRefine((v, ctx) => {
+        if (v == null) return;
+        if (!CLAUDE_MODEL_SLUGS.includes(v)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: `model must be one of: ${CLAUDE_MODEL_SLUGS.join(", ")}`,
+          });
+        }
+      }),
+    // accountId (or null/blank to clear). Never an email/secret. Normalized to
+    // undefined so a clear overwrites the stored value through the merge.
+    default_assignee_account_id: z
+      .string()
+      .trim()
+      .max(128)
+      .nullable()
+      .optional()
+      .transform((v) => (v == null || v.length === 0 ? undefined : v)),
+    assignee_map: z
+      .record(z.string(), z.string().trim().min(1).max(128))
+      .optional(),
+  });
+
   app.get("/api/settings", (c) => {
     const agents = getAgentSettings();
     const workspace = getWorkspaceSettings();
     const notifications = getNotificationSettings();
+    const jira = getJiraConfig();
     return c.json({
       agents: {
         stored: agents,
@@ -1198,6 +1285,17 @@ export function buildApp(): Hono {
         stored: { ntfy_url: notifications.ntfy_url },
         ntfy_token_set: Boolean(resolveNtfyToken()),
         effective: { ntfy_url: resolveNtfyUrl() ?? null },
+      },
+      jira: {
+        // Behavior config only — never a secret. The token is env-only and its
+        // presence (derived from CC_JIRA_TOKEN) is the ONLY token signal that
+        // crosses the boundary; the value itself never does, in either direction.
+        stored: jira,
+        // Env-derived, read-only context so the UI can show the inert banner and
+        // build browse links. base_url/email are non-secret env config.
+        token_set: Boolean(jiraToken()),
+        base_url: jiraBaseUrl(),
+        email: jiraEmail() ?? null,
       },
       model_choices: CLAUDE_MODEL_SLUGS,
       provider_choices: AGENT_PROVIDERS,
@@ -1239,6 +1337,22 @@ export function buildApp(): Hono {
         stored: { ntfy_url: notifications.ntfy_url },
         ntfy_token_set: Boolean(resolveNtfyToken()),
         effective: { ntfy_url: resolveNtfyUrl() ?? null },
+      },
+    });
+  });
+
+  app.patch("/api/settings/jira", async (c) => {
+    const patch = jiraConfigPatchSchema.parse(await c.req.json());
+    const jira = setJiraConfig(patch);
+    // The patch carries no secret (the token is env-only), so it is safe to log
+    // verbatim — mirrors the scheduler/agents/workspace config events.
+    logEvent("settings.config", { payload: { group: "jira", patch } });
+    return c.json({
+      jira: {
+        stored: jira,
+        token_set: Boolean(jiraToken()),
+        base_url: jiraBaseUrl(),
+        email: jiraEmail() ?? null,
       },
     });
   });

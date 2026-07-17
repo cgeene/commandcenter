@@ -530,3 +530,39 @@ dd { word-break: break-all; }
 .apply-immediate { color: var(--green); border-color: #238636; }
 .apply-next-spawn { color: var(--yellow); border-color: #9e6a03; }
 .apply-restart { color: var(--red); border-color: #da3633; }
+
+/* Inline banner (e.g. the JIRA no-token inert state). */
+.banner {
+  border: 1px solid var(--border); border-radius: 6px; padding: 9px 12px;
+  font-size: 12px; line-height: 1.4;
+}
+.banner code { font-size: 11px; }
+.banner-warn {
+  color: var(--yellow); border-color: #9e6a03;
+  background: rgba(158, 106, 3, 0.08);
+}
+.settings-actions { align-items: center; gap: 10px; }
+.jira-endpoint { margin-right: auto; font-size: 11px; }
+
+/* JIRA per-repo configuration. */
+.jira-repos { display: flex; flex-direction: column; gap: 10px; }
+.jira-repo-row {
+  border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 10px; background: var(--bg);
+}
+.jira-repo-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.jira-repo-key { font-size: 12px; word-break: break-all; flex: 1; min-width: 120px; }
+.jira-repo-fields {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px 14px;
+}
+.jira-repo-fields label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.link-btn {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  font-size: 11px; text-decoration: underline; padding: 0;
+}
+.link-btn:hover { color: var(--red); }
