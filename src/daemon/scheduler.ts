@@ -456,14 +456,35 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
     // still be reviewing) and the main agent are excluded by the kind check.
     if (agent.kind === "worker") {
       const task = agent.task_id ? getTask(agent.task_id) : undefined;
-      if (task && TERMINAL_STATUSES.includes(task.status)) {
+      // Early-reap the approved-awaiting-human-merge case too: an in-review
+      // task the internal review already APPROVED, whose PR (if any) has
+      // flipped ready (pr_is_draft=0), needs no live worker. PR #36's loop
+      // covers the only sequels: approve→merge auto-completes and reaps, and a
+      // post-approve rejection re-enters via requeue+respawn-with-session-resume
+      // (applyVerdict's reject branch gets not_live from the reaped worker, so
+      // it requeues and folds the notes into the respawn prompt). Reap keeps
+      // the worktree (branch may still be read) exactly like the terminal case.
+      // Require state "idle" so a mid-turn worker (working/waiting_input) or a
+      // still-running fix round is never reaped; reject/null verdicts keep the
+      // live in-session worker (an in-session resume is faster than a respawn).
+      const terminal = task && TERMINAL_STATUSES.includes(task.status);
+      const approvedAwaitingMerge =
+        task &&
+        task.status === "review" &&
+        task.review_verdict === "approve" &&
+        (!task.open_pr || task.pr_is_draft === 0) &&
+        agent.state === "idle";
+      if (task && (terminal || approvedAwaitingMerge)) {
         const last = Date.parse(agent.last_event_at ?? agent.spawned_at);
         if (nowMs - last > cfg.reap_after_minutes * 60_000) {
           kill(agent.id);
           logEvent("agent.reaped", {
             agentId: agent.id,
             taskId: task.id,
-            payload: { task_status: task.status },
+            payload: {
+              task_status: task.status,
+              reason: terminal ? "task_terminal" : "approved_awaiting_merge",
+            },
           });
           continue;
         }

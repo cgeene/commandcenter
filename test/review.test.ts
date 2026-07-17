@@ -169,6 +169,37 @@ describe("handleVerdict", () => {
     expect(prompt).toContain("REJECTED");
     expect(prompt).toContain("empty-input case");
   });
+
+  // Task #107 safety invariant: after the scheduler early-reaps an
+  // approved-awaiting-merge worker, a post-approve rejection (verdict
+  // supersession on a new push) must still recover. The reaped worker is dead
+  // but task.agent_id stays set, so applyVerdict's reject branch calls
+  // resumeAgent, gets "not_live", and requeues the task (status=queued,
+  // agent_id=null) with the notes folded in — the respawn then resumes the
+  // persisted session via task.session_id.
+  it("a post-approve rejection recovers a reaped (dead) worker via requeue + session-resume", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { updateAgent } = await import("../src/db/agents.js");
+    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
+    const { task, worker } = await setupReviewTask();
+    // The worker was approved, then early-reaped: dead window, but agent_id and
+    // the resumable session persist on the task.
+    updateTask(task.id, { review_verdict: "approve", session_id: "sess-abc" });
+    updateAgent(worker.id, { state: "dead", tmux_target: null });
+
+    await handleVerdict(task.id, 99, "reject", "the added guard regressed the happy path");
+
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("queued"); // resumeAgent -> not_live -> requeue
+    expect(t.agent_id).toBeNull();
+    expect(t.review_verdict).toBeNull();
+    expect(t.review_notes).toContain("regressed the happy path");
+    expect(t.session_id).toBe("sess-abc"); // session preserved for the respawn resume
+    const prompt = _buildWorkerPromptForTest(t, `agent/task-${task.id}`);
+    expect(prompt).toContain("REJECTED");
+    expect(prompt).toContain("happy path");
+  });
 });
 
 describe("handleVerdict — PR draft state", () => {
