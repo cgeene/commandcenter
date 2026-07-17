@@ -209,6 +209,19 @@ main { display: flex; }
 .chip.in_progress { color: var(--green); }
 .chip.cancelled { color: var(--muted, #8b949e); }
 
+/* JIRA ticket chip — colored by the workflow-independent status category. */
+.chip.jira-chip { text-decoration: none; }
+a.chip.jira-chip:hover { text-decoration: underline; }
+.chip.jira-todo { color: var(--muted); }
+.chip.jira-progress { color: var(--accent); }
+.chip.jira-done { color: var(--green); }
+.chip.jira-unknown { color: var(--muted); }
+.chip.jira-pending { color: var(--muted); font-style: italic; }
+/* Failing sync/create (streak ≥ threshold) — mirrors the PR "sync broken" look. */
+.chip.jira-failing {
+  color: var(--red); border: 1px solid var(--red); background: #f851491a;
+}
+
 .events {
   width: 280px; flex-shrink: 0; border-left: 1px solid var(--border);
   padding: 14px; font-size: 12px;

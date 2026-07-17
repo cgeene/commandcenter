@@ -6,7 +6,9 @@ import {
   latestAgentEvent,
   latestAgentEventTs,
   latestEventTs,
+  latestTaskEvent,
 } from "../db/events.js";
+import { JIRA_SYNC_FAIL_THRESHOLD } from "../lib/jira.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { listTasks, readyTasks } from "../db/tasks.js";
 import { reviewMaxCycles } from "./review.js";
@@ -27,7 +29,8 @@ export type AttentionKind =
   | "escalation"
   | "stale_waiting"
   | "scheduler_stalled"
-  | "orchestration";
+  | "orchestration"
+  | "jira_sync";
 
 export type Severity = "red" | "orange" | "yellow";
 
@@ -166,6 +169,35 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
       agent_id: t.agent_id,
       pr_url: t.pr_url,
       created_at: t.updated_at,
+    });
+  }
+
+  // --- jira_sync: a task's JIRA ticket has failed to sync/create ≥ threshold
+  //     times in a row. Mirrors the PR "sync broken" pattern (§5): the daemon
+  //     already pages once via notify() at the threshold; this makes the
+  //     degraded state a standing item until it's fixed or resolves. Anchored
+  //     to the jira.sync_broken event (fired once per failure episode at the
+  //     threshold) so a dismissed item re-raises with a fresh key on a NEW
+  //     episode after a recovery, but a dismissal sticks while one episode's
+  //     streak keeps climbing. ------------------------------------------------
+  for (const t of tasks) {
+    if ((t.jira_sync_fails ?? 0) < JIRA_SYNC_FAIL_THRESHOLD) continue;
+    const broke = latestTaskEvent(t.id, ["jira.sync_broken"]);
+    if (!broke) continue; // no episode anchor yet — daemon logs it at threshold
+    const pending = !t.jira_key; // creation failing vs. sync of an existing key
+    push({
+      id: `jira_sync:${t.id}:${broke.id}`, // new episode -> new event id -> new key
+      kind: "jira_sync",
+      title: pending
+        ? `JIRA ticket creation failing — #${t.id} ${t.title}`
+        : `JIRA sync failing — #${t.id} ${t.title} (${t.jira_key})`,
+      context: `${t.jira_sync_fails} consecutive JIRA ${pending ? "creation" : "sync"} failures; check CC_JIRA_TOKEN / config or JIRA availability`,
+      severity: "orange",
+      urgent: false,
+      task_id: t.id,
+      agent_id: t.agent_id,
+      pr_url: t.pr_url,
+      created_at: broke.ts,
     });
   }
 

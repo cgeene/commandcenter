@@ -9,6 +9,7 @@ import {
   codexHome,
   codexProfile,
   dataDir,
+  jiraBaseUrl,
 } from "../config.js";
 import { TASK_STATUSES, type TaskStatus } from "../db/db.js";
 import { getAgent, listAgents } from "../db/agents.js";
@@ -41,6 +42,7 @@ import {
   getNotificationSettings,
   getSchedulerConfig,
   getWorkspaceSettings,
+  jiraEnabledRepos,
   resolveMainModel,
   resolveMainWorkspaceDir,
   resolveNtfyToken,
@@ -194,6 +196,15 @@ export function buildApp(): Hono {
     const { versionInfo } = await import("./version.js");
     return c.json(versionInfo());
   });
+
+  // Read-only JIRA metadata for the dashboard chips (§5): the base URL for
+  // browse links (never hardcoded in the frontend) and the set of JIRA-enabled
+  // repos (so a PR-bearing task in an enabled repo with no ticket yet can show
+  // a "ticket pending" chip). NOTHING secret — the token lives in env only and
+  // never crosses this boundary.
+  app.get("/api/jira/meta", (c) =>
+    c.json({ base_url: jiraBaseUrl(), enabled_repos: jiraEnabledRepos() }),
+  );
 
   app.get("/api/tasks", (c) => {
     const status = c.req.query("status") as TaskStatus | undefined;

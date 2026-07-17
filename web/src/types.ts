@@ -51,6 +51,12 @@ export interface Task {
   pr_is_draft: number | null; // 1 draft (internal review pending), 0 ready, NULL unknown
   pr_synced_at: string | null;
   pr_sync_fails: number;
+  jira_key: string | null; // JIRA issue key, e.g. "EN-1234"; null = no ticket yet
+  jira_state: string | null; // cached JIRA status name, lowercased
+  jira_status_category: string | null; // new | indeterminate | done (workflow-independent)
+  jira_synced_at: string | null;
+  jira_sync_fails: number; // consecutive jirasync failures; warns at 3
+  jira_project: string | null; // resolved (or per-task override) JIRA project key
   open_pr: number;
   tokens_used: number | null;
   created_at: string;
@@ -145,7 +151,13 @@ export type AttentionKind =
   | "escalation"
   | "stale_waiting"
   | "scheduler_stalled"
-  | "orchestration";
+  | "orchestration"
+  | "jira_sync";
+
+export interface JiraMeta {
+  base_url: string;
+  enabled_repos: string[];
+}
 
 export interface WorkspaceCatalog {
   roots: Array<{ path: string; label: string }>;
