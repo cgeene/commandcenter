@@ -75,6 +75,10 @@ const TEMPLATES: Record<string, Template> = {
   },
   "review.verdict_superseded": (e, p) =>
     `${taskRef(e)}'s approval was superseded by a new push (${clip(p.new_head, 12)}) — re-drafting and re-reviewing`,
+  "review.skipped_no_pr": (e, p) => {
+    const commits = p.branch_has_commits ? " (branch has commits)" : "";
+    return `Skipped auto-review of ${taskRef(e)} — repo task has no PR to review${commits}; review it manually if needed`;
+  },
   "reviewer.auto_spawned": (e) => `Auto-spawned a reviewer for ${taskRef(e)}`,
   "reviewer.spawned": (e) => `Spawned a reviewer for ${taskRef(e)}`,
   "reviewer.budget_skipped": (e) =>

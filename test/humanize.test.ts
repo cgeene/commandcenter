@@ -52,6 +52,31 @@ describe("humanizeEvent", () => {
     expect(s).toBe("#5's approval was superseded by a new push (abcdef123456…) — re-drafting and re-reviewing");
   });
 
+  it("review.skipped_no_pr explains a repo task was not auto-reviewed", () => {
+    const s = humanizeEvent(
+      ev({
+        kind: "review.skipped_no_pr",
+        task_id: 109,
+        payload: JSON.stringify({ task_id: 109, open_pr: 0, branch_has_commits: false }),
+      }),
+    );
+    expect(s).toBe(
+      "Skipped auto-review of #109 — repo task has no PR to review; review it manually if needed",
+    );
+  });
+
+  it("review.skipped_no_pr notes when the branch has commits", () => {
+    const s = humanizeEvent(
+      ev({
+        kind: "review.skipped_no_pr",
+        task_id: 42,
+        payload: JSON.stringify({ task_id: 42, open_pr: 1, branch_has_commits: true }),
+      }),
+    );
+    expect(s).toContain("#42");
+    expect(s).toContain("branch has commits");
+  });
+
   it("agent.auto_nudged names the worker and the transient stall", () => {
     const s = humanizeEvent(
       ev({ kind: "agent.auto_nudged", agent_id: 22, payload: JSON.stringify({ error: "529 overloaded", attempt: 1 }) }),
