@@ -6,6 +6,7 @@ import { dataDir, dbPath, port, webDistDir } from "../config.js";
 import { getDb } from "../db/db.js";
 import { migrateDocsToFrontmatter } from "../db/docs.js";
 import { buildApp } from "./api.js";
+import { startJiraSync } from "./jirasync.js";
 import { startPrSync } from "./prsync.js";
 import { startScheduler } from "./scheduler.js";
 import { registerStatic } from "./static.js";
@@ -41,6 +42,9 @@ const server = serve(
 
 startScheduler();
 startPrSync();
+// JIRA sync: inert unless CC_JIRA_TOKEN is set AND the master switch is on
+// (per-repo opt-in on top). Fail-closed — a token-less install logs one line.
+startJiraSync();
 
 // Live terminal: /ws/term/<agentId> bridges xterm.js <-> tmux via a PTY.
 const wss = new WebSocketServer({ noServer: true });
