@@ -211,24 +211,38 @@ async function resolveTransition(
   return resolved;
 }
 
+/** The status a consequence left the ticket at, when it changed. */
+type ConsequenceResult = { state: string; category: string } | undefined;
+
 /**
  * Apply a task's implied consequence to its ticket, honoring don't-clobber
  * (monotonic-forward only) and degrade-don't-crash semantics. `current` is the
- * status just fetched. Records the post-transition state so a terminal move
- * drops the task out of the poll set on the same pass.
+ * status just fetched.
+ *
+ * Returns the ticket's NEW status when a transition landed (so the caller caches
+ * it and a terminal move drops the task out of the poll set on the same pass),
+ * or undefined when nothing changed the status (no-op, comment-only, degrade).
+ *
+ * Critically, this function does NOT touch the failure streak: the caller clears
+ * the streak (via recordJiraSyncSuccess) ONLY after this returns cleanly. A
+ * throw here (e.g. a forward transition that persistently 400s on a required
+ * screen field) therefore propagates to the caller's failure counter and lets
+ * the streak actually accumulate to SYNC_FAIL_THRESHOLD — resetting the streak
+ * before applying the consequence is exactly the 0→1 oscillation bug that would
+ * strand a ticket forever and never page.
  */
 async function applyConsequence(
   client: JiraClient,
   task: Task,
   current: JiraIssueView,
-): Promise<void> {
+): Promise<ConsequenceResult> {
   const key = task.jira_key!;
   const plan = planConsequence(task);
 
-  if (plan.kind === "none") return;
+  if (plan.kind === "none") return undefined;
 
   if (plan.kind === "closed-comment") {
-    if (commentedThisRun.has(task.id)) return;
+    if (commentedThisRun.has(task.id)) return undefined;
     await client.addComment(
       key,
       buildCommentAdf(
@@ -240,33 +254,30 @@ async function applyConsequence(
       taskId: task.id,
       payload: { jira_key: key, reason: "pr closed unmerged" },
     });
-    return;
+    return undefined; // comment only — status unchanged
   }
 
   if (plan.kind === "willnotdo") {
     // Don't clobber a ticket a human already resolved.
-    if (current.category === "done") return;
+    if (current.category === "done") return undefined;
     const resolved = await resolveTransition(client, task.jira_project!, key, "Will not do");
     if (resolved) {
       try {
         await client.transitionIssue(key, resolved.id);
-        recordJiraSyncSuccess(task.id, {
-          state: resolved.toName.toLowerCase(),
-          category: resolved.toCategory,
-        });
         logEvent("jira.transition", {
           taskId: task.id,
           payload: { jira_key: key, to: resolved.toName },
         });
-        return;
+        return { state: resolved.toName.toLowerCase(), category: resolved.toCategory };
       } catch (err) {
         // "Will not do" hasScreen:true (EN transition 71) — the POST can 400 on
         // a required screen field even though the transition WAS offered. Decision
         // 4 / §2.4 mandate degrading to a comment here, not crashing the pass.
-        // Fall through to the comment path below; crucially we do NOT rethrow, so
-        // the per-task catch never records a hard sync failure — otherwise the
-        // streak would oscillate 0→1 every pass (getIssue resets it) and never
-        // reach SYNC_FAIL_THRESHOLD, silently stranding the ticket forever.
+        // Fall through to the comment path below; we do NOT rethrow, so this
+        // degrade is a clean success (the human intent — cancellation — is
+        // recorded on the ticket). A genuinely stuck cancellation would be one
+        // where even the comment POST keeps failing, which DOES surface as a
+        // sync-failure streak via the caller.
         logEvent("jira.transition_failed", {
           taskId: task.id,
           payload: {
@@ -280,7 +291,7 @@ async function applyConsequence(
     // Reached when "Will not do" is either not offered from the current status OR
     // was offered but the POST failed (required screen field, missing state).
     // Both degrade to the same "task cancelled" comment — never crash the pass.
-    if (commentedThisRun.has(task.id)) return;
+    if (commentedThisRun.has(task.id)) return undefined;
     await client.addComment(
       key,
       buildCommentAdf("commandcenter: task cancelled in commandcenter."),
@@ -290,7 +301,7 @@ async function applyConsequence(
       taskId: task.id,
       payload: { jira_key: key, reason: "cancelled (will-not-do transition failed)" },
     });
-    return;
+    return undefined; // degraded to a comment — status unchanged
   }
 
   // plan.kind === "transition": ordered forward targets.
@@ -298,20 +309,19 @@ async function applyConsequence(
   for (const target of plan.targets) {
     const targetRank = driveRank(target.toLowerCase(), "");
     // Don't-clobber: never move backward or sideways along the driven path.
-    if (targetRank <= currentRank) return; // already at/past this target — no-op
+    if (targetRank <= currentRank) return undefined; // already at/past this target — no-op
     const resolved = await resolveTransition(client, task.jira_project!, key, target);
     if (!resolved) continue; // target not reachable now — try the next fallback
+    // A throw here (e.g. required screen field on Done) is intentionally NOT
+    // caught: it propagates so the streak accumulates and escalate-once fires.
     await client.transitionIssue(key, resolved.id);
-    recordJiraSyncSuccess(task.id, {
-      state: resolved.toName.toLowerCase(),
-      category: resolved.toCategory,
-    });
     logEvent("jira.transition", {
       taskId: task.id,
       payload: { jira_key: key, to: resolved.toName },
     });
-    return;
+    return { state: resolved.toName.toLowerCase(), category: resolved.toCategory };
   }
+  return undefined; // no reachable forward target this pass
 }
 
 /* ------------------------------------------------------------------ *
@@ -395,12 +405,15 @@ async function jiraCreate(
   });
 
   // Downstream: reflect current status and drive the initial transition
-  // (In Progress). Wrapped so a failure here doesn't undo the create — the key
-  // is safely persisted and the sync pass will retry the transition.
+  // (In Progress). A failure here doesn't undo the create — the key is safely
+  // persisted and the sync pass retries the transition; it throws to the create
+  // loop's catch so the failure streak accumulates. recordJiraSyncSuccess (which
+  // caches status AND clears the streak) runs ONLY after applyConsequence
+  // returns cleanly, caching the post-transition status when one landed.
   const fresh = getTask(task.id)!;
   const view = await client.getIssue(created.key);
-  recordJiraSyncSuccess(task.id, view);
-  await applyConsequence(client, fresh, view);
+  const after = await applyConsequence(client, fresh, view);
+  recordJiraSyncSuccess(task.id, after ?? view);
 }
 
 /* ------------------------------------------------------------------ *
@@ -433,13 +446,19 @@ export async function jiraSyncPass(): Promise<void> {
     }
   }
 
-  // Sync existing tickets: cache status + drive any pending consequence.
+  // Sync existing tickets: drive any pending consequence, then cache status +
+  // clear the streak. recordJiraSyncSuccess runs ONLY after applyConsequence
+  // returns cleanly — a persistently-failing consequence (e.g. a Done transition
+  // with a required screen field) throws before the streak is cleared, so the
+  // streak accumulates to SYNC_FAIL_THRESHOLD and escalate-once fires exactly
+  // once. (Resetting the streak before applying the consequence was the 0→1
+  // oscillation bug that stranded tickets and never paged.)
   for (const task of tasksNeedingJiraSync()) {
     if (createdThisPass.has(task.id)) continue;
     try {
       const view = await client.getIssue(task.jira_key!);
-      recordJiraSyncSuccess(task.id, view);
-      await applyConsequence(client, task, view);
+      const after = await applyConsequence(client, task, view);
+      recordJiraSyncSuccess(task.id, after ?? view);
     } catch (err) {
       recordJiraSyncFailure(
         task.id,
