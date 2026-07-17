@@ -457,6 +457,88 @@ describe("deriveAttention — scheduler_stalled", () => {
   });
 });
 
+describe("deriveAttention — jira_sync", () => {
+  /** A PR-bearing task whose JIRA ticket has failed to sync `fails` times. */
+  async function jiraFailingTask(over: { fails?: number; jira_key?: string | null } = {}) {
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const t = createTask({ title: "sync me", prompt: "x", repo: "/r" });
+    return updateTask(t.id, {
+      pr_url: `https://github.com/nylas/repo/pull/${t.id}`,
+      jira_key: over.jira_key === undefined ? "EN-1234" : over.jira_key,
+      jira_sync_fails: over.fails ?? 3,
+    })!;
+  }
+
+  it("does not raise below the failure threshold", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const t = await jiraFailingTask({ fails: 2 });
+    logEvent("jira.sync_broken", { taskId: t.id });
+    const items = deriveAttention({ isPrOpen: allOpen });
+    expect(items.filter((i) => i.kind === "jira_sync")).toHaveLength(0);
+  });
+
+  it("does not raise at threshold until the sync_broken anchor event exists", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const t = await jiraFailingTask({ fails: 3 });
+    // no jira.sync_broken event logged yet
+    const items = deriveAttention({ isPrOpen: allOpen });
+    expect(items.filter((i) => i.kind === "jira_sync")).toHaveLength(0);
+    void t;
+  });
+
+  it("raises a jira_sync item at the threshold for a synced ticket", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const t = await jiraFailingTask({ fails: 3 });
+    logEvent("jira.sync_broken", { taskId: t.id });
+    const items = deriveAttention({ isPrOpen: allOpen });
+    const jira = items.filter((i) => i.kind === "jira_sync");
+    expect(jira).toHaveLength(1);
+    expect(jira[0]).toMatchObject({
+      kind: "jira_sync",
+      task_id: t.id,
+      severity: "orange",
+    });
+    expect(jira[0].title).toContain("EN-1234");
+    expect(jira[0].pr_url).toBe(t.pr_url);
+  });
+
+  it("labels a keyless failing task as ticket-creation failing", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const t = await jiraFailingTask({ fails: 3, jira_key: null });
+    logEvent("jira.sync_broken", { taskId: t.id });
+    const jira = deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "jira_sync");
+    expect(jira).toHaveLength(1);
+    expect(jira[0].title).toContain("creation failing");
+  });
+
+  it("re-raises with a fresh key after a dismissed episode recurs", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { dismissAttention } = await import("../src/db/attention.js");
+    const t = await jiraFailingTask({ fails: 3 });
+
+    // Episode 1: threshold reached, anchor event fires, item raised.
+    logEvent("jira.sync_broken", { taskId: t.id });
+    const first = deriveAttention({ isPrOpen: allOpen }).find((i) => i.kind === "jira_sync")!;
+    expect(first).toBeTruthy();
+
+    // Human dismisses it — gone while this episode's streak persists.
+    dismissAttention(first.id);
+    expect(
+      deriveAttention({ isPrOpen: allOpen }).some((i) => i.kind === "jira_sync"),
+    ).toBe(false);
+
+    // Episode 2: a later failure episode logs a NEW anchor event → fresh key.
+    logEvent("jira.sync_broken", { taskId: t.id });
+    const second = deriveAttention({ isPrOpen: allOpen }).find((i) => i.kind === "jira_sync");
+    expect(second).toBeTruthy();
+    expect(second!.id).not.toBe(first.id);
+  });
+});
+
 describe("prcache", () => {
   it("returns a fresh cached value without shelling out", async () => {
     const { prState, _seedPrCache } = await import("../src/daemon/prcache.js");

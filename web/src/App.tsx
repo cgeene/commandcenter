@@ -21,6 +21,7 @@ import {
 import { openPanel, type Panel } from "../../src/lib/panel";
 import { parseFrontmatter } from "../../src/lib/frontmatter";
 import { softenLineBreaks } from "../../src/lib/markdown";
+import { jiraChip } from "../../src/lib/jira";
 import { Terminal } from "./Terminal";
 import type {
   Agent,
@@ -30,6 +31,7 @@ import type {
   Doc,
   DocWithContent,
   Event,
+  JiraMeta,
   Memory,
   ParsedPane,
   ProviderModel,
@@ -142,6 +144,10 @@ export function App() {
   const [showMemory, setShowMemory] = useState(false);
   const [showCrons, setShowCrons] = useState(false);
   const [scheduler, setScheduler] = useState<SchedulerInfo | null>(null);
+  const [jiraMeta, setJiraMeta] = useState<JiraMeta>({
+    base_url: "https://nylas.atlassian.net",
+    enabled_repos: [],
+  });
   const [stale, setStale] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTabState] = useState<TabId>(tabFromHash);
@@ -154,6 +160,15 @@ export function App() {
     const onHash = () => setTabState(tabFromHash());
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  // JIRA chip metadata (browse base URL + enabled repos) changes rarely — fetch
+  // once on mount, best-effort. A failure just leaves the defaults; it must
+  // never break the hot task/agent refresh loop below.
+  useEffect(() => {
+    api<JiraMeta>("GET", "/api/jira/meta")
+      .then(setJiraMeta)
+      .catch(() => {});
   }, []);
 
   // Every panel-opening control routes through openPanel: opening one closes
@@ -336,13 +351,17 @@ export function App() {
 
       {tab === "tokens" && <TokensView tasks={tasks} onSelect={(t) => openTask(t.id)} />}
 
-      {tab === "prs" && <PrsView tasks={tasks} onSelect={(t) => openTask(t.id)} />}
+      {tab === "prs" && (
+        <PrsView tasks={tasks} meta={jiraMeta} onSelect={(t) => openTask(t.id)} />
+      )}
 
       {tab === "docs" && <DocsView />}
 
       {tab === "settings" && <SettingsView />}
 
-      {tab === "archive" && <ArchiveView tasks={tasks} onSelect={(t) => openTask(t.id)} />}
+      {tab === "archive" && (
+        <ArchiveView tasks={tasks} meta={jiraMeta} onSelect={(t) => openTask(t.id)} />
+      )}
 
       {tab === "board" && (
       <main>
@@ -363,6 +382,7 @@ export function App() {
                     key={t.id}
                     task={t}
                     byId={byId}
+                    meta={jiraMeta}
                     onSelect={(sel) => openTask(sel.id)}
                     reviewMax={scheduler?.config.review_max_cycles ?? 4}
                   />
@@ -470,14 +490,51 @@ function firstLine(s: string | null, n = 140): string {
  * first line of the result, a one-level blocked_by chain, and a PR link — so
  * the card answers "how did this land?" without opening the detail drawer.
  */
+/**
+ * The JIRA ticket chip: key + workflow-independent status category, linking to
+ * the browse URL, with a warning treatment when sync/create is failing (§5). A
+ * PR-bearing task in a JIRA-enabled repo with no key yet shows a muted "ticket
+ * pending" chip. Renders nothing when the task isn't expected to have a ticket.
+ */
+function JiraChipView({ task, meta }: { task: Task; meta: JiraMeta }) {
+  const chip = jiraChip(task, {
+    baseUrl: meta.base_url,
+    enabledRepos: meta.enabled_repos,
+  });
+  if (chip.kind === "none") return null;
+  const cls = `chip jira-chip ${chip.cls}${chip.failing ? " jira-failing" : ""}`;
+  const text = `${chip.failing ? "⚠ " : ""}${chip.kind === "synced" ? `${chip.key} · ${chip.label}` : chip.label}`;
+  if (chip.kind === "synced" && chip.url) {
+    return (
+      <a
+        className={cls}
+        href={chip.url}
+        target="_blank"
+        rel="noreferrer"
+        title={chip.title}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {text}
+      </a>
+    );
+  }
+  return (
+    <span className={cls} title={chip.title}>
+      {text}
+    </span>
+  );
+}
+
 function TaskCard({
   task,
   byId,
+  meta,
   onSelect,
   reviewMax = 4,
 }: {
   task: Task;
   byId: Map<number, Task>;
+  meta: JiraMeta;
   onSelect: (t: Task) => void;
   reviewMax?: number;
 }) {
@@ -514,6 +571,7 @@ function TaskCard({
         {task.reasoning_effort && <span className="chip">{task.reasoning_effort}</span>}
         <span className="chip">{task.worker_provider}</span>
         {task.agent_id && <span className="chip agent-chip">a{task.agent_id}</span>}
+        <JiraChipView task={task} meta={meta} />
       </div>
       {summary && <div className="card-summary">{summary}</div>}
       {chain && (
@@ -572,7 +630,15 @@ function prNumber(url: string | null): string {
   return url?.match(/\/pull\/(\d+)/)?.[1] ?? "?";
 }
 
-function PrRow({ task, onSelect }: { task: Task; onSelect: (t: Task) => void }) {
+function PrRow({
+  task,
+  meta,
+  onSelect,
+}: {
+  task: Task;
+  meta: JiraMeta;
+  onSelect: (t: Task) => void;
+}) {
   const broken = (task.pr_sync_fails ?? 0) >= 3;
   return (
     <div className="pr-row">
@@ -584,6 +650,7 @@ function PrRow({ task, onSelect }: { task: Task; onSelect: (t: Task) => void }) 
       </button>
       <CiBadge checks={task.pr_checks} />
       <VerdictBadge task={task} />
+      <JiraChipView task={task} meta={meta} />
       {broken && (
         <span className="chip bad" title="prsync has failed 3+ times in a row">
           ⚠ sync broken
@@ -603,9 +670,11 @@ function PrRow({ task, onSelect }: { task: Task; onSelect: (t: Task) => void }) 
  */
 function PrsView({
   tasks,
+  meta,
   onSelect,
 }: {
   tasks: Task[];
+  meta: JiraMeta;
   onSelect: (t: Task) => void;
 }) {
   const groups = groupByProject(tasks.filter(isOpenPr));
@@ -621,7 +690,7 @@ function PrsView({
               {g.project} <span className="muted">{g.total}</span>
             </h2>
             {g.tasks.map((t) => (
-              <PrRow key={t.id} task={t} onSelect={onSelect} />
+              <PrRow key={t.id} task={t} meta={meta} onSelect={onSelect} />
             ))}
           </div>
         ))}
@@ -637,9 +706,11 @@ function PrsView({
  */
 function ArchiveView({
   tasks,
+  meta,
   onSelect,
 }: {
   tasks: Task[];
+  meta: JiraMeta;
   onSelect: (t: Task) => void;
 }) {
   const [filter, setFilter] = useState("");
@@ -670,7 +741,7 @@ function ArchiveView({
                 {g.project} <span className="muted">{g.done}/{g.total}</span>
               </h2>
               {g.tasks.map((t) => (
-                <TaskCard key={t.id} task={t} byId={byId} onSelect={onSelect} />
+                <TaskCard key={t.id} task={t} byId={byId} meta={meta} onSelect={onSelect} />
               ))}
             </div>
           ))}
@@ -1532,6 +1603,7 @@ const KIND_ICON: Record<AttentionItem["kind"], string> = {
   stale_waiting: "⏳",
   scheduler_stalled: "🚦",
   orchestration: "◈",
+  jira_sync: "🎫",
 };
 
 /**
