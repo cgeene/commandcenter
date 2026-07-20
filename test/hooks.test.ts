@@ -5,11 +5,15 @@ import path from "node:path";
 
 const sendText = vi.fn(async () => {});
 let paneContent = "";
+// Per-target overrides so a worker's pane can differ from the main's — the
+// catch-up delegator now gates on the main's own prompt being clear, so tests
+// that give a worker a waiting pane must still hand the main a clear one.
+const paneByTarget = new Map<string, string>();
 
 vi.mock("../src/daemon/tmux.js", () => ({
   windowExists: () => true,
   sendText: (...args: unknown[]) => sendText(...args),
-  capturePane: () => paneContent,
+  capturePane: (target: string) => paneByTarget.get(target) ?? paneContent,
 }));
 
 let tmpDir: string;
@@ -35,6 +39,7 @@ beforeEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   paneContent = "";
+  paneByTarget.clear();
   sendText.mockClear();
   sendText.mockImplementation(async () => {});
   const { __clearAutoNudgeCountsForTests, __clearIdleRedelegateForTests } = await import(
@@ -129,6 +134,8 @@ describe("hook events", () => {
       "",
       "Press enter to confirm or esc to cancel",
     ].join("\n");
+    // The main's own composer is clear, so the catch-up may deliver to it.
+    paneByTarget.set("cc:@2", PROMPT_BOX);
 
     await handleHookEvent(main.id, {
       hook_event_name: "SessionStart",
@@ -224,6 +231,8 @@ describe("hook events", () => {
       "",
       "Press enter to confirm or esc to cancel",
     ].join("\n");
+    // The main's own composer is clear, so the catch-up may deliver to it.
+    paneByTarget.set("cc:@2", PROMPT_BOX);
 
     await handleHookEvent(main.id, {
       hook_event_name: "Notification",
@@ -239,6 +248,56 @@ describe("hook events", () => {
     expect(
       listEvents(20).filter((event) => event.kind === "waiting.delegated"),
     ).toHaveLength(1);
+  });
+
+  it("does NOT deliver a catch-up worker wait while the human is mid-typing in the main", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const worker = createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "waiting_input",
+      tmux_target: "cc:@1",
+    });
+    logEvent("hook.permissionrequest", { agentId: worker.id });
+    const main = createAgent({
+      kind: "main",
+      provider: "claude",
+      state: "idle",
+      tmux_target: "cc:@2",
+    });
+    paneContent = [
+      "$ go test ./...",
+      "",
+      "› 1. Yes, proceed (y)",
+      "  2. No (esc)",
+      "",
+      "Press enter to confirm or esc to cancel",
+    ].join("\n");
+    // The human is mid-typing a draft in the main's composer — the catch-up
+    // must NOT clobber it, even though a worker wait is outstanding.
+    paneByTarget.set(
+      "cc:@2",
+      [
+        "╭────────────────────────────────────────────╮",
+        "│ ❯ hold on, do not merge that PR yet          │",
+        "╰────────────────────────────────────────────╯",
+      ].join("\n"),
+    );
+
+    await handleHookEvent(main.id, {
+      hook_event_name: "Notification",
+      notification_type: "idle_prompt",
+      message: "Claude is waiting for your input",
+    });
+
+    expect(sendText).not.toHaveBeenCalled();
+    expect(
+      listEvents(20).filter((event) => event.kind === "waiting.delegated"),
+    ).toHaveLength(0);
+    // The worker is still waiting, so its escalate-to-human page is unaffected.
+    expect(getAgent(worker.id)?.state).toBe("waiting_input");
   });
 
   it("a main permission notification still requires human input", async () => {
