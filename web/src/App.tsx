@@ -22,6 +22,12 @@ import { openPanel, type Panel } from "../../src/lib/panel";
 import { parseFrontmatter } from "../../src/lib/frontmatter";
 import { softenLineBreaks } from "../../src/lib/markdown";
 import { jiraChip } from "../../src/lib/jira";
+import {
+  syncAppBadge,
+  newlyArrivedIds,
+  browserAlertsEnabled,
+  setBrowserAlerts,
+} from "../../src/lib/app-attention";
 import { Terminal } from "./Terminal";
 import type {
   Agent,
@@ -151,6 +157,10 @@ export function App() {
     enabled_repos: [],
   });
   const [stale, setStale] = useState(false);
+  // Flips true after the first successful poll, so the attention notifier seeds
+  // from real data instead of the empty pre-load render (which would make the
+  // whole existing backlog look "new" and fire a burst of notifications).
+  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTabState] = useState<TabId>(tabFromHash);
   const keyboardStyle = useKeyboardAwareStyle();
@@ -203,6 +213,7 @@ export function App() {
       setEvents(e);
       setScheduler(s);
       setAttention(at);
+      setLoaded(true); // first real poll landed — safe to seed the notifier now
 
       // Waiting agents need their pane parsed so the card can show what
       // they're asking without opening the terminal.
@@ -239,6 +250,52 @@ export function App() {
     const id = setInterval(check, 60_000);
     return () => clearInterval(id);
   }, []);
+
+  // Mirror the "Needs You" count onto the installed PWA's app icon (dock /
+  // taskbar / home screen) via the Badging API — the same count as the board
+  // tab badge. It updates only while the app window is running (backgrounded is
+  // fine); a fully-quit app can't refresh its badge without a service worker +
+  // push, which this manifest-only PWA deliberately omits. Best-effort: a
+  // rejected badge call must never surface to the operator.
+  useEffect(() => {
+    syncAppBadge(navigator, attention.length)?.catch(() => {});
+  }, [attention.length]);
+
+  // Bounce the dock icon once per newly-arrived attention item by posting a
+  // system notification. `seenAttention` tracks the ids we've already alerted
+  // on. It's seeded only once `loaded` is true (the first successful poll), so
+  // the pre-load empty render never seeds it and the existing backlog doesn't
+  // all alert on open. Keyed on the id set (+ loaded), so it re-runs when
+  // membership changes, not on every 2.5s poll returning the same items.
+  const seenAttention = useRef<Set<string> | null>(null);
+  // "\n"-joined: ids can't contain a newline, so distinct id sets never collide
+  // into one key (a comma could, if an id ever embedded one).
+  const attentionIdKey = attention.map((a) => a.id).join("\n");
+  useEffect(() => {
+    if (!loaded) return; // wait for real data before seeding (see comment above)
+    const ids = attention.map((a) => a.id);
+    const fresh = newlyArrivedIds(seenAttention.current, ids);
+    seenAttention.current = new Set(ids);
+    if (
+      fresh.length === 0 ||
+      typeof Notification === "undefined" ||
+      Notification.permission !== "granted" ||
+      !browserAlertsEnabled(localStorage, true) // permission already granted here
+    ) {
+      return;
+    }
+    const first = attention.find((a) => a.id === fresh[0]);
+    const body =
+      fresh.length === 1 && first ? first.title : `${fresh.length} items need you`;
+    try {
+      // Shared tag replaces (rather than stacks) a prior unread banner; each
+      // call still raises a fresh alert, which is what bounces the dock icon.
+      new Notification("commandcenter — Needs You", { body, tag: "cc-attention" });
+    } catch {
+      /* Notification constructor unavailable (e.g. some mobile browsers) */
+    }
+    // attentionIdKey captures the attention state we read; loaded gates seeding.
+  }, [attentionIdKey, loaded]);
 
   const act = async (fn: () => Promise<unknown>) => {
     try {
@@ -1316,6 +1373,70 @@ function NotificationsSection({
   const [clearToken, setClearToken] = useState(false);
   const [saving, setSaving] = useState(false);
 
+  // Browser (in-app) alerts: a desktop notification + dock bounce for a new
+  // "Needs You" item. Two independent gates — the browser permission (one-way:
+  // requestable, not revocable from JS) and this per-browser on/off preference
+  // in localStorage. The toggle drives the preference and requests permission
+  // when turning on; App's firing effect honors both.
+  const notifSupported = typeof Notification !== "undefined";
+  const [perm, setPerm] = useState<NotificationPermission>(
+    notifSupported ? Notification.permission : "denied",
+  );
+  const [alertsOn, setAlertsOn] = useState(
+    () => notifSupported && browserAlertsEnabled(localStorage, perm === "granted"),
+  );
+  const toggleAlerts = (on: boolean) => {
+    if (!on) {
+      setAlertsOn(false);
+      setBrowserAlerts(localStorage, false);
+      return;
+    }
+    const commit = (p: NotificationPermission) => {
+      setPerm(p);
+      const granted = p === "granted";
+      setAlertsOn(granted);
+      setBrowserAlerts(localStorage, granted); // deny -> stays off, not stuck "on"
+    };
+    if (perm !== "default") {
+      commit(perm); // granted -> on; denied -> can't, stays off
+      return;
+    }
+    try {
+      // This click is the user gesture browsers require to prompt.
+      const r = Notification.requestPermission(commit);
+      if (r && typeof r.then === "function") r.then(commit).catch(() => {});
+    } catch {
+      /* blocked — leave it off */
+    }
+  };
+
+  // Keep the toggle honest with the live truth it can't see directly: the
+  // preference being flipped in another tab (`storage` fires only in *other*
+  // tabs) and the permission being changed via the browser's own site settings.
+  useEffect(() => {
+    if (!notifSupported) return;
+    const sync = () => {
+      setPerm(Notification.permission);
+      setAlertsOn(browserAlertsEnabled(localStorage, Notification.permission === "granted"));
+    };
+    window.addEventListener("storage", sync);
+    let cancelled = false;
+    let status: PermissionStatus | undefined;
+    navigator.permissions
+      ?.query({ name: "notifications" as PermissionName })
+      .then((s) => {
+        if (cancelled) return; // unmounted before the query resolved
+        status = s;
+        s.addEventListener("change", sync);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      window.removeEventListener("storage", sync);
+      status?.removeEventListener("change", sync);
+    };
+  }, [notifSupported]);
+
   const save = async () => {
     setSaving(true);
     onError("");
@@ -1341,6 +1462,27 @@ function NotificationsSection({
   return (
     <section className="settings-section">
       <h2>Notifications</h2>
+      <SettingRow
+        label="Browser alerts"
+        when="immediate"
+        hint="Desktop notification + dock-icon bounce when a new “Needs You” item appears while this tab is open. Per-browser; the dock badge (count) works regardless. Also requires the browser/app to be allowed to notify in your OS settings."
+      >
+        {!notifSupported ? (
+          <span className="muted">This browser doesn’t support notifications.</span>
+        ) : perm === "denied" ? (
+          <span className="muted">
+            Blocked in your browser — allow notifications for this site, then
+            reload.
+          </span>
+        ) : (
+          <button
+            className={alertsOn ? "sched-on" : ""}
+            onClick={() => toggleAlerts(!alertsOn)}
+          >
+            {alertsOn ? "on" : "off"}
+          </button>
+        )}
+      </SettingRow>
       <p className="muted">
         Push alerts via ntfy (escalations, pages). Overrides CC_NTFY_URL /
         CC_NTFY_TOKEN and applies on the next notification.

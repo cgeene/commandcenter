@@ -119,7 +119,14 @@ export function pkgRoot(): string {
 }
 
 export function webDistDir(): string {
-  return path.join(pkgRoot(), "web", "dist");
+  // Tests point CC_WEB_DIST at a temp dir (CC_DATA_DIR precedent). Blank and
+  // filesystem-root values fall back to the packaged build — static.ts's
+  // prefix guard needs a real, non-root directory to bound what it serves.
+  const override = process.env.CC_WEB_DIST?.trim();
+  const resolved = override ? path.resolve(override) : undefined;
+  return resolved && resolved !== path.parse(resolved).root
+    ? resolved
+    : path.join(pkgRoot(), "web", "dist");
 }
 
 /** ntfy topic URL, e.g. https://ntfy.sh/my-secret-topic — unset disables push. */
