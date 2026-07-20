@@ -571,6 +571,28 @@ async function reviewerStopped(agent: Agent): Promise<void> {
   }
 }
 
+/** For a review-disabled, no-PR task (report/doc crons), worker-finish IS
+ *  completion: mark it done and skip the reviewer entirely. Gated on
+ *  open_pr === 0 so a real code task can never bypass the merge gate — a task
+ *  with auto_review off but a PR obligation falls through to normal review.
+ *  Mirrors the docOnly completion shape in review.handleVerdict. Returns true
+ *  when it completed the task (caller must stop). */
+function completeIfReviewDisabled(task: Task, agentId: number): boolean {
+  if (task.auto_review !== 0 || task.open_pr !== 0) return false;
+  updateTask(task.id, { status: "done", review_verdict: "approve" });
+  logEvent("task.autocompleted", {
+    taskId: task.id,
+    agentId,
+    payload: { reason: "review disabled" },
+  });
+  notify(
+    `task #${task.id} auto-completed`,
+    `${task.title} — review disabled, no PR to merge`,
+    { tags: "tada" },
+  );
+  return true;
+}
+
 /** Worker finished a turn on an in-progress task: verify, then move to
  *  review — or push the failure back into the worker's session. */
 async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
@@ -593,6 +615,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
   if (!task.verify_cmd || !task.worktree) {
     if (wasReview) {
       // Worker moved itself to review; nothing mechanical to run.
+      if (completeIfReviewDisabled(task, agent.id)) return;
       await maybeAutoReview(task.id);
       return;
     }
@@ -602,6 +625,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     // pings the human about work that doesn't exist yet.
     if (hasResult) {
       resetAutoNudgeCount(agent.id);
+      if (completeIfReviewDisabled(task, agent.id)) return;
       updateTask(task.id, { status: "review" });
       logEvent("task.review", { taskId: task.id, agentId: agent.id });
       notify(
@@ -651,8 +675,9 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
 
   if (result.ok) {
     resetAutoNudgeCount(agent.id);
-    updateTask(task.id, { status: "review" });
     logEvent("verify.passed", { taskId: task.id, agentId: agent.id });
+    if (completeIfReviewDisabled(current, agent.id)) return;
+    updateTask(task.id, { status: "review" });
     notify(
       `task #${task.id} ready for review`,
       `${task.title} — verify passed${current.pr_url ? `\n${current.pr_url}` : ""}`,

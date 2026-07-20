@@ -832,6 +832,8 @@ export function buildApp(): Hono {
     reasoning_effort: reasoningEffortSchema.optional(),
     priority: z.number().int().min(0).max(4).optional(),
     verify_cmd: z.string().optional(),
+    open_pr: z.boolean().optional(),
+    auto_review: z.boolean().optional(),
     enabled: z.boolean().optional(),
   });
 
@@ -845,6 +847,8 @@ export function buildApp(): Hono {
     reasoning_effort: reasoningEffortSchema.nullable().optional(),
     priority: z.number().int().min(0).max(4).optional(),
     verify_cmd: z.string().nullable().optional(),
+    open_pr: z.boolean().optional(),
+    auto_review: z.boolean().optional(),
     enabled: z.boolean().optional(),
   });
 
@@ -916,6 +920,8 @@ export function buildApp(): Hono {
       priority: cron.priority,
       verify_cmd: cron.verify_cmd ?? undefined,
       cron_id: cron.id,
+      open_pr: cron.open_pr !== 0,
+      auto_review: cron.auto_review !== 0,
     });
     updateCron(cron.id, { last_run_at: new Date().toISOString() });
     logEvent("cron.fired", {

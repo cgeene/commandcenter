@@ -113,6 +113,8 @@ export function fireDueCrons(now: Date): void {
       priority: cron.priority,
       verify_cmd: cron.verify_cmd ?? undefined,
       cron_id: cron.id,
+      open_pr: cron.open_pr !== 0,
+      auto_review: cron.auto_review !== 0,
     });
     updateCron(cron.id, advance);
     logEvent("cron.fired", {

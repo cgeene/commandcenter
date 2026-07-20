@@ -18,6 +18,8 @@ export interface CronJob {
   reasoning_effort: ReasoningEffort | null;
   priority: number;
   verify_cmd: string | null;
+  open_pr: number; // sqlite boolean, default 1
+  auto_review: number; // sqlite boolean, default 1; 0 = skip the adversarial reviewer
   enabled: number; // sqlite boolean
   last_run_at: string | null;
   next_run_at: string | null;
@@ -42,14 +44,16 @@ export function createCron(c: {
   reasoning_effort?: ReasoningEffort;
   priority?: number;
   verify_cmd?: string;
+  open_pr?: boolean;
+  auto_review?: boolean;
   enabled?: boolean;
 }): CronJob {
   const next = nextRun(c.schedule, new Date()); // validates too
   const workerProvider = parseAgentProvider(c.worker_provider, "claude");
   const info = getDb()
     .prepare(
-      `INSERT INTO crons (name, schedule, title, prompt, repo, worker_provider, model, reasoning_effort, priority, verify_cmd, enabled, next_run_at)
-       VALUES (@name, @schedule, @title, @prompt, @repo, @worker_provider, @model, @reasoning_effort, @priority, @verify_cmd, @enabled, @next_run_at)`,
+      `INSERT INTO crons (name, schedule, title, prompt, repo, worker_provider, model, reasoning_effort, priority, verify_cmd, open_pr, auto_review, enabled, next_run_at)
+       VALUES (@name, @schedule, @title, @prompt, @repo, @worker_provider, @model, @reasoning_effort, @priority, @verify_cmd, @open_pr, @auto_review, @enabled, @next_run_at)`,
     )
     .run({
       name: c.name,
@@ -62,6 +66,8 @@ export function createCron(c: {
       reasoning_effort: reasoningEffortForProvider(workerProvider, c.reasoning_effort),
       priority: c.priority ?? 2,
       verify_cmd: c.verify_cmd ?? null,
+      open_pr: c.open_pr === false ? 0 : 1,
+      auto_review: c.auto_review === false ? 0 : 1,
       enabled: c.enabled === false ? 0 : 1,
       next_run_at: next,
     });
@@ -98,6 +104,8 @@ const UPDATABLE = new Set([
   "reasoning_effort",
   "priority",
   "verify_cmd",
+  "open_pr",
+  "auto_review",
   "enabled",
   "last_run_at",
   "next_run_at",
@@ -122,6 +130,8 @@ export function updateCron(
     patch.worker_provider = parseAgentProvider(patch.worker_provider);
   }
   if (patch.enabled !== undefined) patch.enabled = patch.enabled ? 1 : 0;
+  if (patch.open_pr !== undefined) patch.open_pr = patch.open_pr ? 1 : 0;
+  if (patch.auto_review !== undefined) patch.auto_review = patch.auto_review ? 1 : 0;
   const keys = Object.keys(patch);
   if (keys.length === 0) return getCron(id);
   const sets = keys.map((k) => `${k} = @${k}`).join(", ");

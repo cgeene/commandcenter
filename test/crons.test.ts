@@ -106,6 +106,38 @@ describe("crons", () => {
     expect(listTasks().length).toBe(2);
   });
 
+  it("defaults open_pr and auto_review on, stores overrides, and threads them to fired tasks", async () => {
+    const { createCron, updateCron } = await import("../src/db/crons.js");
+    const { listTasks } = await import("../src/db/tasks.js");
+    const { fireDueCrons } = await import("../src/daemon/scheduler.js");
+
+    const dflt = createCron(TEMPLATE);
+    expect(dflt.open_pr).toBe(1);
+    expect(dflt.auto_review).toBe(1);
+
+    const report = createCron({
+      ...TEMPLATE,
+      name: "report",
+      open_pr: false,
+      auto_review: false,
+    });
+    expect(report.open_pr).toBe(0);
+    expect(report.auto_review).toBe(0);
+
+    updateCron(report.id, { next_run_at: "2020-01-01T00:00:00.000Z" });
+    fireDueCrons(new Date());
+    const task = listTasks().find((t) => t.cron_id === report.id)!;
+    expect(task).toMatchObject({ open_pr: 0, auto_review: 0 });
+  });
+
+  it("updateCron flips open_pr and auto_review back on", async () => {
+    const { createCron, updateCron } = await import("../src/db/crons.js");
+    const c = createCron({ ...TEMPLATE, open_pr: false, auto_review: false });
+    const after = updateCron(c.id, { open_pr: true, auto_review: true } as never)!;
+    expect(after.open_pr).toBe(1);
+    expect(after.auto_review).toBe(1);
+  });
+
   it("disabled crons never fire; re-enabling schedules from now", async () => {
     const { createCron, updateCron, dueCrons, getCron } = await import(
       "../src/db/crons.js"

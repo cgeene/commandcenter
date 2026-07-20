@@ -68,7 +68,7 @@ See [`configuration.md`](configuration.md) for what each knob does and its defau
 
 | Command | Description |
 |---|---|
-| `cron add <name> -s <cron>` | Create a template. `--provider <claude\|codex>`, `-p/--prompt` or `-f/--prompt-file` (required), `-r/--repo`, `--title`, `-m/--model`, Codex `-e/--effort` (default `high`), `-P/--priority`, `-v/--verify`. |
+| `cron add <name> -s <cron>` | Create a template. `--provider <claude\|codex>`, `-p/--prompt` or `-f/--prompt-file` (required), `-r/--repo`, `--title`, `-m/--model`, Codex `-e/--effort` (default `high`), `-P/--priority`, `-v/--verify`, `--no-pr` (no PR; auto-completes without a merge — for report/doc crons), `--no-review` (skip the adversarial reviewer; complete on worker finish — implies `--no-pr`). |
 | `cron ls` | List crons with enabled state, schedule, and next/last run. |
 | `cron enable <idOrName>` / `cron disable <idOrName>` | Toggle a cron. |
 | `cron run <idOrName>` | Enqueue this cron's task immediately. |
