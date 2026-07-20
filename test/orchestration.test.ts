@@ -153,4 +153,57 @@ describe("main-first task delegation", () => {
     expect(kinds).toContain("task.awaiting_main");
     expect(kinds).not.toContain("task.delegated_to_main");
   });
+
+  it("does NOT clobber an idle main with a human draft in the composer", async () => {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { delegateTaskToMain } = await import("../src/daemon/orchestration.js");
+    createAgent({ kind: "main", state: "idle", tmux_target: "cc:@main" });
+    const task = createTask({
+      title: "t",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+      open_pr: false,
+    });
+
+    // The main is idle, but the human is mid-typing a draft in its composer —
+    // exactly the regression this task fixes. The triage prompt must NOT be
+    // merged into that draft.
+    paneText = [
+      "╭────────────────────────────────────────────╮",
+      "│ ❯ actually let me rethink the rollout first  │",
+      "╰────────────────────────────────────────────╯",
+    ].join("\n");
+    expect(await delegateTaskToMain(task.id)).toBe(false);
+    expect(sendText).not.toHaveBeenCalled();
+    const kinds = listEvents(10).map((e) => e.kind);
+    expect(kinds).toContain("task.awaiting_main");
+    expect(kinds).not.toContain("task.delegated_to_main");
+  });
+
+  it("does NOT deliver mid-turn — a working main leaves the task queued", async () => {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { delegateTaskToMain } = await import("../src/daemon/orchestration.js");
+    // availableMain accepts working|idle, but the triage prompt must never fire
+    // mid-turn: a working main defers just like a busy prompt.
+    createAgent({ kind: "main", state: "working", tmux_target: "cc:@main" });
+    const task = createTask({
+      title: "t",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+      open_pr: false,
+    });
+
+    paneText = ""; // prompt is clear; only the working state blocks delivery
+    expect(await delegateTaskToMain(task.id)).toBe(false);
+    expect(sendText).not.toHaveBeenCalled();
+    const kinds = listEvents(10).map((e) => e.kind);
+    expect(kinds).toContain("task.awaiting_main");
+    expect(kinds).not.toContain("task.delegated_to_main");
+  });
 });

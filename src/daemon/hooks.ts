@@ -12,6 +12,7 @@ import { getSchedulerConfig } from "../db/settings.js";
 import { getTask, updateTask, type Task } from "../db/tasks.js";
 import {
   delegateToMain as delegateWorkerWaitToMain,
+  deliverToMainIfClear,
   flushMainQueue,
 } from "./notifqueue.js";
 import { notify } from "./notify.js";
@@ -201,10 +202,12 @@ function delegationPrompt(agent: Agent): string {
 
 /**
  * Startup / idle catch-up delegator: hand a worker wait to a main that has just
- * become available (working or idle). Unlike the real-time worker-wait path
- * (which routes through notifqueue's prompt-clear gate + queue), this delivers
- * to the just-ready main directly — it runs right after the orchestrator clears
- * its own startup/idle screen, catching up waits that accrued while it was down.
+ * become available (working or idle) — it runs right after the orchestrator
+ * clears its own startup/idle screen, catching up waits that accrued while it
+ * was down. Unlike the real-time worker-wait path it does not queue, but it
+ * shares the SAME prompt-clear gate (deliverToMainIfClear) so a human draft in
+ * the just-ready main's composer is never clobbered; `allowWorking` keeps the
+ * original "deliver to a working|idle main" reach.
  */
 async function delegateToMain(
   waiting: Agent,
@@ -219,26 +222,19 @@ async function delegateToMain(
         candidate.tmux_target !== null &&
         windowExists(candidate.tmux_target),
     );
-  if (
-    !main ||
-    !["working", "idle"].includes(main.state) ||
-    !main.tmux_target ||
-    !windowExists(main.tmux_target)
-  ) {
-    return false;
-  }
-  const delegated =
-    (await resumeAgent(main.id, delegationPrompt(waiting))) === "sent";
-  if (delegated) {
-    logEvent("waiting.delegated", {
-      agentId: waiting.id,
-      taskId: waiting.task_id ?? undefined,
-      // Do not persist the command/question text; it can contain sensitive
-      // arguments. The main receives only the agent id and inspects the pane.
-      payload: { to: main.id },
-    });
-  }
-  return delegated;
+  if (!main) return false;
+  const delivered = await deliverToMainIfClear(main, delegationPrompt(waiting), {
+    allowWorking: true,
+  });
+  if (delivered !== "delivered") return false;
+  logEvent("waiting.delegated", {
+    agentId: waiting.id,
+    taskId: waiting.task_id ?? undefined,
+    // Do not persist the command/question text; it can contain sensitive
+    // arguments. The main receives only the agent id and inspects the pane.
+    payload: { to: main.id },
+  });
+  return true;
 }
 
 /** Once the orchestrator clears its own startup trust screen, hand it the

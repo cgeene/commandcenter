@@ -95,6 +95,37 @@ function liveMain(): Agent | undefined {
 }
 
 /**
+ * The ONE gated primitive for injecting text into the main agent's composer.
+ * Delivers `message` only when the prompt is genuinely safe to type into — no
+ * unsubmitted human draft and no pending permission menu (mainPromptClear) —
+ * and, unless `allowWorking` is set, only when the main is idle so a delivery
+ * never fires mid-turn. Returns "delivered" on a confirmed send; "deferred" on
+ * a busy/mid-draft prompt, a lost race (the main started a turn or went waiting
+ * between the check and the send), or a dead window — in which case the caller
+ * keeps the item queued for the next Stop/idle/watchdog retry.
+ *
+ * Every path that writes to the main's prompt — task-triage delegation
+ * (orchestration.ts), real-time worker-wait delegation and its flush (below),
+ * and the startup/idle catch-up (hooks.ts) — funnels through here, so a human's
+ * mid-typed draft can never be clobbered and no future caller can bypass the
+ * gate by re-implementing (and drifting from) it.
+ */
+export async function deliverToMainIfClear(
+  main: Agent,
+  message: string,
+  opts: { allowWorking?: boolean } = {},
+): Promise<"delivered" | "deferred"> {
+  const stateOk = opts.allowWorking
+    ? ["working", "idle"].includes(main.state)
+    : main.state === "idle";
+  if (!main.tmux_target || !stateOk || !mainPromptClear(main.tmux_target)) {
+    return "deferred";
+  }
+  const outcome = await resumeAgent(main.id, message);
+  return outcome === "sent" ? "delivered" : "deferred";
+}
+
+/**
  * Route a waiting-worker notification to the main agent: deliver immediately
  * only when the main is idle with a clear prompt, otherwise queue it. With no
  * live main at all, fall back to paging the human directly (unchanged
@@ -111,22 +142,20 @@ export async function delegateToMain(worker: Agent, message: string): Promise<vo
 
   const item = { worker_id: worker.id, task_id: worker.task_id, message };
 
-  if (main.state === "idle" && mainPromptClear(main.tmux_target)) {
-    const outcome = await resumeAgent(
-      main.id,
-      buildDelegateMessage([item], getSchedulerConfig().escalate_minutes),
-    );
-    if (outcome === "sent") {
-      logEvent("waiting.delegated", {
-        agentId: worker.id,
-        taskId: worker.task_id ?? undefined,
-        payload: { to: main.id, message },
-      });
-      return;
-    }
-    // Raced — the main started a turn or went waiting between the check and
-    // the send. Fall through and queue instead of clobbering.
+  const delivered = await deliverToMainIfClear(
+    main,
+    buildDelegateMessage([item], getSchedulerConfig().escalate_minutes),
+  );
+  if (delivered === "delivered") {
+    logEvent("waiting.delegated", {
+      agentId: worker.id,
+      taskId: worker.task_id ?? undefined,
+      payload: { to: main.id, message },
+    });
+    return;
   }
+  // Busy, mid-draft, or raced — queue instead of clobbering; the Stop hook and
+  // idle-main watchdog flush it once the prompt is clear again.
 
   enqueueNotification({
     mainId: main.id,
@@ -193,14 +222,12 @@ export async function flushMainQueue(
     return "not_live";
   }
 
-  if (!mainPromptClear(main.tmux_target)) {
-    bumpBackoff(mainId, nowMs);
-    return "deferred";
-  }
-
   const message = buildDelegateMessage(items, getSchedulerConfig().escalate_minutes);
-  const outcome = await resumeAgent(mainId, message);
-  if (outcome !== "sent") {
+  // The flush fires from the main's Stop hook (just went idle) and the idle-main
+  // watchdog, so allow a working main through — but still refuse a mid-draft
+  // prompt. A deferred send (busy prompt or lost race) leaves the queue intact.
+  const outcome = await deliverToMainIfClear(main, message, { allowWorking: true });
+  if (outcome !== "delivered") {
     bumpBackoff(mainId, nowMs);
     return "deferred";
   }
