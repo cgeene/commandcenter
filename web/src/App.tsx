@@ -48,12 +48,12 @@ import type {
 
 /** Dashboard tabs — add an entry here + a render branch in App to grow the dashboard. */
 const TABS = [
-  { id: "board", label: "board" },
+  { id: "board", label: "Board" },
   { id: "prs", label: "PRs" },
-  { id: "docs", label: "docs" },
-  { id: "tokens", label: "tokens" },
-  { id: "archive", label: "archive" },
-  { id: "settings", label: "settings" },
+  { id: "docs", label: "Docs" },
+  { id: "tokens", label: "Tokens" },
+  { id: "archive", label: "Archive" },
+  { id: "settings", label: "Settings" },
 ] as const;
 type TabId = (typeof TABS)[number]["id"];
 
@@ -128,6 +128,37 @@ const STATE_COLORS: Record<string, string> = {
   spawning: "#58a6ff",
   stalled: "#f85149",
   dead: "#484f58",
+};
+
+/**
+ * Human-readable labels for the task-status enum. The enum values themselves
+ * are load-bearing (className hooks, logic comparisons) so they're never
+ * changed — this map is display-only, applied wherever a status is shown to a
+ * person. Sentence case, with the underscore variant spelled out.
+ */
+const STATUS_LABEL: Record<string, string> = {
+  queued: "Queued",
+  claimed: "Claimed",
+  in_progress: "In progress",
+  blocked: "Blocked",
+  review: "Review",
+  done: "Done",
+  failed: "Failed",
+  cancelled: "Cancelled",
+};
+
+function statusText(status: string): string {
+  return STATUS_LABEL[status] ?? status;
+}
+
+/** Human-readable label for a live agent's runtime state (see STATE_COLORS). */
+const AGENT_STATE_LABEL: Record<string, string> = {
+  working: "working",
+  idle: "idle",
+  waiting_input: "waiting for input",
+  spawning: "spawning",
+  stalled: "stalled",
+  dead: "dead",
 };
 
 export function App() {
@@ -270,7 +301,7 @@ export function App() {
     <div className="app">
       {stale && (
         <div className="error">
-          daemon is running stale code — run <code>agp upgrade</code>
+          Daemon is running stale code — run <code>agp upgrade</code>
         </div>
       )}
       <header>
@@ -308,8 +339,8 @@ export function App() {
             }
           >
             {scheduler.config.enabled
-              ? `■ auto ON (${scheduler.status.spawns_today}/${scheduler.config.daily_spawn_limit})`
-              : "▶ auto OFF"}
+              ? `■ Auto ON (${scheduler.status.spawns_today}/${scheduler.config.daily_spawn_limit})`
+              : "▶ Auto OFF"}
           </button>
         )}
         {!liveMain && (
@@ -319,10 +350,10 @@ export function App() {
             }
           />
         )}
-        <button onClick={() => setShowCrons(true)}>crons</button>
-        <button onClick={() => setShowMemory(true)}>memory</button>
+        <button onClick={() => setShowCrons(true)}>Crons</button>
+        <button onClick={() => setShowMemory(true)}>Memory</button>
         <button className="primary" onClick={() => setShowNewTask(true)}>
-          + new task
+          + New Task
         </button>
       </header>
 
@@ -394,7 +425,7 @@ export function App() {
           })()}
           {tasks.filter((t) => isActive(t.status)).length === 0 && (
             <span className="muted">
-              {tasks.length === 0 ? "no tasks yet" : "no active tasks — see Archive"}
+              {tasks.length === 0 ? "No tasks yet" : "No active tasks — see Archive"}
             </span>
           )}
         </div>
@@ -407,7 +438,7 @@ export function App() {
               {e.narrative ?? e.kind}
             </div>
           ))}
-          {events.length === 0 && <span className="muted">no activity yet</span>}
+          {events.length === 0 && <span className="muted">No activity yet</span>}
         </aside>
       </main>
       )}
@@ -426,9 +457,9 @@ export function App() {
       {panel?.kind === "terminal" && (
         <div className="drawer terminal-drawer" style={keyboardStyle}>
           <div className="drawer-head">
-            <b>terminal — a{panel.agentId}</b>
+            <b>Terminal — a{panel.agentId}</b>
             <div className="spacer" />
-            <button onClick={closePanel}>close</button>
+            <button onClick={closePanel}>Close</button>
           </div>
           <Terminal agentId={panel.agentId} />
         </div>
@@ -437,9 +468,9 @@ export function App() {
       {panel?.kind === "transcript" && transcript && (
         <div className="drawer">
           <div className="drawer-head">
-            <b>transcript</b>
+            <b>Transcript</b>
             <div className="spacer" />
-            <button onClick={closePanel}>close</button>
+            <button onClick={closePanel}>Close</button>
           </div>
           <div className="transcript">
             {transcript.map((e, i) => (
@@ -544,8 +575,8 @@ function TaskCard({
   const summary = firstLine(task.result_summary);
   const statusLabel =
     task.status === "queued" && task.dispatch_mode === "orchestrated"
-      ? "awaiting main"
-      : task.status;
+      ? "Awaiting main"
+      : statusText(task.status);
   return (
     <div className={`card ${task.status}`} onClick={() => onSelect(task)}>
       <div className="card-title">
@@ -555,18 +586,18 @@ function TaskCard({
         <span className={`chip ${task.status}`}>{statusLabel}</span>
         {task.workspace_kind !== "repo" && (
           <span className="chip">
-            {task.workspace_kind === "portfolio" ? "all repositories" : "investigation"}
+            {task.workspace_kind === "portfolio" ? "All repositories" : "Investigation"}
           </span>
         )}
         {task.review_verdict === "approve" && (
-          <span className="chip approved">✓ approved</span>
+          <span className="chip approved">✓ Approved</span>
         )}
         {task.review_verdict === "reject" && (
-          <span className="chip bad">✗ changes</span>
+          <span className="chip bad">✗ Changes</span>
         )}
         {task.status === "review" && (
-          <span className="chip" title="automatic review⇄fix round (current/cap)">
-            review round {Math.min(task.review_cycles + 1, reviewMax)}/{reviewMax}
+          <span className="chip" title="Automatic review⇄fix round (current/cap)">
+            Review round {Math.min(task.review_cycles + 1, reviewMax)}/{reviewMax}
           </span>
         )}
         {task.model && <span className="chip">{task.model}</span>}
@@ -614,18 +645,18 @@ function CiBadge({ checks }: { checks: string | null }) {
 function VerdictBadge({ task }: { task: Task }) {
   if (task.pr_is_draft === 1) {
     return (
-      <span className="pr-verdict draft" title="draft PR — internal adversarial review pending; flips to ready only on approval">
-        ✎ draft — in internal review
+      <span className="pr-verdict draft" title="Draft PR — internal adversarial review pending; flips to ready only on approval">
+        ✎ Draft — in internal review
       </span>
     );
   }
   if (task.review_verdict === "approve") {
-    return <span className="pr-verdict approved">✓ reviewer approved — awaiting merge</span>;
+    return <span className="pr-verdict approved">✓ Reviewer approved — awaiting merge</span>;
   }
   if (task.review_verdict === "reject") {
-    return <span className="pr-verdict bad">✗ changes requested</span>;
+    return <span className="pr-verdict bad">✗ Changes requested</span>;
   }
-  return <span className="pr-verdict muted">in review</span>;
+  return <span className="pr-verdict muted">In review</span>;
 }
 
 function prNumber(url: string | null): string {
@@ -655,7 +686,7 @@ function PrRow({
       <JiraChipView task={task} meta={meta} />
       {broken && (
         <span className="chip bad" title="prsync has failed 3+ times in a row">
-          ⚠ sync broken
+          ⚠ Sync broken
         </span>
       )}
       <span className="pr-age muted" title={task.pr_synced_at ?? task.updated_at}>
@@ -684,7 +715,7 @@ function PrsView({
     <main>
       <div className="prs-view">
         {groups.length === 0 && (
-          <span className="muted">no open PRs — everything's merged or in flight</span>
+          <span className="muted">No open PRs — everything's merged or in flight</span>
         )}
         {groups.map((g) => (
           <div key={g.project} className="pr-group">
@@ -732,7 +763,7 @@ function ArchiveView({
       <div className="archive-view">
         <input
           className="archive-filter"
-          placeholder="filter archive by project or title…"
+          placeholder="Filter archive by project or title…"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
         />
@@ -750,8 +781,8 @@ function ArchiveView({
           {groups.length === 0 && (
             <span className="muted">
               {archivedCount === 0
-                ? "nothing archived yet"
-                : "no archived tasks match your filter"}
+                ? "Nothing archived yet"
+                : "No archived tasks match your filter"}
             </span>
           )}
         </div>
@@ -832,7 +863,7 @@ function CollapsibleMarkdown({
       </div>
       {overflowing && (
         <button className="clamp-toggle" onClick={() => setExpanded((v) => !v)}>
-          {expanded ? "▲ collapse" : "▼ expand"}
+          {expanded ? "▲ Collapse" : "▼ Expand"}
         </button>
       )}
     </div>
@@ -854,9 +885,9 @@ function basename(p: string): string {
 type ApplyWhen = "immediate" | "next-spawn" | "restart";
 
 const APPLY_LABEL: Record<ApplyWhen, string> = {
-  immediate: "applies immediately",
-  "next-spawn": "applies to next spawn",
-  restart: "needs daemon restart",
+  immediate: "Applies immediately",
+  "next-spawn": "Applies to next spawn",
+  restart: "Needs daemon restart",
 };
 
 function ApplyBadge({ when }: { when: ApplyWhen }) {
@@ -1091,7 +1122,7 @@ function SchedulerSection({
 
       <div className="settings-actions">
         <button className="primary" disabled={saving} onClick={save}>
-          {saving ? "saving…" : "save scheduler"}
+          {saving ? "Saving…" : "Save Scheduler"}
         </button>
       </div>
     </section>
@@ -1156,7 +1187,7 @@ function AgentsSection({
             value={mainModel}
             onChange={(e) => setMainModel(e.target.value)}
           >
-            <option value="">default ({effective.default_main_model})</option>
+            <option value="">Default ({effective.default_main_model})</option>
             {settings.model_choices.map((slug) => (
               <option key={slug} value={slug}>
                 {slug}
@@ -1175,7 +1206,7 @@ function AgentsSection({
             onChange={(e) => setWorkerProvider(e.target.value)}
           >
             <option value="">
-              default ({effective.default_worker_provider})
+              Default ({effective.default_worker_provider})
             </option>
             {settings.provider_choices.map((p) => (
               <option key={p} value={p}>
@@ -1195,7 +1226,7 @@ function AgentsSection({
             onChange={(e) => setReviewerProvider(e.target.value)}
           >
             <option value="">
-              no pin
+              No pin
               {effective.default_reviewer_provider
                 ? ` (env pins ${effective.default_reviewer_provider})`
                 : ""}
@@ -1215,16 +1246,16 @@ function AgentsSection({
         >
           <select value={variety} onChange={(e) => setVariety(e.target.value)}>
             <option value="">
-              default ({effective.reviewer_variety ? "on" : "off"})
+              Default ({effective.reviewer_variety ? "on" : "off"})
             </option>
-            <option value="true">on</option>
-            <option value="false">off</option>
+            <option value="true">On</option>
+            <option value="false">Off</option>
           </select>
         </SettingRow>
       </div>
       <div className="settings-actions">
         <button className="primary" disabled={saving} onClick={save}>
-          {saving ? "saving…" : "save agents"}
+          {saving ? "Saving…" : "Save Agents"}
         </button>
       </div>
     </section>
@@ -1294,7 +1325,7 @@ function WorkspaceSection({
       </SettingRow>
       <div className="settings-actions">
         <button className="primary" disabled={saving} onClick={save}>
-          {saving ? "saving…" : "save workspace"}
+          {saving ? "Saving…" : "Save Workspace"}
         </button>
       </div>
     </section>
@@ -1368,12 +1399,12 @@ function NotificationsSection({
       >
         <div className="setting-inline">
           <span className={`chip ${ntfy_token_set ? "approved" : ""}`}>
-            {ntfy_token_set ? "token set" : "token unset"}
+            {ntfy_token_set ? "Token set" : "Token unset"}
           </span>
           <input
             type="password"
             autoComplete="new-password"
-            placeholder={ntfy_token_set ? "replace token…" : "set token…"}
+            placeholder={ntfy_token_set ? "Replace token…" : "Set token…"}
             value={clearToken ? "" : tokenInput}
             disabled={clearToken}
             onChange={(e) => setTokenInput(e.target.value)}
@@ -1385,14 +1416,14 @@ function NotificationsSection({
                 checked={clearToken}
                 onChange={(e) => setClearToken(e.target.checked)}
               />
-              clear
+              Clear
             </label>
           )}
         </div>
       </SettingRow>
       <div className="settings-actions">
         <button className="primary" disabled={saving} onClick={save}>
-          {saving ? "saving…" : "save notifications"}
+          {saving ? "Saving…" : "Save Notifications"}
         </button>
       </div>
     </section>
@@ -1550,7 +1581,7 @@ function JiraSection({
             checked={enabled}
             onChange={(e) => setEnabled(e.target.checked)}
           />
-          {enabled ? "enabled" : "disabled"}
+          {enabled ? "Enabled" : "Disabled"}
         </label>
       </SettingRow>
 
@@ -1610,10 +1641,10 @@ function JiraSection({
                   checked={r.enabled}
                   onChange={(e) => setRepo(i, { enabled: e.target.checked })}
                 />
-                {r.enabled ? "enabled" : "disabled"}
+                {r.enabled ? "Enabled" : "Disabled"}
               </label>
               <button className="link-btn" onClick={() => removeRepo(i)}>
-                remove
+                Remove
               </button>
             </div>
             <div className="jira-repo-fields">
@@ -1661,7 +1692,7 @@ function JiraSection({
           <input
             type="text"
             list="jira-repo-suggestions"
-            placeholder="add repo (absolute path or owner/name)"
+            placeholder="Add repo (absolute path or owner/name)"
             value={newRepo}
             onChange={(e) => setNewRepo(e.target.value)}
             onKeyDown={(e) => {
@@ -1676,7 +1707,7 @@ function JiraSection({
               <option key={s} value={s} />
             ))}
           </datalist>
-          <button onClick={addRepo}>add repo</button>
+          <button onClick={addRepo}>Add Repo</button>
         </div>
       </div>
 
@@ -1686,7 +1717,7 @@ function JiraSection({
           {settings.jira.email ? ` · ${settings.jira.email}` : ""}
         </span>
         <button className="primary" disabled={saving} onClick={save}>
-          {saving ? "saving…" : "save JIRA"}
+          {saving ? "Saving…" : "Save JIRA"}
         </button>
       </div>
     </section>
@@ -1733,7 +1764,7 @@ function SettingsView() {
   return (
     <main className="settings-view">
       {error && <div className="error">{error}</div>}
-      {!loaded && !error && <span className="muted">loading settings…</span>}
+      {!loaded && !error && <span className="muted">Loading settings…</span>}
       {scheduler && (
         // key on the fetched config so a save+refetch re-seeds each section's
         // local draft from the server's canonical values.
@@ -1858,14 +1889,14 @@ function DocsView() {
             </div>
           ))}
           {docs.length === 0 && !error && (
-            <span className="muted">no docs yet</span>
+            <span className="muted">No docs yet</span>
           )}
         </aside>
         <section className="docs-body">
           {error && <div className="error">{error}</div>}
-          {loading && <span className="muted">loading…</span>}
+          {loading && <span className="muted">Loading…</span>}
           {!loading && !selected && !error && (
-            <span className="muted">select a doc to read it</span>
+            <span className="muted">Select a doc to read it</span>
           )}
           {selected && (
             <>
@@ -1887,7 +1918,7 @@ function DocsView() {
               </div>
               {attachments.length > 0 && (
                 <div className="docs-attachments">
-                  <b className="muted">attachments</b>
+                  <b className="muted">Attachments</b>
                   {attachments.map((rel) => {
                     const name = basename(rel);
                     return (
@@ -1939,14 +1970,14 @@ function AttentionPanel({
   if (items.length === 0) {
     return (
       <section className="attention empty">
-        <span className="muted">✓ nothing needs you</span>
+        <span className="muted">✓ Nothing needs you</span>
       </section>
     );
   }
   return (
     <section className="attention">
       <h2>
-        Needs you <span className="muted">{items.length}</span>
+        Needs You <span className="muted">{items.length}</span>
       </h2>
       {items.map((it) => (
         <div key={it.id} className={`attention-row sev-${it.severity}`}>
@@ -1956,7 +1987,7 @@ function AttentionPanel({
           <div className="att-main">
             <div className="att-title">
               {it.title}
-              {it.urgent && <span className="att-urgent">urgent</span>}
+              {it.urgent && <span className="att-urgent">Urgent</span>}
             </div>
             {it.context && <div className="att-context muted">{it.context}</div>}
           </div>
@@ -1970,17 +2001,17 @@ function AttentionPanel({
               target="_blank"
               rel="noreferrer"
             >
-              open
+              Open
             </a>
           ) : it.task_id != null ? (
             <button className="att-open" onClick={() => onOpenTask(it.task_id!)}>
-              open
+              Open
             </button>
           ) : (
             <span className="att-open" />
           )}
           <button className="att-dismiss" onClick={() => onDismiss(it.id)}>
-            dismiss
+            Dismiss
           </button>
         </div>
       ))}
@@ -2028,13 +2059,13 @@ function AgentList({
         />
       ) : (
         <div className="agent-entry main empty">
-          <span className="muted">no main agent — spawn one above</span>
+          <span className="muted">No main agent — spawn one above</span>
         </div>
       )}
 
       <div className="agents-workers">
         <div className="agents-section-label muted">
-          workers <span>{workers.length}</span>
+          Workers <span>{workers.length}</span>
         </div>
         {workers.map((a) => (
           <AgentEntry
@@ -2048,7 +2079,7 @@ function AgentList({
           />
         ))}
         {workers.length === 0 && (
-          <span className="muted">no worker agents</span>
+          <span className="muted">No worker agents</span>
         )}
       </div>
     </section>
@@ -2081,7 +2112,7 @@ function AgentEntry({
 }) {
   const waiting = agent.state === "waiting_input";
   const label = prominent
-    ? "main agent"
+    ? "Main agent"
     : `a${agent.id}${
         agent.task_id
           ? ` · #${agent.task_id}`
@@ -2100,20 +2131,21 @@ function AgentEntry({
         />
         <b>{label}</b>
         <span className="muted agent-state">
-          {agent.state} · {agent.provider} · {agent.model ?? "default"}
+          {AGENT_STATE_LABEL[agent.state] ?? agent.state} · {agent.provider} ·{" "}
+          {agent.model ?? "default"}
           {agent.reasoning_effort ? ` · ${agent.reasoning_effort}` : ""}
         </span>
-        {waiting && <span className="waiting-badge">waiting</span>}
+        {waiting && <span className="waiting-badge">Waiting</span>}
         {waiting && (
           <button onClick={onToggleRespond}>
-            {expanded ? "hide" : "respond"}
+            {expanded ? "Hide" : "Respond"}
           </button>
         )}
         <button
           className={prominent ? "primary" : ""}
           onClick={() => onOpenTerminal(agent.id)}
         >
-          terminal
+          Terminal
         </button>
         {!prominent && (
           <button
@@ -2126,7 +2158,7 @@ function AgentEntry({
               )
             }
           >
-            kill
+            Kill
           </button>
         )}
       </div>
@@ -2174,7 +2206,7 @@ function AgentPane({
       {pane?.unsubmitted_input && (
         <div className="pane-banner">
           <span>
-            unsubmitted text in prompt: "{pane.unsubmitted_input}"
+            Unsubmitted text in prompt: "{pane.unsubmitted_input}"
           </span>
           <div className="pane-banner-actions">
             <button
@@ -2183,7 +2215,7 @@ function AgentPane({
                 onAction(() => api("POST", `/api/agents/${agentId}/submit-input`, {}))
               }
             >
-              submit it
+              Submit It
             </button>
             <button
               className="danger"
@@ -2191,7 +2223,7 @@ function AgentPane({
                 onAction(() => api("POST", `/api/agents/${agentId}/clear-input`, {}))
               }
             >
-              clear it
+              Clear It
             </button>
           </div>
         </div>
@@ -2218,12 +2250,12 @@ function AgentPane({
             // already sitting unsubmitted in the prompt, garbling both into
             // one message — resolve the banner above first.
             <span className="muted">
-              resolve the unsubmitted text above before replying
+              Resolve the unsubmitted text above before replying
             </span>
           ) : (
             <div className="pane-reply">
               <input
-                placeholder="reply…"
+                placeholder="Reply…"
                 value={reply}
                 onChange={(e) => setReply(e.target.value)}
                 onKeyDown={(e) => {
@@ -2231,7 +2263,7 @@ function AgentPane({
                 }}
               />
               <button className="primary" disabled={!reply.trim()} onClick={submitReply}>
-                send
+                Send
               </button>
             </div>
           )}
@@ -2239,7 +2271,7 @@ function AgentPane({
       )}
 
       <button className="pane-terminal-link" onClick={onOpenTerminal}>
-        open terminal
+        Open Terminal
       </button>
     </div>
   );
@@ -2280,15 +2312,15 @@ function TokensView({
         <div className="stat-cards">
           <div className="stat-card">
             <b>{fmtTokens(total)}</b>
-            <span className="muted">total tokens</span>
+            <span className="muted">Total tokens</span>
           </div>
           <div className="stat-card">
             <b>{fmtTokens(todayTotal)}</b>
-            <span className="muted">tasks touched today</span>
+            <span className="muted">Tasks touched today</span>
           </div>
           <div className="stat-card">
             <b>{tracked.length}</b>
-            <span className="muted">tasks tracked</span>
+            <span className="muted">Tasks tracked</span>
           </div>
           {[...byModel.entries()]
             .sort((a, b) => b[1] - a[1])
@@ -2304,11 +2336,11 @@ function TokensView({
           <table className="token-table">
             <thead>
               <tr>
-                <th>task</th>
-                <th>model</th>
-                <th>status</th>
-                <th className="num">tokens</th>
-                <th className="num">share</th>
+                <th>Task</th>
+                <th>Model</th>
+                <th>Status</th>
+                <th className="num">Tokens</th>
+                <th className="num">Share</th>
               </tr>
             </thead>
             <tbody>
@@ -2319,7 +2351,7 @@ function TokensView({
                   </td>
                   <td>{t.model ?? "—"}</td>
                   <td>
-                    <span className={`chip ${t.status}`}>{t.status}</span>
+                    <span className={`chip ${t.status}`}>{statusText(t.status)}</span>
                   </td>
                   <td className="num">{fmtTokens(t.tokens_used ?? 0)}</td>
                   <td className="num muted">
@@ -2331,11 +2363,11 @@ function TokensView({
           </table>
         ) : (
           <span className="muted">
-            no token data yet — usage is recorded each time a worker finishes a turn
+            No token data yet — usage is recorded each time a worker finishes a turn
           </span>
         )}
         <p className="muted token-note">
-          input + output + cache tokens summed from session transcripts.
+          Input + output + cache tokens summed from session transcripts.
           Approximate: a fresh (non-resumed) respawn resets a task's count.
         </p>
       </div>
@@ -2380,7 +2412,7 @@ function MainAgentSpawn({
   return (
     <div className="main-spawn">
       <select
-        aria-label="main agent model"
+        aria-label="Main agent model"
         value={modelChoice}
         onChange={(e) => {
           setModelChoice(e.target.value);
@@ -2396,11 +2428,11 @@ function MainAgentSpawn({
             {model.description ? ` — ${model.description}` : ""}
           </option>
         ))}
-        <option value="__custom__">custom Claude model…</option>
+        <option value="__custom__">Custom Claude model…</option>
       </select>
       {modelChoice === "__custom__" && (
         <input
-          aria-label="custom main agent model"
+          aria-label="Custom main agent model"
           placeholder="Claude model slug"
           value={customModel}
           onChange={(e) => setCustomModel(e.target.value)}
@@ -2410,7 +2442,7 @@ function MainAgentSpawn({
         disabled={modelChoice === "__custom__" && !selectedModel}
         onClick={() => onSpawn(selectedModel || undefined)}
       >
-        ▶ spawn main agent
+        ▶ Spawn Main Agent
       </button>
     </div>
   );
@@ -2435,35 +2467,35 @@ function TaskPanel({
         <b>
           #{task.id} {task.title}
         </b>
-        <span className={`chip ${task.status}`}>{task.status}</span>
+        <span className={`chip ${task.status}`}>{statusText(task.status)}</span>
         <div className="spacer" />
-        <button onClick={onClose}>close</button>
+        <button onClick={onClose}>Close</button>
       </div>
       <div className="panel-body">
-        <div className="field-label">prompt</div>
+        <div className="field-label">Prompt</div>
         <div className="prompt">
           <CollapsibleMarkdown content={task.prompt} looseLineBreaks />
         </div>
         <dl>
-          <dt>workspace</dt>
+          <dt>Workspace</dt>
           <dd>
             {task.workspace_kind === "portfolio"
-              ? "all repositories"
+              ? "All repositories"
               : task.workspace_kind === "scratch"
-                ? "investigation scratch"
-                : "repository"}
+                ? "Investigation scratch"
+                : "Repository"}
           </dd>
-          <dt>{task.workspace_kind === "portfolio" ? "root" : "path"}</dt>
+          <dt>{task.workspace_kind === "portfolio" ? "Root" : "Path"}</dt>
           <dd>{task.repo}</dd>
           {task.parent_task_id && (
             <>
-              <dt>parent</dt>
+              <dt>Parent</dt>
               <dd>#{task.parent_task_id}</dd>
             </>
           )}
-          <dt>dispatch</dt>
-          <dd>{task.dispatch_mode === "orchestrated" ? "Claude main" : "direct scheduler"}</dd>
-          <dt>worker</dt>
+          <dt>Dispatch</dt>
+          <dd>{task.dispatch_mode === "orchestrated" ? "Claude main" : "Direct scheduler"}</dd>
+          <dt>Worker</dt>
           <dd>
             {task.worker_provider}
             {task.model ? ` · ${task.model}` : " · default model"}
@@ -2471,25 +2503,25 @@ function TaskPanel({
           </dd>
           {task.branch && (
             <>
-              <dt>branch</dt>
+              <dt>Branch</dt>
               <dd>{task.branch}</dd>
             </>
           )}
           {task.worktree && (
             <>
-              <dt>worktree</dt>
+              <dt>Worktree</dt>
               <dd>{task.worktree}</dd>
             </>
           )}
           {task.verify_cmd && (
             <>
-              <dt>verify</dt>
+              <dt>Verify</dt>
               <dd>{task.verify_cmd}</dd>
             </>
           )}
           {task.tokens_used != null && task.tokens_used > 0 && (
             <>
-              <dt>tokens</dt>
+              <dt>Tokens</dt>
               <dd>{fmtTokens(task.tokens_used)}</dd>
             </>
           )}
@@ -2506,13 +2538,13 @@ function TaskPanel({
         </dl>
         {task.result_summary && (
           <>
-            <div className="field-label">result</div>
+            <div className="field-label">Result</div>
             <CollapsibleMarkdown content={task.result_summary} looseLineBreaks />
           </>
         )}
         {task.review_notes && (
           <>
-            <div className="field-label">review notes</div>
+            <div className="field-label">Review notes</div>
             <CollapsibleMarkdown content={task.review_notes} looseLineBreaks />
           </>
         )}
@@ -2526,7 +2558,7 @@ function TaskPanel({
                 onAction(() => api("POST", "/api/agents", { task_id: task.id }))
               }
             >
-              ▶ spawn worker
+              ▶ Spawn Worker
             </button>
           )}
           {task.status === "queued" && task.dispatch_mode === "orchestrated" && (
@@ -2536,11 +2568,11 @@ function TaskPanel({
                 onAction(() => api("POST", `/api/tasks/${task.id}/delegate`, {}))
               }
             >
-              notify Claude main
+              Notify Claude Main
             </button>
           )}
           {task.agent_id && (
-            <button onClick={() => onTerminal(task.agent_id!)}>terminal</button>
+            <button onClick={() => onTerminal(task.agent_id!)}>Terminal</button>
           )}
           {task.session_id && (
             <button
@@ -2548,7 +2580,7 @@ function TaskPanel({
                 onTranscript(task.session_id!, task.session_provider ?? "claude")
               }
             >
-              transcript
+              Transcript
             </button>
           )}
           {task.status === "review" && (
@@ -2560,7 +2592,7 @@ function TaskPanel({
                 )
               }
             >
-              ✓ mark done
+              ✓ Mark Done
             </button>
           )}
           {["blocked", "review", "failed", "cancelled"].includes(task.status) && (
@@ -2571,7 +2603,7 @@ function TaskPanel({
                 )
               }
             >
-              ↺ requeue
+              ↺ Requeue
             </button>
           )}
           {!["done", "cancelled"].includes(task.status) && (
@@ -2587,7 +2619,7 @@ function TaskPanel({
                 void onAction(() => api("POST", `/api/tasks/${task.id}/cancel`, {}));
               }}
             >
-              ✕ cancel task
+              ✕ Cancel Task
             </button>
           )}
         </div>
@@ -2615,9 +2647,9 @@ function CronsDrawer({ onClose }: { onClose: () => void }) {
   return (
     <div className="drawer">
       <div className="drawer-head">
-        <b>crons</b>
+        <b>Crons</b>
         <div className="spacer" />
-        <button onClick={onClose}>close</button>
+        <button onClick={onClose}>Close</button>
       </div>
       <div className="panel-body">
         {crons.map((c) => (
@@ -2628,7 +2660,7 @@ function CronsDrawer({ onClose }: { onClose: () => void }) {
               </b>
               <span>
                 <button onClick={() => patch(c.id, { enabled: !c.enabled })}>
-                  {c.enabled ? "disable" : "enable"}
+                  {c.enabled ? "Disable" : "Enable"}
                 </button>{" "}
                 <button
                   onClick={async () => {
@@ -2636,7 +2668,7 @@ function CronsDrawer({ onClose }: { onClose: () => void }) {
                     load();
                   }}
                 >
-                  run now
+                  Run Now
                 </button>{" "}
                 <button
                   className="danger"
@@ -2645,7 +2677,7 @@ function CronsDrawer({ onClose }: { onClose: () => void }) {
                     load();
                   }}
                 >
-                  delete
+                  Delete
                 </button>
               </span>
             </div>
@@ -2661,7 +2693,7 @@ function CronsDrawer({ onClose }: { onClose: () => void }) {
         ))}
         {crons.length === 0 && (
           <span className="muted">
-            no crons — create one with: agp cron add &lt;name&gt; -s "0 3 * * *" -p "..."
+            No crons — create one with: agp cron add &lt;name&gt; -s "0 3 * * *" -p "..."
           </span>
         )}
       </div>
@@ -2687,19 +2719,19 @@ function MemoryDrawer({ onClose }: { onClose: () => void }) {
   return (
     <div className="drawer">
       <div className="drawer-head">
-        <b>memory</b>
+        <b>Memory</b>
         <div className="spacer" />
-        <button onClick={onClose}>close</button>
+        <button onClick={onClose}>Close</button>
       </div>
       <div className="panel-body">
         <input
-          placeholder="search memories…"
+          placeholder="Search memories…"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
         <div className="memory-add">
           <textarea
-            placeholder="store a new memory…"
+            placeholder="Store a new memory…"
             rows={2}
             value={newText}
             onChange={(e) => setNewText(e.target.value)}
@@ -2713,7 +2745,7 @@ function MemoryDrawer({ onClose }: { onClose: () => void }) {
               load(query);
             }}
           >
-            remember
+            Remember
           </button>
         </div>
         {memories.map((m) => (
@@ -2732,13 +2764,13 @@ function MemoryDrawer({ onClose }: { onClose: () => void }) {
                   load(query);
                 }}
               >
-                forget
+                Forget
               </button>
             </div>
             <div>{m.text}</div>
           </div>
         ))}
-        {memories.length === 0 && <span className="muted">no memories</span>}
+        {memories.length === 0 && <span className="muted">No memories</span>}
       </div>
     </div>
   );
@@ -2872,15 +2904,15 @@ function NewTaskForm({
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2>New task</h2>
+        <h2>New Task</h2>
         <input
-          placeholder="title"
+          placeholder="Title"
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           autoFocus
         />
         <textarea
-          placeholder="prompt — what should be accomplished?"
+          placeholder="Prompt — what should be accomplished?"
           rows={6}
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
@@ -2889,7 +2921,7 @@ function NewTaskForm({
           <label>
             <span>Workspace</span>
             <select
-              aria-label="workspace type"
+              aria-label="Workspace type"
               value={workspaceKind}
               onChange={(e) => setWorkspaceKind(e.target.value as WorkspaceKind)}
             >
@@ -2910,8 +2942,8 @@ function NewTaskForm({
             <label>
               <span>Repository</span>
               <input
-                aria-label="repository path"
-                placeholder="repo (absolute path)"
+                aria-label="Repository path"
+                placeholder="Repo (absolute path)"
                 value={repo}
                 onChange={(e) => setRepo(e.target.value)}
               />
@@ -2923,17 +2955,17 @@ function NewTaskForm({
             <label>
               <span>Repository</span>
               <select
-                aria-label="repository"
+                aria-label="Repository"
                 value={repo}
                 onChange={(e) => setRepo(e.target.value)}
                 disabled={workspacesLoading || !workspaceCatalog?.repositories.length}
               >
                 <option value="">
                   {workspacesLoading
-                    ? "loading repositories…"
+                    ? "Loading repositories…"
                     : workspaceCatalog?.repositories.length
-                      ? "select a repository…"
-                      : "no repositories configured"}
+                      ? "Select a repository…"
+                      : "No repositories configured"}
                 </option>
                 {workspaceCatalog?.repositories.map((entry) => (
                   <option key={entry.path} value={entry.path}>
@@ -2951,13 +2983,13 @@ function NewTaskForm({
             <label>
               <span>Repository root</span>
               <select
-                aria-label="repository root"
+                aria-label="Repository root"
                 value={repoRoot}
                 onChange={(e) => setRepoRoot(e.target.value)}
                 disabled={workspacesLoading || !workspaceCatalog?.roots.length}
               >
                 <option value="">
-                  {workspacesLoading ? "loading roots…" : "select a root…"}
+                  {workspacesLoading ? "Loading roots…" : "Select a root…"}
                 </option>
                 {workspaceCatalog?.roots.map((root) => (
                   <option key={root.path} value={root.path}>
@@ -2990,7 +3022,7 @@ function NewTaskForm({
               setReasoningEffort("high");
             }}
           >
-            <option value="">provider (system default)</option>
+            <option value="">Provider (system default)</option>
             <option value="claude">Claude Code</option>
             <option value="codex">Codex</option>
           </select>
@@ -2998,8 +3030,8 @@ function NewTaskForm({
             value={modelChoice}
             onChange={(e) => setModelChoice(e.target.value)}
           >
-            <option value="">model (provider default)</option>
-            {modelsLoading && <option disabled>loading models…</option>}
+            <option value="">Model (provider default)</option>
+            {modelsLoading && <option disabled>Loading models…</option>}
             {models.map((option) => (
               <option key={option.slug} value={option.slug}>
                 {option.display_name}
@@ -3007,12 +3039,12 @@ function NewTaskForm({
               </option>
             ))}
             <option value="__custom__">
-              {modelsUnavailable ? "model catalog unavailable — type model…" : "custom model…"}
+              {modelsUnavailable ? "Model catalog unavailable — type model…" : "Custom model…"}
             </option>
           </select>
           {modelChoice === "__custom__" && (
             <input
-              placeholder="provider model slug"
+              placeholder="Provider model slug"
               value={customModel}
               onChange={(e) => setCustomModel(e.target.value)}
             />
@@ -3040,13 +3072,13 @@ function NewTaskForm({
           >
             {[0, 1, 2, 3, 4].map((p) => (
               <option key={p} value={p}>
-                priority {p}
+                Priority {p}
               </option>
             ))}
           </select>
         </div>
         <input
-          placeholder="verify command (optional, e.g. make test)"
+          placeholder="Verify command (optional, e.g. make test)"
           value={verify}
           onChange={(e) => setVerify(e.target.value)}
         />
@@ -3076,9 +3108,9 @@ function NewTaskForm({
               })
             }
           >
-            create
+            Create
           </button>
-          <button onClick={onClose}>cancel</button>
+          <button onClick={onClose}>Cancel</button>
         </div>
       </div>
     </div>
