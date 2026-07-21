@@ -465,6 +465,13 @@ describe("open_pr prompt wiring", () => {
     expect(prompt).toContain("leave its draft/ready state");
     // workers must not run gh pr ready themselves — the platform owns it
     expect(prompt).toContain("Do NOT run `gh pr ready`");
+    // PR body is aimed at human reviewers, not commandcenter internals
+    expect(prompt).toContain("human engineers");
+    // traceability trailer is an invisible HTML comment, not visible body text
+    expect(prompt).toContain(`<!-- commandcenter task #${task.id} -->`);
+    expect(prompt).not.toContain('ending with "commandcenter task #');
+    // body goes through a file to avoid inline shell-escaping bugs
+    expect(prompt).toContain("--body-file");
   });
 
   it("resume prompt tells a normal task to keep new PRs draft and leave existing state alone", async () => {
@@ -474,6 +481,9 @@ describe("open_pr prompt wiring", () => {
     const prompt = _buildResumePromptForTest(task);
     expect(prompt).toContain("gh pr create --draft");
     expect(prompt).toContain("leave its draft/ready state");
+    // same human-facing PR body guidance on resume
+    expect(prompt).toContain("--body-file");
+    expect(prompt).toContain(`<!-- commandcenter task #${task.id} -->`);
   });
 
   it("scratch worker prompts prohibit Git/PR work and require evidence", async () => {
