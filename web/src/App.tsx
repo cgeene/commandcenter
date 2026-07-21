@@ -637,7 +637,7 @@ function TaskCard({
   return (
     <div className={`card ${task.status}`} onClick={() => onSelect(task)}>
       <div className="card-title">
-        #{task.id} {task.title}
+        <span className="card-id">#{task.id}</span> {task.title}
       </div>
       <div className="chips">
         <span className={`chip ${task.status}`}>{statusLabel}</span>
