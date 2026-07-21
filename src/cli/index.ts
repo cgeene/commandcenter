@@ -19,6 +19,8 @@ import type { Event } from "../db/events.js";
 import type { Task } from "../db/tasks.js";
 import { gitToplevel } from "../daemon/worktree.js";
 import { writeCodexConfig } from "../daemon/genconfig.js";
+import { countRepositoriesUnder } from "../daemon/workspaces.js";
+import { classifyGhStatus } from "./doctor.js";
 import { api } from "./client.js";
 
 const program = new Command()
@@ -818,13 +820,7 @@ program
     checks.push(["git", ...probe("git", ["--version"])]);
 
     const gh = spawnSync("gh", ["auth", "status"], { encoding: "utf8" });
-    checks.push([
-      "GitHub CLI (authenticated)",
-      gh.status === 0,
-      gh.status === 0
-        ? "authenticated"
-        : "not authenticated — run `gh auth login`",
-    ]);
+    checks.push(["GitHub CLI (authenticated)", ...classifyGhStatus(gh)]);
 
     checks.push(["Claude Code", ...probe(claudeBin(), ["--version"])]);
 
@@ -836,34 +832,6 @@ program
       true,
     ]);
 
-    // Count git roots beneath a directory the way the daemon's picker does:
-    // bounded-depth, and never descend into a repo once found. Mirrors the
-    // "returns only git roots beneath the allow-list" discovery so the count
-    // isn't misleadingly 0 when repos are nested a level or two down.
-    const countGitRoots = (base: string, maxDepth = 3): number => {
-      let found = 0;
-      const walk = (dir: string, depth: number) => {
-        if (depth > maxDepth) return;
-        let entries: fs.Dirent[];
-        try {
-          entries = fs.readdirSync(dir, { withFileTypes: true });
-        } catch {
-          return;
-        }
-        if (entries.some((e) => e.name === ".git")) {
-          found++;
-          return; // a git root; don't descend into its working tree
-        }
-        for (const e of entries) {
-          if (e.isDirectory() && !e.isSymbolicLink() && !e.name.startsWith(".")) {
-            walk(path.join(dir, e.name), depth + 1);
-          }
-        }
-      };
-      walk(base, 0);
-      return found;
-    };
-
     const roots = configuredRepoRoots();
     if (roots.length === 0) {
       checks.push([
@@ -874,25 +842,38 @@ program
     } else {
       for (const root of roots) {
         let ok = false;
+        let optional: boolean | undefined;
         let detail = root;
         try {
           if (fs.statSync(root).isDirectory()) {
-            const repos = countGitRoots(root);
-            ok = true;
-            detail = `${root} (${repos} git repo${repos === 1 ? "" : "s"} found)`;
+            // Count git roots exactly as the daemon's picker discovers them.
+            const repos = countRepositoriesUnder(root);
+            if (repos > 0) {
+              ok = true;
+              detail = `${root} (${repos} git repo${repos === 1 ? "" : "s"} found)`;
+            } else {
+              // A valid but empty root isn't a failure, but the picker will be
+              // empty — surface it as a warning rather than a passing check.
+              optional = true;
+              detail = `${root} (0 git repos found — the repository picker will be empty)`;
+            }
           } else {
             detail = `${root} — not a directory`;
           }
         } catch {
           detail = `${root} — does not exist`;
         }
-        checks.push(["CC_REPO_ROOTS", ok, detail]);
+        checks.push(["CC_REPO_ROOTS", ok, detail, optional]);
       }
     }
 
     let daemonUp = false;
     try {
-      const res = await fetch(`${baseUrl()}/healthz`);
+      // Bound the probe so a wedged daemon can't hang doctor indefinitely;
+      // a timeout/abort is reported the same as unreachable.
+      const res = await fetch(`${baseUrl()}/healthz`, {
+        signal: AbortSignal.timeout(2000),
+      });
       daemonUp = res.ok;
     } catch {
       daemonUp = false;

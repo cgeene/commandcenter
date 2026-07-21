@@ -74,6 +74,31 @@ describe("repository workspace catalog", () => {
   });
 });
 
+describe("countRepositoriesUnder", () => {
+  it("counts git roots the way the picker walks: depth, SKIP_DIRS, and symlinked .git", async () => {
+    gitRepo("top");
+    gitRepo("platform/unicorn-k8s");
+    // Depth: MAX_SCAN_DEPTH is 5, so a repo six levels below the base is missed.
+    gitRepo("a/b/c/d/e/deep");
+    // SKIP_DIRS: vendored/generated checkouts are never surfaced.
+    gitRepo("node_modules/dep");
+    gitRepo("vendor/lib");
+    gitRepo(".commandcenter/worktrees/wt");
+    // A symlinked .git marker is rejected (lstat, not a name check).
+    const linkedGit = path.join(root, "linked-marker");
+    fs.mkdirSync(linkedGit);
+    fs.symlinkSync(path.join(root, "top", ".git"), path.join(linkedGit, ".git"));
+
+    const { countRepositoriesUnder } = await import("../src/daemon/workspaces.js");
+    expect(countRepositoriesUnder(root)).toBe(2);
+  });
+
+  it("returns 0 for a valid directory with no repositories", async () => {
+    const { countRepositoriesUnder } = await import("../src/daemon/workspaces.js");
+    expect(countRepositoriesUnder(root)).toBe(0);
+  });
+});
+
 describe("scratch workspace lifecycle", () => {
   it("allocates an empty private directory and rejects unmanaged paths", async () => {
     const {

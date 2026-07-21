@@ -284,8 +284,10 @@ export CC_REPO_ROOTS="$HOME/projects"   # ":"-separate multiple roots
 ```
 
 Verify: `agp doctor` now reports `ok  CC_REPO_ROOTS: … (N git repos found)` with
-`N > 0`. (The DB and data dir at `~/.commandcenter` are created automatically on
-first daemon boot — no manual DB setup.)
+`N > 0`. A valid root with no repos reports `warn` instead (the picker would be
+empty), so make sure the count is non-zero. (The DB and data dir at
+`~/.commandcenter` are created automatically on first daemon boot — no manual DB
+setup.)
 
 **6. Start the daemon in the foreground** (to try it out — see
 [launchd](#running-the-daemon-for-real-launchd) for real use). Run this in a
