@@ -34,13 +34,23 @@ export function hookCommand(agentId: number): string {
 export function writeSettingsFile(
   tag: string,
   agentId: number,
-  permissions?: { allow?: string[]; deny?: string[] },
+  permissions?: {
+    allow?: string[];
+    deny?: string[];
+    ask?: string[];
+    /** Baseline for tools no rule matches. Omit for the provider default
+     *  (prompt). Workers/reviewers use "dontAsk" so routine work never pages
+     *  the human; the allow/deny/ask lists still apply (deny > ask > allow). */
+    defaultMode?: "default" | "acceptEdits" | "plan" | "dontAsk";
+  },
 ): string {
   const hook = [{ hooks: [{ type: "command", command: hookCommand(agentId) }] }];
   const settings = {
     permissions: {
+      ...(permissions?.defaultMode ? { defaultMode: permissions.defaultMode } : {}),
       allow: ["mcp__cc", ...(permissions?.allow ?? [])],
       ...(permissions?.deny?.length ? { deny: permissions.deny } : {}),
+      ...(permissions?.ask?.length ? { ask: permissions.ask } : {}),
     },
     hooks: { SessionStart: hook, Stop: hook, Notification: hook },
   };
