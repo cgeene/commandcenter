@@ -609,7 +609,7 @@ function TaskCard({
       {summary && <div className="card-summary">{summary}</div>}
       {chain && (
         <div className="card-blocked muted">
-          ⇠ #{chain.id} ({chain.status})
+          ⇠ #{chain.id} ({statusText(chain.status)})
         </div>
       )}
       {task.pr_url && (
