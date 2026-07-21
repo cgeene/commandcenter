@@ -4,9 +4,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { Command } from "commander";
 import {
+  baseUrl,
+  claudeBin,
   codexBin,
   codexHome,
   codexProfile,
+  configuredRepoRoots,
   pkgRoot,
   tmuxSession,
 } from "../config.js";
@@ -777,6 +780,144 @@ codex
       process.exitCode = 1;
     } else {
       console.log("Hook trust is intentionally user-reviewed; verify it with /hooks.");
+    }
+  });
+
+// ---- doctor (preflight) ----
+
+program
+  .command("doctor")
+  .description("check prerequisites and configuration for running commandcenter")
+  .action(async () => {
+    // [name, ok, detail, optional?] — optional checks report status but never
+    // set a non-zero exit code (Codex is opt-in; the daemon may not be up yet).
+    const checks: Array<[string, boolean, string, boolean?]> = [];
+
+    const nodeMajor = Number(process.versions.node.split(".")[0]);
+    checks.push([
+      "Node.js >= 22",
+      nodeMajor >= 22,
+      `v${process.versions.node}`,
+    ]);
+
+    const probe = (bin: string, args: string[]): [boolean, string] => {
+      const r = spawnSync(bin, args, { encoding: "utf8" });
+      if (r.error || r.status !== 0) {
+        return [false, `not runnable: ${bin}`];
+      }
+      return [true, (r.stdout || r.stderr).trim().split("\n")[0]];
+    };
+
+    const [tmuxOk, tmuxDetail] = probe("tmux", ["-V"]);
+    checks.push([
+      "tmux",
+      tmuxOk,
+      tmuxOk ? tmuxDetail : "not found — install with `brew install tmux` (macOS) or `apt install tmux`",
+    ]);
+
+    checks.push(["git", ...probe("git", ["--version"])]);
+
+    const gh = spawnSync("gh", ["auth", "status"], { encoding: "utf8" });
+    checks.push([
+      "GitHub CLI (authenticated)",
+      gh.status === 0,
+      gh.status === 0
+        ? "authenticated"
+        : "not authenticated — run `gh auth login`",
+    ]);
+
+    checks.push(["Claude Code", ...probe(claudeBin(), ["--version"])]);
+
+    const [codexOk, codexDetail] = probe(codexBin(), ["--version"]);
+    checks.push([
+      "Codex CLI (optional)",
+      codexOk,
+      codexOk ? codexDetail : "not installed — only needed for Codex workers",
+      true,
+    ]);
+
+    // Count git roots beneath a directory the way the daemon's picker does:
+    // bounded-depth, and never descend into a repo once found. Mirrors the
+    // "returns only git roots beneath the allow-list" discovery so the count
+    // isn't misleadingly 0 when repos are nested a level or two down.
+    const countGitRoots = (base: string, maxDepth = 3): number => {
+      let found = 0;
+      const walk = (dir: string, depth: number) => {
+        if (depth > maxDepth) return;
+        let entries: fs.Dirent[];
+        try {
+          entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        if (entries.some((e) => e.name === ".git")) {
+          found++;
+          return; // a git root; don't descend into its working tree
+        }
+        for (const e of entries) {
+          if (e.isDirectory() && !e.isSymbolicLink() && !e.name.startsWith(".")) {
+            walk(path.join(dir, e.name), depth + 1);
+          }
+        }
+      };
+      walk(base, 0);
+      return found;
+    };
+
+    const roots = configuredRepoRoots();
+    if (roots.length === 0) {
+      checks.push([
+        "CC_REPO_ROOTS",
+        false,
+        'not set — the repository picker will be empty; e.g. export CC_REPO_ROOTS="$HOME/projects"',
+      ]);
+    } else {
+      for (const root of roots) {
+        let ok = false;
+        let detail = root;
+        try {
+          if (fs.statSync(root).isDirectory()) {
+            const repos = countGitRoots(root);
+            ok = true;
+            detail = `${root} (${repos} git repo${repos === 1 ? "" : "s"} found)`;
+          } else {
+            detail = `${root} — not a directory`;
+          }
+        } catch {
+          detail = `${root} — does not exist`;
+        }
+        checks.push(["CC_REPO_ROOTS", ok, detail]);
+      }
+    }
+
+    let daemonUp = false;
+    try {
+      const res = await fetch(`${baseUrl()}/healthz`);
+      daemonUp = res.ok;
+    } catch {
+      daemonUp = false;
+    }
+    checks.push([
+      "daemon",
+      daemonUp,
+      daemonUp
+        ? `reachable at ${baseUrl()}`
+        : `not running at ${baseUrl()} — start it with \`agentd\` (this is expected before first boot)`,
+      true,
+    ]);
+
+    for (const [name, ok, detail, optional] of checks) {
+      const mark = ok ? "ok  " : optional ? "warn" : "FAIL";
+      console.log(`${mark}  ${name}: ${detail}`);
+    }
+    const requiredFailed = checks.some(([, ok, , optional]) => !ok && !optional);
+    if (requiredFailed) {
+      console.error(
+        "\nSome required checks failed. Install/configure the items marked FAIL above, then re-run `agp doctor`.",
+      );
+      process.exitCode = 1;
+    } else {
+      console.log("\nAll required checks passed.");
     }
   });
 

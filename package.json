@@ -16,6 +16,7 @@
     "test": "vitest run",
     "build:web": "npm --prefix web run build",
     "build:all": "npm run build && npm run build:web",
+    "setup": "npm install && npm install --prefix web && npm run build:all",
     "postinstall": "chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true"
   },
   "engines": {

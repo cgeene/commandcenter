@@ -208,11 +208,16 @@ Verify each with the command shown; all must succeed before continuing.
 | Requirement | Check | Notes |
 |---|---|---|
 | **Node.js ≥ 22** | `node --version` | Runtime + build. |
-| **tmux** | `tmux -V` | Workers run inside a tmux session. |
+| **tmux** | `tmux -V` | Workers run inside a tmux session. Install with `brew install tmux` (macOS) or `apt install tmux` (Debian/Ubuntu) if missing. |
 | **git** | `git --version` | Repos you target need a configured `origin` remote. |
 | **GitHub CLI** | `gh auth status` | Must be **authenticated** — used for PR create/sync. Run `gh auth login` if not. |
 | **Claude Code** | `claude --version` | The `claude` binary must be on `PATH` (override with `CC_CLAUDE_BIN`). Must be logged in. |
 | **Codex CLI** (optional) | `codex --version` | Only if you want Codex workers (see [below](#enabling-codex-workers-optional)). Override binary with `CC_CODEX_BIN`. |
+
+Once the CLI is on your `PATH` (checklist step 4), **`agp doctor`** re-runs all of
+the above in one shot — plus checks that `CC_REPO_ROOTS` points at real
+directories with git repos and that the daemon is reachable. Required items show
+`ok`/`FAIL`; optional ones (Codex, a not-yet-started daemon) show `warn`.
 
 **Platform:** macOS is the primary target (launchd, tmux). Linux works via the
 foreground daemon (`npm run dev:daemon` / `agentd`); there is no bundled Linux
@@ -233,26 +238,28 @@ cd commandcenter
 
 Verify: `git rev-parse --show-toplevel` prints the `commandcenter` checkout path.
 
-**2. Install dependencies in BOTH the root and `web/`.** This is the classic
-gotcha: `web/` is a *separate* npm package (its own `package.json` +
-`package-lock.json`, and `web/node_modules` is git-ignored). The root
-`npm install` does **not** install it, and the next step will fail without it.
+**2 + 3. Install dependencies and build — one command.** `npm run setup`
+installs the root deps **and** the `web/` deps (a *separate* npm package with its
+own `package.json`; `web/node_modules` is git-ignored) and then builds both, so
+you can't hit the classic gotcha of forgetting `npm install --prefix web` and
+having the build fail.
 
 ```sh
-npm install                 # root: daemon, CLI, MCP deps
-npm install --prefix web    # dashboard deps — REQUIRED, easy to forget
-```
-
-Verify: `test -d node_modules && test -d web/node_modules && echo OK` prints `OK`.
-
-**3. Build the backend and the dashboard.**
-
-```sh
-npm run build:all           # backend → dist/, dashboard → web/dist/
+npm run setup    # = npm install && npm install --prefix web && npm run build:all
 ```
 
 Verify: `test -f dist/daemon/index.js && test -f web/dist/index.html && echo OK`
 prints `OK`.
+
+<details><summary>Prefer to run the steps individually?</summary>
+
+```sh
+npm install                 # root: daemon, CLI, MCP deps
+npm install --prefix web    # dashboard deps — REQUIRED, easy to forget
+npm run build:all           # backend → dist/, dashboard → web/dist/
+```
+
+</details>
 
 **4. Put `agentd`, `agp`, and `cc-mcp` on your `PATH`.**
 
@@ -260,21 +267,25 @@ prints `OK`.
 npm link
 ```
 
-Verify: `command -v agentd agp cc-mcp` prints three paths.
+Verify: `command -v agentd agp cc-mcp` prints three paths. Now that the CLI is
+linked, `agp doctor` gives you a one-shot recheck of every prerequisite (it will
+flag `CC_REPO_ROOTS` as `FAIL` until you set it in the next step).
 
 **5. Configure the repository-picker allow-list.** Point it at the parent
-folder(s) holding the git repos you want to target. This is a *daemon* setting,
-so it must be in the environment that starts `agentd` (your shell profile now,
-the launchd plist later). Discovery is read-only, bounded, ignores symlinks, and
-returns only git roots beneath the allow-list.
+folder(s) holding the git repos you want to target — use wherever *your* repos
+actually live (find candidates with `ls -d ~/**/.git 2>/dev/null` or e.g.
+`~/projects`, `~/src`, `~/Documents/git`). This is a *daemon* setting, so it must
+be in the environment that starts `agentd` (your shell profile now, the launchd
+plist later). Discovery is read-only, bounded, ignores symlinks, and returns only
+git roots beneath the allow-list.
 
 ```sh
-export CC_REPO_ROOTS="$HOME/Documents/git"   # ":"-separate multiple roots
+export CC_REPO_ROOTS="$HOME/projects"   # ":"-separate multiple roots
 ```
 
-Verify: `echo "$CC_REPO_ROOTS"` prints your path(s). (The DB and data dir at
-`~/.commandcenter` are created automatically on first daemon boot — no manual DB
-setup.)
+Verify: `agp doctor` now reports `ok  CC_REPO_ROOTS: … (N git repos found)` with
+`N > 0`. (The DB and data dir at `~/.commandcenter` are created automatically on
+first daemon boot — no manual DB setup.)
 
 **6. Start the daemon in the foreground** (to try it out — see
 [launchd](#running-the-daemon-for-real-launchd) for real use). Run this in a
@@ -284,13 +295,19 @@ dedicated terminal; it stays attached.
 agentd                      # or: npm run dev:daemon  (tsx, no build needed)
 ```
 
-Expected stdout:
+Expected stdout (the scheduler/JIRA lines are informational — the scheduler is
+off and JIRA sync is inert unless you configure them):
 
 ```
+scheduler: disabled (toggle: agp scheduler on|off)
+JIRA sync disabled: no CC_JIRA_TOKEN
 agentd listening on http://127.0.0.1:4711
 data dir: /Users/you/.commandcenter (db: /Users/you/.commandcenter/state.db)
 dashboard: /Users/you/.../commandcenter/web/dist
 ```
+
+If you forgot step 5, you'll also see a one-line `warning: CC_REPO_ROOTS is not
+set …` here — the daemon still boots, but the repository picker will be empty.
 
 **7. Verify the daemon is healthy** (from a second terminal):
 
@@ -318,7 +335,7 @@ Setup is complete. File your first task from the dashboard's new-task form, or:
 
 ```sh
 agp task add "Fix the flaky retry test" \
-  --workspace repo --repo ~/Documents/git/foo -v "npm test" \
+  --workspace repo --repo ~/projects/foo -v "npm test" \
   -p "tests/retry.test.ts is flaky because of a real timer. Fix it properly."
 agp task ls
 ```
@@ -503,8 +520,14 @@ Runtime-configurable — **not** environment variables. Edit with
 
 ## Troubleshooting
 
+> First stop for any setup issue: run **`agp doctor`** — it checks every
+> prerequisite, `CC_REPO_ROOTS`, and daemon reachability in one shot.
+
 | Symptom | Cause & fix |
 |---|---|
+| Setup fails and you're not sure which prerequisite | Run `agp doctor`. Anything marked `FAIL` is a required item to install/configure; `warn` is optional (Codex, or a daemon you haven't started yet). |
+| `tmux: command not found`, or workers never start | tmux isn't installed. `brew install tmux` (macOS) or `apt install tmux` (Debian/Ubuntu). (A harmless `error connecting to …/default` on the *first* boot just means no tmux server existed yet — the daemon starts one.) |
+| Repository picker / new-task form shows no repos | `CC_REPO_ROOTS` is unset or points at the wrong place. The daemon logs a `warning: CC_REPO_ROOTS is not set …` line at boot when it's missing. Set it in the environment that starts `agentd` and confirm with `agp doctor`. |
 | `agp` warns the daemon is **stale**, or agents lack new MCP tools | The daemon/MCP run from `dist/`. After any source change, run `agp upgrade` (rebuild + restart in place; `--main` also respawns main). `curl /api/version` shows `"stale":true` when `dist/` is older than the source. |
 | `npm run build:all` fails in `web/` (`vite`/`tsc` not found, or missing React types) | You skipped `npm install --prefix web`. `web/` is a separate package; install it, then rebuild. |
 | A worker fails immediately with `npm`/dependency errors in its worktree | Each worktree is a fresh checkout — its `node_modules` isn't shared. A worker that needs deps must run the repo's install step itself; make sure your `verify_cmd`/task prompt accounts for that. Codex workers additionally have the sandbox network disabled, so installs can stall on approval. |
