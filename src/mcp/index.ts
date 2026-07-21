@@ -112,6 +112,7 @@ server.registerTool(
         ...args,
         repo,
         workspace_kind: workspaceKind ?? "repo",
+        agent_id: process.env.CC_AGENT_ID ? Number(process.env.CC_AGENT_ID) : undefined,
       }),
     );
   },

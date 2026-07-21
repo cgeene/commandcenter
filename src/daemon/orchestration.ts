@@ -15,8 +15,28 @@ function availableMain(preferred?: Agent): Agent | undefined {
   );
 }
 
-function taskPrompt(task: Task): string {
-  return `[commandcenter] New human-submitted task #${task.id} is awaiting your triage (workspace_kind=${task.workspace_kind}). Call get_task(${task.id}), study its full prompt, validate the scope and execution settings, then dispatch it. For portfolio tasks, never spawn the parent: mark it in_progress, use list_repositories, create per-repository child tasks with parent_task_id=${task.id}, preserve the parent's selected provider/model/reasoning effort unless you deliberately document an override, and spawn those isolated children. For scratch tasks, spawn the task directly and review its result/transcript rather than expecting a Git diff.`;
+/** Kind of the agent that created a task, from its task.created event
+ *  (null when a human filed it via the dashboard/CLI). */
+function taskCreatorKind(taskId: number): Agent["kind"] | null {
+  const created = latestTaskEvent(taskId, ["task.created"]);
+  if (!created?.payload) return null;
+  try {
+    const payload = JSON.parse(created.payload) as { creator_kind?: unknown };
+    const kind = payload.creator_kind;
+    return kind === "main" || kind === "worker" || kind === "reviewer"
+      ? kind
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function taskPrompt(task: Task, creatorKind: Agent["kind"] | null): string {
+  const descriptor =
+    creatorKind === "worker"
+      ? `worker-filed follow-up task #${task.id}`
+      : `human-submitted task #${task.id}`;
+  return `[commandcenter] New ${descriptor} is awaiting your triage (workspace_kind=${task.workspace_kind}). Call get_task(${task.id}), study its full prompt, validate the scope and execution settings, then dispatch it. For portfolio tasks, never spawn the parent: mark it in_progress, use list_repositories, create per-repository child tasks with parent_task_id=${task.id}, preserve the parent's selected provider/model/reasoning effort unless you deliberately document an override, and spawn those isolated children. For scratch tasks, spawn the task directly and review its result/transcript rather than expecting a Git diff.`;
 }
 
 /** Deliver a newly-created orchestrated task to Claude main, or leave it queued. */
@@ -26,6 +46,14 @@ export async function delegateTaskToMain(
 ): Promise<boolean> {
   const task = getTask(taskId);
   if (!task || task.dispatch_mode !== "orchestrated" || task.status !== "queued") {
+    return false;
+  }
+  // A task main filed itself must never trigger a triage ping back to main —
+  // on ANY route (immediate POST, PATCH re-queue, the manual /delegate
+  // endpoint, or the idle/SessionStart hooks and periodic scheduler that call
+  // delegatePendingTaskToMain). Main already knows about it and dispatches it
+  // directly; it stays queued and visible via list_tasks(ready=true).
+  if (taskCreatorKind(task.id) === "main") {
     return false;
   }
   if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
@@ -41,7 +69,10 @@ export async function delegateTaskToMain(
   // (the same gate every main-delivery path shares — see deliverToMainIfClear).
   // Otherwise leave the task queued — the main's idle/Stop hooks and the
   // scheduler's periodic delegatePendingTaskToLiveMain retry it.
-  const delivered = await deliverToMainIfClear(main, taskPrompt(task));
+  const delivered = await deliverToMainIfClear(
+    main,
+    taskPrompt(task, taskCreatorKind(task.id)),
+  );
   if (delivered !== "delivered") {
     logEvent("task.awaiting_main", {
       taskId,
@@ -61,6 +92,10 @@ export async function delegateTaskToMain(
 export async function delegatePendingTaskToMain(main: Agent): Promise<boolean> {
   if (!availableMain(main)) return false;
   const pending = readyTasks("orchestrated").filter((task) => {
+    // Skip main-created tasks: they need no triage, and leaving one in the
+    // pending set would park it at the queue head forever (delegatePending
+    // only delivers pending[0]), starving the tasks behind it.
+    if (taskCreatorKind(task.id) === "main") return false;
     const delegated = latestTaskEvent(task.id, ["task.delegated_to_main"]);
     return !delegated || delegated.agent_id !== main.id;
   });

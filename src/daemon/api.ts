@@ -145,6 +145,9 @@ const newTaskSchema = z.object({
   blocked_by: z.number().int().positive().optional(),
   verify_cmd: z.string().max(4096).optional(),
   open_pr: z.boolean().optional(),
+  // Identity of the agent filing this task (via the MCP add_task tool).
+  // Absent for human submissions (dashboard/CLI). Unknown ids are ignored.
+  agent_id: z.number().int().positive().optional(),
 });
 
 const updateTaskSchema = z.object({
@@ -331,14 +334,24 @@ export function buildApp(): Hono {
       }
       throw error;
     }
+    // Resolve the creating agent (if any) so the audit log records who filed
+    // the task and so we can skip re-triaging a task main created itself.
+    // Unknown ids are ignored gracefully — treated as a human submission.
+    const creator = body.agent_id !== undefined ? getAgent(body.agent_id) : undefined;
     logEvent("task.created", {
       taskId: task.id,
+      agentId: creator?.id,
       payload: {
         workspace_kind: task.workspace_kind,
         dispatch_mode: task.dispatch_mode,
         parent_task_id: task.parent_task_id,
+        creator_agent_id: creator?.id ?? null,
+        creator_kind: creator?.kind ?? null,
       },
     });
+    // delegateTaskToMain self-guards main-created tasks (see orchestration.ts),
+    // so every delegation route — this POST, the PATCH re-queue, the manual
+    // /delegate endpoint, and the idle/scheduler retries — skips the self-ping.
     if (task.dispatch_mode === "orchestrated" && task.parent_task_id === null) {
       try {
         await delegateTaskToMain(task.id);
