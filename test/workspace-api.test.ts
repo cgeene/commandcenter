@@ -269,4 +269,94 @@ describe("workspace API", () => {
       dispatch_mode: "orchestrated",
     });
   });
+
+  it("skips triage delegation for a task main filed itself", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const main = createAgent({ kind: "main", state: "idle" });
+    const response = await buildApp().request("/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        title: "main's own task",
+        prompt: "do the work",
+        workspace_kind: "repo",
+        repo,
+        agent_id: main.id,
+      }),
+    });
+    expect(response.status).toBe(201);
+    // Main already knows about a task it created; it must not be pinged to
+    // triage it — neither delivered nor left awaiting.
+    const kinds = listEvents(10).map((event) => event.kind);
+    expect(kinds).not.toContain("task.awaiting_main");
+    expect(kinds).not.toContain("task.delegated_to_main");
+  });
+
+  it("delegates a human-submitted task with no creating agent", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const response = await buildApp().request("/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        title: "human task",
+        prompt: "do the work",
+        workspace_kind: "repo",
+        repo,
+      }),
+    });
+    expect(response.status).toBe(201);
+    // No live main is available, so delegation is attempted and left awaiting.
+    const events = listEvents(10);
+    expect(events.map((event) => event.kind)).toContain("task.awaiting_main");
+    const created = events.find((event) => event.kind === "task.created")!;
+    expect(JSON.parse(created.payload!).creator_kind).toBe(null);
+  });
+
+  it("delegates a worker-filed follow-up and records the worker as creator", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const worker = createAgent({ kind: "worker", state: "working" });
+    const response = await buildApp().request("/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        title: "follow-up",
+        prompt: "do the work",
+        workspace_kind: "repo",
+        repo,
+        agent_id: worker.id,
+      }),
+    });
+    expect(response.status).toBe(201);
+    // Worker-filed follow-ups genuinely need main's triage.
+    const events = listEvents(10);
+    expect(events.map((event) => event.kind)).toContain("task.awaiting_main");
+    const created = events.find((event) => event.kind === "task.created")!;
+    expect(JSON.parse(created.payload!).creator_kind).toBe("worker");
+  });
+
+  it("ignores an unknown creator id and treats it as a human submission", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const response = await buildApp().request("/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        title: "stale id task",
+        prompt: "do the work",
+        workspace_kind: "repo",
+        repo,
+        agent_id: 9999,
+      }),
+    });
+    expect(response.status).toBe(201);
+    const events = listEvents(10);
+    expect(events.map((event) => event.kind)).toContain("task.awaiting_main");
+    const created = events.find((event) => event.kind === "task.created")!;
+    expect(JSON.parse(created.payload!).creator_kind).toBe(null);
+  });
 });

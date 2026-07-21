@@ -183,6 +183,47 @@ describe("main-first task delegation", () => {
     expect(kinds).not.toContain("task.delegated_to_main");
   });
 
+  it("labels a worker-filed follow-up accurately in the triage prompt", async () => {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { delegateTaskToMain } = await import("../src/daemon/orchestration.js");
+    createAgent({ kind: "main", state: "idle", tmux_target: "cc:@main" });
+    const task = createTask({
+      title: "follow-up",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+      open_pr: false,
+    });
+    // A worker filed this follow-up — recorded on its task.created event.
+    logEvent("task.created", { taskId: task.id, payload: { creator_kind: "worker" } });
+
+    expect(await delegateTaskToMain(task.id)).toBe(true);
+    expect(String(sendText.mock.calls[0]?.[1])).toContain(
+      `worker-filed follow-up task #${task.id}`,
+    );
+  });
+
+  it("labels a human submission with no creating agent as human-submitted", async () => {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { delegateTaskToMain } = await import("../src/daemon/orchestration.js");
+    createAgent({ kind: "main", state: "idle", tmux_target: "cc:@main" });
+    const task = createTask({
+      title: "human task",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+      open_pr: false,
+    });
+
+    expect(await delegateTaskToMain(task.id)).toBe(true);
+    expect(String(sendText.mock.calls[0]?.[1])).toContain(
+      `human-submitted task #${task.id}`,
+    );
+  });
+
   it("does NOT deliver mid-turn — a working main leaves the task queued", async () => {
     const { createAgent } = await import("../src/db/agents.js");
     const { createTask } = await import("../src/db/tasks.js");

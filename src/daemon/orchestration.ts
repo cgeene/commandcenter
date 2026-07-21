@@ -15,8 +15,28 @@ function availableMain(preferred?: Agent): Agent | undefined {
   );
 }
 
-function taskPrompt(task: Task): string {
-  return `[commandcenter] New human-submitted task #${task.id} is awaiting your triage (workspace_kind=${task.workspace_kind}). Call get_task(${task.id}), study its full prompt, validate the scope and execution settings, then dispatch it. For portfolio tasks, never spawn the parent: mark it in_progress, use list_repositories, create per-repository child tasks with parent_task_id=${task.id}, preserve the parent's selected provider/model/reasoning effort unless you deliberately document an override, and spawn those isolated children. For scratch tasks, spawn the task directly and review its result/transcript rather than expecting a Git diff.`;
+/** Kind of the agent that created a task, from its task.created event
+ *  (null when a human filed it via the dashboard/CLI). */
+function taskCreatorKind(taskId: number): Agent["kind"] | null {
+  const created = latestTaskEvent(taskId, ["task.created"]);
+  if (!created?.payload) return null;
+  try {
+    const payload = JSON.parse(created.payload) as { creator_kind?: unknown };
+    const kind = payload.creator_kind;
+    return kind === "main" || kind === "worker" || kind === "reviewer"
+      ? kind
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function taskPrompt(task: Task, creatorKind: Agent["kind"] | null): string {
+  const descriptor =
+    creatorKind === "worker"
+      ? `worker-filed follow-up task #${task.id}`
+      : `human-submitted task #${task.id}`;
+  return `[commandcenter] New ${descriptor} is awaiting your triage (workspace_kind=${task.workspace_kind}). Call get_task(${task.id}), study its full prompt, validate the scope and execution settings, then dispatch it. For portfolio tasks, never spawn the parent: mark it in_progress, use list_repositories, create per-repository child tasks with parent_task_id=${task.id}, preserve the parent's selected provider/model/reasoning effort unless you deliberately document an override, and spawn those isolated children. For scratch tasks, spawn the task directly and review its result/transcript rather than expecting a Git diff.`;
 }
 
 /** Deliver a newly-created orchestrated task to Claude main, or leave it queued. */
@@ -41,7 +61,10 @@ export async function delegateTaskToMain(
   // (the same gate every main-delivery path shares — see deliverToMainIfClear).
   // Otherwise leave the task queued — the main's idle/Stop hooks and the
   // scheduler's periodic delegatePendingTaskToLiveMain retry it.
-  const delivered = await deliverToMainIfClear(main, taskPrompt(task));
+  const delivered = await deliverToMainIfClear(
+    main,
+    taskPrompt(task, taskCreatorKind(task.id)),
+  );
   if (delivered !== "delivered") {
     logEvent("task.awaiting_main", {
       taskId,
