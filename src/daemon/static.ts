@@ -12,6 +12,7 @@ const MIME: Record<string, string> = {
   ".map": "application/json",
   ".woff2": "font/woff2",
   ".png": "image/png",
+  ".webmanifest": "application/manifest+json",
 };
 
 /** Serve the built dashboard (web/dist) with SPA index.html fallback.
@@ -26,10 +27,11 @@ export function registerStatic(app: Hono): void {
       );
     }
     const urlPath = new URL(c.req.url).pathname;
-    // resolve + prefix check prevents path traversal
+    // resolve + prefix check prevents path traversal; the separator keeps
+    // sibling dirs sharing dist's name as a prefix (dist-foo) out of bounds
     const resolved = path.resolve(dist, "." + urlPath);
     const file =
-      resolved.startsWith(dist) &&
+      resolved.startsWith(dist + path.sep) &&
       fs.existsSync(resolved) &&
       fs.statSync(resolved).isFile()
         ? resolved
