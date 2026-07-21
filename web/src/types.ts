@@ -58,6 +58,7 @@ export interface Task {
   jira_sync_fails: number; // consecutive jirasync failures; warns at 3
   jira_project: string | null; // resolved (or per-task override) JIRA project key
   open_pr: number;
+  auto_review: number;
   tokens_used: number | null;
   created_at: string;
   updated_at: string;
@@ -139,6 +140,8 @@ export interface CronJob {
   reasoning_effort: ReasoningEffort | null;
   priority: number;
   verify_cmd: string | null;
+  open_pr: number;
+  auto_review: number;
   enabled: number;
   last_run_at: string | null;
   next_run_at: string | null;

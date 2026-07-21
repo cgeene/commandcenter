@@ -373,12 +373,18 @@ cron
   .option("--provider <provider>", "worker provider (claude|codex)")
   .option("-P, --priority <n>", "0-4", "2")
   .option("-v, --verify <cmd>")
+  .option("--no-pr", "task produces no PR; auto-completes without a merge (report/doc crons)")
+  .option("--no-review", "skip the adversarial reviewer; complete on worker finish (implies --no-pr)")
   .action(async (name: string, opts) => {
     const prompt = opts.promptFile
       ? fs.readFileSync(opts.promptFile, "utf8")
       : opts.prompt;
     if (!prompt) {
       console.error("error: provide --prompt or --prompt-file");
+      process.exit(1);
+    }
+    if (opts.review === false && opts.pr !== false) {
+      console.error("error: --no-review requires --no-pr");
       process.exit(1);
     }
     const c = await api<CronJob>("POST", "/api/crons", {
@@ -392,6 +398,8 @@ cron
       worker_provider: opts.provider,
       priority: Number(opts.priority),
       verify_cmd: opts.verify,
+      open_pr: opts.pr,
+      auto_review: opts.review,
     });
     console.log(`cron #${c.id} "${c.name}" — next run ${c.next_run_at}`);
   });

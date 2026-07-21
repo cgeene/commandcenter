@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   jira_sync_fails INTEGER NOT NULL DEFAULT 0,
   jira_project   TEXT,
   open_pr        INTEGER NOT NULL DEFAULT 1,
+  auto_review    INTEGER NOT NULL DEFAULT 1,
   tokens_used    INTEGER,
   created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -180,6 +181,8 @@ CREATE TABLE IF NOT EXISTS crons (
   reasoning_effort TEXT,
   priority    INTEGER NOT NULL DEFAULT 2,
   verify_cmd  TEXT,
+  open_pr     INTEGER NOT NULL DEFAULT 1,
+  auto_review INTEGER NOT NULL DEFAULT 1,
   enabled     INTEGER NOT NULL DEFAULT 1,
   last_run_at TEXT,
   next_run_at TEXT,
@@ -243,6 +246,9 @@ function migrate(db: Database.Database): void {
   }
   if (!cols.includes("open_pr")) {
     db.exec("ALTER TABLE tasks ADD COLUMN open_pr INTEGER NOT NULL DEFAULT 1");
+  }
+  if (!cols.includes("auto_review")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN auto_review INTEGER NOT NULL DEFAULT 1");
   }
   if (!cols.includes("pr_state")) {
     db.exec("ALTER TABLE tasks ADD COLUMN pr_state TEXT");
@@ -319,6 +325,12 @@ function migrate(db: Database.Database): void {
   }
   if (!cronCols.includes("reasoning_effort")) {
     db.exec("ALTER TABLE crons ADD COLUMN reasoning_effort TEXT");
+  }
+  if (!cronCols.includes("open_pr")) {
+    db.exec("ALTER TABLE crons ADD COLUMN open_pr INTEGER NOT NULL DEFAULT 1");
+  }
+  if (!cronCols.includes("auto_review")) {
+    db.exec("ALTER TABLE crons ADD COLUMN auto_review INTEGER NOT NULL DEFAULT 1");
   }
   const memCols = (db.prepare("PRAGMA table_info(memories)").all() as { name: string }[]).map(
     (c) => c.name,

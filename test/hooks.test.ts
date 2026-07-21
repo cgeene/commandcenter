@@ -351,6 +351,54 @@ describe("hook events", () => {
     expect(getTask(task.id)?.status).toBe("review");
   });
 
+  it("review-disabled no-PR task completes straight to done on Stop (no reviewer)", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createTask, updateTask, getTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const task = createTask({
+      title: "report",
+      prompt: "x",
+      repo: "/r",
+      open_pr: false,
+      auto_review: false,
+    });
+    const agent = createAgent({ kind: "worker", state: "working", task_id: task.id });
+    updateTask(task.id, {
+      status: "in_progress",
+      agent_id: agent.id,
+      worktree: tmpDir,
+      result_summary: "weekly report saved to the doc store",
+    });
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    expect(getTask(task.id)?.status).toBe("done");
+    const kinds = listEvents(20).map((e) => e.kind);
+    expect(kinds).toContain("task.autocompleted");
+    expect(kinds).not.toContain("task.review");
+  });
+
+  it("review-disabled but PR-obligated task still goes to review (merge gate not bypassed)", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createTask, updateTask, getTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    // auto_review off but open_pr on (default): the guard must NOT auto-complete.
+    const task = createTask({
+      title: "code",
+      prompt: "x",
+      repo: "/r",
+      auto_review: false,
+    });
+    const agent = createAgent({ kind: "worker", state: "working", task_id: task.id });
+    updateTask(task.id, {
+      status: "in_progress",
+      agent_id: agent.id,
+      worktree: tmpDir,
+      result_summary: "made changes on a branch",
+    });
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    expect(getTask(task.id)?.status).toBe("review");
+  });
+
   it("Stop with failing verify_cmd and no live window blocks the task", async () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");
     const { getTask } = await import("../src/db/tasks.js");

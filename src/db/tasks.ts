@@ -51,6 +51,7 @@ export interface Task {
   jira_sync_fails: number; // consecutive jirasync failures; escalates at 3
   jira_project: string | null; // resolved (or per-task override) JIRA project key
   open_pr: number; // sqlite boolean, default 1
+  auto_review: number; // sqlite boolean, default 1; 0 = skip the adversarial reviewer
   tokens_used: number | null;
   cron_id: number | null;
   created_at: string;
@@ -72,6 +73,7 @@ export interface NewTask {
   verify_cmd?: string;
   cron_id?: number;
   open_pr?: boolean;
+  auto_review?: boolean;
 }
 
 export function createTask(t: NewTask): Task {
@@ -79,8 +81,8 @@ export function createTask(t: NewTask): Task {
   const workerProvider = parseAgentProvider(t.worker_provider, "claude");
   const info = db
     .prepare(
-      `INSERT INTO tasks (title, prompt, repo, workspace_kind, dispatch_mode, parent_task_id, priority, worker_provider, model, reasoning_effort, blocked_by, verify_cmd, cron_id, open_pr)
-       VALUES (@title, @prompt, @repo, @workspace_kind, @dispatch_mode, @parent_task_id, @priority, @worker_provider, @model, @reasoning_effort, @blocked_by, @verify_cmd, @cron_id, @open_pr)`,
+      `INSERT INTO tasks (title, prompt, repo, workspace_kind, dispatch_mode, parent_task_id, priority, worker_provider, model, reasoning_effort, blocked_by, verify_cmd, cron_id, open_pr, auto_review)
+       VALUES (@title, @prompt, @repo, @workspace_kind, @dispatch_mode, @parent_task_id, @priority, @worker_provider, @model, @reasoning_effort, @blocked_by, @verify_cmd, @cron_id, @open_pr, @auto_review)`,
     )
     .run({
       title: t.title,
@@ -97,6 +99,7 @@ export function createTask(t: NewTask): Task {
       verify_cmd: t.verify_cmd ?? null,
       cron_id: t.cron_id ?? null,
       open_pr: t.open_pr === false ? 0 : 1,
+      auto_review: t.auto_review === false ? 0 : 1,
     });
   return getTask(Number(info.lastInsertRowid))!;
 }
