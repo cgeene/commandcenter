@@ -48,6 +48,14 @@ export async function delegateTaskToMain(
   if (!task || task.dispatch_mode !== "orchestrated" || task.status !== "queued") {
     return false;
   }
+  // A task main filed itself must never trigger a triage ping back to main —
+  // on ANY route (immediate POST, PATCH re-queue, the manual /delegate
+  // endpoint, or the idle/SessionStart hooks and periodic scheduler that call
+  // delegatePendingTaskToMain). Main already knows about it and dispatches it
+  // directly; it stays queued and visible via list_tasks(ready=true).
+  if (taskCreatorKind(task.id) === "main") {
+    return false;
+  }
   if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
     return false;
   }
@@ -84,6 +92,10 @@ export async function delegateTaskToMain(
 export async function delegatePendingTaskToMain(main: Agent): Promise<boolean> {
   if (!availableMain(main)) return false;
   const pending = readyTasks("orchestrated").filter((task) => {
+    // Skip main-created tasks: they need no triage, and leaving one in the
+    // pending set would park it at the queue head forever (delegatePending
+    // only delivers pending[0]), starving the tasks behind it.
+    if (taskCreatorKind(task.id) === "main") return false;
     const delegated = latestTaskEvent(task.id, ["task.delegated_to_main"]);
     return !delegated || delegated.agent_id !== main.id;
   });

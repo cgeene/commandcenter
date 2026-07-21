@@ -224,6 +224,95 @@ describe("main-first task delegation", () => {
     );
   });
 
+  it("never pings main to triage a task main filed itself — direct delegation", async () => {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const { delegateTaskToMain } = await import("../src/daemon/orchestration.js");
+    const main = createAgent({ kind: "main", state: "idle", tmux_target: "cc:@main" });
+    const task = createTask({
+      title: "main's own task",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+      open_pr: false,
+    });
+    // Main filed this itself — recorded on its task.created event.
+    logEvent("task.created", {
+      taskId: task.id,
+      agentId: main.id,
+      payload: { creator_kind: "main" },
+    });
+
+    expect(await delegateTaskToMain(task.id)).toBe(false);
+    expect(sendText).not.toHaveBeenCalled();
+    const kinds = listEvents(10).map((event) => event.kind);
+    expect(kinds).not.toContain("task.delegated_to_main");
+    expect(kinds).not.toContain("task.awaiting_main");
+  });
+
+  it("never pings main via the idle-hook retry for a task main filed itself", async () => {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { logEvent, latestTaskEvent } = await import("../src/db/events.js");
+    const { delegatePendingTaskToMain } = await import(
+      "../src/daemon/orchestration.js"
+    );
+    const main = createAgent({ kind: "main", state: "idle", tmux_target: "cc:@main" });
+    const task = createTask({
+      title: "main's own task",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+      open_pr: false,
+    });
+    logEvent("task.created", {
+      taskId: task.id,
+      agentId: main.id,
+      payload: { creator_kind: "main" },
+    });
+
+    // The idle/SessionStart hooks and periodic scheduler all funnel here.
+    expect(await delegatePendingTaskToMain(main)).toBe(false);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(latestTaskEvent(task.id, ["task.delegated_to_main"])).toBeUndefined();
+  });
+
+  it("a main-created task at the queue head does not starve a human task behind it", async () => {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { delegatePendingTaskToMain } = await import(
+      "../src/daemon/orchestration.js"
+    );
+    const main = createAgent({ kind: "main", state: "idle", tmux_target: "cc:@main" });
+    const mainTask = createTask({
+      title: "main's own task",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+      open_pr: false,
+    });
+    logEvent("task.created", {
+      taskId: mainTask.id,
+      agentId: main.id,
+      payload: { creator_kind: "main" },
+    });
+    const humanTask = createTask({
+      title: "human task",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+      open_pr: false,
+    });
+
+    // The main-created task must be skipped, not parked at the head blocking
+    // the human task behind it.
+    expect(await delegatePendingTaskToMain(main)).toBe(true);
+    expect(String(sendText.mock.calls[0]?.[1])).toContain(`#${humanTask.id}`);
+    expect(String(sendText.mock.calls[0]?.[1])).not.toContain(`#${mainTask.id}`);
+  });
+
   it("does NOT deliver mid-turn — a working main leaves the task queued", async () => {
     const { createAgent } = await import("../src/db/agents.js");
     const { createTask } = await import("../src/db/tasks.js");

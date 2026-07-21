@@ -349,13 +349,10 @@ export function buildApp(): Hono {
         creator_kind: creator?.kind ?? null,
       },
     });
-    // A task main files itself needs no triage ping back to main. Human
-    // submissions (no creator) and worker-filed follow-ups still delegate.
-    if (
-      task.dispatch_mode === "orchestrated" &&
-      task.parent_task_id === null &&
-      creator?.kind !== "main"
-    ) {
+    // delegateTaskToMain self-guards main-created tasks (see orchestration.ts),
+    // so every delegation route — this POST, the PATCH re-queue, the manual
+    // /delegate endpoint, and the idle/scheduler retries — skips the self-ping.
+    if (task.dispatch_mode === "orchestrated" && task.parent_task_id === null) {
       try {
         await delegateTaskToMain(task.id);
       } catch {
