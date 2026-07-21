@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 
 let tmpDir: string;
+let savedRepoRoots: string | undefined;
+let savedRepoRoot: string | undefined;
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-provider-"));
@@ -14,6 +16,12 @@ beforeEach(async () => {
   delete process.env.CC_CODEX_BIN;
   delete process.env.CC_CODEX_HOME;
   delete process.env.CC_CODEX_PROFILE;
+  // Keep task creation on the legacy absolute-path branch regardless of any
+  // CC_REPO_ROOTS in the ambient environment, so these tests are hermetic.
+  savedRepoRoots = process.env.CC_REPO_ROOTS;
+  savedRepoRoot = process.env.CC_REPO_ROOT;
+  delete process.env.CC_REPO_ROOTS;
+  delete process.env.CC_REPO_ROOT;
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
 });
@@ -22,6 +30,10 @@ afterEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  if (savedRepoRoots === undefined) delete process.env.CC_REPO_ROOTS;
+  else process.env.CC_REPO_ROOTS = savedRepoRoots;
+  if (savedRepoRoot === undefined) delete process.env.CC_REPO_ROOT;
+  else process.env.CC_REPO_ROOT = savedRepoRoot;
 });
 
 describe("provider metadata", () => {
