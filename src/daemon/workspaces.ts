@@ -101,47 +101,72 @@ export function repositoryRoots(): RepositoryRoot[] {
   return roots;
 }
 
+/**
+ * Discover Git-root directories beneath `base` without following symlinks or
+ * descending into a repo once found. Bounded by MAX_SCAN_DEPTH and MAX_REPOSITORIES
+ * and skips generated/vendored dirs — the single source of truth for what the
+ * picker considers a repository.
+ */
+function discoverGitRoots(base: string): string[] {
+  const found: string[] = [];
+  const visit = (dir: string, depth: number): void => {
+    if (found.length >= MAX_REPOSITORIES || depth > MAX_SCAN_DEPTH) return;
+    if (hasGitMarker(dir)) {
+      found.push(dir);
+      return;
+    }
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      if (
+        found.length >= MAX_REPOSITORIES ||
+        !entry.isDirectory() ||
+        entry.isSymbolicLink() ||
+        entry.name.startsWith(".") ||
+        SKIP_DIRS.has(entry.name)
+      ) {
+        continue;
+      }
+      visit(path.join(dir, entry.name), depth + 1);
+    }
+  };
+  visit(base, 0);
+  return found;
+}
+
 /** Discover Git roots without following symlinks or descending into repos. */
 export function listRepositories(): RepositoryEntry[] {
   const roots = repositoryRoots();
   const repositories: RepositoryEntry[] = [];
   for (const root of roots) {
-    const visit = (dir: string, depth: number): void => {
-      if (repositories.length >= MAX_REPOSITORIES || depth > MAX_SCAN_DEPTH) return;
-      if (hasGitMarker(dir)) {
-        const relative = path.relative(root.path, dir) || path.basename(dir);
-        repositories.push({
-          path: dir,
-          name: path.basename(dir),
-          relative_path: relative,
-          root: root.path,
-        });
-        return;
-      }
-      let entries: fs.Dirent[];
-      try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
-      } catch {
-        return;
-      }
-      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-        if (
-          repositories.length >= MAX_REPOSITORIES ||
-          !entry.isDirectory() ||
-          entry.isSymbolicLink() ||
-          entry.name.startsWith(".") ||
-          SKIP_DIRS.has(entry.name)
-        ) {
-          continue;
-        }
-        visit(path.join(dir, entry.name), depth + 1);
-      }
-    };
-    visit(root.path, 0);
+    for (const dir of discoverGitRoots(root.path)) {
+      if (repositories.length >= MAX_REPOSITORIES) break;
+      const relative = path.relative(root.path, dir) || path.basename(dir);
+      repositories.push({
+        path: dir,
+        name: path.basename(dir),
+        relative_path: relative,
+        root: root.path,
+      });
+    }
   }
   return repositories.sort(
     (a, b) => a.root.localeCompare(b.root) || a.relative_path.localeCompare(b.relative_path),
   );
+}
+
+/**
+ * Count the Git roots the picker would discover beneath `base`, using the exact
+ * same walk as listRepositories() (depth limit, SKIP_DIRS, symlinked `.git`
+ * rejection). `base` is walked as given; the count is unaffected by whether it
+ * is canonicalized, since discovery only follows real subdirectories.
+ */
+export function countRepositoriesUnder(base: string): number {
+  return discoverGitRoots(base).length;
 }
 
 export function workspaceCatalog(): WorkspaceCatalog {

@@ -2,7 +2,13 @@
 import { serve } from "@hono/node-server";
 import type { Server } from "node:http";
 import { WebSocketServer } from "ws";
-import { dataDir, dbPath, port, webDistDir } from "../config.js";
+import {
+  configuredRepoRoots,
+  dataDir,
+  dbPath,
+  port,
+  webDistDir,
+} from "../config.js";
 import { getDb } from "../db/db.js";
 import { migrateDocsToFrontmatter } from "../db/docs.js";
 import { buildApp } from "./api.js";
@@ -37,6 +43,13 @@ const server = serve(
     console.log(`agentd listening on http://127.0.0.1:${info.port}`);
     console.log(`data dir: ${dataDir()} (db: ${dbPath()})`);
     console.log(`dashboard: ${webDistDir()}`);
+    if (configuredRepoRoots().length === 0) {
+      console.warn(
+        "warning: CC_REPO_ROOTS is not set — the repository picker will be empty. " +
+          "Set it to the parent folder(s) of your git repos, e.g. " +
+          'export CC_REPO_ROOTS="$HOME/projects" (":"-separate multiple roots).',
+      );
+    }
   },
 ) as Server;
 

@@ -5,7 +5,16 @@ import { localeEnv } from "./locale.js";
 function tmux(...args: string[]): string {
   // Run with a UTF-8 locale so the tmux server (and worker processes it
   // spawns) start under UTF-8 rather than the daemon's bare C locale.
-  return execFileSync("tmux", args, { encoding: "utf8", env: localeEnv() });
+  // Pipe stderr (rather than letting it inherit the daemon's console) so
+  // tmux's own diagnostics — e.g. "error connecting to .../default" on the
+  // first call before any server exists — don't leak to stdout as scary
+  // boot noise. Callers that need the text read it from the thrown error's
+  // `.stderr` (see tmuxSessionIsDefinitelyAbsent).
+  return execFileSync("tmux", args, {
+    encoding: "utf8",
+    env: localeEnv(),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 }
 
 export function ensureSession(): void {
