@@ -42,7 +42,14 @@ import {
   writeMcpConfigFile,
   writeSettingsFile,
 } from "./genconfig.js";
-import { readOnlyProfileAllow } from "./permissions.js";
+import {
+  BASH_TOOL_ALLOW,
+  DANGEROUS_BASH_DENY,
+  DANGEROUS_PUSH_ASK,
+  readOnlyProfileAllow,
+  REVIEWER_TOOL_ALLOW,
+  WORKER_TOOL_ALLOW,
+} from "./permissions.js";
 import { findProviderTranscript } from "./transcript.js";
 import { killWindow, newWindow, windowExists } from "./tmux.js";
 import {
@@ -162,17 +169,32 @@ function buildResumePrompt(task: Task): string {
   return lines.join("\n");
 }
 
-/** Workers may publish their own branch + PR without a permission stall —
- *  but only their own branch; anything else still prompts. Exact commands,
- *  no trailing glob: `${branch}*` would also match a refspec push onto the
- *  remote's main (`git push origin ${branch}:main`) and sibling branches
- *  by prefix (task-1* matches task-10..task-19). The read-only profile is
- *  a base layer underneath — anything outside it still prompts normally. */
+/**
+ * Worker permission settings. The baseline is `dontAsk` (deny-unless-allowed,
+ * never prompt), so a worker's routine self-verification — build, test,
+ * install, typecheck — never stalls the orchestrator: we allow the whole Bash
+ * tool rather than trying to enumerate every wrapped form (env-var prefixes,
+ * output redirection, `&&`/`;` chains) that a prefix rule can't match. The
+ * genuinely dangerous commands are carved back out via deny/ask, which win
+ * over the blanket allow (precedence: deny > ask > allow).
+ *
+ * Publishing stays scoped to the task's own branch: the own-branch push and
+ * draft PR fall through to the Bash allow and run frictionlessly, while
+ * force-pushes and pushes to main/master are routed to `ask` so they still
+ * prompt. See {@link DANGEROUS_PUSH_ASK}. Non-Git scratch workers have no
+ * branch to publish, so all Git publishing is denied outright.
+ */
 function buildWorkerAllow(branch: string | null): string[] {
-  const base = [...readOnlyProfileAllow()];
-  if (!branch) return base;
+  const allow = [
+    ...WORKER_TOOL_ALLOW,
+    BASH_TOOL_ALLOW,
+    ...readOnlyProfileAllow(),
+  ];
+  if (!branch) return allow;
+  // Redundant under the blanket Bash allow, but kept as an explicit,
+  // self-documenting record of the one push form a worker is meant to run.
   return [
-    ...base,
+    ...allow,
     `Bash(git push -u origin ${branch})`,
     `Bash(git push origin ${branch})`,
     "Bash(gh pr create*)",
@@ -180,9 +202,12 @@ function buildWorkerAllow(branch: string | null): string[] {
   ];
 }
 
-function buildWorkerDeny(task: Task): string[] | undefined {
-  if (task.workspace_kind !== "scratch") return undefined;
+function buildWorkerDeny(task: Task): string[] {
+  if (task.workspace_kind !== "scratch") return [...DANGEROUS_BASH_DENY];
+  // Non-Git scratch workers can't publish anything — deny all Git/PR mutation
+  // on top of the shared dangerous-command guards.
   return [
+    ...DANGEROUS_BASH_DENY,
     "Bash(git init*)",
     "Bash(git commit*)",
     "Bash(git push*)",
@@ -191,16 +216,32 @@ function buildWorkerDeny(task: Task): string[] | undefined {
   ];
 }
 
-/** Reviewers are read-only by design (Edit/Write/commit/push are denied
- *  below), so the shared read-only profile applies unconditionally. */
-function buildReviewerAllow(task: Task): string[] {
+/** Force-pushes and pushes to main/master still prompt even for Git workers;
+ *  scratch workers can't push at all, so the list is moot but harmless. */
+function buildWorkerAsk(_task: Task): string[] {
+  return [...DANGEROUS_PUSH_ASK];
+}
+
+/** Reviewers run read-only: they get the same frictionless Bash catch-all so
+ *  their verify/build/test never stalls, but editing and Git publishing are
+ *  denied (see {@link buildReviewerDeny}). Under `dontAsk` the editing tools
+ *  are absent from the allow list *and* explicitly denied. */
+function buildReviewerAllow(_task: Task): string[] {
   return [
-    "Read",
-    "Grep",
-    "Glob",
+    ...REVIEWER_TOOL_ALLOW,
+    BASH_TOOL_ALLOW,
     ...readOnlyProfileAllow(),
-    "Bash(git status*)",
-    ...(task.verify_cmd ? [`Bash(${task.verify_cmd})`] : []),
+  ];
+}
+
+function buildReviewerDeny(): string[] {
+  return [
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "Bash(git commit*)",
+    "Bash(git push*)",
+    ...DANGEROUS_BASH_DENY,
   ];
 }
 
@@ -209,7 +250,9 @@ export const _buildWorkerPromptForTest = buildWorkerPrompt;
 export const _buildResumePromptForTest = buildResumePrompt;
 export const _buildWorkerAllowForTest = buildWorkerAllow;
 export const _buildWorkerDenyForTest = buildWorkerDeny;
+export const _buildWorkerAskForTest = buildWorkerAsk;
 export const _buildReviewerAllowForTest = buildReviewerAllow;
+export const _buildReviewerDenyForTest = buildReviewerDeny;
 
 function buildClaudeCmd(opts: {
   model?: string;
@@ -217,6 +260,12 @@ function buildClaudeCmd(opts: {
   mcpFile: string;
   promptFile: string;
   resumeSession?: string;
+  /** CLI permission mode. Must match the settings file's defaultMode: a
+   *  `--permission-mode` flag overrides `permissions.defaultMode`, so workers
+   *  and reviewers (whose settings set "dontAsk") pass "dontAsk" here or the
+   *  flag would silently revert them to prompting. Defaults to "acceptEdits"
+   *  for the main orchestrator, which keeps its historical behavior. */
+  permissionMode?: "default" | "acceptEdits" | "plan" | "dontAsk";
 }): string {
   // The prompt positional MUST come before the flags: --mcp-config is
   // variadic (space-separated configs), so a trailing positional gets
@@ -227,7 +276,7 @@ function buildClaudeCmd(opts: {
     `"$(cat ${shellQuote(opts.promptFile)})"`,
     ...(opts.model ? ["--model", shellQuote(opts.model)] : []),
     "--permission-mode",
-    "acceptEdits",
+    opts.permissionMode ?? "acceptEdits",
     "--settings",
     shellQuote(opts.settingsFile),
     "--mcp-config",
@@ -406,8 +455,10 @@ export function spawnWorker(
     let workerEnvironment: Record<string, string> | undefined;
     if (provider === "claude") {
       settingsFile = writeSettingsFile(tag, agent.id, {
+        defaultMode: "dontAsk",
         allow: buildWorkerAllow(branch),
         deny: buildWorkerDeny(task),
+        ask: buildWorkerAsk(task),
       });
       mcpFile = writeMcpConfigFile(tag, {
         CC_ROLE: "worker",
@@ -461,6 +512,7 @@ export function spawnWorker(
             mcpFile: mcpFile!,
             promptFile,
             resumeSession,
+            permissionMode: "dontAsk",
           });
     target = newWindow(`t${taskId}`, dir, command, workerEnvironment);
     // SessionStart is the readiness handshake. Leaving the agent in spawning
@@ -606,8 +658,9 @@ export function spawnReviewer(
   let reviewerEnvironment: Record<string, string> | undefined;
   if (provider === "claude") {
     const settingsFile = writeSettingsFile(tag, agent.id, {
+      defaultMode: "dontAsk",
       allow: buildReviewerAllow(task),
-      deny: ["Edit", "Write", "NotebookEdit", "Bash(git commit*)", "Bash(git push*)"],
+      deny: buildReviewerDeny(),
     });
     const mcpFile = writeMcpConfigFile(tag, {
       CC_ROLE: "reviewer",
@@ -615,7 +668,13 @@ export function spawnReviewer(
       CC_TASK_ID: String(taskId),
     });
     runtimeConfigPath = settingsFile;
-    command = buildClaudeCmd({ model, settingsFile, mcpFile, promptFile });
+    command = buildClaudeCmd({
+      model,
+      settingsFile,
+      mcpFile,
+      promptFile,
+      permissionMode: "dontAsk",
+    });
   } else {
     // Codex reviewer: same isolated CODEX_HOME profile/hooks/policy as a Codex
     // worker (workspace-write / on-request / network_access=false; push+merge
