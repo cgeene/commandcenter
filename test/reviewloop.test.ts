@@ -80,6 +80,10 @@ async function reviewTask(
     status: "review",
     branch,
     result_summary: "claims done",
+    // A repo task is auto-reviewed ONLY when it has a real PR (task #110); the
+    // loop-mechanics tests below all exercise the PR-linked path, so give them a
+    // pr_url by default. The no-PR gate tests pass `pr_url: null` explicitly.
+    pr_url: `https://github.com/x/y/pull/${taskId}`,
     ...fields,
   });
   return t.id;
@@ -127,15 +131,13 @@ describe("review⇄fix loop — auto next round", () => {
     expect(listEvents(20).map((e) => e.kind)).not.toContain("review.round_started");
   });
 
-  it("first entry into review (never reviewed) spawns round 1 even with no PR", async () => {
+  it("first entry into review with a PR spawns round 1", async () => {
     const { maybeAutoReview } = await import("../src/daemon/review.js");
     const { listEvents } = await import("../src/db/events.js");
     const { getTask } = await import("../src/db/tasks.js");
     const repo = makeRepo(3);
-    // no-PR task: open_pr flag is irrelevant to the trigger
-    const { updateTask } = await import("../src/db/tasks.js");
+    // never reviewed; PR present -> the auto-review gate lets it through
     const id = await reviewTask(3, repo.repo, repo.branch);
-    updateTask(id, { open_pr: 0 } as never);
 
     await maybeAutoReview(id);
 
@@ -198,6 +200,117 @@ describe("review⇄fix loop — auto next round", () => {
     const kinds = listEvents(20).map((e) => e.kind);
     expect(kinds).toContain("review.loop_exhausted");
     expect(getTask(id)?.status).toBe("blocked");
+  });
+});
+
+/** A real git repo whose task branch sits exactly at the base (no commits beyond
+ *  the merge-base) — a branch-only task that produced nothing to review. */
+function makeEmptyRepo(taskId: number): { repo: string; branch: string } {
+  const repo = path.join(tmpDir, `empty-${taskId}`);
+  fs.mkdirSync(repo, { recursive: true });
+  const g = (...a: string[]) =>
+    execFileSync("git", ["-C", repo, "-c", "user.email=t@t", "-c", "user.name=t", ...a]);
+  g("init", "-q", "-b", "main");
+  g("commit", "-q", "--allow-empty", "-m", "init");
+  const branch = `agent/task-${taskId}`;
+  g("branch", branch); // branch tip == main == base: no commits ahead
+  return { repo, branch };
+}
+
+describe("auto-review gate — repo tasks need a PR (task #110)", () => {
+  it("a repo task WITH commits but NO pr_url is NOT auto-reviewed; direct spawn still works", async () => {
+    const { maybeAutoReview } = await import("../src/daemon/review.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const spawn = await import("../src/daemon/spawn.js");
+    const repo = makeRepo(10);
+    // has real commits, but the branch was never turned into a PR
+    const id = await reviewTask(10, repo.repo, repo.branch, { pr_url: null, open_pr: 1 });
+
+    await maybeAutoReview(id);
+
+    // the AUTOMATIC trigger must not spawn a reviewer for a PR-less repo task
+    expect(spawnReviewer).not.toHaveBeenCalled();
+    const events = listEvents(20);
+    expect(events.map((e) => e.kind)).toContain("review.skipped_no_pr");
+    expect(events.map((e) => e.kind)).not.toContain("review.round_started");
+    const skip = events.find((e) => e.kind === "review.skipped_no_pr")!;
+    expect(JSON.parse(skip.payload!)).toMatchObject({
+      task_id: id,
+      open_pr: 1,
+      branch_has_commits: true,
+    });
+
+    // but the MANUAL path (spawn_reviewer MCP tool -> spawnReviewer) is ungated:
+    // an orchestrator can still explicitly review this branch-only task.
+    expect(spawn.spawnReviewer(id)).toEqual({ agent: { id: 999 }, task: {} });
+  });
+
+  it("a repo task with no commits and no pr_url logs review.skipped_no_pr and does not spawn", async () => {
+    const { maybeAutoReview } = await import("../src/daemon/review.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    // the task #109 incident shape: branch-only (open_pr=false), zero commits
+    const repo = makeEmptyRepo(11);
+    const t = createTask({ title: "deploy prep", prompt: "x", repo: repo.repo, open_pr: false });
+    updateTask(t.id, { status: "review", branch: repo.branch, result_summary: "prepped" });
+
+    await maybeAutoReview(t.id);
+
+    expect(spawnReviewer).not.toHaveBeenCalled();
+    const events = listEvents(20);
+    expect(events.map((e) => e.kind)).toContain("review.skipped_no_pr");
+    const skip = events.find((e) => e.kind === "review.skipped_no_pr")!;
+    expect(JSON.parse(skip.payload!)).toMatchObject({
+      task_id: t.id,
+      open_pr: 0,
+      branch_has_commits: false,
+    });
+  });
+
+  it("logs the no-PR skip once per review episode, not on every sweep", async () => {
+    const { maybeAutoReview } = await import("../src/daemon/review.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const repo = makeRepo(12);
+    const id = await reviewTask(12, repo.repo, repo.branch, { pr_url: null });
+
+    await maybeAutoReview(id);
+    await maybeAutoReview(id); // a later sweep re-enters with nothing changed
+
+    const skips = listEvents(30).filter((e) => e.kind === "review.skipped_no_pr");
+    expect(skips).toHaveLength(1);
+  });
+
+  it("a scratch task is unaffected by the gate — it still auto-reviews with no PR", async () => {
+    const { maybeAutoReview } = await import("../src/daemon/review.js");
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const t = createTask({
+      title: "investigate",
+      prompt: "x",
+      repo: path.join(tmpDir, "scratch-13"),
+      workspace_kind: "scratch",
+      open_pr: false,
+    });
+    updateTask(t.id, { status: "review", result_summary: "root cause found" });
+
+    await maybeAutoReview(t.id);
+
+    expect(spawnReviewer).toHaveBeenCalledOnce();
+    const kinds = listEvents(20).map((e) => e.kind);
+    expect(kinds).toContain("review.round_started");
+    expect(kinds).not.toContain("review.skipped_no_pr");
+  });
+
+  it("the sweep (reviewLoopSweep) respects the gate for a PR-less repo task", async () => {
+    const { reviewLoopSweep } = await import("../src/daemon/review.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const repo = makeRepo(14);
+    await reviewTask(14, repo.repo, repo.branch, { pr_url: null });
+
+    await reviewLoopSweep();
+
+    expect(spawnReviewer).not.toHaveBeenCalled();
+    expect(listEvents(20).map((e) => e.kind)).toContain("review.skipped_no_pr");
   });
 });
 

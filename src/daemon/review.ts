@@ -1,5 +1,5 @@
 import { listAgents } from "../db/agents.js";
-import { countEventsToday, logEvent } from "../db/events.js";
+import { countEventsToday, latestTaskEventId, logEvent } from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { getTask, listTasks, updateTask, type Task } from "../db/tasks.js";
 import { notify } from "./notify.js";
@@ -54,6 +54,26 @@ function isReviewable(task: Task): boolean {
   if (task.workspace_kind === "scratch") return Boolean(task.result_summary);
   if (!task.branch) return false;
   return branchHasCommits(task);
+}
+
+/**
+ * Has a `review.skipped_no_pr` already been logged for the task's *current*
+ * review episode? The no-PR gate below is re-evaluated on every sweep (~every
+ * poll) for a task sitting in `review`, so without this the feed would fill
+ * with an identical skip line every couple of minutes. We log it once per time
+ * the task enters review: a skip newer than the latest review-entry marker means
+ * "already surfaced this episode". Leaving review and coming back (a fix round)
+ * produces a fresh marker, so the next skip re-logs.
+ */
+function noPrSkipAlreadyLogged(taskId: number): boolean {
+  const skipped = latestTaskEventId(taskId, ["review.skipped_no_pr"]);
+  if (!skipped) return false;
+  const entered = latestTaskEventId(taskId, [
+    "task.review",
+    "verify.passed",
+    "task.status",
+  ]);
+  return !entered || skipped > entered;
 }
 
 /** Is there a live reviewer already judging this task? */
@@ -176,7 +196,33 @@ export async function maybeAutoReview(taskId: number): Promise<void> {
   const cfg = getSchedulerConfig();
   if (!cfg.auto_review) return;
   let task = getTask(taskId);
-  if (!task || !isReviewable(task)) return;
+  if (!task || task.status !== "review") return;
+
+  // AUTO-review gate (task #110): a repo task is auto-reviewed ONLY when it has
+  // an actual PR to judge. A branch-only / no-PR repo task — even one WITH
+  // commits — must NOT auto-spawn an adversarial code reviewer: there is no PR
+  // diff to review, and the reviewer worktree can't fetch a branch that was
+  // never pushed to origin (the task #109 incident). This gate applies to the
+  // AUTOMATIC trigger only — the MANUAL spawn_reviewer MCP path is untouched, so
+  // an orchestrator can still explicitly review a PR-less repo task. Scratch
+  // tasks are deliberately reviewable via their result_summary and are NOT gated
+  // here (task #96 design). Checked before isReviewable so a no-commit repo task
+  // still surfaces the skip rather than being silently dropped.
+  if (task.workspace_kind === "repo" && !task.pr_url) {
+    if (!noPrSkipAlreadyLogged(task.id)) {
+      logEvent("review.skipped_no_pr", {
+        taskId: task.id,
+        payload: {
+          task_id: task.id,
+          open_pr: task.open_pr,
+          branch_has_commits: branchHasCommits(task),
+        },
+      });
+    }
+    return;
+  }
+
+  if (!isReviewable(task)) return;
 
   const headSha = branchHeadSha(task); // null for scratch/no-git
 
