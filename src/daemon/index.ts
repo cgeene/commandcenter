@@ -53,6 +53,36 @@ const server = serve(
   },
 ) as Server;
 
+// A second `agentd` on a port that's already bound (leftover process, `agp
+// upgrade` already respawned it, launchd + a manual run, etc.) used to crash
+// with a raw EADDRINUSE stack trace. Tell the difference between "another
+// agentd already has this" (fine, just exit) and "something else owns the
+// port" (loud failure, since that's a real misconfiguration).
+server.on("error", async (err) => {
+  if ((err as NodeJS.ErrnoException).code !== "EADDRINUSE") throw err;
+  const url = `http://127.0.0.1:${port()}`;
+  try {
+    const res = await fetch(`${url}/api/version`, { signal: AbortSignal.timeout(2000) });
+    if (res.ok) {
+      const v = (await res.json()) as { started_at: string; stale: boolean };
+      console.log(
+        `agentd is already running at ${url} (started ${v.started_at}, stale: ${v.stale}).`,
+      );
+      console.log(
+        "Nothing to do — this process is exiting. Use `agp doctor` to confirm, `agp upgrade` to rebuild+restart it in place.",
+      );
+      process.exit(0);
+    }
+  } catch {
+    /* not agentd (or unreachable) — fall through to the loud failure below */
+  }
+  console.error(
+    `port ${port()} is already in use by something that isn't agentd (no response from ${url}/api/version).\n` +
+      `Find it with \`lsof -i :${port()}\` and stop it, or run agentd on another port: CC_PORT=<port> agentd`,
+  );
+  process.exit(1);
+});
+
 startScheduler();
 startPrSync();
 // JIRA sync: inert unless CC_JIRA_TOKEN is set AND the master switch is on
