@@ -449,6 +449,29 @@ if (ROLE === "main") {
   );
 
   server.registerTool(
+    "confirm_human_publication",
+    {
+      description:
+        "After the human reviews, commits, and publishes a Human-publishes task, verify that the committed tree exactly matches the reviewer-approved snapshot and record its PR. This never commits, pushes, or creates a PR.",
+      inputSchema: {
+        task_id: z.number().int().positive(),
+        pr_url: z
+          .string()
+          .url()
+          .max(2048)
+          .optional()
+          .describe("required when the task expects a pull request"),
+      },
+    },
+    async ({ task_id, pr_url }) =>
+      asText(
+        await call("POST", `/api/tasks/${task_id}/publication`, {
+          ...(pr_url ? { pr_url } : {}),
+        }),
+      ),
+  );
+
+  server.registerTool(
     "claim_task",
     {
       description: "Atomically claim a queued task without spawning a worker yet.",

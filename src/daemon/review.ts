@@ -8,6 +8,13 @@ import { resumeAgent } from "./resume.js";
 import { branchHasCommits, branchHeadSha, hashResult } from "./reviewstate.js";
 import { killAgent, spawnReviewer } from "./spawn.js";
 import { git } from "./worktree.js";
+import {
+  approvedSnapshotIsPublished,
+  captureReviewSnapshot,
+  clearReviewSnapshot,
+  reviewSnapshotChanged,
+  snapshotHasChanges,
+} from "./reviewsnapshot.js";
 
 /** Rejection/round cap before the review⇄fix loop escalates to the human.
  *  Runtime-configurable via the scheduler settings; this reads the live value. */
@@ -31,9 +38,13 @@ export function taskDiff(task: Task): TaskDiff {
   if (!task.branch) throw new Error(`task ${task.id} has no branch`);
   const base = git(task.repo, "merge-base", "HEAD", task.branch).trim();
   const range = `${base}..${task.branch}`;
+  const target =
+    task.publication_mode === "human" && task.review_snapshot_tree
+      ? task.review_snapshot_tree
+      : task.branch;
   const commits = git(task.repo, "log", "--oneline", range).trim();
-  const stat = git(task.repo, "diff", "--stat", base, task.branch).trim();
-  const full = git(task.repo, "diff", base, task.branch);
+  const stat = git(task.repo, "diff", "--stat", base, target).trim();
+  const full = git(task.repo, "diff", base, target);
   const truncated = full.length > DIFF_CHAR_LIMIT;
   return {
     branch: task.branch,
@@ -53,6 +64,12 @@ function isReviewable(task: Task): boolean {
   if (task.workspace_kind === "portfolio") return false; // no branch to review
   if (task.workspace_kind === "scratch") return Boolean(task.result_summary);
   if (!task.branch) return false;
+  if (
+    task.publication_mode === "human" &&
+    task.publication_state !== "published"
+  ) {
+    return snapshotHasChanges(task);
+  }
   return branchHasCommits(task);
 }
 
@@ -197,6 +214,43 @@ export async function maybeAutoReview(taskId: number): Promise<void> {
   if (!cfg.auto_review) return;
   let task = getTask(taskId);
   if (!task || task.status !== "review") return;
+  const humanRepo =
+    task.publication_mode === "human" &&
+    task.workspace_kind === "repo" &&
+    task.publication_state !== "published";
+
+  // A reviewer always judges one immutable candidate. Human-mode workers leave
+  // their branch uncommitted, so pin the full working tree before spawning.
+  if (humanRepo) {
+    if (reviewerLive(taskId)) return;
+    if (task.review_verdict === "approve") {
+      if (!reviewSnapshotChanged(task)) return;
+      const marker =
+        "\n\n---\n\n[approval superseded: the working tree changed after review]";
+      updateTask(task.id, {
+        review_verdict: null,
+        review_notes: (task.review_notes ?? "") + marker,
+        review_cycles: task.review_cycles + 1,
+        publication_state: "reviewing",
+      });
+      logEvent("review.verdict_superseded", {
+        taskId: task.id,
+        payload: { reason: "human working tree changed", superseded: "approve" },
+      });
+      task = getTask(task.id)!;
+    }
+    if (
+      !task.review_snapshot_tree ||
+      task.publication_state === "editing" ||
+      reviewSnapshotChanged(task)
+    ) {
+      task = captureReviewSnapshot(task.id);
+      logEvent("review.snapshot_captured", {
+        taskId: task.id,
+        payload: { base: task.review_snapshot_base },
+      });
+    }
+  }
 
   // AUTO-review gate (task #110): a repo task is auto-reviewed ONLY when it has
   // an actual PR to judge. A branch-only / no-PR repo task — even one WITH
@@ -208,7 +262,7 @@ export async function maybeAutoReview(taskId: number): Promise<void> {
   // tasks are deliberately reviewable via their result_summary and are NOT gated
   // here (task #96 design). Checked before isReviewable so a no-commit repo task
   // still surfaces the skip rather than being silently dropped.
-  if (task.workspace_kind === "repo" && !task.pr_url) {
+  if (task.workspace_kind === "repo" && !task.pr_url && !humanRepo) {
     if (!noPrSkipAlreadyLogged(task.id)) {
       logEvent("review.skipped_no_pr", {
         taskId: task.id,
@@ -224,7 +278,9 @@ export async function maybeAutoReview(taskId: number): Promise<void> {
 
   if (!isReviewable(task)) return;
 
-  const headSha = branchHeadSha(task); // null for scratch/no-git
+  const headSha = humanRepo
+    ? task.review_snapshot_tree
+    : branchHeadSha(task); // null for scratch/no-git
 
   // --- Invariant: a non-draft/approved PR must match its current HEAD ---
   if (task.review_verdict === "approve") {
@@ -277,6 +333,31 @@ export async function handleVerdict(
     throw new Error(`task ${taskId} is ${task.status}, not review`);
   }
 
+  if (
+    verdict === "approve" &&
+    task.publication_mode === "human" &&
+    task.workspace_kind === "repo" &&
+    task.publication_state !== "published" &&
+    reviewSnapshotChanged(task)
+  ) {
+    const marker =
+      "\n\n---\n\n[review verdict ignored: the working tree changed while the snapshot was under review]";
+    clearReviewSnapshot(taskId);
+    updateTask(taskId, {
+      review_verdict: null,
+      review_notes: (task.review_notes ?? "") + marker,
+      review_head_sha: null,
+      review_result_hash: null,
+      publication_state: "editing",
+    });
+    logEvent("review.verdict_stale", {
+      taskId,
+      agentId,
+      payload: { attempted_verdict: verdict },
+    });
+    return getTask(taskId)!;
+  }
+
   logEvent(verdict === "approve" ? "review.approved" : "review.rejected", {
     taskId,
     agentId,
@@ -287,7 +368,29 @@ export async function handleVerdict(
     // Record the SHA this approval covers so a post-approval push is detectable
     // as stale (the premature-merge fix). Falls back to whatever the reviewer
     // was spawned against (review_head_sha) for scratch/no-git tasks.
-    const approvedSha = branchHeadSha(task) ?? task.review_head_sha;
+    const approvedSha =
+      task.publication_mode === "human"
+        ? task.review_snapshot_tree ?? task.review_head_sha
+        : branchHeadSha(task) ?? task.review_head_sha;
+
+    if (
+      task.publication_mode === "human" &&
+      task.workspace_kind === "repo" &&
+      task.publication_state !== "published"
+    ) {
+      updateTask(taskId, {
+        review_verdict: "approve",
+        review_notes: notes,
+        review_head_sha: approvedSha,
+        publication_state: "awaiting_human",
+      });
+      notify(
+        `task #${taskId} approved — your review is next`,
+        `${task.title} — inspect the uncommitted changes in GitHub Desktop, then commit, push, and record the PR in Command Center`,
+        { tags: "white_check_mark,eyes" },
+      );
+      return getTask(taskId)!;
+    }
 
     // Doc-only tasks (created open_pr=false) never produce a PR, so there is no
     // merge to gate completion on — approve IS completion: mark done here and
@@ -406,6 +509,10 @@ export async function handleVerdict(
     return getTask(taskId)!;
   }
 
+  if (task.publication_mode === "human" && task.workspace_kind === "repo") {
+    clearReviewSnapshot(taskId);
+  }
+
   const outcome = task.agent_id
     ? await resumeAgent(
         task.agent_id,
@@ -420,6 +527,8 @@ export async function handleVerdict(
       review_verdict: null,
       review_notes: notes,
       review_cycles: cycles,
+      publication_state:
+        task.publication_mode === "human" ? "editing" : task.publication_state,
     });
     logEvent("task.reopened", { taskId, payload: { reason: "review rejected" } });
   } else {
@@ -433,6 +542,8 @@ export async function handleVerdict(
       review_verdict: null,
       review_notes: notes,
       review_cycles: cycles,
+      publication_state:
+        task.publication_mode === "human" ? "editing" : task.publication_state,
     });
     logEvent("task.requeued", {
       taskId,
@@ -440,6 +551,57 @@ export async function handleVerdict(
     });
   }
   return getTask(taskId)!;
+}
+
+export class PublicationValidationError extends Error {}
+
+/** Confirm the human committed the exact reviewer-approved tree and completed
+ * the requested publication step. No Git mutation occurs here. */
+export function confirmHumanPublication(
+  taskId: number,
+  prUrl?: string,
+): Task {
+  const task = getTask(taskId);
+  if (!task) throw new PublicationValidationError("task not found");
+  if (
+    task.publication_mode !== "human" ||
+    task.workspace_kind !== "repo" ||
+    task.publication_state !== "awaiting_human" ||
+    task.review_verdict !== "approve"
+  ) {
+    throw new PublicationValidationError(
+      "task is not awaiting human publication",
+    );
+  }
+  if (!approvedSnapshotIsPublished(task)) {
+    throw new PublicationValidationError(
+      "commit and push the unchanged approved working tree before confirming publication",
+    );
+  }
+  const effectivePrUrl = prUrl ?? task.pr_url ?? undefined;
+  if (task.open_pr !== 0 && !effectivePrUrl) {
+    throw new PublicationValidationError("pull request URL is required");
+  }
+  const approvedHead = branchHeadSha(task);
+  clearReviewSnapshot(task.id);
+  const updated = updateTask(task.id, {
+    status: task.open_pr === 0 ? "done" : "review",
+    publication_state: "published",
+    review_head_sha: approvedHead,
+    ...(effectivePrUrl ? { pr_url: effectivePrUrl } : {}),
+  })!;
+  logEvent("publication.human_confirmed", {
+    taskId: task.id,
+    payload: { has_pr: Boolean(effectivePrUrl), open_pr: task.open_pr !== 0 },
+  });
+  notify(
+    task.open_pr === 0
+      ? `task #${task.id} published`
+      : `task #${task.id} publication recorded`,
+    task.title,
+    { tags: "white_check_mark" },
+  );
+  return updated;
 }
 
 /**

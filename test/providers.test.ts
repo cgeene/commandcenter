@@ -76,6 +76,7 @@ describe("provider metadata", () => {
       );
       CREATE TABLE agents (id INTEGER PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'worker');
       CREATE TABLE crons (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
+      INSERT INTO tasks (id, title, prompt, repo) VALUES (1, 'legacy', 'x', '/r');
     `);
     legacy.close();
 
@@ -93,8 +94,15 @@ describe("provider metadata", () => {
         "workspace_kind",
         "dispatch_mode",
         "parent_task_id",
+        "publication_mode",
+        "publication_state",
+        "review_snapshot_base",
+        "review_snapshot_tree",
       ]),
     );
+    expect(
+      db.prepare("SELECT publication_mode FROM tasks WHERE id = 1").get(),
+    ).toEqual({ publication_mode: "agent" });
     expect(names("agents")).toEqual(
       expect.arrayContaining([
         "provider",

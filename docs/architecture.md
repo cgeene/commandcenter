@@ -12,7 +12,7 @@ document walks the pieces and the lifecycle of a task.
 | **`agentd`** (daemon) | `src/daemon/index.ts` → `dist/daemon/index.js` | Owns the queue, REST API + WebSocket on `127.0.0.1:$CC_PORT`, tmux/worktree lifecycle, scheduler, watchdog, PR sync, and serves the dashboard. |
 | **`agp`** (CLI) | `src/cli/index.ts` | Thin REST client for the daemon. |
 | **`cc-mcp`** (MCP server) | `src/mcp/index.ts` | stdio MCP server launched per agent via a generated `--mcp-config`; its toolset is scoped by `CC_ROLE`. |
-| **Agents** | `claude` or `codex` sessions in tmux windows | Workers may use either provider; reviewers and the main orchestrator remain Claude. |
+| **Agents** | `claude` or `codex` sessions in tmux windows | Workers and reviewers may use either provider; the main orchestrator remains Claude. |
 
 ## Storage
 
@@ -39,16 +39,19 @@ pointing at `cc-mcp` with a `CC_ROLE` env var. The toolset is scoped by role
 - **Main (orchestrator):** the full set — `list_tasks`, `get_task`,
   `list_repositories`, `update_task`, `claim_task`, `cancel_task`, `spawn_worker`, `spawn_reviewer`,
   `list_agents`, `peek_worker`, `send_to_worker`, `kill_worker`, `get_task_diff`,
-  `read_worker_transcript`, `escalate`, `recent_events`, `forget`.
+  `confirm_human_publication`, `read_worker_transcript`, `escalate`,
+  `recent_events`, `forget`.
 
 **Hooks (lifecycle events).** Claude's generated settings forward
 `SessionStart`, `Stop`, and `Notification`. Codex's static bridge forwards
 `SessionStart`, `Stop`, `PreToolUse`, and `PermissionRequest` from Command
-Center's isolated profile. `PreToolUse` denies publishing outside the exact
-task branch even after remembered approvals; `PermissionRequest` auto-approves
-that one canonical push. Worker identity comes from process environment,
-keeping the hook hash stable for one-time trust. A daemon outage never blocks
-the agent, while the local publishing policy remains enforced by the hook.
+Center's isolated profile. In the default publication mode, `PreToolUse` denies
+publishing outside the exact task branch even after remembered approvals and
+`PermissionRequest` auto-approves that one canonical push. Human-publication
+workers and all reviewers instead deny commit/push/merge and PR mutations.
+Worker identity comes from process environment, keeping the hook hash stable
+for one-time trust. A daemon outage never blocks the agent, while the local
+publishing policy remains enforced by the hook.
 The local `cc` MCP server is role-scoped and explicitly approved so a worker
 can record its result without a separate prompt for each platform tool call.
 
@@ -102,7 +105,7 @@ Repository task lifecycle:
                                                          review
                                                             |
                                                  reviewer proofs branch
-                              reject (<=2 cycles)  |               approve
+                            reject (until cap)     |               approve
                        (back to in_progress/queued) <---+            |
                                                             worker opens PR
                                                                  |
@@ -115,6 +118,33 @@ Repository task lifecycle:
   done  ->  agent reaped, worktree removed, local branch pruned
   (cancelled is reachable from ANY state via `agp task cancel`)
 ```
+
+That diagram is the default **Agent publishes** lifecycle. The opt-in **Human
+publishes** branch changes only the publication portion:
+
+```
+ worker edits + verifies, leaves worktree uncommitted
+                         |
+             daemon pins full tree snapshot
+                         |
+       independent reviewer reads snapshot worktree
+              | reject                 | approve
+              v                        v
+     worker fixes uncommitted     awaiting_human
+     files; new snapshot               |
+                                human reviews in
+                                GitHub Desktop,
+                                commits + publishes
+                                       |
+                          daemon verifies clean committed
+                          and pushed tree == approved snapshot
+                                       |
+                               PR sync / completion
+```
+
+The mode is a local runtime default stored in SQLite and copied onto each new
+task. `agent` is the fallback for old databases and existing behavior; changing
+the setting never changes tasks already created.
 
 1. **Triage** — an explicit workspace task is delivered to a live Claude main.
    If main is unavailable, it remains queued and the Needs You panel surfaces
@@ -136,14 +166,20 @@ Repository task lifecycle:
    `--fresh`).
 4. **Work** — the worker uses its MCP tools inside its isolated worktree or
    scratch directory. Scratch prompts prohibit Git initialization, commits,
-   pushes, and PRs and direct durable findings to the internal doc store.
+   pushes, and PRs and direct durable findings to the internal doc store. In
+   Human publishes mode, repository workers may edit and verify but commit,
+   push, merge, and PR mutations are denied.
 5. **Verify** — on the `Stop` hook the daemon runs the task's `verify_cmd` in the
    task workspace. Pass → `review`. Fail → the failure output is fed back into the
    session (up to 2 nudges, then `blocked`). The `Stop` hook re-verifies even a
    task the worker moved to `review` itself, so `verify_cmd` can't be bypassed.
 6. **Review** — an independent reviewer proofs a repository branch (details
-   below). Scratch work has no branch reviewer; main checks its transcript,
-   result summary, saved docs, and external read-only evidence.
+   below). In Human publishes mode, the daemon builds a tree object from the
+   complete non-ignored working tree using a temporary Git index, pins that
+   object under an internal ref, and materializes it in the disposable reviewer
+   worktree. The real branch, index, and working files are not changed. Scratch
+   work has no branch reviewer; main checks its transcript, result summary,
+   saved docs, and external read-only evidence.
 7. **PR** — the repository worker pushes its own branch and opens a PR **as a
    draft** (`gh pr create --draft`), recording it via `update_my_task(pr_url)`.
    The draft is the GitHub-native signal that internal review has not yet
@@ -173,9 +209,9 @@ calls `submit_review(approve|reject, notes)`:
   task returns to `in_progress`. If the PR had already been flipped to ready
   (a fix round on a previously-approved PR), it is sent back to draft
   (`gh pr ready --undo`) so its GitHub state keeps meaning "not yet approved".
-- after **2** rejected cycles (`MAX_REVIEW_CYCLES`) → `blocked`, escalated to the
-  human with both sides' notes. The PR stays a draft — the GitHub-visible "still
-  not approved" signal.
+- after the configured review-round cap (default **4**) → `blocked`, escalated
+  to the human with both sides' notes. The PR stays a draft — the GitHub-visible
+  "still not approved" signal.
 - **approve** → the platform flips the draft PR to ready-for-review
   (`gh pr ready`, emitting `pr.marked_ready`) and pings the human; the merge
   stays human. A failed flip is surfaced loudly (event + push) so an approved PR
