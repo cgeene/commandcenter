@@ -110,6 +110,23 @@ describe("createWorktree", () => {
     );
   });
 
+  it("hardens upstream only for opt-in human publication tasks", async () => {
+    const { remoteDir } = setupRemote();
+    const mainRepo = cloneRepo(remoteDir, "main-checkout");
+    git(mainRepo, "config", "branch.autoSetupMerge", "always");
+
+    const { createWorktree } = await import("../src/daemon/worktree.js");
+    const agent = createWorktree(mainRepo, 501);
+    expect(git(agent.dir, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe(
+      "origin/main",
+    );
+
+    const human = createWorktree(mainRepo, 502, "claude", "human");
+    expect(() =>
+      git(human.dir, "rev-parse", "--abbrev-ref", "@{upstream}"),
+    ).toThrow();
+  });
+
   it("falls back to local HEAD (loudly) when the repo has no origin remote", async () => {
     const repo = path.join(tmpDir, "no-remote");
     fs.mkdirSync(repo);

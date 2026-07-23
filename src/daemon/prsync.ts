@@ -348,16 +348,25 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
   // Deliver BEFORE persisting: once pr_feedback_at advances these comments
   // are never looked at again, so a failed send must leave it untouched.
   if (task.agent_id) {
+    const finishInstruction =
+      task.publication_mode === "human"
+        ? "Address every point, leave the fixes uncommitted for a new review snapshot, then update your result_summary and stop."
+        : "Address every point, push to the same branch, then update your result_summary and stop.";
     const outcome = await resumeAgent(
       task.agent_id,
-      `New feedback on your PR (${task.pr_url}). Address every point, push to the same branch, then update your result_summary and stop.\n\n${feedback}`,
+      `New feedback on your PR (${task.pr_url}). ${finishInstruction}\n\n${feedback}`,
     );
     // Worker is parked on a permission prompt — injected text would answer
     // the menu, not reach the conversation. The wait is already being
     // escalated; retry on a later pass once it's unblocked.
     if (outcome === "waiting_input") return;
     if (outcome === "sent") {
-      updateTask(taskId, { status: "in_progress", pr_feedback_at: mark });
+      updateTask(taskId, {
+        status: "in_progress",
+        pr_feedback_at: mark,
+        publication_state:
+          task.publication_mode === "human" ? "editing" : task.publication_state,
+      });
       logEvent("pr.feedback", {
         taskId,
         payload: { comments: fresh.length, changes_requested: changesRequested },
@@ -371,7 +380,10 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
   // notes flow into the respawn prompt, same as a reviewer rejection. Append
   // rather than overwrite — the internal reviewer's evidence (and any earlier
   // PR-feedback round) must survive, else it's lost the moment a human comments.
-  const feedbackNote = `PR feedback (${task.pr_url}) — address every point and push to the same branch:\n${feedback}`;
+  const feedbackNote =
+    task.publication_mode === "human"
+      ? `PR feedback (${task.pr_url}) — address every point and leave the fixes uncommitted for review:\n${feedback}`
+      : `PR feedback (${task.pr_url}) — address every point and push to the same branch:\n${feedback}`;
   const notes = task.review_notes
     ? `${task.review_notes}\n\n---\n\n${feedbackNote}`
     : feedbackNote;
@@ -380,6 +392,8 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
     agent_id: null,
     pr_feedback_at: mark,
     review_notes: notes,
+    publication_state:
+      task.publication_mode === "human" ? "editing" : task.publication_state,
   });
   logEvent("pr.feedback", {
     taskId,

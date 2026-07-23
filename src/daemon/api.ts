@@ -52,6 +52,7 @@ import {
   resolveNtfyUrl,
   resolveReviewerProviderPin,
   resolveReviewerVariety,
+  resolveWorkerPublicationMode,
   resolveWorkerProvider,
   resolveWorktreesDir,
   setAgentSettings,
@@ -74,7 +75,13 @@ import {
   type Task,
 } from "../db/tasks.js";
 import { handleHookEvent, resetAutoNudgeCount, type HookPayload } from "./hooks.js";
-import { handleVerdict, taskDiff } from "./review.js";
+import {
+  confirmHumanPublication,
+  handleVerdict,
+  PublicationValidationError,
+  taskDiff,
+} from "./review.js";
+import { clearReviewSnapshot } from "./reviewsnapshot.js";
 import {
   cancelTask,
   killAgent,
@@ -86,6 +93,7 @@ import { resumeAgent, submitPending } from "./resume.js";
 import { capturePane, clearInputLine, windowExists } from "./tmux.js";
 import { parsePane } from "./pane.js";
 import { AGENT_PROVIDERS } from "../providers.js";
+import { PUBLICATION_MODES } from "../publication.js";
 import {
   DEFAULT_CODEX_REASONING_EFFORT,
   REASONING_EFFORTS,
@@ -379,6 +387,20 @@ export function buildApp(): Hono {
     if (body.open_pr === true && before.workspace_kind !== "repo") {
       return c.json({ error: "non-repository tasks cannot open pull requests" }, 400);
     }
+    if (
+      body.status === "done" &&
+      before.publication_mode === "human" &&
+      before.workspace_kind === "repo" &&
+      before.publication_state !== "published"
+    ) {
+      return c.json(
+        {
+          error:
+            "human-publication tasks must pass review and be confirmed as published",
+        },
+        409,
+      );
+    }
     if (body.repo !== undefined) {
       if (before.workspace_kind !== "repo") {
         return c.json({ error: "only repository tasks can change repositories" }, 400);
@@ -407,6 +429,18 @@ export function buildApp(): Hono {
     // sent it, so an explicit `undefined` never gets bound as a SQL param
     // (that binds NULL against a NOT NULL column — see the crons.enabled bug).
     const patch: Record<string, unknown> = { ...body };
+    if (
+      body.status === "queued" &&
+      before.publication_mode === "human" &&
+      before.workspace_kind === "repo" &&
+      before.publication_state !== "published"
+    ) {
+      if (before.review_snapshot_tree) clearReviewSnapshot(before.id);
+      patch.publication_state = "editing";
+      patch.review_verdict = null;
+      patch.review_head_sha = null;
+      patch.review_result_hash = null;
+    }
     if (body.status === "queued" && before.workspace_kind === "scratch") {
       try {
         validateScratchWorkspace(before.repo);
@@ -559,6 +593,37 @@ export function buildApp(): Hono {
       .parse(await c.req.json());
     const task = await handleVerdict(id, body.agent_id, body.verdict, body.notes);
     return c.json(task);
+  });
+
+  app.post("/api/tasks/:id/publication", async (c) => {
+    const id = Number(c.req.param("id"));
+    const body = z
+      .object({
+        pr_url: z
+          .string()
+          .trim()
+          .max(2048)
+          .url()
+          .refine((value) => {
+            try {
+              const url = new URL(value);
+              return (
+                url.protocol === "https:" &&
+                url.hostname === "github.com" &&
+                /^\/[^/]+\/[^/]+\/pull\/[1-9]\d*\/?$/.test(url.pathname) &&
+                !url.username &&
+                !url.password &&
+                !url.search &&
+                !url.hash
+              );
+            } catch {
+              return false;
+            }
+          }, "must be a canonical GitHub pull request URL")
+          .optional(),
+      })
+      .parse(await c.req.json().catch(() => ({})));
+    return c.json(confirmHumanPublication(id, body.pr_url));
   });
 
   app.post("/api/tasks/:id/cancel", async (c) => {
@@ -1153,6 +1218,7 @@ export function buildApp(): Hono {
     default_worker_provider: providerOverrideSchema,
     default_reviewer_provider: providerOverrideSchema,
     reviewer_variety: z.boolean().nullable().optional(),
+    worker_publication_mode: z.enum(PUBLICATION_MODES).nullable().optional(),
   });
 
   const workspaceSettingsPatchSchema = z.object({
@@ -1290,6 +1356,7 @@ export function buildApp(): Hono {
           default_worker_provider: resolveWorkerProvider(),
           default_reviewer_provider: resolveReviewerProviderPin() ?? null,
           reviewer_variety: resolveReviewerVariety(),
+          worker_publication_mode: resolveWorkerPublicationMode(),
         },
       },
       workspace: {
@@ -1395,6 +1462,9 @@ export function buildApp(): Hono {
     }
     if (err instanceof WorkspaceValidationError) {
       return c.json({ error: err.message }, 400);
+    }
+    if (err instanceof PublicationValidationError) {
+      return c.json({ error: err.message }, 409);
     }
     // Do not expose stack traces, local paths, command output, or provider
     // details through the browser/API boundary.

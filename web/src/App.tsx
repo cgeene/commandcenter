@@ -652,6 +652,13 @@ function TaskCard({
         {task.review_verdict === "reject" && (
           <span className="chip bad">✗ Changes</span>
         )}
+        {task.publication_mode === "human" && (
+          <span className="chip">
+            {task.publication_state === "awaiting_human"
+              ? "Needs your review"
+              : "Human publishes"}
+          </span>
+        )}
         {task.status === "review" && (
           <span className="chip" title="Automatic review⇄fix round (current/cap)">
             Review round {Math.min(task.review_cycles + 1, reviewMax)}/{reviewMax}
@@ -939,10 +946,11 @@ function basename(p: string): string {
  *  natural point (a scheduler tick, the next spawn, the next notify call), so
  *  changes rarely need a restart — but the badge tells the operator exactly
  *  when to expect each change to bite. */
-type ApplyWhen = "immediate" | "next-spawn" | "restart";
+type ApplyWhen = "immediate" | "next-task" | "next-spawn" | "restart";
 
 const APPLY_LABEL: Record<ApplyWhen, string> = {
   immediate: "Applies immediately",
+  "next-task": "Applies to new tasks",
   "next-spawn": "Applies to next spawn",
   restart: "Needs daemon restart",
 };
@@ -1206,6 +1214,9 @@ function AgentsSection({
   const [variety, setVariety] = useState(
     stored.reviewer_variety === null ? "" : String(stored.reviewer_variety),
   );
+  const [publicationMode, setPublicationMode] = useState(
+    stored.worker_publication_mode ?? "",
+  );
   const [saving, setSaving] = useState(false);
 
   const save = async () => {
@@ -1217,6 +1228,7 @@ function AgentsSection({
         default_worker_provider: workerProvider || null,
         default_reviewer_provider: reviewerProvider || null,
         reviewer_variety: variety === "" ? null : variety === "true",
+        worker_publication_mode: publicationMode || null,
       });
       onSaved();
     } catch (e) {
@@ -1307,6 +1319,23 @@ function AgentsSection({
             </option>
             <option value="true">On</option>
             <option value="false">Off</option>
+          </select>
+        </SettingRow>
+
+        <SettingRow
+          label="Worker publication"
+          when="next-task"
+          hint={`Agent publishes keeps the existing commit/push/PR workflow. Human publishes leaves reviewed changes uncommitted for you. In use now: ${effective.worker_publication_mode}.`}
+        >
+          <select
+            value={publicationMode}
+            onChange={(e) => setPublicationMode(e.target.value)}
+          >
+            <option value="">
+              Default ({effective.worker_publication_mode})
+            </option>
+            <option value="agent">Agent publishes</option>
+            <option value="human">Human publishes</option>
           </select>
         </SettingRow>
       </div>
@@ -2085,6 +2114,7 @@ function DocsView() {
 }
 
 const KIND_ICON: Record<AttentionItem["kind"], string> = {
+  publish_task: "👤",
   merge_pr: "⇧",
   merge_and_apply: "⚡",
   decision: "⚖",
@@ -2603,6 +2633,7 @@ function TaskPanel({
   onTerminal: (agentId: number) => void;
   onTranscript: (sessionId: string, provider: "claude" | "codex") => Promise<void>;
 }) {
+  const [publicationPrUrl, setPublicationPrUrl] = useState(task.pr_url ?? "");
   return (
     <div className="drawer">
       <div className="drawer-head">
@@ -2642,6 +2673,12 @@ function TaskPanel({
             {task.worker_provider}
             {task.model ? ` · ${task.model}` : " · default model"}
             {task.reasoning_effort ? ` · ${task.reasoning_effort}` : ""}
+          </dd>
+          <dt>Publication</dt>
+          <dd>
+            {task.publication_mode === "human"
+              ? `Human publishes${task.publication_state ? ` · ${task.publication_state.replaceAll("_", " ")}` : ""}`
+              : "Agent publishes"}
           </dd>
           {task.branch && (
             <>
@@ -2690,6 +2727,23 @@ function TaskPanel({
             <CollapsibleMarkdown content={task.review_notes} looseLineBreaks />
           </>
         )}
+        {task.publication_mode === "human" &&
+          task.publication_state === "awaiting_human" &&
+          task.review_verdict === "approve" && (
+            <div className="prompt">
+              Automated review approved this exact working-tree snapshot.
+              Review the uncommitted changes in GitHub Desktop, commit and
+              publish them without changing the content, then confirm below.
+              {task.open_pr !== 0 && (
+                <input
+                  type="url"
+                  placeholder="https://github.com/owner/repo/pull/123"
+                  value={publicationPrUrl}
+                  onChange={(e) => setPublicationPrUrl(e.target.value)}
+                />
+              )}
+            </div>
+          )}
         <div className="actions">
           {["queued", "claimed"].includes(task.status) &&
             task.dispatch_mode === "direct" &&
@@ -2725,7 +2779,30 @@ function TaskPanel({
               Transcript
             </button>
           )}
-          {task.status === "review" && (
+          {task.publication_mode === "human" &&
+            task.publication_state === "awaiting_human" &&
+            task.review_verdict === "approve" && (
+              <button
+                className="primary"
+                disabled={task.open_pr !== 0 && !publicationPrUrl.trim()}
+                onClick={() =>
+                  onAction(() =>
+                    api("POST", `/api/tasks/${task.id}/publication`, {
+                      ...(publicationPrUrl.trim()
+                        ? { pr_url: publicationPrUrl.trim() }
+                        : {}),
+                    }),
+                  )
+                }
+              >
+                ✓ Confirm Published
+              </button>
+            )}
+          {task.status === "review" &&
+            !(
+              task.publication_mode === "human" &&
+              task.publication_state !== "published"
+            ) && (
             <button
               className="primary"
               onClick={() =>

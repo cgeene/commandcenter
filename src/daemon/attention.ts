@@ -23,6 +23,7 @@ import { WAIT_HOOK_EVENTS } from "./waiting.js";
  */
 
 export type AttentionKind =
+  | "publish_task"
   | "merge_pr"
   | "merge_and_apply"
   | "decision"
@@ -122,6 +123,32 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
       agent_id: main?.id ?? null,
       pr_url: null,
       created_at: oldest.created_at,
+    });
+  }
+
+  // Automated review finished first; the human now reviews the exact approved
+  // uncommitted tree and performs every publication action.
+  for (const t of tasks) {
+    if (
+      t.publication_mode !== "human" ||
+      t.publication_state !== "awaiting_human" ||
+      t.review_verdict !== "approve" ||
+      t.status !== "review"
+    ) {
+      continue;
+    }
+    push({
+      id: `publish_task:${t.id}:${t.review_snapshot_tree ?? t.updated_at}`,
+      kind: "publish_task",
+      title: `Review and publish — #${t.id} ${t.title}`,
+      context:
+        "Automated review approved the snapshot. Review the uncommitted changes in GitHub Desktop, commit and publish them, then confirm publication.",
+      severity: "yellow",
+      urgent: false,
+      task_id: t.id,
+      agent_id: t.agent_id,
+      pr_url: null,
+      created_at: t.updated_at,
     });
   }
 

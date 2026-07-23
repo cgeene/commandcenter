@@ -347,11 +347,17 @@ export async function handleHookEvent(
     case "PermissionRequest": {
       const policyDecision =
         event === "PermissionRequest" && agent.provider === "codex"
-          ? codexPermissionDecision(
-              body,
-              agent.task_id ? String(agent.task_id) : undefined,
-              agent.task_id ? getTask(agent.task_id)?.workspace_kind : undefined,
-            )
+          ? (() => {
+              const policyTask = agent.task_id
+                ? getTask(agent.task_id)
+                : undefined;
+              return codexPermissionDecision(body, {
+                taskId: policyTask ? String(policyTask.id) : undefined,
+                workspaceKind: policyTask?.workspace_kind,
+                publicationMode: policyTask?.publication_mode ?? "agent",
+                role: agent.kind === "reviewer" ? "reviewer" : "worker",
+              });
+            })()
           : undefined;
       if (policyDecision) {
         logEvent(
@@ -543,7 +549,11 @@ function recordTokens(agent: Agent, sessionId?: string): void {
  *  for pure Anthropic-side flakiness. */
 async function reviewerStopped(agent: Agent): Promise<void> {
   const submitted =
-    countAgentEvents(agent.id, ["review.approved", "review.rejected"]) > 0;
+    countAgentEvents(agent.id, [
+      "review.approved",
+      "review.rejected",
+      "review.verdict_stale",
+    ]) > 0;
   if (submitted) {
     killAgent(agent.id, { rmWorktree: true });
     return;
@@ -574,7 +584,13 @@ async function reviewerStopped(agent: Agent): Promise<void> {
  *  Mirrors the docOnly completion shape in review.handleVerdict. Returns true
  *  when it completed the task (caller must stop). */
 function completeIfReviewDisabled(task: Task, agentId: number): boolean {
-  if (task.auto_review !== 0 || task.open_pr !== 0) return false;
+  if (
+    task.publication_mode === "human" ||
+    task.auto_review !== 0 ||
+    task.open_pr !== 0
+  ) {
+    return false;
+  }
   updateTask(task.id, { status: "done", review_verdict: "approve" });
   logEvent("task.autocompleted", {
     taskId: task.id,
