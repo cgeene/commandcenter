@@ -52,6 +52,7 @@ import {
   resolveNtfyUrl,
   resolveReviewerProviderPin,
   resolveReviewerVariety,
+  resolveWorkerPublicationMode,
   resolveWorkerProvider,
   resolveWorktreesDir,
   setAgentSettings,
@@ -74,7 +75,13 @@ import {
   type Task,
 } from "../db/tasks.js";
 import { handleHookEvent, resetAutoNudgeCount, type HookPayload } from "./hooks.js";
-import { handleVerdict, taskDiff } from "./review.js";
+import {
+  confirmHumanPublication,
+  handleVerdict,
+  PublicationValidationError,
+  taskDiff,
+} from "./review.js";
+import { clearReviewSnapshot } from "./reviewsnapshot.js";
 import {
   cancelTask,
   killAgent,
@@ -83,9 +90,14 @@ import {
   spawnWorker,
 } from "./spawn.js";
 import { resumeAgent, submitPending } from "./resume.js";
+import {
+  resumeArchivedTask,
+  TaskResumeValidationError,
+} from "./taskresume.js";
 import { capturePane, clearInputLine, windowExists } from "./tmux.js";
 import { parsePane } from "./pane.js";
 import { AGENT_PROVIDERS } from "../providers.js";
+import { PUBLICATION_MODES } from "../publication.js";
 import {
   DEFAULT_CODEX_REASONING_EFFORT,
   REASONING_EFFORTS,
@@ -172,6 +184,11 @@ const spawnSchema = z.object({
   model: z.string().optional(),
   reasoning_effort: reasoningEffortSchema.optional(),
   fresh: z.boolean().optional(),
+});
+
+const resumeTaskSchema = z.object({
+  instructions: z.string().trim().max(20_000).optional(),
+  agent_id: z.number().int().positive().optional(),
 });
 
 export function buildApp(): Hono {
@@ -379,6 +396,20 @@ export function buildApp(): Hono {
     if (body.open_pr === true && before.workspace_kind !== "repo") {
       return c.json({ error: "non-repository tasks cannot open pull requests" }, 400);
     }
+    if (
+      body.status === "done" &&
+      before.publication_mode === "human" &&
+      before.workspace_kind === "repo" &&
+      before.publication_state !== "published"
+    ) {
+      return c.json(
+        {
+          error:
+            "human-publication tasks must pass review and be confirmed as published",
+        },
+        409,
+      );
+    }
     if (body.repo !== undefined) {
       if (before.workspace_kind !== "repo") {
         return c.json({ error: "only repository tasks can change repositories" }, 400);
@@ -407,6 +438,18 @@ export function buildApp(): Hono {
     // sent it, so an explicit `undefined` never gets bound as a SQL param
     // (that binds NULL against a NOT NULL column — see the crons.enabled bug).
     const patch: Record<string, unknown> = { ...body };
+    if (
+      body.status === "queued" &&
+      before.publication_mode === "human" &&
+      before.workspace_kind === "repo" &&
+      before.publication_state !== "published"
+    ) {
+      if (before.review_snapshot_tree) clearReviewSnapshot(before.id);
+      patch.publication_state = "editing";
+      patch.review_verdict = null;
+      patch.review_head_sha = null;
+      patch.review_result_hash = null;
+    }
     if (body.status === "queued" && before.workspace_kind === "scratch") {
       try {
         validateScratchWorkspace(before.repo);
@@ -506,6 +549,43 @@ export function buildApp(): Hono {
     return c.json(task);
   });
 
+  app.post("/api/tasks/:id/resume", async (c) => {
+    const id = Number(c.req.param("id"));
+    if (!Number.isSafeInteger(id) || id < 1) {
+      return c.json({ error: "invalid task id" }, 400);
+    }
+    if (!getTask(id)) return c.json({ error: "not found" }, 404);
+    const body = resumeTaskSchema.parse(await c.req.json().catch(() => ({})));
+    const result = await resumeArchivedTask(id, {
+      instructions: body.instructions,
+      actorAgentId: body.agent_id,
+    });
+    const actor = body.agent_id ? getAgent(body.agent_id) : undefined;
+
+    if (result.task.dispatch_mode === "orchestrated") {
+      if (actor?.kind === "main" && actor.state !== "dead") {
+        // Main invoked the resume tool and is already holding the task. Mark
+        // this queue generation as delivered so the idle retry cannot inject
+        // a duplicate triage message into the same main session.
+        logEvent("task.delegated_to_main", {
+          taskId: result.task.id,
+          agentId: actor.id,
+          payload: {
+            workspace_kind: result.task.workspace_kind,
+            reason: "main initiated archived-task resume",
+          },
+        });
+      } else {
+        try {
+          await delegateTaskToMain(result.task.id);
+        } catch {
+          logEvent("task.awaiting_main", { taskId: result.task.id });
+        }
+      }
+    }
+    return c.json(result);
+  });
+
   app.post("/api/tasks/:id/delegate", async (c) => {
     const id = Number(c.req.param("id"));
     const task = getTask(id);
@@ -559,6 +639,37 @@ export function buildApp(): Hono {
       .parse(await c.req.json());
     const task = await handleVerdict(id, body.agent_id, body.verdict, body.notes);
     return c.json(task);
+  });
+
+  app.post("/api/tasks/:id/publication", async (c) => {
+    const id = Number(c.req.param("id"));
+    const body = z
+      .object({
+        pr_url: z
+          .string()
+          .trim()
+          .max(2048)
+          .url()
+          .refine((value) => {
+            try {
+              const url = new URL(value);
+              return (
+                url.protocol === "https:" &&
+                url.hostname === "github.com" &&
+                /^\/[^/]+\/[^/]+\/pull\/[1-9]\d*\/?$/.test(url.pathname) &&
+                !url.username &&
+                !url.password &&
+                !url.search &&
+                !url.hash
+              );
+            } catch {
+              return false;
+            }
+          }, "must be a canonical GitHub pull request URL")
+          .optional(),
+      })
+      .parse(await c.req.json().catch(() => ({})));
+    return c.json(confirmHumanPublication(id, body.pr_url));
   });
 
   app.post("/api/tasks/:id/cancel", async (c) => {
@@ -720,12 +831,20 @@ export function buildApp(): Hono {
     const taskIdEnv = agent.task_id
       ? ` CC_TASK_ID=${quote(String(agent.task_id))}`
       : "";
+    const sessionTask = agent.task_id ? getTask(agent.task_id) : undefined;
     const command =
       agent.provider === "codex"
         ? [
             `CC_URL=${quote(baseUrl())}`,
             `CC_ROLE=${quote(agent.kind)}`,
             `CC_AGENT_ID=${quote(String(agent.id))}${taskIdEnv}`,
+            ...(sessionTask
+              ? [
+                  `CC_TASK_BRANCH=${quote(sessionTask.branch ?? "")}`,
+                  `CC_WORKSPACE_KIND=${quote(sessionTask.workspace_kind)}`,
+                  `CC_PUBLICATION_MODE=${quote(sessionTask.publication_mode)}`,
+                ]
+              : []),
             `CODEX_HOME=${quote(codexHome())}`,
             quote(codexBin()),
             "--profile",
@@ -1153,6 +1272,7 @@ export function buildApp(): Hono {
     default_worker_provider: providerOverrideSchema,
     default_reviewer_provider: providerOverrideSchema,
     reviewer_variety: z.boolean().nullable().optional(),
+    worker_publication_mode: z.enum(PUBLICATION_MODES).nullable().optional(),
   });
 
   const workspaceSettingsPatchSchema = z.object({
@@ -1290,6 +1410,7 @@ export function buildApp(): Hono {
           default_worker_provider: resolveWorkerProvider(),
           default_reviewer_provider: resolveReviewerProviderPin() ?? null,
           reviewer_variety: resolveReviewerVariety(),
+          worker_publication_mode: resolveWorkerPublicationMode(),
         },
       },
       workspace: {
@@ -1395,6 +1516,12 @@ export function buildApp(): Hono {
     }
     if (err instanceof WorkspaceValidationError) {
       return c.json({ error: err.message }, 400);
+    }
+    if (err instanceof PublicationValidationError) {
+      return c.json({ error: err.message }, 409);
+    }
+    if (err instanceof TaskResumeValidationError) {
+      return c.json({ error: err.message }, 409);
     }
     // Do not expose stack traces, local paths, command output, or provider
     // details through the browser/API boundary.

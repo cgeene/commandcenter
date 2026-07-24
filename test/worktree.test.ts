@@ -110,6 +110,40 @@ describe("createWorktree", () => {
     );
   });
 
+  it("creates a resumed attempt on its rotated task branch and worktree path", async () => {
+    const { remoteDir } = setupRemote();
+    const mainRepo = cloneRepo(remoteDir, "main-checkout");
+    const { createWorktree, git: worktreeGit } = await import(
+      "../src/daemon/worktree.js"
+    );
+
+    const branch = "agent/task-203-resume-2";
+    const resumed = createWorktree(mainRepo, 203, "codex", "agent", branch);
+
+    expect(resumed.branch).toBe(branch);
+    expect(resumed.dir).toContain("main-checkout-task-203-resume-2");
+    expect(worktreeGit(resumed.dir, "branch", "--show-current").trim()).toBe(
+      branch,
+    );
+  });
+
+  it("hardens upstream only for opt-in human publication tasks", async () => {
+    const { remoteDir } = setupRemote();
+    const mainRepo = cloneRepo(remoteDir, "main-checkout");
+    git(mainRepo, "config", "branch.autoSetupMerge", "always");
+
+    const { createWorktree } = await import("../src/daemon/worktree.js");
+    const agent = createWorktree(mainRepo, 501);
+    expect(git(agent.dir, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe(
+      "origin/main",
+    );
+
+    const human = createWorktree(mainRepo, 502, "claude", "human");
+    expect(() =>
+      git(human.dir, "rev-parse", "--abbrev-ref", "@{upstream}"),
+    ).toThrow();
+  });
+
   it("falls back to local HEAD (loudly) when the repo has no origin remote", async () => {
     const repo = path.join(tmpDir, "no-remote");
     fs.mkdirSync(repo);

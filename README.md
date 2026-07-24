@@ -12,10 +12,12 @@ Codex workers. A long-running daemon owns a SQLite task queue. Claude main studi
 each interactive request first, then dispatches repository work into an isolated
 **git worktree + tmux window** or investigations into a private non-Git scratch
 workspace. Finished code is proofed by an **independent adversarial reviewer**
-before you ever see it, pushed as a **draft** GitHub PR that flips to
-ready-for-review only once that review approves, and surfaced on a **live web
-dashboard** with a "Needs You" panel that tells you the one thing only a human
-can do next. Agents share a **platform memory** of hard-won lessons and an
+before you ever see it. By default, workers retain the existing flow: commit,
+push a **draft** GitHub PR, and let Command Center flip it to ready-for-review
+after approval. An opt-in local setting instead leaves worker changes
+uncommitted, reviews an immutable snapshot first, and then hands the approved
+work to you to publish. Both flows surface the next human action on a **live web
+dashboard**. Agents share a **platform memory** of hard-won lessons and an
 **internal doc store** for research. The control plane runs on your machine —
 there is no hosted service and no telemetry. Claude Code and Codex still send
 model requests and selected working context to their respective services.
@@ -57,12 +59,15 @@ non-Git investigation worker, or a set of isolated per-repository child tasks.
 For repository work, the daemon cuts a fresh branch and git worktree from the
 repo's origin default branch, opens a tmux window, and launches an interactive
 provider session scoped to that worktree with an MCP toolset. The worker does
-the work, commits, pushes its branch, and opens a **draft** PR. A separate
+the work and, by default, commits, pushes its branch, and opens a **draft** PR. A separate
 reviewer agent — a fresh session with **no** access to the worker's conversation
-and with file-editing tools denied — tries to *reject* the work; two rejections
-block the task for your arbitration. Approved work flips its PR to ready and
+and with file-editing tools denied — tries to *reject* the work; exhausting the
+configured review-round cap blocks the task for your arbitration. Approved work flips its PR to ready and
 lands in `review`, waiting for **you** to merge. A scheduler can run this whole
-loop autonomously within budgets you set, but nothing ever merges itself.
+loop autonomously within budgets you set, but nothing ever merges itself. If
+you opt into **Human publishes**, the worker instead leaves its changes
+uncommitted; the reviewer judges a pinned snapshot, and only an approved
+snapshot is handed to you for commit, push, and PR creation.
 
 The primitives:
 
@@ -71,7 +76,7 @@ The primitives:
 | **`agentd`** | The daemon. Owns the SQLite queue, a localhost REST API + WebSocket, the tmux/worktree lifecycle, the scheduler, PR sync, and serves the dashboard. |
 | **`agp`** | CLI client for the daemon (`agp task add`, `agp agent spawn`, …). |
 | **`cc-mcp`** | MCP server exposing the platform to agents (scoped per role). |
-| **Workers** | Claude Code or Codex sessions, one per executable task, in either an `agent/task-N` worktree + branch or a private scratch directory. |
+| **Workers** | Claude Code or Codex sessions, one per executable task, in either an `agent/task-N` (or resumed `agent/task-N-resume-K`) worktree + branch or a private scratch directory. |
 | **Reviewers** | Independent read-only `claude`/`codex` sessions that adversarially proof a branch. |
 | **Main agent** | An orchestrator `claude` session that triages the queue and manages workers. |
 | **Dashboard** | React SPA served by the daemon: board, PRs, tokens, live terminals. |
@@ -116,7 +121,9 @@ A task carries a `title`, `prompt`, `workspace_kind`, canonical `repo`/root,
 `2`), worker provider/model, Codex `reasoning_effort` (default `high`), an
 optional `verify_cmd`, and an optional `blocked_by` (another task id — it won't
 become ready until its blocker is `done`). `open_pr` (default on) controls whether
-a worker opens a PR or leaves the branch as the deliverable. Statuses:
+a PR is expected. Each task also snapshots the effective publication mode when
+it is created, so changing the local default never changes work already in
+flight. Statuses:
 
 ```
 queued → claimed → in_progress → blocked / review → done / failed
@@ -124,6 +131,18 @@ queued → claimed → in_progress → blocked / review → done / failed
 
 `cancelled` is reachable from **any** state (`agp task cancel <id>`). Claiming is
 a single atomic SQLite `UPDATE`, so two agents can never take the same task.
+
+Done and cancelled tasks move to **Archive**. Use the task drawer's **Resume
+Task** action, tell Claude main to resume task `#N`, or run
+`agp task resume <id> --prompt "changed requirements"` to reopen the same task
+instead of creating a duplicate. Command Center preserves its provider/model,
+session ownership, surviving workspace, task history, token total, and JIRA link while
+clearing stale result/reviewer/publication state. If the same-provider
+transcript still exists, the respawn uses `claude --resume` or `codex resume`;
+otherwise the prior result/review/PR handoff is already folded into the prompt
+for a safe fresh-session fallback. An expired scratch directory is recreated.
+A merged/closed PR gets a new
+`agent/task-N-resume-K` branch from the current upstream default branch.
 
 Interactive workspace modes:
 
@@ -146,8 +165,8 @@ calls `submit_review(approve|reject, notes)`.
 - **Reject** → notes go back into the worker's session (or the respawn prompt if
   it's gone), task returns to `in_progress`. A ready PR is converted back to a
   **draft**.
-- After **2 rejected cycles** (`MAX_REVIEW_CYCLES`) the task is **blocked** and
-  escalated to you with both sides' notes.
+- After the configured review-round cap (default **4**) the task is **blocked**
+  and escalated to you with both sides' notes.
 - **Approve** → the PR flips from **draft** to **ready for review** and you get
   pinged; the merge is still yours.
 
@@ -157,13 +176,32 @@ Worker PRs are opened as **drafts** (`gh pr create --draft`), so on GitHub
 `[UNREVIEWED] …`, renamed on approval.) The `Stop` hook re-verifies any task a
 worker moved to `review` itself, so `verify_cmd` can't be bypassed.
 
+#### Publication modes
+
+The runtime **Worker publication** setting affects newly created repository
+tasks only:
+
+| Mode | Worker | Independent reviewer | Human |
+|---|---|---|---|
+| **Agent publishes (default)** | Commits, pushes its task branch, and opens/updates the draft PR. | Reviews the branch/PR; approval marks the PR ready. | Reviews and merges the approved PR. |
+| **Human publishes (opt-in)** | Edits and verifies, but cannot commit, push, merge, or mutate a PR. | Reviews an immutable full-working-tree snapshot, including untracked files. | After approval, reviews the uncommitted changes in GitHub Desktop, commits and publishes them, then records the PR URL in Command Center. |
+
+For Human publishes, Command Center refuses the final confirmation unless the
+worktree is clean, the committed tree exactly matches the approved snapshot,
+and the same tree is present on the task's `origin/agent/task-N` branch. If the
+files change after approval, that approval is superseded and a new review is
+required. The default remains Agent publishes for existing and new installations
+unless a user explicitly changes this local setting.
+
 ### Worktree isolation & branch hygiene
 
 Every task gets its own git worktree under `$CC_DATA_DIR/worktrees` on branch
 `agent/task-N`, cut from the repo's **origin default branch** (fetched fresh),
 not your local `HEAD` — so branches start clean and your main checkout is never
-touched. Workers may push **only** their own branch and open a PR; merges,
-force-pushes, and every other branch stay yours.
+touched. In the default publication mode, workers may push **only** their own
+branch and open a PR; merges, force-pushes, and every other branch stay yours.
+In Human publishes, worker publishing is denied and the human takes over only
+after reviewer approval.
 
 ### Platform memory & doc store
 
@@ -419,6 +457,7 @@ running. Full reference: [`docs/cli.md`](docs/cli.md).
 | `agp task add <title> …` | File a main-orchestrated task (`-w` workspace, `-r` repo, `-p` prompt, `-v` verify, `--provider`, `-m` model, `-P` priority, `-b` blocked-by). |
 | `agp task ls` / `task show <id>` / `task diff <id>` | List / inspect a task / show its branch diff. |
 | `agp task cancel <id>` | Close a task from any state; kills its live agents. |
+| `agp task resume <id>` | Reopen an archived task in place; `--prompt`/`--prompt-file` adds changed requirements. |
 | `agp main` | Spawn the Claude orchestrator (one at a time). |
 | `agp agent ls` / `agent peek <id>` / `agent send <id> …` | List agents / view a terminal without attaching / send text into a session. |
 | `agp attach <id>` | Attach to an agent's tmux window (detach with `Ctrl-b d`). |
@@ -462,7 +501,7 @@ your phone via [ntfy](https://ntfy.sh/).
 
 ## Configuration
 
-Two kinds of configuration:
+Three kinds of configuration:
 
 1. **Environment variables** — read at call time (from
    [`src/config.ts`](src/config.ts)); set them in the environment the daemon runs
@@ -470,6 +509,10 @@ Two kinds of configuration:
 2. **Scheduler config** — a JSON blob in the SQLite `settings` table, edited at
    **runtime** via `agp scheduler set …` / the API / the dashboard (**not** env
    vars); defaults in [`src/db/settings.ts`](src/db/settings.ts).
+3. **Local agent defaults** — stored in the same local SQLite database and
+   edited in the dashboard settings. **Worker publication** defaults to
+   `Agent publishes`; `Human publishes` is opt-in and applies only to tasks
+   created after the setting changes.
 
 Full reference: [`docs/configuration.md`](docs/configuration.md).
 
@@ -593,7 +636,9 @@ about, on your own machine.
   work belongs in a different repo is instructed to *report blocked*, not edit it.
 - **Least-privilege permissions.** Agents run against a **generated** settings
   file — commandcenter never touches your `~/.claude/settings.json`. Workers may
-  push only their own branch and open a PR; reviewers deny Edit/Write/commit/push.
+  push only their own branch and open a PR in the default mode; Human publishes
+  denies worker/reviewer publication and hands the approved snapshot to you.
+  Reviewers deny Edit/Write/commit/push.
   Codex workers use an isolated profile with `workspace-write`, network disabled
   in the sandbox, and a fail-closed push policy. The read-only allowlist is an
   explicit, auditable list in

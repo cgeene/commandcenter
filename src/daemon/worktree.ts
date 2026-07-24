@@ -5,6 +5,7 @@ import { resolveWorktreesDir } from "../db/settings.js";
 import { logEvent } from "../db/events.js";
 import { injectWorkspaceContext } from "./context.js";
 import { type AgentProvider } from "../providers.js";
+import { type PublicationMode } from "../publication.js";
 
 export function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
@@ -88,6 +89,25 @@ export function branchForTask(taskId: number): string {
   return `agent/task-${taskId}`;
 }
 
+/** A task branch must never inherit origin/main from its creation start point.
+ * Reuse a same-name remote branch when it exists; otherwise leave the task
+ * branch without an upstream so a bare human push cannot target main. */
+function hardenTaskUpstream(worktree: string, branch: string): void {
+  const remoteRef = `refs/remotes/origin/${branch}`;
+  try {
+    git(worktree, "show-ref", "--verify", "--quiet", remoteRef);
+    git(worktree, "branch", "--set-upstream-to", `origin/${branch}`, branch);
+    return;
+  } catch {
+    // A missing same-name remote branch is normal for a new task.
+  }
+  try {
+    git(worktree, "branch", "--unset-upstream", branch);
+  } catch {
+    // Already unset.
+  }
+}
+
 /**
  * Create (or reuse) the worktree for a task. If the branch already exists —
  * e.g. a worker was killed and the task respawned — reattach to it so prior
@@ -99,12 +119,25 @@ export function createWorktree(
   repo: string,
   taskId: number,
   provider: AgentProvider = "claude",
+  publicationMode: PublicationMode = "agent",
+  branchOverride?: string | null,
 ): { dir: string; branch: string } {
   const repoName = path.basename(repo);
-  const dir = path.join(resolveWorktreesDir(), `${repoName}-task-${taskId}`);
-  const branch = branchForTask(taskId);
+  const branch = branchOverride ?? branchForTask(taskId);
+  const standardBranch = branchForTask(taskId);
+  const attemptSuffix = branch === standardBranch
+    ? ""
+    : branch.match(new RegExp(`^agent/task-${taskId}(-resume-\\d+)$`))?.[1];
+  if (attemptSuffix === undefined) {
+    throw new Error(`invalid branch for task ${taskId}`);
+  }
+  const dir = path.join(
+    resolveWorktreesDir(),
+    `${repoName}-task-${taskId}${attemptSuffix}`,
+  );
 
   if (fs.existsSync(dir)) {
+    if (publicationMode === "human") hardenTaskUpstream(dir, branch);
     // Already set up (respawn case) — still refresh injected context so a
     // resumed worker picks up any workspace-file changes since it was created.
     injectWorkspaceContext(repo, dir, taskId, provider);
@@ -124,6 +157,7 @@ export function createWorktree(
       git(repo, "worktree", "add", dir, "-b", branch);
     }
   }
+  if (publicationMode === "human") hardenTaskUpstream(dir, branch);
   injectWorkspaceContext(repo, dir, taskId, provider);
   return { dir, branch };
 }
@@ -229,6 +263,28 @@ export function createReviewWorktree(
   fs.mkdirSync(resolveWorktreesDir(), { recursive: true });
   git(repo, "worktree", "add", "--detach", dir, target);
   // Reviewers benefit from the same workspace context as workers.
+  injectWorkspaceContext(repo, dir, taskId, provider);
+  return dir;
+}
+
+/** Materialize an immutable human-publication tree in the disposable reviewer
+ * worktree. HEAD stays detached at the worker's base commit; read-tree updates
+ * only the review worktree/index to the snapshotted candidate. */
+export function createSnapshotReviewWorktree(
+  repo: string,
+  taskId: number,
+  base: string,
+  tree: string,
+  provider: AgentProvider = "claude",
+): string {
+  const dir = reviewWorktreeDir(repo, taskId);
+  if (fs.existsSync(dir)) {
+    git(dir, "reset", "--hard", base);
+  } else {
+    fs.mkdirSync(resolveWorktreesDir(), { recursive: true });
+    git(repo, "worktree", "add", "--detach", dir, base);
+  }
+  git(dir, "read-tree", "--reset", "-u", tree);
   injectWorkspaceContext(repo, dir, taskId, provider);
   return dir;
 }

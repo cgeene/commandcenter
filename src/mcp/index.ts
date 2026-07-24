@@ -449,6 +449,54 @@ if (ROLE === "main") {
   );
 
   server.registerTool(
+    "resume_task",
+    {
+      description:
+        "Reopen an archived done/cancelled task IN PLACE. Reuses the same task, provider session (when its transcript still exists), workspace/unfinished branch, and history; it does not create a duplicate. Completion/review state is safely reset. After this succeeds, inspect the returned task and spawn_worker for repo/scratch tasks.",
+      inputSchema: {
+        task_id: z.number().int().positive(),
+        instructions: z
+          .string()
+          .max(20_000)
+          .optional()
+          .describe("the human's changed or additional requirements"),
+      },
+    },
+    async ({ task_id, instructions }) =>
+      asText(
+        await call("POST", `/api/tasks/${task_id}/resume`, {
+          instructions,
+          agent_id: process.env.CC_AGENT_ID
+            ? Number(process.env.CC_AGENT_ID)
+            : undefined,
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "confirm_human_publication",
+    {
+      description:
+        "After the human reviews, commits, and publishes a Human-publishes task, verify that the committed tree exactly matches the reviewer-approved snapshot and record its PR. This never commits, pushes, or creates a PR.",
+      inputSchema: {
+        task_id: z.number().int().positive(),
+        pr_url: z
+          .string()
+          .url()
+          .max(2048)
+          .optional()
+          .describe("required when the task expects a pull request"),
+      },
+    },
+    async ({ task_id, pr_url }) =>
+      asText(
+        await call("POST", `/api/tasks/${task_id}/publication`, {
+          ...(pr_url ? { pr_url } : {}),
+        }),
+      ),
+  );
+
+  server.registerTool(
     "claim_task",
     {
       description: "Atomically claim a queued task without spawning a worker yet.",

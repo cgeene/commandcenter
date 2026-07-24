@@ -2,6 +2,7 @@
 /** Forward Codex lifecycle JSON to agentd while preserving each hook's output contract. */
 
 import { codexPermissionDecision } from "../codex-policy.js";
+import { isPublicationMode } from "../publication.js";
 
 interface Payload {
   hook_event_name?: string;
@@ -34,13 +35,22 @@ async function main(): Promise<void> {
   const agentId = safeAgentId();
   const base = process.env.CC_URL ?? "http://127.0.0.1:4711";
   const workspaceKind = process.env.CC_WORKSPACE_KIND;
-  const decision = codexPermissionDecision(
-    payload,
-    process.env.CC_TASK_ID,
-    workspaceKind === "repo" || workspaceKind === "portfolio" || workspaceKind === "scratch"
-      ? workspaceKind
-      : undefined,
-  );
+  const publicationMode = process.env.CC_PUBLICATION_MODE;
+  const role = process.env.CC_ROLE;
+  const decision = codexPermissionDecision(payload, {
+    taskId: process.env.CC_TASK_ID,
+    taskBranch: process.env.CC_TASK_BRANCH,
+    workspaceKind:
+      workspaceKind === "repo" ||
+      workspaceKind === "portfolio" ||
+      workspaceKind === "scratch"
+        ? workspaceKind
+        : undefined,
+    publicationMode: isPublicationMode(publicationMode)
+      ? publicationMode
+      : "agent",
+    role: role === "reviewer" ? "reviewer" : "worker",
+  });
   if (agentId) {
     try {
       await fetch(`${base}/api/hooks/agent/${agentId}`, {

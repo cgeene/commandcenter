@@ -12,6 +12,12 @@ export type AgentProvider = "claude" | "codex";
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export type WorkspaceKind = "repo" | "portfolio" | "scratch";
 export type DispatchMode = "direct" | "orchestrated";
+export type PublicationMode = "agent" | "human";
+export type PublicationState =
+  | "editing"
+  | "reviewing"
+  | "awaiting_human"
+  | "published";
 
 export interface ProviderModel {
   slug: string;
@@ -59,6 +65,10 @@ export interface Task {
   jira_project: string | null; // resolved (or per-task override) JIRA project key
   open_pr: number;
   auto_review: number;
+  publication_mode: PublicationMode;
+  publication_state: PublicationState | null;
+  review_snapshot_base: string | null;
+  review_snapshot_tree: string | null;
   tokens_used: number | null;
   created_at: string;
   updated_at: string;
@@ -148,6 +158,7 @@ export interface CronJob {
 }
 
 export type AttentionKind =
+  | "publish_task"
   | "merge_pr"
   | "merge_and_apply"
   | "decision"
@@ -235,12 +246,14 @@ export interface AppSettings {
       default_worker_provider: AgentProvider | null;
       default_reviewer_provider: AgentProvider | null;
       reviewer_variety: boolean | null;
+      worker_publication_mode: PublicationMode | null;
     };
     effective: {
       default_main_model: string;
       default_worker_provider: AgentProvider;
       default_reviewer_provider: AgentProvider | null;
       reviewer_variety: boolean;
+      worker_publication_mode: PublicationMode;
     };
   };
   workspace: {

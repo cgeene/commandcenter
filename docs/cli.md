@@ -18,6 +18,7 @@ agp <group> <command> [options]
 | `task update <id>` | Update fields: `-s/--status`, `-P/--priority`, `--provider <claude\|codex>`, `-m/--model`, `-e/--effort`, `--result <summary>`. Provider changes are rejected while the task has a live agent. |
 | `task claim <id>` | Atomically claim a queued task. |
 | `task cancel <id>` | Close a task from any state (kills its live worker/reviewer). `--rm-worktree` also removes the worktree (uncommitted work is lost). Reports any tasks left dangling by `blocked_by`. |
+| `task resume <id>` | Reopen a done/cancelled task in place. `-p/--prompt` or `-f/--prompt-file` supplies changed requirements. Preserves a resumable same-provider session and safely falls back to a fresh session with the archived handoff. |
 | `task diff <id>` | Show the diff on the task's branch. `--stat` for stat + commits only. |
 
 ## `agp review <taskId>`

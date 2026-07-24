@@ -32,6 +32,11 @@ function taskCreatorKind(taskId: number): Agent["kind"] | null {
 }
 
 function taskPrompt(task: Task, creatorKind: Agent["kind"] | null): string {
+  const reopened = latestTaskEvent(task.id, ["task.archived_resumed"]);
+  const created = latestTaskEvent(task.id, ["task.created"]);
+  if (reopened && (!created || reopened.id > created.id)) {
+    return `[commandcenter] Archived task #${task.id} was reopened and is awaiting your triage (workspace_kind=${task.workspace_kind}). Call get_task(${task.id}), study the original task plus its Resume request section, then continue the SAME task. Do not create a duplicate task. For repo/scratch tasks, call spawn_worker(${task.id}); Command Center will resume the same provider session when its transcript still exists and otherwise start a fresh session with the preserved handoff. For portfolio tasks, re-evaluate its existing children and create only genuinely missing repository work.`;
+  }
   const descriptor =
     creatorKind === "worker"
       ? `worker-filed follow-up task #${task.id}`
@@ -97,7 +102,17 @@ export async function delegatePendingTaskToMain(main: Agent): Promise<boolean> {
     // only delivers pending[0]), starving the tasks behind it.
     if (taskCreatorKind(task.id) === "main") return false;
     const delegated = latestTaskEvent(task.id, ["task.delegated_to_main"]);
-    return !delegated || delegated.agent_id !== main.id;
+    const queued = latestTaskEvent(task.id, [
+      "task.created",
+      "task.archived_resumed",
+      "task.reopened",
+      "task.requeued",
+    ]);
+    return (
+      !delegated ||
+      delegated.agent_id !== main.id ||
+      Boolean(queued && queued.id > delegated.id)
+    );
   });
   const task = pending[0];
   return task ? delegateTaskToMain(task.id, main) : false;
