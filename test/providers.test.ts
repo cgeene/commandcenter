@@ -470,6 +470,30 @@ describe("Codex worker permission policy", () => {
         "scratch",
       )?.behavior,
     ).toBe("deny");
+    expect(
+      codexPermissionDecision(
+        payload("git push origin agent/task-12-resume-2"),
+        {
+          taskId: "12",
+          taskBranch: "agent/task-12-resume-2",
+          workspaceKind: "repo",
+          publicationMode: "agent",
+          role: "worker",
+        },
+      )?.behavior,
+    ).toBe("allow");
+    expect(
+      codexPermissionDecision(
+        payload("git push origin agent/task-12"),
+        {
+          taskId: "12",
+          taskBranch: "agent/task-12-resume-2",
+          workspaceKind: "repo",
+          publicationMode: "agent",
+          role: "worker",
+        },
+      )?.behavior,
+    ).toBe("deny");
   });
 });
 

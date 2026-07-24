@@ -181,6 +181,31 @@ task
   });
 
 task
+  .command("resume <id>")
+  .description("reopen an archived task in place and send it to Claude main")
+  .option("-p, --prompt <instructions>", "changed or additional requirements")
+  .option("-f, --prompt-file <file>", "read resume instructions from a file")
+  .action(async (id: string, opts) => {
+    if (opts.prompt && opts.promptFile) {
+      throw new Error("use either --prompt or --prompt-file, not both");
+    }
+    const instructions = opts.promptFile
+      ? fs.readFileSync(opts.promptFile, "utf8")
+      : opts.prompt;
+    const result = await api<{
+      task: Task;
+      session_mode: "same_provider_session" | "fresh_session";
+    }>("POST", `/api/tasks/${id}/resume`, { instructions });
+    console.log(
+      `task #${result.task.id} reopened and ${
+        result.task.dispatch_mode === "orchestrated"
+          ? "queued for Claude main"
+          : "queued for the scheduler"
+      } (${result.session_mode.replaceAll("_", " ")})`,
+    );
+  });
+
+task
   .command("diff <id>")
   .description("show the diff on a task's branch")
   .option("--stat", "stat + commits only")

@@ -343,6 +343,7 @@ function buildClaudeCmd(opts: {
 function buildCodexCmd(opts: {
   agentId: number;
   taskId: number;
+  branch?: string | null;
   role?: "worker" | "reviewer";
   model?: string;
   reasoningEffort: ReasoningEffort;
@@ -357,6 +358,7 @@ function buildCodexCmd(opts: {
     ["CC_ROLE", opts.role ?? "worker"],
     ["CC_AGENT_ID", String(opts.agentId)],
     ["CC_TASK_ID", String(opts.taskId)],
+    ["CC_TASK_BRANCH", opts.branch ?? ""],
     ["CC_WORKSPACE_KIND", opts.workspaceKind],
     ["CC_PUBLICATION_MODE", opts.publicationMode ?? "agent"],
   ]
@@ -497,6 +499,12 @@ export function spawnWorker(
             taskId,
             provider,
             task.publication_mode,
+            task.branch &&
+              new RegExp(`^agent/task-${task.id}(?:-resume-\\d+)?$`).test(
+                task.branch,
+              )
+              ? task.branch
+              : undefined,
           );
     const { dir, branch } = workspace;
 
@@ -563,6 +571,7 @@ export function spawnWorker(
         ? buildCodexCmd({
             agentId: agent.id,
             taskId,
+            branch,
             model,
             reasoningEffort: reasoningEffort!,
             workspaceKind: task.workspace_kind,

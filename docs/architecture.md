@@ -37,7 +37,8 @@ pointing at `cc-mcp` with a `CC_ROLE` env var. The toolset is scoped by role
 - **Worker:** `get_my_task`, `update_my_task`, `report_blocked`.
 - **Reviewer:** `get_my_task`, `get_task_diff`, `submit_review`.
 - **Main (orchestrator):** the full set — `list_tasks`, `get_task`,
-  `list_repositories`, `update_task`, `claim_task`, `cancel_task`, `spawn_worker`, `spawn_reviewer`,
+  `list_repositories`, `update_task`, `claim_task`, `cancel_task`, `resume_task`,
+  `spawn_worker`, `spawn_reviewer`,
   `list_agents`, `peek_worker`, `send_to_worker`, `kill_worker`, `get_task_diff`,
   `confirm_human_publication`, `read_worker_transcript`, `escalate`,
   `recent_events`, `forget`.
@@ -239,6 +240,12 @@ live from tasks/agents/events on every request.
 - **Session resume** — respawning a task uses provider-aware `claude --resume`
   or `codex resume`, so requeued / rejected work keeps its context; outstanding
   review/PR feedback rides along in the resume message.
+- **Archived-task resume** — `resume_task` reopens a done/cancelled row in
+  place, clears attempt-local result/review/publication state, and preserves the
+  same-provider session/workspace/history. If its transcript has expired, the
+  archived result/review/PR context embedded in the revised prompt is the
+  fresh-session handoff. Terminal PRs rotate to `agent/task-N-resume-K` so a
+  follow-up cannot collide with the already-merged/closed remote branch.
 - **Optional Codex MCP inheritance** — `CC_CODEX_MCP_SOURCE_HOME` mirrors only
   explicit `mcp_servers` into the isolated Codex base config. Plugin-provided
   MCPs are flattened into transport entries instead of enabling the plugin or

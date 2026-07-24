@@ -449,6 +449,31 @@ if (ROLE === "main") {
   );
 
   server.registerTool(
+    "resume_task",
+    {
+      description:
+        "Reopen an archived done/cancelled task IN PLACE. Reuses the same task, provider session (when its transcript still exists), workspace/unfinished branch, and history; it does not create a duplicate. Completion/review state is safely reset. After this succeeds, inspect the returned task and spawn_worker for repo/scratch tasks.",
+      inputSchema: {
+        task_id: z.number().int().positive(),
+        instructions: z
+          .string()
+          .max(20_000)
+          .optional()
+          .describe("the human's changed or additional requirements"),
+      },
+    },
+    async ({ task_id, instructions }) =>
+      asText(
+        await call("POST", `/api/tasks/${task_id}/resume`, {
+          instructions,
+          agent_id: process.env.CC_AGENT_ID
+            ? Number(process.env.CC_AGENT_ID)
+            : undefined,
+        }),
+      ),
+  );
+
+  server.registerTool(
     "confirm_human_publication",
     {
       description:

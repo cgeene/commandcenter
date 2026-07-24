@@ -120,10 +120,21 @@ export function createWorktree(
   taskId: number,
   provider: AgentProvider = "claude",
   publicationMode: PublicationMode = "agent",
+  branchOverride?: string | null,
 ): { dir: string; branch: string } {
   const repoName = path.basename(repo);
-  const dir = path.join(resolveWorktreesDir(), `${repoName}-task-${taskId}`);
-  const branch = branchForTask(taskId);
+  const branch = branchOverride ?? branchForTask(taskId);
+  const standardBranch = branchForTask(taskId);
+  const attemptSuffix = branch === standardBranch
+    ? ""
+    : branch.match(new RegExp(`^agent/task-${taskId}(-resume-\\d+)$`))?.[1];
+  if (attemptSuffix === undefined) {
+    throw new Error(`invalid branch for task ${taskId}`);
+  }
+  const dir = path.join(
+    resolveWorktreesDir(),
+    `${repoName}-task-${taskId}${attemptSuffix}`,
+  );
 
   if (fs.existsSync(dir)) {
     if (publicationMode === "human") hardenTaskUpstream(dir, branch);

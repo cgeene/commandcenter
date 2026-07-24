@@ -353,6 +353,7 @@ export async function handleHookEvent(
                 : undefined;
               return codexPermissionDecision(body, {
                 taskId: policyTask ? String(policyTask.id) : undefined,
+                taskBranch: policyTask?.branch ?? undefined,
                 workspaceKind: policyTask?.workspace_kind,
                 publicationMode: policyTask?.publication_mode ?? "agent",
                 role: agent.kind === "reviewer" ? "reviewer" : "worker",
@@ -665,13 +666,15 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
   // Already in review AND already verified since work last resumed — an
   // extra Stop, e.g. after the human messaged the idle worker. Nothing to
   // re-run. Every review -> work transition logs a resume marker
-  // (task.reopened / task.requeued / agent.spawned), so a pass that predates
+  // (task.reopened / task.archived_resumed / task.requeued / agent.spawned),
+  // so a pass that predates
   // the latest one never suppresses a re-verify of the new work. Event ids
   // order reliably where same-second timestamps cannot.
   if (wasReview) {
     const pass = latestTaskEventId(task.id, ["verify.passed"]);
     const resumed = latestTaskEventId(task.id, [
       "task.reopened",
+      "task.archived_resumed",
       "task.requeued",
       "agent.spawned",
     ]);

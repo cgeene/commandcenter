@@ -179,7 +179,7 @@ export function writeCodexConfig(): CodexConfigFiles {
     // only Command Center operations appropriate to that worker. Approve its
     // tools directly so completing a task never stalls on its own result call.
     'default_tools_approval_mode = "approve"',
-    'env_vars = ["CC_ROLE", "CC_AGENT_ID", "CC_TASK_ID"]',
+    'env_vars = ["CC_ROLE", "CC_AGENT_ID", "CC_TASK_ID", "CC_TASK_BRANCH"]',
     "",
     "[mcp_servers.cc.env]",
     `CC_URL = ${tomlString(baseUrl())}`,
@@ -225,7 +225,7 @@ export function writeCodexConfig(): CodexConfigFiles {
     rulesFile,
     [
       "# Route every canonical push through PermissionRequest. The static hook",
-      "# then allows only the exact agent/task-N branch from CC_TASK_ID.",
+      "# then allows only the exact CC_TASK_BRANCH for this task.",
       "prefix_rule(",
       '    pattern = ["git", "push"],',
       '    decision = "prompt",',

@@ -90,6 +90,10 @@ import {
   spawnWorker,
 } from "./spawn.js";
 import { resumeAgent, submitPending } from "./resume.js";
+import {
+  resumeArchivedTask,
+  TaskResumeValidationError,
+} from "./taskresume.js";
 import { capturePane, clearInputLine, windowExists } from "./tmux.js";
 import { parsePane } from "./pane.js";
 import { AGENT_PROVIDERS } from "../providers.js";
@@ -180,6 +184,11 @@ const spawnSchema = z.object({
   model: z.string().optional(),
   reasoning_effort: reasoningEffortSchema.optional(),
   fresh: z.boolean().optional(),
+});
+
+const resumeTaskSchema = z.object({
+  instructions: z.string().trim().max(20_000).optional(),
+  agent_id: z.number().int().positive().optional(),
 });
 
 export function buildApp(): Hono {
@@ -540,6 +549,43 @@ export function buildApp(): Hono {
     return c.json(task);
   });
 
+  app.post("/api/tasks/:id/resume", async (c) => {
+    const id = Number(c.req.param("id"));
+    if (!Number.isSafeInteger(id) || id < 1) {
+      return c.json({ error: "invalid task id" }, 400);
+    }
+    if (!getTask(id)) return c.json({ error: "not found" }, 404);
+    const body = resumeTaskSchema.parse(await c.req.json().catch(() => ({})));
+    const result = await resumeArchivedTask(id, {
+      instructions: body.instructions,
+      actorAgentId: body.agent_id,
+    });
+    const actor = body.agent_id ? getAgent(body.agent_id) : undefined;
+
+    if (result.task.dispatch_mode === "orchestrated") {
+      if (actor?.kind === "main" && actor.state !== "dead") {
+        // Main invoked the resume tool and is already holding the task. Mark
+        // this queue generation as delivered so the idle retry cannot inject
+        // a duplicate triage message into the same main session.
+        logEvent("task.delegated_to_main", {
+          taskId: result.task.id,
+          agentId: actor.id,
+          payload: {
+            workspace_kind: result.task.workspace_kind,
+            reason: "main initiated archived-task resume",
+          },
+        });
+      } else {
+        try {
+          await delegateTaskToMain(result.task.id);
+        } catch {
+          logEvent("task.awaiting_main", { taskId: result.task.id });
+        }
+      }
+    }
+    return c.json(result);
+  });
+
   app.post("/api/tasks/:id/delegate", async (c) => {
     const id = Number(c.req.param("id"));
     const task = getTask(id);
@@ -785,12 +831,20 @@ export function buildApp(): Hono {
     const taskIdEnv = agent.task_id
       ? ` CC_TASK_ID=${quote(String(agent.task_id))}`
       : "";
+    const sessionTask = agent.task_id ? getTask(agent.task_id) : undefined;
     const command =
       agent.provider === "codex"
         ? [
             `CC_URL=${quote(baseUrl())}`,
             `CC_ROLE=${quote(agent.kind)}`,
             `CC_AGENT_ID=${quote(String(agent.id))}${taskIdEnv}`,
+            ...(sessionTask
+              ? [
+                  `CC_TASK_BRANCH=${quote(sessionTask.branch ?? "")}`,
+                  `CC_WORKSPACE_KIND=${quote(sessionTask.workspace_kind)}`,
+                  `CC_PUBLICATION_MODE=${quote(sessionTask.publication_mode)}`,
+                ]
+              : []),
             `CODEX_HOME=${quote(codexHome())}`,
             quote(codexBin()),
             "--profile",
@@ -1464,6 +1518,9 @@ export function buildApp(): Hono {
       return c.json({ error: err.message }, 400);
     }
     if (err instanceof PublicationValidationError) {
+      return c.json({ error: err.message }, 409);
+    }
+    if (err instanceof TaskResumeValidationError) {
       return c.json({ error: err.message }, 409);
     }
     // Do not expose stack traces, local paths, command output, or provider

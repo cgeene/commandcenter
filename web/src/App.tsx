@@ -2814,7 +2814,7 @@ function TaskPanel({
               ✓ Mark Done
             </button>
           )}
-          {["blocked", "review", "failed", "cancelled"].includes(task.status) && (
+          {["blocked", "review", "failed"].includes(task.status) && (
             <button
               onClick={() =>
                 onAction(() =>
@@ -2823,6 +2823,25 @@ function TaskPanel({
               }
             >
               ↺ Requeue
+            </button>
+          )}
+          {isArchived(task.status) && (
+            <button
+              className="primary"
+              onClick={() => {
+                const instructions = window.prompt(
+                  `Resume task #${task.id}?\n\nAdd changed requirements, or leave this blank to continue from the archived result.${task.dispatch_mode === "orchestrated" ? " Claude main will triage it before the worker resumes." : ""}`,
+                  "",
+                );
+                if (instructions === null) return;
+                void onAction(() =>
+                  api("POST", `/api/tasks/${task.id}/resume`, {
+                    ...(instructions.trim() ? { instructions: instructions.trim() } : {}),
+                  }),
+                );
+              }}
+            >
+              ↺ Resume Task
             </button>
           )}
           {!["done", "cancelled"].includes(task.status) && (

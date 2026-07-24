@@ -252,7 +252,7 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
         /* leave it for manual cleanup */
       }
     }
-    if (task.branch && /^agent\/task-\d+$/.test(task.branch)) {
+    if (task.branch && /^agent\/task-\d+(?:-resume-\d+)?$/.test(task.branch)) {
       try {
         git(task.repo, "branch", "-D", task.branch);
       } catch {

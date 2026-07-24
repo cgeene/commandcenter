@@ -110,6 +110,23 @@ describe("createWorktree", () => {
     );
   });
 
+  it("creates a resumed attempt on its rotated task branch and worktree path", async () => {
+    const { remoteDir } = setupRemote();
+    const mainRepo = cloneRepo(remoteDir, "main-checkout");
+    const { createWorktree, git: worktreeGit } = await import(
+      "../src/daemon/worktree.js"
+    );
+
+    const branch = "agent/task-203-resume-2";
+    const resumed = createWorktree(mainRepo, 203, "codex", "agent", branch);
+
+    expect(resumed.branch).toBe(branch);
+    expect(resumed.dir).toContain("main-checkout-task-203-resume-2");
+    expect(worktreeGit(resumed.dir, "branch", "--show-current").trim()).toBe(
+      branch,
+    );
+  });
+
   it("hardens upstream only for opt-in human publication tasks", async () => {
     const { remoteDir } = setupRemote();
     const mainRepo = cloneRepo(remoteDir, "main-checkout");
