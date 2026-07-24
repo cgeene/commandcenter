@@ -13,6 +13,7 @@ export interface CodexPermissionDecision {
 
 export interface CodexPolicyContext {
   taskId?: string;
+  taskBranch?: string;
   workspaceKind?: "repo" | "portfolio" | "scratch";
   publicationMode?: PublicationMode;
 }
@@ -275,14 +276,18 @@ function substitutions(command: string): string[] {
   return found;
 }
 
-function exactOwnPush(invocation: GitInvocation, taskId: string): boolean {
+function exactOwnPush(
+  invocation: GitInvocation,
+  taskId: string,
+  taskBranch?: string,
+): boolean {
   if (invocation.verb !== "push") return false;
   const args = invocation.argv.slice(invocation.verbIndex + 1);
   if (args[0] === "-u" || args[0] === "--set-upstream") args.shift();
   return (
     args.length === 2 &&
     args[0] === "origin" &&
-    args[1] === `agent/task-${taskId}`
+    args[1] === (taskBranch || `agent/task-${taskId}`)
   );
 }
 
@@ -332,7 +337,7 @@ function bashDecision(
       if (
         context.workspaceKind === "repo" &&
         context.taskId &&
-        exactOwnPush(git, context.taskId) &&
+        exactOwnPush(git, context.taskId, context.taskBranch) &&
         depth === 0 &&
         segments.length === 1 &&
         nestedSubstitutions.length === 0
@@ -382,8 +387,10 @@ function legacyAgentDecision(
   if (typeof command !== "string" || !taskId || !/^\d+$/.test(taskId)) {
     return undefined;
   }
+  const ownBranch = context.taskBranch || `agent/task-${taskId}`;
+  const escapedBranch = ownBranch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const ownPush = new RegExp(
-    `^\\s*git\\s+push\\s+(?:-u\\s+)?origin\\s+agent/task-${taskId}\\s*$`,
+    `^\\s*git\\s+push\\s+(?:-u\\s+)?origin\\s+${escapedBranch}\\s*$`,
   );
   if (context.workspaceKind === "repo" && ownPush.test(command)) {
     return { behavior: "allow" };
