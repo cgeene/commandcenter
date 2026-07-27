@@ -155,6 +155,25 @@ export function jiraToken(): string | undefined {
   return process.env.CC_JIRA_TOKEN;
 }
 
+/** Anthropic Admin API key (`sk-ant-admin01-...`) for the org cost report.
+ *  Env-only and never persisted or logged — same contract as CC_JIRA_TOKEN.
+ *  Unset ⇒ the org-billing poller stays inert. */
+export function anthropicAdminKey(): string | undefined {
+  return process.env.CC_ANTHROPIC_ADMIN_KEY?.trim() || undefined;
+}
+
+/** Kill switch for the live Claude-usage poller, which reads the OAuth token
+ *  Claude Code already keeps on this machine. Set CC_LIVE_USAGE=0 to opt out. */
+export function liveUsageEnabled(): boolean {
+  return (process.env.CC_LIVE_USAGE?.trim() ?? "1") !== "0";
+}
+
+/** Directory holding Claude Code's own state, including the Linux/WSL
+ *  credentials file. Overridable so tests never touch the real one. */
+export function claudeHomeDir(): string {
+  return process.env.CC_CLAUDE_HOME?.trim() || path.join(os.homedir(), ".claude");
+}
+
 export function claudeProjectsDir(): string {
   return (
     process.env.CC_CLAUDE_PROJECTS ??

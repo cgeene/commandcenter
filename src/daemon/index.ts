@@ -12,7 +12,9 @@ import {
 import { getDb } from "../db/db.js";
 import { migrateDocsToFrontmatter } from "../db/docs.js";
 import { buildApp } from "./api.js";
+import { startCostSync } from "./costsync.js";
 import { startJiraSync } from "./jirasync.js";
+import { startLiveUsageSync } from "./usagelive.js";
 import { startPrSync } from "./prsync.js";
 import { startScheduler } from "./scheduler.js";
 import { registerStatic } from "./static.js";
@@ -88,6 +90,11 @@ startPrSync();
 // JIRA sync: inert unless CC_JIRA_TOKEN is set AND the master switch is on
 // (per-repo opt-in on top). Fail-closed — a token-less install logs one line.
 startJiraSync();
+// Spend telemetry, both optional and both fail-soft: the live Claude usage
+// feed (reads the OAuth token Claude Code already maintains here) and, only
+// with CC_ANTHROPIC_ADMIN_KEY, the org billing cost report.
+startLiveUsageSync();
+startCostSync();
 
 // Live terminal: /ws/term/<agentId> bridges xterm.js <-> tmux via a PTY.
 const wss = new WebSocketServer({ noServer: true });

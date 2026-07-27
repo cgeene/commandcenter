@@ -4,6 +4,7 @@ import path from "node:path";
 import { z } from "zod";
 import {
   baseUrl,
+  anthropicAdminKey,
   claudeBin,
   codexBin,
   codexHome,
@@ -55,12 +56,24 @@ import {
   resolveWorkerPublicationMode,
   resolveWorkerProvider,
   resolveWorktreesDir,
+  getQuotaSettings,
+  getOrgCostCache,
   setAgentSettings,
   setJiraConfig,
   setNotificationSettings,
+  setQuotaSettings,
   setSchedulerConfig,
   setWorkspaceSettings,
 } from "../db/settings.js";
+import {
+  allBuckets,
+  dayBuckets,
+  earliestTrackedDay,
+  summarizeByDay,
+  summarizeByModel,
+} from "../db/tokens.js";
+import { cycleWindow, daysInWindow } from "../lib/pricing.js";
+import { getLiveUsage, refreshLiveUsage } from "./usagelive.js";
 import { dismissAttention } from "../db/attention.js";
 import {
   claimTask,
@@ -1357,6 +1370,14 @@ export function buildApp(): Hono {
       .optional(),
   });
 
+  const quotaSettingsPatchSchema = z.object({
+    // Positive dollars, or null to clear the budget line entirely.
+    monthly_quota_usd: z.number().positive().max(1_000_000).nullable().optional(),
+    // 1-28 so every month has the day. Larger values are pinned to the month's
+    // last day downstream, but the UI shouldn't offer them.
+    cycle_reset_day: z.number().int().min(1).max(28).optional(),
+  });
+
   app.get("/api/settings", (c) => {
     const agents = getAgentSettings();
     const workspace = getWorkspaceSettings();
@@ -1397,9 +1418,22 @@ export function buildApp(): Hono {
         base_url: jiraBaseUrl(),
         email: jiraEmail() ?? null,
       },
+      quota: {
+        stored: getQuotaSettings(),
+        // Presence only — the admin key itself never crosses the boundary,
+        // mirroring how jira.token_set is derived from CC_JIRA_TOKEN.
+        admin_key_set: Boolean(anthropicAdminKey()),
+      },
       model_choices: CLAUDE_MODEL_SLUGS,
       provider_choices: AGENT_PROVIDERS,
     });
+  });
+
+  app.patch("/api/settings/quota", async (c) => {
+    const patch = quotaSettingsPatchSchema.parse(await c.req.json());
+    const quota = setQuotaSettings(patch);
+    logEvent("settings.config", { payload: { group: "quota", patch } });
+    return c.json({ quota });
   });
 
   app.patch("/api/settings/agents", async (c) => {
@@ -1455,6 +1489,67 @@ export function buildApp(): Hono {
         email: jiraEmail() ?? null,
       },
     });
+  });
+
+  /**
+   * Everything the spend widgets need, in one poll-friendly payload.
+   *
+   * Three sources, in descending order of truth, all returned together so the
+   * dashboard can label its provenance instead of silently mixing them:
+   *
+   *   live  — Claude's own usage feed (matches the claude.ai usage page, and
+   *           includes work done outside commandcenter). The headline.
+   *   org   — Admin API billing dollars, when an admin key is configured.
+   *   local — the transcript-derived estimate. Always present; it's the only
+   *           source that can break burn down per day, model, and task.
+   */
+  function burnPayload() {
+    const quota = getQuotaSettings();
+    const now = new Date();
+    const cycle = cycleWindow(now, quota.cycle_reset_day);
+    const cycleBuckets = dayBuckets(cycle.start, cycle.end);
+    const cycleDays = summarizeByDay(cycleBuckets);
+    const byDay = new Map(cycleDays.map((d) => [d.day, d]));
+    const all = allBuckets();
+    const allDays = summarizeByDay(all);
+
+    return {
+      live: getLiveUsage(),
+      org: getOrgCostCache(),
+      local: {
+        cycle: {
+          ...cycle,
+          // Zero-spend days included so the chart shows real gaps rather than
+          // compressing a quiet week into a dense-looking bar run.
+          days: daysInWindow(cycle.start, cycle.end).map(
+            (day) =>
+              byDay.get(day) ?? { day, tokens: 0, cost_usd: 0, unpriced_tokens: 0 },
+          ),
+          cost_usd: cycleDays.reduce((s, d) => s + d.cost_usd, 0),
+          tokens: cycleDays.reduce((s, d) => s + d.tokens, 0),
+          by_model: summarizeByModel(cycleBuckets),
+        },
+        all_time: {
+          days: allDays,
+          cost_usd: allDays.reduce((s, d) => s + d.cost_usd, 0),
+          tokens: allDays.reduce((s, d) => s + d.tokens, 0),
+          by_model: summarizeByModel(all),
+        },
+        // Null until the first Stop hook lands. The UI uses it to say "tracked
+        // since X" so a cycle that predates this feature isn't read as $0 spent.
+        tracked_since: earliestTrackedDay(),
+      },
+      quota: { monthly_quota_usd: quota.monthly_quota_usd, cycle_reset_day: quota.cycle_reset_day },
+    };
+  }
+
+  app.get("/api/usage", (c) => c.json(burnPayload()));
+
+  /** Manual "refresh now" behind the dashboard button — the poller is hourly,
+   *  and after a big run the operator wants the number immediately. */
+  app.post("/api/usage/refresh", async (c) => {
+    await refreshLiveUsage();
+    return c.json(burnPayload());
   });
 
   app.get("/api/transcript/:sessionId", async (c) => {

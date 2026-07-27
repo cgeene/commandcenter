@@ -321,6 +321,50 @@ export function sessionTokens(sessionId: string): SessionTokens | undefined {
   return t;
 }
 
+/**
+ * Same walk as sessionTokens, but split by the model that served each turn.
+ * The per-day burn table prices each model separately, and a single session
+ * routinely spans models (a /model switch, or a subagent on a cheaper tier),
+ * so a lumped total can't be costed. Turns with no model recorded land under
+ * `fallbackModel` — the agent's configured model, our best available guess.
+ */
+export function sessionTokensByModel(
+  sessionId: string,
+  fallbackModel: string,
+): Map<string, SessionTokens> {
+  const out = new Map<string, SessionTokens>();
+  const file = findTranscript(sessionId);
+  if (!file) return out;
+
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    if (!line.includes('"usage"')) continue;
+    let row: { type?: string; message?: { model?: unknown; usage?: Record<string, unknown> } };
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (row.type !== "assistant") continue;
+    const u = row.message?.usage;
+    if (!u) continue;
+    const model =
+      typeof row.message?.model === "string" && row.message.model
+        ? row.message.model
+        : fallbackModel;
+    const t =
+      out.get(model) ??
+      { input: 0, output: 0, cache_read: 0, cache_creation: 0, total: 0 };
+    const n = (k: string) => (typeof u[k] === "number" ? (u[k] as number) : 0);
+    t.input += n("input_tokens");
+    t.output += n("output_tokens");
+    t.cache_read += n("cache_read_input_tokens");
+    t.cache_creation += n("cache_creation_input_tokens");
+    t.total = t.input + t.output + t.cache_read + t.cache_creation;
+    out.set(model, t);
+  }
+  return out;
+}
+
 function codexSessionTokens(file: string): SessionTokens {
   let latest: SessionTokens = {
     input: 0,
@@ -368,4 +412,20 @@ export function providerSessionTokens(
   if (provider === "claude") return sessionTokens(sessionId);
   const file = findCodexTranscript(sessionId, transcriptPath);
   return file ? codexSessionTokens(file) : undefined;
+}
+
+/** Per-model cumulative totals for a session, whichever provider ran it.
+ *  Codex transcripts record only a running whole-session total with no model
+ *  on it, so those collapse into a single `fallbackModel` bucket. */
+export function providerSessionTokensByModel(
+  provider: AgentProvider,
+  sessionId: string,
+  fallbackModel: string,
+  transcriptPath?: string | null,
+): Map<string, SessionTokens> {
+  if (provider === "claude") return sessionTokensByModel(sessionId, fallbackModel);
+  const file = findCodexTranscript(sessionId, transcriptPath);
+  if (!file) return new Map();
+  const t = codexSessionTokens(file);
+  return t.total > 0 ? new Map([[fallbackModel, t]]) : new Map();
 }
