@@ -222,6 +222,28 @@ calls `submit_review(approve|reject, notes)`:
 The main agent also gets `get_task_diff` and `read_worker_transcript`, so it can
 proof workers with evidence rather than terminal peeks.
 
+### Review depth: `review_mode`
+
+Each task carries a `review_mode` — `full` (the default) or `light` — chosen by
+the orchestrator when the task is created or triaged, never inferred from the
+diff. A `light` review still spawns a real reviewer with the same verdict
+contract, but its prompt scopes it to reading the diff and checking the worker's
+claims against it: no independently re-running the worker's infrastructure
+verification, one pass, and low reasoning effort on a Codex reviewer. It is only
+for documentation, threshold, and runbook changes — never for code logic or
+anything that mutates production. A light reviewer that finds the diff outside
+that envelope is told to reject it as mis-classified rather than quietly
+escalating its own depth.
+
+### Re-review after a superseded verdict
+
+A push past the reviewed commit supersedes the verdict, and the next round is
+scoped to the delta: the reviewer gets the previous verdict, its notes, and the
+diff since the commit it judged, and re-verifies only what the delta touches or
+invalidates. If that commit is no longer an ancestor of the branch tip (a rebase
+or force-push rewrote it), nothing can be carried forward — the round falls back
+to a full re-review and logs `review.delta_unavailable`.
+
 ## The web dashboard
 
 A React SPA (`web/`) built by Vite and served by the daemon at
