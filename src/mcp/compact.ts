@@ -54,6 +54,13 @@ export const TASK_ROW_FIELDS = [
   "updated_at",
 ] as const;
 
+/**
+ * Human-publication state. Deliberately NOT in the compact core (most tasks are
+ * agent-published and never look at it) — confirm_human_publication appends it
+ * because it is the field that call changes.
+ */
+export const PUBLICATION_FIELDS = ["publication_mode", "publication_state"] as const;
+
 export interface ShapeOptions {
   /** Return the untouched record (previous behavior). */
   verbose?: boolean;
@@ -81,10 +88,13 @@ export function truncateSummary(value: unknown): unknown {
   return value.slice(0, RESULT_SUMMARY_LIMIT) + TRUNCATION_MARKER;
 }
 
-/** Default single-task shape: core fields only, result_summary truncated. */
-export function compactTask(task: unknown): unknown {
+/**
+ * Default single-task shape: core fields only, result_summary truncated.
+ * `extraFields` lets a mutation echo the specific column it just changed.
+ */
+export function compactTask(task: unknown, extraFields: readonly string[] = []): unknown {
   if (!isRecord(task)) return task;
-  const out = pick(task, COMPACT_TASK_FIELDS);
+  const out = pick(task, [...COMPACT_TASK_FIELDS, ...extraFields]);
   if ("result_summary" in out) out.result_summary = truncateSummary(out.result_summary);
   return out;
 }

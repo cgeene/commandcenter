@@ -8,6 +8,9 @@ commandcenter has two kinds of configuration:
 2. **Scheduler config** — a JSON blob in the SQLite `settings` table, edited via
    `agp scheduler set …` or the dashboard (defaults in
    [`src/db/settings.ts`](../src/db/settings.ts)).
+3. **Local agent defaults** — stored in the SQLite `settings` table and edited
+   in the dashboard settings. These are machine-local choices, not repository
+   configuration.
 
 ## Environment variables
 
@@ -46,8 +49,9 @@ commandcenter has two kinds of configuration:
 - `mcp/` — generated per-agent `--mcp-config` JSON
 - `main-workspace/` — empty least-privilege cwd for the Claude main agent
 - `codex/` — isolated Codex profile, hooks, login/trust state, and sessions
-- `codex/rules/commandcenter.rules` — push/merge policy that routes pushes
-  through branch validation and keeps merges human-only
+- `codex/rules/commandcenter.rules` — publication policy that validates the
+  task branch in Agent publishes mode and denies agent publication in Human
+  publishes mode
 
 Run `agp codex setup` after building, complete the printed isolated `codex
 login`, inspect and trust the static hooks with `/hooks`, then run `agp codex
@@ -60,6 +64,17 @@ roots. Explicit interactive task paths outside the canonical allow-list are
 rejected. If the variable is unset, legacy API/cron behavior remains available,
 the dashboard falls back to its absolute-path repository field, and portfolio
 tasks remain unavailable until a root is configured.
+
+## Local agent defaults
+
+| Setting | Default | Meaning |
+|---|---|---|
+| Worker publication | Agent publishes | `Agent publishes` preserves the existing worker commit/push/draft-PR workflow. `Human publishes` makes repository workers leave changes uncommitted, runs the independent reviewer against a pinned full-tree snapshot, and asks the human to commit/push/create the PR only after approval. |
+
+The selected value is snapshotted onto each task at creation time. Changing it
+does not rewrite queued, active, archived, or resumed tasks. The setting lives
+only in `$CC_DATA_DIR/state.db`; it is not committed to a repository and does
+not affect another installation.
 
 ## Scheduler config
 

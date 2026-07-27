@@ -474,7 +474,9 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
         task &&
         task.status === "review" &&
         task.review_verdict === "approve" &&
-        (!task.open_pr || task.pr_is_draft === 0) &&
+        (task.publication_state === "awaiting_human" ||
+          !task.open_pr ||
+          task.pr_is_draft === 0) &&
         agent.state === "idle";
       if (task && (terminal || approvedAwaitingMerge)) {
         const last = Date.parse(agent.last_event_at ?? agent.spawned_at);

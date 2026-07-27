@@ -13,6 +13,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { REASONING_EFFORTS } from "../reasoning.js";
 import {
+  PUBLICATION_FIELDS,
   compactTask,
   shapeTask,
   shapeTaskList,
@@ -475,11 +476,50 @@ if (ROLE === "main") {
           .boolean()
           .optional()
           .describe("also remove the task's worktree (uncommitted work is lost; the branch survives)"),
+        discard_unpublished: z
+          .boolean()
+          .optional()
+          .describe(
+            "required with rm_worktree to intentionally destroy reviewer-approved Human-publishes work",
+          ),
       },
     },
-    async ({ task_id, rm_worktree }) =>
+    async ({ task_id, rm_worktree, discard_unpublished }) =>
       asText(
-        shapeTaskPayload(await call("POST", `/api/tasks/${task_id}/cancel`, { rm_worktree })),
+        shapeTaskPayload(
+          await call("POST", `/api/tasks/${task_id}/cancel`, {
+            rm_worktree,
+            discard_unpublished,
+          }),
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "confirm_human_publication",
+    {
+      description:
+        "After the human reviews, commits, and publishes a Human-publishes task, verify that the committed tree exactly matches the reviewer-approved snapshot, mark its PR ready, and record it. This never commits, pushes, or creates a PR. Returns the compact task record plus publication_mode/publication_state.",
+      inputSchema: {
+        task_id: z.number().int().positive(),
+        pr_url: z
+          .string()
+          .url()
+          .max(2048)
+          .optional()
+          .describe("required when the task expects a pull request"),
+      },
+    },
+    async ({ task_id, pr_url }) =>
+      asText(
+        // publication_* is omitted from the compact core, but it IS what this
+        // call changes — echo it so the caller can see the new state.
+        compactTask(
+          await call("POST", `/api/tasks/${task_id}/publication`, {
+            ...(pr_url ? { pr_url } : {}),
+          }),
+          PUBLICATION_FIELDS,
+        ),
       ),
   );
 

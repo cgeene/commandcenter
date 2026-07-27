@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   COMPACT_TASK_FIELDS,
+  PUBLICATION_FIELDS,
   RESULT_SUMMARY_LIMIT,
   TASK_ROW_FIELDS,
   TRUNCATION_MARKER,
@@ -88,6 +89,10 @@ function fullTask(over: Partial<FakeTask> = {}): FakeTask {
     jira_project: "EN",
     open_pr: 1,
     auto_review: 1,
+    publication_mode: "human",
+    publication_state: "published",
+    review_snapshot_base: "1111111",
+    review_snapshot_tree: "2222222",
     tokens_used: 120_000,
     cron_id: null,
     created_at: "2026-07-27T09:00:00.000Z",
@@ -109,6 +114,10 @@ const OMITTED_BY_DEFAULT = [
   "jira_project",
   "worktree",
   "session_id",
+  "publication_mode",
+  "publication_state",
+  "review_snapshot_base",
+  "review_snapshot_tree",
 ];
 
 describe("task projections", () => {
@@ -134,6 +143,13 @@ describe("task projections", () => {
     expect(truncateSummary("x".repeat(RESULT_SUMMARY_LIMIT))).toHaveLength(RESULT_SUMMARY_LIMIT);
     expect(truncateSummary(null)).toBeNull();
     expect((compactTask(fullTask({ result_summary: null })) as Record<string, unknown>).result_summary).toBeNull();
+  });
+
+  it("compactTask appends explicitly requested extra fields", () => {
+    const out = compactTask(fullTask(), PUBLICATION_FIELDS) as Record<string, unknown>;
+    expect(Object.keys(out)).toEqual([...COMPACT_TASK_FIELDS, ...PUBLICATION_FIELDS]);
+    expect(out.publication_state).toBe("published");
+    expect(out).not.toHaveProperty("review_snapshot_tree");
   });
 
   it("is an allow-list: a column added later stays out until listed", () => {
@@ -287,6 +303,11 @@ describe("main-role tools", () => {
       "id",
       "prompt",
     ]);
+    // the escape hatch for anything left out of the compact core
+    expect(await callTool("get_task", { id: 42, fields: ["publication_mode"] })).toEqual({
+      id: 42,
+      publication_mode: "human",
+    });
   });
 
   it("list_tasks returns minimal rows by default and full records when verbose", async () => {
@@ -358,6 +379,18 @@ describe("main-role tools", () => {
     const out = await callTool("spawn_reviewer", { task_id: 42 });
     expect(out.agent).toEqual(agent);
     expect(Object.keys(out.task)).toEqual([...COMPACT_TASK_FIELDS]);
+  });
+
+  it("cancel_task forwards discard_unpublished", async () => {
+    respond = () => ({ task: fullTask(), killed_agents: [], open_dependents: [] });
+    await callTool("cancel_task", { task_id: 42, rm_worktree: true, discard_unpublished: true });
+    expect(fetchCalls.at(-1)?.body).toEqual({ rm_worktree: true, discard_unpublished: true });
+  });
+
+  it("confirm_human_publication echoes the compact record plus the publication state", async () => {
+    const out = await callTool("confirm_human_publication", { task_id: 42 });
+    expect(Object.keys(out)).toEqual([...COMPACT_TASK_FIELDS, ...PUBLICATION_FIELDS]);
+    expect(out).not.toHaveProperty("review_snapshot_tree");
   });
 
   it("advertises verbose and fields on the read tools", () => {

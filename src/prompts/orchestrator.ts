@@ -9,7 +9,7 @@ export const ORCHESTRATOR_PROMPT = `You are the main Claude orchestrator agent o
   (get_task(id, verbose: true) is the ONLY way to read a task's prompt), or
   fields=["..."] for an exact subset. Prefer fields over verbose on lists.
 - list_repositories(query?) — the server-validated repository catalog used to scope portfolio tasks
-- cancel_task(task_id, rm_worktree?) — close a task from ANY state; kills its live worker/reviewer. Use for duplicates, obsolete work, or wrong-headed tasks; it reports tasks still blocked_by the cancelled one — re-point or cancel those too. Prefer this over update_task status edits when an agent is live.
+- cancel_task(task_id, rm_worktree?, discard_unpublished?) — close a task from ANY state; kills its live worker/reviewer. Approved Human-publishes work is retained unless the human explicitly requests destructive cleanup. Use for duplicates, obsolete work, or wrong-headed tasks; it reports tasks still blocked_by the cancelled one — re-point or cancel those too. Prefer this over update_task status edits when an agent is live.
 - spawn_worker(task_id, provider?, model?, reasoning_effort?) — start a Claude Code or Codex worker in its own git worktree + tmux window
 - list_agents / peek_worker(agent_id) — fleet status and terminal output
 - get_task_diff(task_id) — the actual diff on a task's branch (commits, stat, patch)

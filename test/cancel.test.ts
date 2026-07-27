@@ -111,4 +111,148 @@ describe("cancelTask", () => {
     expect(getTask(task.id)?.status).toBe("cancelled");
     expect(listEvents(20).map((e) => e.kind)).not.toContain("verify.passed");
   });
+
+  it("retains an approved unpublished snapshot when cancelling without cleanup", async () => {
+    const { cancelTask } = await import("../src/daemon/spawn.js");
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const task = createTask({
+      title: "approved human work",
+      prompt: "x",
+      repo: "/repo",
+      publication_mode: "human",
+    });
+    updateTask(task.id, {
+      status: "review",
+      worktree: "/retained/worktree",
+      branch: `agent/task-${task.id}`,
+      review_verdict: "approve",
+      publication_state: "awaiting_human",
+      review_snapshot_base: "a".repeat(40),
+      review_snapshot_tree: "b".repeat(40),
+    });
+
+    const result = cancelTask(task.id);
+
+    expect(result.task).toMatchObject({
+      status: "cancelled",
+      worktree: "/retained/worktree",
+      review_snapshot_base: "a".repeat(40),
+      review_snapshot_tree: "b".repeat(40),
+    });
+    expect(getTask(task.id)?.publication_state).toBe("awaiting_human");
+  });
+
+  it("refuses destructive cleanup of approved unpublished work without explicit discard", async () => {
+    const { cancelTask, TaskCancellationValidationError } = await import(
+      "../src/daemon/spawn.js"
+    );
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const task = createTask({
+      title: "approved human work",
+      prompt: "x",
+      repo: "/repo",
+      publication_mode: "human",
+    });
+    updateTask(task.id, {
+      status: "review",
+      worktree: "/sole/copy",
+      branch: `agent/task-${task.id}`,
+      review_verdict: "approve",
+      publication_state: "awaiting_human",
+      review_snapshot_base: "a".repeat(40),
+      review_snapshot_tree: "b".repeat(40),
+    });
+
+    expect(() => cancelTask(task.id, { rmWorktree: true })).toThrow(
+      TaskCancellationValidationError,
+    );
+    expect(getTask(task.id)).toMatchObject({
+      status: "review",
+      worktree: "/sole/copy",
+      review_snapshot_tree: "b".repeat(40),
+    });
+  });
+
+  it("requires worktree cleanup when explicitly discarding unpublished work", async () => {
+    const { cancelTask, TaskCancellationValidationError } = await import(
+      "../src/daemon/spawn.js"
+    );
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({
+      title: "approved human work",
+      prompt: "x",
+      repo: "/repo",
+      publication_mode: "human",
+    });
+
+    expect(() =>
+      cancelTask(task.id, { discardUnpublished: true }),
+    ).toThrow(TaskCancellationValidationError);
+  });
+
+  it("discards approved unpublished state only when explicitly requested with cleanup", async () => {
+    const { cancelTask } = await import("../src/daemon/spawn.js");
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const task = createTask({
+      title: "discard approved human work",
+      prompt: "x",
+      repo: "/repo",
+      publication_mode: "human",
+    });
+    updateTask(task.id, {
+      status: "review",
+      review_verdict: "approve",
+      publication_state: "awaiting_human",
+      review_snapshot_base: "a".repeat(40),
+      review_snapshot_tree: "b".repeat(40),
+    });
+
+    const result = cancelTask(task.id, {
+      rmWorktree: true,
+      discardUnpublished: true,
+    });
+
+    expect(result.task).toMatchObject({
+      status: "cancelled",
+      worktree: null,
+      review_snapshot_base: null,
+      review_snapshot_tree: null,
+    });
+  });
+
+  it("returns 409 before destructive API cleanup without explicit discard", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const task = createTask({
+      title: "protected through API",
+      prompt: "x",
+      repo: "/repo",
+      publication_mode: "human",
+    });
+    updateTask(task.id, {
+      status: "review",
+      worktree: "/sole/copy",
+      review_verdict: "approve",
+      publication_state: "awaiting_human",
+      review_snapshot_base: "a".repeat(40),
+      review_snapshot_tree: "b".repeat(40),
+    });
+
+    const response = await buildApp().request(`/api/tasks/${task.id}/cancel`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ rm_worktree: true }),
+    });
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({
+      error:
+        "approved unpublished work would be lost; cancel without removing the worktree, or explicitly discard unpublished work",
+    });
+    expect(getTask(task.id)).toMatchObject({
+      status: "review",
+      worktree: "/sole/copy",
+      review_snapshot_tree: "b".repeat(40),
+    });
+  });
 });

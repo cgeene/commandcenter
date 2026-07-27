@@ -74,6 +74,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   jira_project   TEXT,
   open_pr        INTEGER NOT NULL DEFAULT 1,
   auto_review    INTEGER NOT NULL DEFAULT 1,
+  publication_mode TEXT NOT NULL DEFAULT 'agent',
+  publication_state TEXT,
+  review_snapshot_base TEXT,
+  review_snapshot_tree TEXT,
   tokens_used    INTEGER,
   created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -249,6 +253,18 @@ function migrate(db: Database.Database): void {
   }
   if (!cols.includes("auto_review")) {
     db.exec("ALTER TABLE tasks ADD COLUMN auto_review INTEGER NOT NULL DEFAULT 1");
+  }
+  if (!cols.includes("publication_mode")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN publication_mode TEXT NOT NULL DEFAULT 'agent'");
+  }
+  if (!cols.includes("publication_state")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN publication_state TEXT");
+  }
+  if (!cols.includes("review_snapshot_base")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN review_snapshot_base TEXT");
+  }
+  if (!cols.includes("review_snapshot_tree")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN review_snapshot_tree TEXT");
   }
   if (!cols.includes("pr_state")) {
     db.exec("ALTER TABLE tasks ADD COLUMN pr_state TEXT");
