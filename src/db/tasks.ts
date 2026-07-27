@@ -4,6 +4,13 @@ import {
   reasoningEffortForProvider,
   type ReasoningEffort,
 } from "../reasoning.js";
+import {
+  isPublicationMode,
+  isPublicationState,
+  type PublicationMode,
+  type PublicationState,
+} from "../publication.js";
+import { resolveWorkerPublicationMode } from "./settings.js";
 
 export const WORKSPACE_KINDS = ["repo", "portfolio", "scratch"] as const;
 export type WorkspaceKind = (typeof WORKSPACE_KINDS)[number];
@@ -52,6 +59,10 @@ export interface Task {
   jira_project: string | null; // resolved (or per-task override) JIRA project key
   open_pr: number; // sqlite boolean, default 1
   auto_review: number; // sqlite boolean, default 1; 0 = skip the adversarial reviewer
+  publication_mode: PublicationMode;
+  publication_state: PublicationState | null;
+  review_snapshot_base: string | null;
+  review_snapshot_tree: string | null;
   tokens_used: number | null;
   cron_id: number | null;
   created_at: string;
@@ -74,15 +85,18 @@ export interface NewTask {
   cron_id?: number;
   open_pr?: boolean;
   auto_review?: boolean;
+  publication_mode?: PublicationMode;
 }
 
 export function createTask(t: NewTask): Task {
   const db = getDb();
   const workerProvider = parseAgentProvider(t.worker_provider, "claude");
+  const publicationMode =
+    t.publication_mode ?? resolveWorkerPublicationMode();
   const info = db
     .prepare(
-      `INSERT INTO tasks (title, prompt, repo, workspace_kind, dispatch_mode, parent_task_id, priority, worker_provider, model, reasoning_effort, blocked_by, verify_cmd, cron_id, open_pr, auto_review)
-       VALUES (@title, @prompt, @repo, @workspace_kind, @dispatch_mode, @parent_task_id, @priority, @worker_provider, @model, @reasoning_effort, @blocked_by, @verify_cmd, @cron_id, @open_pr, @auto_review)`,
+      `INSERT INTO tasks (title, prompt, repo, workspace_kind, dispatch_mode, parent_task_id, priority, worker_provider, model, reasoning_effort, blocked_by, verify_cmd, cron_id, open_pr, auto_review, publication_mode, publication_state)
+       VALUES (@title, @prompt, @repo, @workspace_kind, @dispatch_mode, @parent_task_id, @priority, @worker_provider, @model, @reasoning_effort, @blocked_by, @verify_cmd, @cron_id, @open_pr, @auto_review, @publication_mode, @publication_state)`,
     )
     .run({
       title: t.title,
@@ -100,6 +114,12 @@ export function createTask(t: NewTask): Task {
       cron_id: t.cron_id ?? null,
       open_pr: t.open_pr === false ? 0 : 1,
       auto_review: t.auto_review === false ? 0 : 1,
+      publication_mode: publicationMode,
+      publication_state:
+        publicationMode === "human" &&
+          (t.workspace_kind ?? "repo") === "repo"
+          ? "editing"
+          : null,
     });
   return getTask(Number(info.lastInsertRowid))!;
 }
@@ -323,6 +343,10 @@ const UPDATABLE = new Set([
   "jira_sync_fails",
   "jira_project",
   "open_pr",
+  "publication_mode",
+  "publication_state",
+  "review_snapshot_base",
+  "review_snapshot_tree",
   "tokens_used",
   "workspace_kind",
   "dispatch_mode",
@@ -355,6 +379,19 @@ export function updateTask(
     !DISPATCH_MODES.includes(fields.dispatch_mode)
   ) {
     throw new Error(`invalid dispatch mode: ${fields.dispatch_mode}`);
+  }
+  if (
+    fields.publication_mode !== undefined &&
+    !isPublicationMode(fields.publication_mode)
+  ) {
+    throw new Error(`invalid publication mode: ${fields.publication_mode}`);
+  }
+  if (
+    fields.publication_state !== undefined &&
+    fields.publication_state !== null &&
+    !isPublicationState(fields.publication_state)
+  ) {
+    throw new Error(`invalid publication state: ${fields.publication_state}`);
   }
   const sets = keys.map((k) => `${k} = @${k}`).join(", ");
   getDb()
