@@ -120,42 +120,91 @@ function logUnreadableComposer(mainId: number, provider: AgentProvider): void {
   });
 }
 
-/** Test-only: the throttle is process-global but agent ids reset per db. */
-export function __clearUnreadableLogForTests(): void {
-  unreadableLoggedAt.clear();
+/**
+ * A draft normally clears within seconds (the human submits), but a withheld
+ * submit leaves the injected message merged into their draft and only they can
+ * clear it — and until they do, promptClarity reports "draft" and EVERY main
+ * delivery defers. So a persistent draft is escalated to the human rather than
+ * deferred forever in silence. Escalates once per streak; the streak resets the
+ * moment a delivery gets through.
+ */
+export const DRAFT_BLOCKED_ESCALATE_AFTER = 10;
+const draftBlockedCounts = new Map<number, number>();
+
+function noteDraftBlocked(mainId: number): void {
+  const attempts = (draftBlockedCounts.get(mainId) ?? 0) + 1;
+  draftBlockedCounts.set(mainId, attempts);
+  if (attempts !== DRAFT_BLOCKED_ESCALATE_AFTER) return;
+  logEvent("main.draft_blocking_delivery", {
+    agentId: mainId,
+    payload: { attempts },
+  });
+  notify(
+    "Orchestrator prompt is blocked",
+    `An unsubmitted draft in a${mainId}'s prompt has deferred ${attempts} deliveries. ` +
+      `Submit or clear it so queued worker notifications can reach the orchestrator. ` +
+      `(If it contains a "[commandcenter]" message merged into your text, that was an ` +
+      `injection held back rather than submitted over you — delete it and send the rest.)`,
+    { priority: "default", tags: "warning" },
+  );
 }
 
-function normalizeComposerText(text: string): string {
-  return text.replace(/\s+/g, " ").trim();
+/** Test-only: both maps are process-global but agent ids reset per db. */
+export function __clearUnreadableLogForTests(): void {
+  unreadableLoggedAt.clear();
+  draftBlockedCounts.clear();
 }
+
+/**
+ * Compare composer content to what we typed with ALL whitespace removed, not
+ * merely collapsed. The composer is read back as trimmed physical rows joined
+ * with " ", so a message the TUI hard-wrapped mid-word ("destruc" / "tive")
+ * reconstructs with a space inside that word. Collapsing whitespace would call
+ * that foreign content and withhold the submit on every single delivery —
+ * stranding ~600 characters in the prompt and wedging all delivery behind the
+ * "draft" that creates.
+ */
+function squashWhitespace(text: string): string {
+  return text.replace(/\s+/g, "");
+}
+
+type SubmitVerdict = "submit" | "foreign_content" | "permission";
 
 /**
  * Run once the message is in the composer but before Enter: it must hold
  * nothing but that message. A keystroke can land in the milliseconds between
  * reading the composer and typing into it, and submitting then would merge the
  * human's words into the notification and send the wreckage as their turn.
- * Leaving it unsubmitted instead keeps every character they typed on screen for
- * them to fix.
+ * Leaving it unsubmitted instead keeps every character they typed on screen.
  *
- * Deliberately conservative: only positively foreign content withholds the
- * submit. A capture we cannot read, or a composer showing some subset of the
- * message (clipped by pane height, re-wrapped), submits as before.
+ * A permission menu appearing in that window is the dangerous case: Enter would
+ * confirm the highlighted option (usually "Yes"). promptClarity already refuses
+ * to type into a menu, and this last line of defence must refuse to submit into
+ * one — parsePane reports composer_found=false for a menu, so that check must
+ * come first.
+ *
+ * Otherwise deliberately biased toward submitting: the composer was verified
+ * empty moments earlier, so at worst a submit carries along the handful of
+ * characters typed since, whereas a wrong withhold strands the message in the
+ * prompt and blocks every later delivery.
  */
-function composerHoldsOnly(
+function submitVerdict(
   target: string,
   provider: AgentProvider,
   message: string,
-): boolean {
+): SubmitVerdict {
   let pane;
   try {
     pane = parsePane(capturePane(target, PANE_TAIL_LINES, { escapes: true }), provider);
   } catch {
-    return true;
+    return "submit";
   }
-  if (!pane.composer_found) return true;
-  const seen = normalizeComposerText(pane.unsubmitted_input ?? "");
-  if (seen === "") return true;
-  return normalizeComposerText(message).includes(seen);
+  if (pane.pending_permission) return "permission";
+  if (!pane.composer_found) return "submit";
+  const seen = squashWhitespace(pane.unsubmitted_input ?? "");
+  // `includes` also covers a composer clipped by pane height or still mid-repaint
+  // (a subset of the message); "" is a substring of anything.
+  return squashWhitespace(message).includes(seen) ? "submit" : "foreign_content";
 }
 
 /** Find the one live main agent with a tmux window, whatever its state. */
@@ -202,9 +251,23 @@ export async function deliverToMainIfClear(
       beforeType: () => {
         const clarity = promptClarity(target, main.provider);
         if (clarity === "unreadable") logUnreadableComposer(main.id, main.provider);
+        if (clarity === "draft") noteDraftBlocked(main.id);
+        if (clarity === "clear") draftBlockedCounts.delete(main.id);
         return clarity === "clear";
       },
-      beforeSubmit: () => composerHoldsOnly(target, main.provider, message),
+      beforeSubmit: () => {
+        const verdict = submitVerdict(target, main.provider, message);
+        if (verdict === "submit") return true;
+        // Held back rather than submitted over whatever else is in the pane. The
+        // text stays in the composer, so the human sees both and keeps every
+        // character they typed; the notification stays queued for a later retry,
+        // and the draft it leaves behind is what noteDraftBlocked escalates.
+        logEvent("notification.submit_withheld", {
+          agentId: main.id,
+          payload: { reason: verdict },
+        });
+        return false;
+      },
     },
   });
   return outcome === "sent" ? "delivered" : "deferred";

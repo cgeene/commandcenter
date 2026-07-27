@@ -60,6 +60,52 @@ export function draftComposer(...lines: string[]): string {
   ]);
 }
 
+/**
+ * Wrap `text` into composer rows the way the TUI lays a long message out, so a
+ * test can render what is actually on screen after send-keys types a ~600-char
+ * notification in. `wrap: "hard"` breaks at exactly `width` characters — mid-word,
+ * which the live pane demonstrably does — and `wrap: "word"` breaks at spaces.
+ */
+export function wrappedComposer(
+  text: string,
+  opts: { width?: number; wrap?: "word" | "hard" } = {},
+): string {
+  const width = opts.width ?? 120;
+  const rows: string[] = [];
+  if (opts.wrap === "word") {
+    let row = "";
+    for (const word of text.split(" ")) {
+      if (row === "") row = word;
+      else if (row.length + 1 + word.length <= width) row += ` ${word}`;
+      else {
+        rows.push(row);
+        row = word;
+      }
+    }
+    if (row !== "") rows.push(row);
+  } else {
+    for (let i = 0; i < text.length; i += width) rows.push(text.slice(i, i + width));
+  }
+  return draftComposer(...rows);
+}
+
+/** A boxed permission menu, as it renders when one pops mid-turn. Pressing
+ *  Enter here confirms the highlighted option. */
+export function permissionMenu(): string {
+  return [
+    `${ESC}[38;5;231m⏺${ESC}[39m Running the migration`,
+    "",
+    `╭${"─".repeat(60)}╮`,
+    `│ Run rm -rf ./build in /repo?${" ".repeat(32)}│`,
+    `│${" ".repeat(60)}│`,
+    `│ ❯ 1. Yes${" ".repeat(51)}│`,
+    `│   2. Yes, and don't ask again${" ".repeat(31)}│`,
+    `│   3. No, and tell Claude what to do differently (esc)${" ".repeat(7)}│`,
+    `╰${"─".repeat(60)}╯`,
+    "",
+  ].join("\n");
+}
+
 /** Assistant output with no composer on screen at all (mid-turn, or a TUI whose
  *  chrome this parser no longer recognizes). */
 export function noComposer(): string {
