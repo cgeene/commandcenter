@@ -5,8 +5,13 @@ import { getTask, listTasks, updateTask, type Task } from "../db/tasks.js";
 import { notify } from "./notify.js";
 import { markPrDraft, markPrReady } from "./prdraft.js";
 import { resumeAgent } from "./resume.js";
-import { branchHasCommits, branchHeadSha, hashResult } from "./reviewstate.js";
-import { killAgent, spawnReviewer } from "./spawn.js";
+import {
+  branchHasCommits,
+  branchHeadSha,
+  DIFF_CHAR_LIMIT,
+  hashResult,
+} from "./reviewstate.js";
+import { killAgent, spawnReviewer, type PriorReviewRound } from "./spawn.js";
 import { git } from "./worktree.js";
 import {
   approvedSnapshotIsPublished,
@@ -21,8 +26,6 @@ import {
 export function reviewMaxCycles(): number {
   return getSchedulerConfig().review_max_cycles;
 }
-
-const DIFF_CHAR_LIMIT = 20_000;
 
 export interface TaskDiff {
   branch: string;
@@ -121,10 +124,16 @@ function withinReviewBudget(task: Task): boolean {
 }
 
 /** Spawn the next reviewer round for a task and record what it is judging so a
- *  later idle re-entry doesn't re-trigger. Emits review.round_started. */
-function startReviewRound(task: Task, headSha: string | null): void {
+ *  later idle re-entry doesn't re-trigger. Emits review.round_started.
+ *  `prior` (when the round follows a superseded verdict) lets the reviewer
+ *  scope itself to what changed since that verdict — see spawnReviewer. */
+function startReviewRound(
+  task: Task,
+  headSha: string | null,
+  prior?: PriorReviewRound,
+): void {
   try {
-    const { agent } = spawnReviewer(task.id);
+    const { agent } = spawnReviewer(task.id, prior ? { priorRound: prior } : undefined);
     updateTask(task.id, {
       review_head_sha: headSha,
       review_result_hash: hashResult(task.result_summary),
@@ -283,9 +292,24 @@ export async function maybeAutoReview(taskId: number): Promise<void> {
     : branchHeadSha(task); // null for scratch/no-git
 
   // --- Invariant: a non-draft/approved PR must match its current HEAD ---
+  // Captured BEFORE supersedeApproval clears the verdict: what the superseded
+  // round judged and concluded. The next reviewer re-verifies only the delta
+  // past that SHA instead of re-doing an approval that still holds for
+  // everything the new commits don't touch.
+  let prior: PriorReviewRound | undefined;
   if (task.review_verdict === "approve") {
     // No git signal (scratch) or HEAD unchanged since approval: still current.
     if (!headSha || headSha === task.review_head_sha) return;
+    // Human-publication tasks are excluded: their "sha" is a snapshot tree, not
+    // a commit, so there is no commit range to scope a re-review to. (Their
+    // supersession is handled above and clears the verdict before this point.)
+    if (task.review_head_sha && !humanRepo) {
+      prior = {
+        fromSha: task.review_head_sha,
+        verdict: "approve",
+        notes: task.review_notes,
+      };
+    }
     await supersedeApproval(task, headSha);
     task = getTask(taskId)!; // reload: verdict cleared, cycle bumped
   }
@@ -311,7 +335,7 @@ export async function maybeAutoReview(taskId: number): Promise<void> {
   }
 
   if (!withinReviewBudget(task)) return;
-  startReviewRound(task, headSha);
+  startReviewRound(task, headSha, prior);
 }
 
 /**

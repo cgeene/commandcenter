@@ -15,6 +15,7 @@ import { REASONING_EFFORTS } from "../reasoning.js";
 import {
   PUBLICATION_FIELDS,
   compactTask,
+  echoedFields,
   shapeTask,
   shapeTaskList,
   shapeTaskPayload,
@@ -46,6 +47,15 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
 function asText(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
 }
+
+/** How hard the adversarial reviewer works. The orchestrator sets this at
+ *  triage from what the task IS — never from what the diff turns out to be. */
+const REVIEW_MODE_SCHEMA = z
+  .enum(["full", "light"])
+  .optional()
+  .describe(
+    "how hard the adversarial reviewer works (default 'full'). 'light' = a diff-scoped read with no independent re-verification: use ONLY for documentation, threshold, and runbook changes. NEVER for prod-mutating work or code-logic changes, however small. When in doubt, leave it 'full'.",
+  );
 
 // Read tools default to a compact projection; these opt back into more.
 const verboseArg = z
@@ -103,6 +113,7 @@ server.registerTool(
         .describe(
           "false = branch-only: the worker commits and pushes but must NOT open a PR (default true)",
         ),
+      review_mode: REVIEW_MODE_SCHEMA,
     },
   },
   async (args) => {
@@ -432,7 +443,7 @@ if (ROLE === "main") {
     "update_task",
     {
       description:
-        "Update a task (status, priority, worker provider, model, reasoning effort, prompt, result_summary...). Returns the compact task record — the values you just sent are not echoed back; use get_task(id, verbose: true) if you need to re-read the whole thing.",
+        "Update a task (status, priority, worker provider, model, reasoning effort, review mode, prompt, result_summary...). Returns the compact task record plus whichever fields you changed — the values you just sent are otherwise not echoed back; use get_task(id, verbose: true) if you need to re-read the whole thing.",
       inputSchema: {
         id: z.number().int(),
         status: z
@@ -459,10 +470,21 @@ if (ROLE === "main") {
           .describe(
             "false = branch-only: the worker commits and pushes but must NOT open a PR",
           ),
+        review_mode: REVIEW_MODE_SCHEMA,
       },
     },
+    // Echo the compact record PLUS whatever this call changed, so a field
+    // outside the core (verify_cmd, …) is still visible as the confirmation
+    // that the update landed — the same mechanism confirm_human_publication
+    // uses for the publication columns. echoedFields keeps the bulk (the
+    // prompt the caller just sent) out of the echo.
     async ({ id, ...fields }) =>
-      asText(compactTask(await call("PATCH", `/api/tasks/${id}`, fields))),
+      asText(
+        compactTask(
+          await call("PATCH", `/api/tasks/${id}`, fields),
+          echoedFields(Object.keys(fields)),
+        ),
+      ),
   );
 
   server.registerTool(

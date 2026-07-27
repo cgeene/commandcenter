@@ -50,6 +50,7 @@ export interface Task {
   review_verdict: string | null;
   review_notes: string | null;
   review_cycles: number;
+  review_mode: "full" | "light"; // 'light' = diff-scoped review (docs/thresholds/runbooks)
   pr_url: string | null;
   pr_feedback_at: string | null;
   pr_state: string | null; // open | merged | closed
