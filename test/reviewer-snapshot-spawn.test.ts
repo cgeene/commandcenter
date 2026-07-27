@@ -4,6 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// This test drives a real git repo (init/commit/write-tree/worktree add) via
+// synchronous execFileSync. It runs in ~3s alone, but the 5s default per-test
+// timeout is not survivable under full-suite parallel load — see the same
+// setting in worktree.test.ts / publication.test.ts.
+vi.setConfig({ testTimeout: 30_000 });
+
 const newWindow = vi.fn(
   (_name: string, _cwd: string, _command: string) => "cc:@review",
 );
@@ -48,6 +54,13 @@ afterEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  // The git work in these tests is synchronous, so this worker's event loop
+  // can sit blocked for tens of seconds at a time. Node runs the timers phase
+  // before the poll phase, so vitest's fixed 60s worker->main RPC timer can
+  // fire on a reply that was already delivered but not yet read, failing the
+  // run with 'Timeout calling "onTaskUpdate"'. Yield a macrotask so those
+  // replies get drained between tests.
+  await new Promise((resolve) => setImmediate(resolve));
 });
 
 describe("manual human-publication review", () => {

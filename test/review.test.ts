@@ -1,7 +1,12 @@
-import { beforeEach, afterEach, describe, expect, it } from "vitest";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+// A few tests here shell out to real git; those have been measured at 3s+
+// under full-suite parallel load, uncomfortably close to the 5s default.
+// Same budget as the other git-touching test files.
+vi.setConfig({ testTimeout: 30_000 });
 
 let tmpDir: string;
 
@@ -18,6 +23,13 @@ afterEach(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
   const { _setGhRunner } = await import("../src/daemon/prdraft.js");
   _setGhRunner(null); // restore the real gh runner for the next file
+  // The git work in these tests is synchronous, so this worker's event loop
+  // can sit blocked for tens of seconds at a time. Node runs the timers phase
+  // before the poll phase, so vitest's fixed 60s worker->main RPC timer can
+  // fire on a reply that was already delivered but not yet read, failing the
+  // run with 'Timeout calling "onTaskUpdate"'. Yield a macrotask so those
+  // replies get drained between tests.
+  await new Promise((resolve) => setImmediate(resolve));
 });
 
 /** A task in review with a (dead-window) worker agent attached. Defaults to a

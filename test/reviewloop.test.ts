@@ -4,6 +4,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+// Most tests here build a real git repo (init/branch/commit/checkout) via
+// synchronous execFileSync, so they blow past the 5s default per-test timeout
+// under full-suite parallel load. Same budget as worktree.test.ts.
+vi.setConfig({ testTimeout: 30_000 });
+
 // Stub the reviewer spawn so the loop's decision logic is testable without a
 // real tmux window or review worktree. spawnReviewer records its calls and
 // returns a fake agent; killAgent is a no-op. Everything else in the loop
@@ -38,6 +43,13 @@ afterEach(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
   const { _setGhRunner } = await import("../src/daemon/prdraft.js");
   _setGhRunner(null);
+  // The git work in these tests is synchronous, so this worker's event loop
+  // can sit blocked for tens of seconds at a time. Node runs the timers phase
+  // before the poll phase, so vitest's fixed 60s worker->main RPC timer can
+  // fire on a reply that was already delivered but not yet read, failing the
+  // run with 'Timeout calling "onTaskUpdate"'. Yield a macrotask so those
+  // replies get drained between tests.
+  await new Promise((resolve) => setImmediate(resolve));
 });
 
 /** A real git repo whose task branch sits one commit ahead of the base the

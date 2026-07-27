@@ -6,8 +6,9 @@ import { execFileSync } from "node:child_process";
 
 // Each test spins up real git repos (init/clone/commit/push/fetch) rather
 // than mocking — comfortably under 5s alone, but the default per-test
-// timeout gets tight under full-suite parallel load.
-vi.setConfig({ testTimeout: 15_000 });
+// timeout gets tight under full-suite parallel load. 15s was still not
+// enough: tests here have been measured past 18s on a loaded machine.
+vi.setConfig({ testTimeout: 30_000 });
 
 let tmpDir: string;
 
@@ -35,6 +36,13 @@ afterEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  // The git work in these tests is synchronous, so this worker's event loop
+  // can sit blocked for tens of seconds at a time. Node runs the timers phase
+  // before the poll phase, so vitest's fixed 60s worker->main RPC timer can
+  // fire on a reply that was already delivered but not yet read, failing the
+  // run with 'Timeout calling "onTaskUpdate"'. Yield a macrotask so those
+  // replies get drained between tests.
+  await new Promise((resolve) => setImmediate(resolve));
 });
 
 /** Bare "remote" whose default branch is `main`, seeded with one commit. */
