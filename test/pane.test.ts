@@ -548,6 +548,18 @@ describe("parsePane — background shell / monitor status-bar indicator", () => 
     ).toEqual({ shells: 0, monitors: 1 });
   });
 
+  // The bar grows segments as context appears (a "PR #61" segment shows up once
+  // a PR is associated), so the scan must find the counts wherever they sit
+  // rather than assuming a fixed position. Captured live while idle.
+  it("finds the counts on a bar carrying extra unrelated segments", () => {
+    const parsed = parsePane(
+      paneWithStatusBar(
+        "  ⏵⏵ don't ask on · PR #61 · 1 shell, 1 monitor · ← 1 agent · ↓ to manage",
+      ),
+    );
+    expect(parsed.background_activity).toEqual({ shells: 1, monitors: 1 });
+  });
+
   it("does not claim the Claude-only indicator for a Codex pane", () => {
     const parsed = parsePane(
       paneWithStatusBar(statusBar("1 shell, 1 monitor")),
