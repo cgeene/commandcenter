@@ -42,11 +42,14 @@ beforeEach(async () => {
   paneByTarget.clear();
   sendText.mockClear();
   sendText.mockImplementation(async () => {});
-  const { __clearAutoNudgeCountsForTests, __clearIdleRedelegateForTests } = await import(
-    "../src/daemon/hooks.js"
-  );
+  const {
+    __clearAutoNudgeCountsForTests,
+    __clearIdleRedelegateForTests,
+    __clearBackgroundParkForTests,
+  } = await import("../src/daemon/hooks.js");
   __clearAutoNudgeCountsForTests();
   __clearIdleRedelegateForTests();
+  __clearBackgroundParkForTests();
 });
 
 afterEach(async () => {
@@ -755,5 +758,283 @@ describe("transient API error auto-nudge", () => {
     const events = listEvents(20);
     expect(events.filter((e) => e.kind === "agent.auto_nudged").length).toBe(3);
     expect(events.filter((e) => e.kind === "task.stopped_incomplete").length).toBe(0);
+  });
+});
+
+/**
+ * A worker that parks between turns while a Monitor watch or a background shell
+ * is still running re-wakes itself when that work completes, so its idle_prompt
+ * must not reach the orchestrator or start the escalate-to-human timer.
+ *
+ * The status bars below mirror captures from a live daemon worker (Claude Code
+ * v2.1.220, 2026-07-27); the separator is U+00B7.
+ */
+describe("idle-prompt suppression for workers parked on background work", () => {
+  const IDLE_PROMPT = {
+    hook_event_name: "Notification" as const,
+    notification_type: "idle_prompt",
+    message: "Claude is waiting for your input",
+  };
+  const WORKER_TARGET = "cc:@1";
+  const RULE = "─".repeat(100);
+
+  /** An idle composer capped by a status bar, optionally reporting background
+   *  work in its own interpunct-delimited segment. */
+  function workerPane(indicator: string | null, transcript: string[] = []): string {
+    const segments = [
+      "⏵⏵ don't ask on",
+      ...(indicator ? [indicator] : []),
+      "← for agents",
+      "↓ to manage",
+    ];
+    return [
+      ...transcript,
+      RULE,
+      "❯ ",
+      RULE,
+      `  ${segments.join(" · ")}`,
+    ].join("\n");
+  }
+
+  /** A live idle main with a clear prompt, so any delegation really would send. */
+  async function liveIdleMain() {
+    const { createAgent } = await import("../src/db/agents.js");
+    paneByTarget.set("cc:@2", PROMPT_BOX);
+    return createAgent({ kind: "main", state: "idle", tmux_target: "cc:@2" });
+  }
+
+  it("suppresses the idle ping while a monitor and shell are still running", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    await liveIdleMain();
+    const { agent } = await setup({ tmux_target: WORKER_TARGET });
+    paneByTarget.set(WORKER_TARGET, workerPane("1 shell, 1 monitor"));
+
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    sendText.mockClear(); // ignore anything the Stop path itself sent
+    await handleHookEvent(agent.id, IDLE_PROMPT);
+
+    // Never enters waiting_input, so neither the delegation nor the scheduler's
+    // escalate-to-human page (which keys on waiting_input) can fire.
+    expect(getAgent(agent.id)?.state).toBe("idle");
+    expect(sendText).not.toHaveBeenCalled();
+    const events = listEvents(30);
+    const suppressed = events.find((e) => e.kind === "waiting.suppressed_active_monitor");
+    expect(suppressed).toBeDefined();
+    expect(JSON.parse(suppressed!.payload!)).toEqual({ shells: 1, monitors: 1 });
+    expect(events.map((e) => e.kind)).not.toContain("waiting.delegated");
+  });
+
+  it("suppresses for a monitor alone and for a background shell alone", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    await liveIdleMain();
+    for (const indicator of ["1 monitor", "2 shells"]) {
+      const { agent } = await setup({ tmux_target: WORKER_TARGET });
+      paneByTarget.set(WORKER_TARGET, workerPane(indicator));
+      await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+      await handleHookEvent(agent.id, IDLE_PROMPT);
+      expect(getAgent(agent.id)?.state, indicator).toBe("idle");
+    }
+  });
+
+  it("does NOT suppress when a permission menu is up, even with a monitor running", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    await liveIdleMain();
+    const { agent } = await setup({ tmux_target: WORKER_TARGET });
+    // Background work running alongside a decision someone has to make does not
+    // make that decision self-resolving.
+    paneByTarget.set(
+      WORKER_TARGET,
+      [
+        "╭──────────────────────────────────────────────────────────╮",
+        "│ Run the packer build?                                    │",
+        "│                                                          │",
+        "│ ❯ 1. Yes                                                 │",
+        "│   2. No                                                  │",
+        "╰──────────────────────────────────────────────────────────╯",
+        "  ⏵⏵ don't ask on · 1 shell, 1 monitor · ↓ to manage",
+      ].join("\n"),
+    );
+
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    await handleHookEvent(agent.id, IDLE_PROMPT);
+
+    expect(getAgent(agent.id)?.state).toBe("waiting_input");
+    const kinds = listEvents(30).map((e) => e.kind);
+    expect(kinds).not.toContain("waiting.suppressed_active_monitor");
+    expect(kinds).toContain("waiting.delegated");
+  });
+
+  it("does NOT suppress when a draft is sitting unsent in the composer", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    await liveIdleMain();
+    const { agent } = await setup({ tmux_target: WORKER_TARGET });
+    paneByTarget.set(
+      WORKER_TARGET,
+      [
+        RULE,
+        "❯ should I also bump the AMI version?",
+        RULE,
+        "  ⏵⏵ don't ask on · 1 monitor · ↓ to manage",
+      ].join("\n"),
+    );
+
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    await handleHookEvent(agent.id, IDLE_PROMPT);
+
+    expect(getAgent(agent.id)?.state).toBe("waiting_input");
+    const kinds = listEvents(30).map((e) => e.kind);
+    expect(kinds).not.toContain("waiting.suppressed_active_monitor");
+  });
+
+  it("does NOT suppress when the status bar reports no background work", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    await liveIdleMain();
+    const { agent } = await setup({ tmux_target: WORKER_TARGET });
+    paneByTarget.set(WORKER_TARGET, workerPane(null));
+
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    await handleHookEvent(agent.id, IDLE_PROMPT);
+
+    expect(getAgent(agent.id)?.state).toBe("waiting_input");
+    const kinds = listEvents(30).map((e) => e.kind);
+    expect(kinds).not.toContain("waiting.suppressed_active_monitor");
+    expect(kinds).toContain("waiting.delegated");
+  });
+
+  it("does NOT suppress on the indicator merely quoted in the worker's own transcript", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    await liveIdleMain();
+    const { agent } = await setup({ tmux_target: WORKER_TARGET });
+    paneByTarget.set(
+      WORKER_TARGET,
+      workerPane(null, [
+        "⏺ The status bar renders it as · 1 shell, 1 monitor · between segments.",
+        "",
+      ]),
+    );
+
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    await handleHookEvent(agent.id, IDLE_PROMPT);
+
+    expect(getAgent(agent.id)?.state).toBe("waiting_input");
+  });
+
+  it("does NOT suppress a mid-work permission notification (no Stop for this turn)", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    await liveIdleMain();
+    const { agent } = await setup({ tmux_target: WORKER_TARGET });
+    paneByTarget.set(WORKER_TARGET, workerPane("1 monitor"));
+
+    // A permission_prompt is a different notification_type, and no Stop has
+    // fired for this turn — the worker is blocked mid-work, not parked.
+    await handleHookEvent(agent.id, {
+      hook_event_name: "Notification",
+      notification_type: "permission_prompt",
+      message: "Claude needs permission to run a command",
+    });
+
+    expect(getAgent(agent.id)?.state).toBe("waiting_input");
+    const kinds = listEvents(30).map((e) => e.kind);
+    expect(kinds).not.toContain("waiting.suppressed_active_monitor");
+  });
+
+  it("does NOT suppress a REVIEWER parked on background work", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    await liveIdleMain();
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    updateTask(task.id, { status: "review" });
+    const reviewer = createAgent({
+      kind: "reviewer",
+      state: "working",
+      task_id: task.id,
+      tmux_target: WORKER_TARGET,
+    });
+    paneByTarget.set(WORKER_TARGET, workerPane("1 shell, 1 monitor"));
+
+    await handleHookEvent(reviewer.id, { hook_event_name: "Stop" });
+    await handleHookEvent(reviewer.id, IDLE_PROMPT);
+
+    // Worker-scoped, exactly like the in-review suppression: a reviewer keeps
+    // its normal idle → waiting_input → escalation path.
+    expect(getAgent(reviewer.id)?.state).toBe("waiting_input");
+    const kinds = listEvents(30).map((e) => e.kind);
+    expect(kinds).not.toContain("waiting.suppressed_active_monitor");
+  });
+
+  it("stops suppressing once the park window is exhausted", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent, updateAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    await liveIdleMain();
+    const { agent } = await setup({ tmux_target: WORKER_TARGET });
+    paneByTarget.set(WORKER_TARGET, workerPane("1 monitor"));
+
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    await handleHookEvent(agent.id, IDLE_PROMPT); // starts the park clock
+    expect(getAgent(agent.id)?.state).toBe("idle");
+
+    // A worker wedged behind a `persistent` monitor would otherwise stay silent
+    // forever: an "idle" agent is checked by neither the escalation watchdog
+    // (waiting_input only) nor the stall detector (working only).
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.now() + 91 * 60_000);
+      updateAgent(agent.id, { state: "working" });
+      await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+      await handleHookEvent(agent.id, IDLE_PROMPT);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(getAgent(agent.id)?.state).toBe("waiting_input");
+    const suppressed = listEvents(40).filter(
+      (e) => e.kind === "waiting.suppressed_active_monitor",
+    );
+    expect(suppressed).toHaveLength(1); // only the first park, before expiry
+  });
+
+  it("re-arms a fresh park window after the background work finishes", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent, updateAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    await liveIdleMain();
+    const { agent } = await setup({ tmux_target: WORKER_TARGET });
+
+    // Park, then the monitor completes and the worker runs a turn that ends with
+    // nothing in flight, then it parks on new background work.
+    paneByTarget.set(WORKER_TARGET, workerPane("1 monitor"));
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    await handleHookEvent(agent.id, IDLE_PROMPT);
+
+    paneByTarget.set(WORKER_TARGET, workerPane(null));
+    updateAgent(agent.id, { state: "working" });
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    await handleHookEvent(agent.id, IDLE_PROMPT); // normal wait — clears the clock
+
+    paneByTarget.set(WORKER_TARGET, workerPane("1 shell"));
+    updateAgent(agent.id, { state: "working" });
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    await handleHookEvent(agent.id, IDLE_PROMPT);
+
+    expect(getAgent(agent.id)?.state).toBe("idle");
+    const suppressed = listEvents(60).filter(
+      (e) => e.kind === "waiting.suppressed_active_monitor",
+    );
+    expect(suppressed).toHaveLength(2);
   });
 });

@@ -71,10 +71,17 @@ export interface PendingPermission {
   options: PaneOption[];
 }
 
+/** Background work the provider reports as still running for this session. */
+export interface BackgroundActivity {
+  shells: number;
+  monitors: number;
+}
+
 export interface ParsedPane {
   pending_permission: PendingPermission | null;
   pending_question: string | null;
   unsubmitted_input: string | null;
+  background_activity: BackgroundActivity | null;
   raw: string;
 }
 
@@ -313,6 +320,71 @@ function parseCodexQuestion(lines: string[], inputIndex: number): string | null 
   return question || null;
 }
 
+// Claude Code's bottom status bar reports still-running background work as one
+// of its interpunct-delimited segments, e.g.
+//   "⏵⏵ don't ask on · 3 shells, 2 monitors · esc to interrupt · ↓ to manage"
+//
+// POSITION is the load-bearing anchor: only the bottom-most non-blank row of the
+// capture is considered. That is what keeps an agent's own transcript text from
+// registering, and it has to do that work alone, because agents DO quote this
+// indicator in prose — the pane this parser was written against contained the
+// literal string "· N shell(s), N monitor". Neither of the cheaper-looking
+// guards actually holds:
+//   - the whole-segment rule below does NOT reject prose. "⏺ Confirmed: · 1
+//     shell, 1 monitor · is what renders." splits into three segments, one of
+//     which is a bare count pair, and parses as a hit. It is a secondary filter
+//     for sloppy near-misses, not a defense.
+//   - a chrome-anchor requirement ("must also contain '↓ to manage'") does not
+//     hold either, because agents quote the WHOLE bar verbatim, chrome included.
+// So do not widen this scan. Reading one row further up trades a guaranteed-safe
+// no-op for a false positive, and a false positive here silences a genuine wait
+// for the whole park window while it is invisible to both the escalation
+// watchdog and Needs You (each keys on waiting_input, which suppression skips).
+// The residual hole is a pane whose bottom row is prose, which in a live TUI
+// means the composer/bar is not painted at all — a worker in that state is not
+// asking a question either. test/pane.test.ts pins this behavior explicitly.
+const STATUS_SEPARATOR = "·";
+// Only the bottom-most non-blank row. See the note above before changing this:
+// the number 1 is the guard, not a tunable.
+const STATUS_BAR_LOOKBACK = 1;
+const BACKGROUND_ITEM_RE = /^(\d{1,3})\s+(shells?|monitors?)$/;
+
+/** Counts of background shells / Monitor watches the status bar says are still
+ *  running, or null when the bar shows none (or isn't present at all). */
+function parseBackgroundActivity(lines: string[]): BackgroundActivity | null {
+  let inspected = 0;
+  for (let i = lines.length - 1; i >= 0 && inspected < STATUS_BAR_LOOKBACK; i--) {
+    const line = lines[i].trim();
+    if (line === "") continue;
+    inspected++;
+
+    const segments = line.split(STATUS_SEPARATOR).map((s) => s.trim());
+    // A real status bar is a multi-segment bar; a lone segment means this is
+    // ordinary text that merely happens to contain an interpunct. Secondary
+    // filter only — position is the actual anchor (see the note above).
+    if (segments.length < 2) continue;
+
+    let shells = 0;
+    let monitors = 0;
+    let found = false;
+    for (const segment of segments) {
+      const items = segment.split(",").map((s) => s.trim());
+      const matches = items.map((item) => BACKGROUND_ITEM_RE.exec(item));
+      // Every comma-separated item must be a count. A segment that is only
+      // partly counts is prose, not the indicator.
+      if (matches.some((m) => m === null)) continue;
+      for (const m of matches) {
+        const n = Number(m![1]);
+        if (m![2].startsWith("shell")) shells += n;
+        else monitors += n;
+      }
+      found = true;
+    }
+    if (found && shells + monitors > 0) return { shells, monitors };
+  }
+  return null;
+}
+
 /** The agent's last assistant text before the (empty or not) input box. */
 function parseQuestion(lines: string[]): string | null {
   let boxTop = -1;
@@ -369,5 +441,18 @@ export function parsePane(
       ? parseCodexQuestion(lines, codexInput.index)
       : parseQuestion(lines);
 
-  return { pending_permission, pending_question, unsubmitted_input, raw };
+  // Claude-only: the counts come from Claude Code's own status-bar chrome.
+  // Codex is left null rather than guessed at — nothing reads this for Codex
+  // (it has no idle Notification hook at all), so a wrong guess would be
+  // strictly worse than no signal.
+  const background_activity =
+    provider === "codex" ? null : parseBackgroundActivity(lines);
+
+  return {
+    pending_permission,
+    pending_question,
+    unsubmitted_input,
+    background_activity,
+    raw,
+  };
 }
