@@ -4,6 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// This test drives a real git repo (init/commit/write-tree/worktree add) via
+// synchronous execFileSync. It runs in ~3s alone, but the 5s default per-test
+// timeout is not survivable under full-suite parallel load — see the same
+// setting in worktree.test.ts / publication.test.ts.
+vi.setConfig({ testTimeout: 30_000 });
+
 const newWindow = vi.fn(
   (_name: string, _cwd: string, _command: string) => "cc:@review",
 );

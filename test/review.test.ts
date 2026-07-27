@@ -1,7 +1,12 @@
-import { beforeEach, afterEach, describe, expect, it } from "vitest";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+// A few tests here shell out to real git; those have been measured at 3s+
+// under full-suite parallel load, uncomfortably close to the 5s default.
+// Same budget as the other git-touching test files.
+vi.setConfig({ testTimeout: 30_000 });
 
 let tmpDir: string;
 

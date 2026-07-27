@@ -6,8 +6,9 @@ import { execFileSync } from "node:child_process";
 
 // Each test spins up real git repos (init/clone/commit/push/fetch) rather
 // than mocking — comfortably under 5s alone, but the default per-test
-// timeout gets tight under full-suite parallel load.
-vi.setConfig({ testTimeout: 15_000 });
+// timeout gets tight under full-suite parallel load. 15s was still not
+// enough: tests here have been measured past 18s on a loaded machine.
+vi.setConfig({ testTimeout: 30_000 });
 
 let tmpDir: string;
 

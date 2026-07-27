@@ -4,6 +4,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+// Most tests here build a real git repo (init/branch/commit/checkout) via
+// synchronous execFileSync, so they blow past the 5s default per-test timeout
+// under full-suite parallel load. Same budget as worktree.test.ts.
+vi.setConfig({ testTimeout: 30_000 });
+
 // Stub the reviewer spawn so the loop's decision logic is testable without a
 // real tmux window or review worktree. spawnReviewer records its calls and
 // returns a fake agent; killAgent is a no-op. Everything else in the loop

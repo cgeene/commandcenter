@@ -2,7 +2,13 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// The "immutable review snapshot" tests build a real repo + bare remote and
+// push to it. Alone they are 3-9s; under full-suite parallel load they have
+// been measured past 16s, so the per-test 15s budgets they used to carry were
+// still too tight. File-wide budget, same as worktree.test.ts.
+vi.setConfig({ testTimeout: 30_000 });
 
 let tmpDir: string;
 
@@ -266,7 +272,7 @@ describe("immutable review snapshot", () => {
     const diff = taskDiff(captured);
     expect(diff.diff).toContain("two");
     expect(diff.diff).toContain("new.txt");
-  }, 15_000);
+  });
 
   it("runs reviewer approval before human commit and validates the exact committed tree", async () => {
     const { repo, task } = await setupHumanTask();
@@ -318,7 +324,7 @@ describe("immutable review snapshot", () => {
       "ready",
       "https://github.com/x/y/pull/1",
     ]);
-  }, 15_000);
+  });
 
   it("retains the approved snapshot when the draft PR cannot be marked ready", async () => {
     const { repo, task } = await setupHumanTask();
@@ -350,7 +356,7 @@ describe("immutable review snapshot", () => {
       review_snapshot_tree: captured.review_snapshot_tree,
       pr_url: null,
     });
-  }, 15_000);
+  });
 
   it("returns rejected snapshots to the uncommitted worker loop", async () => {
     const { task } = await setupHumanTask();
