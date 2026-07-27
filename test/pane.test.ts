@@ -530,6 +530,24 @@ describe("parsePane — background shell / monitor status-bar indicator", () => 
     expect(parsed.background_activity).toEqual({ shells: 0, monitors: 1 });
   });
 
+  // The bar this suppression actually reads is the IDLE one — the hook fires
+  // after the worker's turn ends, at which point "esc to interrupt" is gone and
+  // the trailing segment can read "← 1 agent" instead of "← for agents". Both
+  // shapes were captured live while idle with background work still running, and
+  // are why the parser keys on segment structure rather than any chrome wording.
+  it("reads the indicator off an IDLE status bar (no 'esc to interrupt')", () => {
+    expect(
+      parsePane(
+        paneWithStatusBar("  ⏵⏵ don't ask on · 2 shells · ← for agents · ↓ to manage"),
+      ).background_activity,
+    ).toEqual({ shells: 2, monitors: 0 });
+    expect(
+      parsePane(
+        paneWithStatusBar("  ⏵⏵ don't ask on · 1 monitor · ← 1 agent · ↓ to manage"),
+      ).background_activity,
+    ).toEqual({ shells: 0, monitors: 1 });
+  });
+
   it("does not claim the Claude-only indicator for a Codex pane", () => {
     const parsed = parsePane(
       paneWithStatusBar(statusBar("1 shell, 1 monitor")),
