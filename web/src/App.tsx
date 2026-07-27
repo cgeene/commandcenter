@@ -54,6 +54,7 @@ import type {
 
 /** Dashboard tabs — add an entry here + a render branch in App to grow the dashboard. */
 const TABS = [
+  { id: "dashboard", label: "Dashboard" },
   { id: "board", label: "Board" },
   { id: "prs", label: "PRs" },
   { id: "docs", label: "Docs" },
@@ -128,12 +129,12 @@ function useKeyboardAwareStyle(): CSSProperties | undefined {
 }
 
 const STATE_COLORS: Record<string, string> = {
-  working: "#3fb950",
-  idle: "#8b949e",
-  waiting_input: "#d29922",
-  spawning: "#58a6ff",
-  stalled: "#f85149",
-  dead: "#484f58",
+  working: "#68d982",
+  idle: "#8d96a6",
+  waiting_input: "#f3b95f",
+  spawning: "#7aa7ff",
+  stalled: "#ff6b6b",
+  dead: "#3b4658",
 };
 
 /**
@@ -179,6 +180,7 @@ export function App() {
   // keyed off the active panel's sessionId.
   const [panel, setPanel] = useState<Panel>(null);
   const [transcript, setTranscript] = useState<TranscriptEntry[] | null>(null);
+  const [expandedAgentId, setExpandedAgentId] = useState<number | null>(null);
   const [showNewTask, setShowNewTask] = useState(false);
   const [showMemory, setShowMemory] = useState(false);
   const [showCrons, setShowCrons] = useState(false);
@@ -344,6 +346,13 @@ export function App() {
   const selTask = panel?.kind === "task" ? (tasks.find((t) => t.id === panel.id) ?? null) : null;
 
   const liveMain = agents.find((a) => a.kind === "main" && a.state !== "dead");
+  const taskAgents = new Map<number, Agent[]>();
+  for (const agent of agents) {
+    if (agent.kind === "main" || agent.task_id == null || agent.state === "dead") continue;
+    const list = taskAgents.get(agent.task_id) ?? [];
+    list.push(agent);
+    taskAgents.set(agent.task_id, list);
+  }
   // Nav badge: open PRs the reviewer has approved and are now waiting on a
   // human merge — the one state that most wants Caleb's attention.
   const prsAwaitingMerge = tasks.filter(
@@ -353,152 +362,223 @@ export function App() {
     board: attention.length,
     prs: prsAwaitingMerge,
   };
+  const runningCount = tasks.filter((t) => t.status === "in_progress").length;
+  const queuedCount = tasks.filter((t) => ["queued", "claimed"].includes(t.status)).length;
+  const blockedCount = tasks.filter((t) => t.status === "blocked").length;
+  const failedCount = tasks.filter((t) => t.status === "failed").length;
+  const reviewCount = tasks.filter((t) => t.status === "review").length;
+  const activeProjectCount = new Set(
+    tasks.filter((t) => isActive(t.status)).map((t) => projectOfTask(t)),
+  ).size;
 
   return (
     <div className="app">
-      {stale && (
-        <div className="error">
-          Daemon is running stale code — run <code>agp upgrade</code>
-        </div>
-      )}
-      <header>
-        <h1>commandcenter</h1>
-        <nav className="tabs">
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              className={tab === t.id ? "active" : ""}
-              onClick={() => setTab(t.id)}
-            >
-              {t.label}
-              {(tabBadge[t.id] ?? 0) > 0 && (
-                <span className="tab-badge">{tabBadge[t.id]}</span>
-              )}
+      <div className="app-shell">
+        <aside className="nav-rail">
+          <div className="brand-lockup">
+            <span className="brand-mark">CC</span>
+            <div>
+              <h1>Command Center</h1>
+              <span>Mission Control</span>
+            </div>
+          </div>
+          <nav className="tabs" aria-label="Primary">
+            {TABS.map((t) => (
+              <button
+                key={t.id}
+                className={tab === t.id ? "active" : ""}
+                onClick={() => setTab(t.id)}
+              >
+                <span>{t.label}</span>
+                {(tabBadge[t.id] ?? 0) > 0 && (
+                  <span className="tab-badge">{tabBadge[t.id]}</span>
+                )}
+              </button>
+            ))}
+          </nav>
+          <div className="nav-health">
+            <span>Operations</span>
+            <b>{attention.length}</b>
+            <small>items need a decision</small>
+          </div>
+        </aside>
+
+        <div className="app-workspace">
+          {stale && (
+            <div className="error">
+              Daemon is running stale code — run <code>agp upgrade</code>
+            </div>
+          )}
+          <header className="command-bar">
+            <div className="command-title">
+              <span className="eyebrow">Live Operating Console</span>
+              <strong>{TABS.find((t) => t.id === tab)?.label ?? "Board"}</strong>
+            </div>
+            <div className="command-summary" aria-label="Operational summary">
+              <span className={attention.length > 0 ? "summary-pill attention" : "summary-pill"}>
+                {attention.length} needs you
+              </span>
+              <span className="summary-pill">{runningCount} running</span>
+              <span className="summary-pill">{queuedCount} queued</span>
+              <span className={blockedCount > 0 ? "summary-pill blocked" : "summary-pill"}>
+                {blockedCount} blocked
+              </span>
+              <span className="summary-pill">{reviewCount} in review</span>
+              <span className="summary-pill">{agents.length} agents</span>
+            </div>
+            <div className="spacer" />
+            {liveMain && (
+              <button
+                className={`main-agent-status state-${liveMain.state}`}
+                title={`Open main agent terminal · ${AGENT_STATE_LABEL[liveMain.state] ?? liveMain.state}`}
+                onClick={() => openTerminal(liveMain.id)}
+              >
+                <span
+                  className="dot"
+                  style={{ background: STATE_COLORS[liveMain.state] ?? STATE_COLORS.idle }}
+                />
+                Main {AGENT_STATE_LABEL[liveMain.state] ?? liveMain.state}
+              </button>
+            )}
+            {scheduler && (
+              <button
+                className={scheduler.config.enabled ? "sched-on" : ""}
+                title={`workers ${scheduler.status.live_workers}/${scheduler.config.max_concurrent} · spawns today ${scheduler.status.spawns_today}/${scheduler.config.daily_spawn_limit}`}
+                onClick={() =>
+                  act(() =>
+                    api("PATCH", "/api/scheduler", {
+                      enabled: !scheduler.config.enabled,
+                    }),
+                  )
+                }
+              >
+                {scheduler.config.enabled
+                  ? `Auto ON (${scheduler.status.spawns_today}/${scheduler.config.daily_spawn_limit})`
+                  : "Auto OFF"}
+              </button>
+            )}
+            {!liveMain && (
+              <MainAgentSpawn
+                onSpawn={(model) =>
+                  act(() => api("POST", "/api/main", model ? { model } : {}))
+                }
+              />
+            )}
+            <button onClick={() => setShowCrons(true)}>Crons</button>
+            <button onClick={() => setShowMemory(true)}>Memory</button>
+            <button className="primary" onClick={() => setShowNewTask(true)}>
+              New Task
             </button>
-          ))}
-        </nav>
-        <span className="muted">
-          {tasks.filter((t) => t.status === "in_progress").length} running ·{" "}
-          {tasks.filter((t) => ["queued", "claimed"].includes(t.status)).length}{" "}
-          queued · {agents.length} live agents
-        </span>
-        <div className="spacer" />
-        {scheduler && (
-          <button
-            className={scheduler.config.enabled ? "sched-on" : ""}
-            title={`workers ${scheduler.status.live_workers}/${scheduler.config.max_concurrent} · spawns today ${scheduler.status.spawns_today}/${scheduler.config.daily_spawn_limit}`}
-            onClick={() =>
-              act(() =>
-                api("PATCH", "/api/scheduler", {
-                  enabled: !scheduler.config.enabled,
-                }),
-              )
-            }
-          >
-            {scheduler.config.enabled
-              ? `■ Auto ON (${scheduler.status.spawns_today}/${scheduler.config.daily_spawn_limit})`
-              : "▶ Auto OFF"}
-          </button>
-        )}
-        {!liveMain && (
-          <MainAgentSpawn
-            onSpawn={(model) =>
-              act(() => api("POST", "/api/main", model ? { model } : {}))
-            }
-          />
-        )}
-        <button onClick={() => setShowCrons(true)}>Crons</button>
-        <button onClick={() => setShowMemory(true)}>Memory</button>
-        <button className="primary" onClick={() => setShowNewTask(true)}>
-          + New Task
-        </button>
-      </header>
+          </header>
 
-      {error && (
-        <div className="error" onClick={() => setError(null)}>
-          {error}
-        </div>
-      )}
+          {error && (
+            <div className="error" onClick={() => setError(null)}>
+              {error}
+            </div>
+          )}
 
-      {tab === "board" && (
-        <AttentionPanel
-          items={attention}
-          onDismiss={(key) =>
-            act(() => api("POST", `/api/attention/${encodeURIComponent(key)}/dismiss`, {}))
-          }
-          onOpenTask={openTask}
-        />
-      )}
+          {tab === "board" && (
+            <OperationsSnapshot
+              attentionCount={attention.length}
+              runningCount={runningCount}
+              queuedCount={queuedCount}
+              activeProjectCount={activeProjectCount}
+              reviewCount={reviewCount}
+              prsAwaitingMerge={prsAwaitingMerge}
+              blockedCount={blockedCount}
+              failedCount={failedCount}
+              agentCount={agents.length}
+              mainOnline={!!liveMain}
+              schedulerEnabled={scheduler?.config.enabled ?? false}
+            />
+          )}
 
-      {tab === "board" && (
-        <AgentList
-          agents={agents}
-          panes={panes}
-          onOpenTerminal={openTerminal}
-          onAction={act}
-        />
-      )}
+          {tab === "board" && (
+            <AttentionPanel
+              items={attention}
+              onDismiss={(key) =>
+                act(() => api("POST", `/api/attention/${encodeURIComponent(key)}/dismiss`, {}))
+              }
+              onOpenTask={openTask}
+            />
+          )}
 
-      {tab === "tokens" && <TokensView tasks={tasks} onSelect={(t) => openTask(t.id)} />}
+          {tab === "dashboard" && (
+            <DashboardView
+              tasks={tasks}
+              agents={agents}
+              events={events}
+              attention={attention}
+              onSelect={(t) => openTask(t.id)}
+            />
+          )}
 
-      {tab === "prs" && (
-        <PrsView tasks={tasks} meta={jiraMeta} onSelect={(t) => openTask(t.id)} />
-      )}
+          {tab === "tokens" && <TokensView tasks={tasks} onSelect={(t) => openTask(t.id)} />}
 
-      {tab === "docs" && <DocsView />}
+          {tab === "prs" && (
+            <PrsView tasks={tasks} meta={jiraMeta} onSelect={(t) => openTask(t.id)} />
+          )}
 
-      {tab === "settings" && <SettingsView />}
+          {tab === "docs" && <DocsView />}
 
-      {tab === "archive" && (
-        <ArchiveView tasks={tasks} meta={jiraMeta} onSelect={(t) => openTask(t.id)} />
-      )}
+          {tab === "settings" && <SettingsView />}
 
-      {tab === "board" && (
-      <main>
-        <div className="board">
-          {(() => {
-            // Blocker may live in another project group, so resolve chains
-            // against all tasks, not just the current group's.
-            const byId = new Map(tasks.map((t) => [t.id, t] as const));
-            // Only active cards on the board; done/cancelled live under Archive.
-            // Headers still count archived tasks (rollup is over all tasks).
-            return groupByProject(tasks, { visible: (t) => isActive(t.status) }).map((g) => (
-              <div key={g.project} className="column">
-                <h2>
-                  {g.project} <span className="muted">{g.done}/{g.total}</span>
-                </h2>
-                {g.tasks.map((t) => (
-                  <TaskCard
-                    key={t.id}
-                    task={t}
-                    byId={byId}
-                    meta={jiraMeta}
-                    onSelect={(sel) => openTask(sel.id)}
-                    reviewMax={scheduler?.config.review_max_cycles ?? 4}
-                  />
-                ))}
+          {tab === "archive" && (
+            <ArchiveView tasks={tasks} meta={jiraMeta} onSelect={(t) => openTask(t.id)} />
+          )}
+
+          {tab === "board" && (
+            <main>
+              <div className="board">
+                {(() => {
+                  // Blocker may live in another project group, so resolve chains
+                  // against all tasks, not just the current group's.
+                  const byId = new Map(tasks.map((t) => [t.id, t] as const));
+                  // Only active cards on the board; done/cancelled live under Archive.
+                  // Headers still count archived tasks (rollup is over all tasks).
+                  return groupByProject(tasks, { visible: (t) => isActive(t.status) }).map((g) => (
+                    <div key={g.project} className="column">
+                      <h2>
+                        {g.project} <span className="muted">{g.done}/{g.total}</span>
+                      </h2>
+                      {g.tasks.map((t) => (
+                        <TaskCard
+                          key={t.id}
+                          task={t}
+                          byId={byId}
+                          meta={jiraMeta}
+                          onSelect={(sel) => openTask(sel.id)}
+                          reviewMax={scheduler?.config.review_max_cycles ?? 4}
+                          agents={taskAgents.get(t.id) ?? []}
+                          panes={panes}
+                          expandedAgentId={expandedAgentId}
+                          onToggleAgent={(agentId) =>
+                            setExpandedAgentId((cur) => (cur === agentId ? null : agentId))
+                          }
+                          onOpenTerminal={openTerminal}
+                          onAction={act}
+                        />
+                      ))}
+                    </div>
+                  ));
+                })()}
+                {tasks.filter((t) => isActive(t.status)).length === 0 && (
+                  <span className="muted">
+                    {tasks.length === 0 ? "No tasks yet" : "No active tasks — see Archive"}
+                  </span>
+                )}
               </div>
-            ));
-          })()}
-          {tasks.filter((t) => isActive(t.status)).length === 0 && (
-            <span className="muted">
-              {tasks.length === 0 ? "No tasks yet" : "No active tasks — see Archive"}
-            </span>
+
+              <SignalsPanel
+                events={events}
+                tasks={tasks}
+                onOpenTask={openTask}
+                onOpenTerminal={openTerminal}
+              />
+            </main>
           )}
         </div>
-
-        <aside className="events">
-          <h2>Activity</h2>
-          {events.map((e) => (
-            <div key={e.id} className="event">
-              <span className="muted">{e.ts.slice(11, 19)}</span>{" "}
-              {e.narrative ?? e.kind}
-            </div>
-          ))}
-          {events.length === 0 && <span className="muted">No activity yet</span>}
-        </aside>
-      </main>
-      )}
+      </div>
 
       {selTask && (
         <TaskPanel
@@ -621,12 +701,24 @@ function TaskCard({
   meta,
   onSelect,
   reviewMax = 4,
+  agents = [],
+  panes = {},
+  expandedAgentId = null,
+  onToggleAgent,
+  onOpenTerminal,
+  onAction,
 }: {
   task: Task;
   byId: Map<number, Task>;
   meta: JiraMeta;
   onSelect: (t: Task) => void;
   reviewMax?: number;
+  agents?: Agent[];
+  panes?: Record<number, ParsedPane>;
+  expandedAgentId?: number | null;
+  onToggleAgent?: (agentId: number) => void;
+  onOpenTerminal?: (agentId: number) => void;
+  onAction?: (fn: () => Promise<unknown>) => Promise<void>;
 }) {
   const chain = blockedByChain(task, byId);
   const summary = firstLine(task.result_summary);
@@ -687,7 +779,298 @@ function TaskCard({
           PR ↗
         </a>
       )}
+      {agents.length > 0 && onOpenTerminal && onAction && (
+        <div className="card-agents" onClick={(e) => e.stopPropagation()}>
+          {agents.map((agent) => {
+            const waiting = agent.state === "waiting_input";
+            const expanded = expandedAgentId === agent.id;
+            return (
+              <div key={agent.id} className={`card-agent${waiting ? " waiting" : ""}`}>
+                <div className="card-agent-row">
+                  <span
+                    className="dot"
+                    style={{ background: STATE_COLORS[agent.state] ?? STATE_COLORS.idle }}
+                  />
+                  <span className="card-agent-meta">
+                    a{agent.id} · {agent.kind} · {AGENT_STATE_LABEL[agent.state] ?? agent.state}
+                  </span>
+                  {waiting && <span className="waiting-badge">Waiting</span>}
+                </div>
+                <div className="card-agent-actions">
+                  {waiting && onToggleAgent && (
+                    <button onClick={() => onToggleAgent(agent.id)}>
+                      {expanded ? "Hide" : "Respond"}
+                    </button>
+                  )}
+                  <button onClick={() => onOpenTerminal(agent.id)}>Terminal</button>
+                  <button
+                    className="danger"
+                    onClick={() =>
+                      onAction(() =>
+                        api("POST", `/api/agents/${agent.id}/kill`, {
+                          requeue: agent.kind === "worker",
+                        }),
+                      )
+                    }
+                  >
+                    Kill
+                  </button>
+                </div>
+                {waiting && expanded && (
+                  <div className="card-agent-pane">
+                    <AgentPane
+                      agentId={agent.id}
+                      pane={panes[agent.id]}
+                      onAction={onAction}
+                      onOpenTerminal={() => onOpenTerminal(agent.id)}
+                    />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
+  );
+}
+
+type SignalFilter = "all" | "attention" | "review" | "progress" | "system";
+type SignalTone = "attention" | "review" | "progress" | "done" | "system";
+
+const SIGNAL_FILTERS: Array<{ id: SignalFilter; label: string }> = [
+  { id: "all", label: "All" },
+  { id: "attention", label: "Attention" },
+  { id: "review", label: "Review" },
+  { id: "progress", label: "Progress" },
+  { id: "system", label: "System" },
+];
+
+function eventPayload(event: Event): Record<string, unknown> {
+  if (!event.payload) return {};
+  try {
+    const parsed: unknown = JSON.parse(event.payload);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function signalTitle(kind: string, payload: Record<string, unknown>): string {
+  const titles: Record<string, string> = {
+    "task.created": "Task queued",
+    "task.claimed": "Task claimed",
+    "task.review": "Ready for review",
+    "task.blocked": "Task blocked",
+    "task.failed": "Task failed",
+    "task.cancelled": "Task cancelled",
+    "task.reopened": "Task reopened",
+    "task.requeued": "Task requeued",
+    "task.autocompleted": "Task completed",
+    "verify.passed": "Verification passed",
+    "verify.failed": "Verification failed",
+    "review.approved": "Review approved",
+    "review.rejected": "Review rejected",
+    "review.round_started": "Review started",
+    "review.loop_exhausted": "Review exhausted",
+    "review.verdict_superseded": "Review superseded",
+    "review.skipped_no_pr": "Review skipped",
+    "reviewer.auto_spawned": "Reviewer spawned",
+    "reviewer.spawned": "Reviewer spawned",
+    "reviewer.spawn_error": "Reviewer failed",
+    "pr.feedback": payload.changes_requested ? "Changes requested" : "PR feedback",
+    "pr.marked_ready": "PR ready",
+    "pr.ready_failed": "PR ready failed",
+    "pr.merged": "PR merged",
+    "pr.closed": "PR closed",
+    "pr.sync_broken": "PR sync broken",
+    "pr.sync_error": "PR sync failed",
+    "agent.spawned": "Agent spawned",
+    "agent.killed": "Agent killed",
+    "agent.stalled": "Agent stalled",
+    "agent.vanished": "Agent vanished",
+    "agent.auto_nudged": "Agent nudged",
+    "waiting.escalated": "Waiting escalated",
+    "waiting.delegated": "Question delegated",
+    "scheduler.capacity_blocked": "Scheduler at capacity",
+    "scheduler.spawned": "Scheduler spawned",
+    "scheduler.spawn_error": "Scheduler failed",
+    "scheduler.budget_reached": "Spawn budget reached",
+    "daemon.stale": "Daemon stale",
+    "jira.sync_broken": "Jira sync broken",
+    "jira.sync_error": "Jira sync failed",
+    "jira.transition_failed": "Jira update failed",
+    "jira.created": "Jira ticket created",
+    "jira.transition": "Jira updated",
+    "jira.commented": "Jira commented",
+  };
+  if (kind === "task.status") {
+    const to = typeof payload.to === "string" ? payload.to : "";
+    return to ? `Moved to ${statusText(to)}` : "Status changed";
+  }
+  return titles[kind] ?? kind.replaceAll(".", " ");
+}
+
+function signalCategory(kind: string, payload: Record<string, unknown>): SignalFilter {
+  if (
+    kind.includes("failed") ||
+    kind.includes("broken") ||
+    kind.includes("stalled") ||
+    kind.includes("vanished") ||
+    kind.includes("exhausted") ||
+    kind === "task.blocked" ||
+    kind === "task.failed" ||
+    kind === "task.stopped_incomplete" ||
+    kind === "review.rejected" ||
+    kind === "review.verdict_superseded" ||
+    kind === "waiting.escalated" ||
+    kind === "scheduler.capacity_blocked" ||
+    kind === "daemon.stale" ||
+    (kind === "pr.feedback" && payload.changes_requested === true)
+  ) {
+    return "attention";
+  }
+  if (kind.startsWith("review.") || kind.startsWith("reviewer.") || kind.startsWith("pr.")) {
+    return "review";
+  }
+  if (
+    kind.startsWith("settings.") ||
+    kind.startsWith("memory.") ||
+    kind.startsWith("doc.") ||
+    kind.startsWith("worktree.") ||
+    kind.startsWith("hook.") ||
+    kind.startsWith("cron.") ||
+    kind.startsWith("scheduler.") ||
+    kind.startsWith("watchdog.") ||
+    kind.startsWith("notification.") ||
+    kind.startsWith("jira.")
+  ) {
+    return "system";
+  }
+  return "progress";
+}
+
+function signalTone(kind: string, category: SignalFilter, payload: Record<string, unknown>): SignalTone {
+  if (category === "attention") return "attention";
+  if (kind.includes("approved") || kind.includes("passed") || kind.includes("completed") || kind.includes("merged")) {
+    return "done";
+  }
+  if (kind === "pr.feedback" && payload.changes_requested !== true) return "review";
+  if (category === "review") return "review";
+  if (category === "system") return "system";
+  return "progress";
+}
+
+function signalIcon(tone: SignalTone): string {
+  switch (tone) {
+    case "attention":
+      return "!";
+    case "review":
+      return "R";
+    case "done":
+      return "✓";
+    case "system":
+      return "S";
+    default:
+      return "→";
+  }
+}
+
+function SignalsPanel({
+  events,
+  tasks,
+  onOpenTask,
+  onOpenTerminal,
+}: {
+  events: Event[];
+  tasks: Task[];
+  onOpenTask: (taskId: number) => void;
+  onOpenTerminal: (agentId: number) => void;
+}) {
+  const [filter, setFilter] = useState<SignalFilter>("all");
+  const taskById = new Map(tasks.map((task) => [task.id, task]));
+  const signals = events.map((event) => {
+    const payload = eventPayload(event);
+    const category = signalCategory(event.kind, payload);
+    const tone = signalTone(event.kind, category, payload);
+    const task = event.task_id != null ? taskById.get(event.task_id) : undefined;
+    return {
+      event,
+      category,
+      tone,
+      title: signalTitle(event.kind, payload),
+      task,
+      detail: event.narrative ?? event.kind,
+    };
+  });
+  const counts = SIGNAL_FILTERS.reduce<Record<SignalFilter, number>>(
+    (acc, f) => {
+      acc[f.id] = f.id === "all" ? signals.length : signals.filter((s) => s.category === f.id).length;
+      return acc;
+    },
+    { all: 0, attention: 0, review: 0, progress: 0, system: 0 },
+  );
+  const visible = signals.filter((signal) => filter === "all" || signal.category === filter).slice(0, 14);
+
+  return (
+    <aside className="signals">
+      <div className="signals-head">
+        <div>
+          <span className="eyebrow">Signals</span>
+          <h2>Latest system movement</h2>
+        </div>
+      </div>
+      <div className="signal-filters" aria-label="Signal filters">
+        {SIGNAL_FILTERS.map((f) => (
+          <button
+            key={f.id}
+            className={filter === f.id ? "active" : ""}
+            onClick={() => setFilter(f.id)}
+          >
+            {f.label}
+            {counts[f.id] > 0 && <span>{counts[f.id]}</span>}
+          </button>
+        ))}
+      </div>
+      <div className="signal-list">
+        {visible.map(({ event, category, tone, title, task, detail }) => (
+          <div key={event.id} className={`signal-row tone-${tone}`}>
+            <span className="signal-icon">{signalIcon(tone)}</span>
+            <div className="signal-main">
+              <div className="signal-title">
+                <b>{title}</b>
+                <span>{category}</span>
+              </div>
+              <div className="signal-context">
+                {task ? `#${task.id} ${task.title}` : detail}
+              </div>
+              {task && detail && (
+                <div className="signal-detail">{detail}</div>
+              )}
+              <div className="signal-meta">
+                {event.agent_id != null && <span>a{event.agent_id}</span>}
+                <span title={event.ts}>{fmtAge(Date.now() - Date.parse(event.ts))} ago</span>
+              </div>
+            </div>
+            <div className="signal-actions">
+              {event.task_id != null && (
+                <button onClick={() => onOpenTask(event.task_id!)}>Task</button>
+              )}
+              {event.agent_id != null && (
+                <button onClick={() => onOpenTerminal(event.agent_id!)}>Terminal</button>
+              )}
+            </div>
+          </div>
+        ))}
+        {visible.length === 0 && (
+          <span className="muted">
+            {events.length === 0 ? "No signals yet" : "No signals match this filter"}
+          </span>
+        )}
+      </div>
+    </aside>
   );
 }
 
@@ -757,6 +1140,306 @@ function PrRow({
         {fmtAge(Date.now() - Date.parse(task.updated_at))}
       </span>
     </div>
+  );
+}
+
+function dayKey(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+function shortDayLabel(key: string): string {
+  const [, month, day] = key.split("-");
+  return `${month}/${day}`;
+}
+
+function DashboardView({
+  tasks,
+  agents,
+  events,
+  attention,
+  onSelect,
+}: {
+  tasks: Task[];
+  agents: Agent[];
+  events: Event[];
+  attention: AttentionItem[];
+  onSelect: (t: Task) => void;
+}) {
+  const statusOrder = ["queued", "in_progress", "review", "blocked", "done", "failed"];
+  const statusRows = statusOrder.map((status) => ({
+    status,
+    label: statusText(status),
+    count: tasks.filter((t) => t.status === status).length,
+  }));
+  const maxStatus = Math.max(1, ...statusRows.map((row) => row.count));
+
+  const today = new Date();
+  const flow = Array.from({ length: 14 }, (_, i) => {
+    const d = new Date(today);
+    d.setDate(today.getDate() - (13 - i));
+    return { key: dayKey(d), created: 0, completed: 0 };
+  });
+  const flowByKey = new Map(flow.map((bucket) => [bucket.key, bucket]));
+  for (const task of tasks) {
+    const createdBucket = flowByKey.get(task.created_at.slice(0, 10));
+    if (createdBucket) createdBucket.created++;
+    if (["done", "cancelled"].includes(task.status)) {
+      const completedBucket = flowByKey.get(task.updated_at.slice(0, 10));
+      if (completedBucket) completedBucket.completed++;
+    }
+  }
+  const maxFlow = Math.max(1, ...flow.flatMap((bucket) => [bucket.created, bucket.completed]));
+
+  const tokenRows = Array.from(
+    tasks.reduce((acc, task) => {
+      const tokens = task.tokens_used ?? 0;
+      if (tokens <= 0) return acc;
+      const key = task.model ?? task.worker_provider;
+      acc.set(key, (acc.get(key) ?? 0) + tokens);
+      return acc;
+    }, new Map<string, number>()),
+  )
+    .map(([label, tokens]) => ({ label, tokens }))
+    .sort((a, b) => b.tokens - a.tokens)
+    .slice(0, 5);
+  const maxTokens = Math.max(1, ...tokenRows.map((row) => row.tokens));
+
+  const reviewRows = [
+    {
+      label: "Approved",
+      count: tasks.filter((t) => t.review_verdict === "approve" && isOpenPr(t)).length,
+      cls: "approved",
+    },
+    {
+      label: "In review",
+      count: tasks.filter((t) => t.status === "review" && t.review_verdict !== "approve").length,
+      cls: "review",
+    },
+    {
+      label: "Changes",
+      count: tasks.filter((t) => t.review_verdict === "reject").length,
+      cls: "bad",
+    },
+  ];
+  const reviewTotal = Math.max(1, reviewRows.reduce((sum, row) => sum + row.count, 0));
+
+  const agentRows = ["working", "waiting_input", "idle", "spawning", "stalled"].map((state) => ({
+    state,
+    label: AGENT_STATE_LABEL[state] ?? state,
+    count: agents.filter((agent) => agent.state === state).length,
+  }));
+  const maxAgents = Math.max(1, ...agentRows.map((row) => row.count));
+
+  const riskTasks = tasks
+    .filter((task) => ["blocked", "failed"].includes(task.status) || attention.some((it) => it.task_id === task.id))
+    .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at))
+    .slice(0, 4);
+
+  return (
+    <main className="dashboard-page">
+      <div className="dashboard-grid">
+        <section className="dashboard-panel panel-wide">
+          <div className="panel-head">
+            <div>
+              <span className="eyebrow">Task Flow</span>
+              <h2>Created vs completed</h2>
+            </div>
+            <span className="panel-meta">14 days</span>
+          </div>
+          <div className="flow-chart" aria-label="Created and completed tasks over the last 14 days">
+            {flow.map((bucket) => (
+              <div key={bucket.key} className="flow-day" title={`${bucket.key}: ${bucket.created} created, ${bucket.completed} completed`}>
+                <div className="flow-bars">
+                  <span
+                    className="flow-bar created"
+                    style={{ height: `${Math.max(4, (bucket.created / maxFlow) * 100)}%` }}
+                  />
+                  <span
+                    className="flow-bar completed"
+                    style={{ height: `${Math.max(4, (bucket.completed / maxFlow) * 100)}%` }}
+                  />
+                </div>
+                <span>{shortDayLabel(bucket.key)}</span>
+              </div>
+            ))}
+          </div>
+          <div className="chart-legend">
+            <span><i className="legend-dot created" /> Created</span>
+            <span><i className="legend-dot completed" /> Completed</span>
+          </div>
+        </section>
+
+        <section className="dashboard-panel">
+          <div className="panel-head">
+            <div>
+              <span className="eyebrow">Workload</span>
+              <h2>Status distribution</h2>
+            </div>
+          </div>
+          <div className="bar-list">
+            {statusRows.map((row) => (
+              <div key={row.status} className="bar-row">
+                <div className="bar-label">
+                  <span>{row.label}</span>
+                  <b>{row.count}</b>
+                </div>
+                <div className="bar-track">
+                  <span className={`bar-fill ${row.status}`} style={{ width: `${(row.count / maxStatus) * 100}%` }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="dashboard-panel">
+          <div className="panel-head">
+            <div>
+              <span className="eyebrow">Review</span>
+              <h2>Review lane</h2>
+            </div>
+          </div>
+          <div className="pipeline-bar">
+            {reviewRows.map((row) => (
+              <span
+                key={row.label}
+                className={`pipeline-segment ${row.cls}`}
+                style={{ width: `${(row.count / reviewTotal) * 100}%` }}
+                title={`${row.label}: ${row.count}`}
+              />
+            ))}
+          </div>
+          <div className="metric-list">
+            {reviewRows.map((row) => (
+              <div key={row.label} className="metric-row">
+                <span>{row.label}</span>
+                <b>{row.count}</b>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="dashboard-panel">
+          <div className="panel-head">
+            <div>
+              <span className="eyebrow">Spend</span>
+              <h2>Token burn</h2>
+            </div>
+          </div>
+          {tokenRows.length > 0 ? (
+            <div className="bar-list">
+              {tokenRows.map((row) => (
+                <div key={row.label} className="bar-row">
+                  <div className="bar-label">
+                    <span>{row.label}</span>
+                    <b>{fmtTokens(row.tokens)}</b>
+                  </div>
+                  <div className="bar-track">
+                    <span className="bar-fill tokens" style={{ width: `${(row.tokens / maxTokens) * 100}%` }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <span className="empty-panel muted">No token usage recorded yet</span>
+          )}
+        </section>
+
+        <section className="dashboard-panel">
+          <div className="panel-head">
+            <div>
+              <span className="eyebrow">Fleet</span>
+              <h2>Agent states</h2>
+            </div>
+          </div>
+          <div className="bar-list">
+            {agentRows.map((row) => (
+              <div key={row.state} className="bar-row">
+                <div className="bar-label">
+                  <span>{row.label}</span>
+                  <b>{row.count}</b>
+                </div>
+                <div className="bar-track">
+                  <span className={`bar-fill agent-${row.state}`} style={{ width: `${(row.count / maxAgents) * 100}%` }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="dashboard-panel panel-wide">
+          <div className="panel-head">
+            <div>
+              <span className="eyebrow">Embedded Views</span>
+              <h2>Operational graph slots</h2>
+            </div>
+          </div>
+          <div className="embed-grid">
+            <div className="embed-frame">
+              <div className="embed-head">
+                <span>API SLA</span>
+                <b>source pending</b>
+              </div>
+              <div className="embed-sparkline" aria-hidden="true">
+                {Array.from({ length: 18 }, (_, i) => (
+                  <span key={i} style={{ height: `${28 + ((i * 17) % 52)}%` }} />
+                ))}
+              </div>
+            </div>
+            <div className="embed-frame">
+              <div className="embed-head">
+                <span>Jira Risk Report</span>
+                <b>source pending</b>
+              </div>
+              <div className="embed-bars" aria-hidden="true">
+                <span style={{ width: "72%" }} />
+                <span style={{ width: "46%" }} />
+                <span style={{ width: "58%" }} />
+                <span style={{ width: "31%" }} />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section className="dashboard-panel">
+          <div className="panel-head">
+            <div>
+              <span className="eyebrow">Attention</span>
+              <h2>Current risks</h2>
+            </div>
+          </div>
+          {riskTasks.length > 0 ? (
+            <div className="risk-list">
+              {riskTasks.map((task) => (
+                <button key={task.id} className="risk-row" onClick={() => onSelect(task)}>
+                  <span>#{task.id} {task.title}</span>
+                  <b>{statusText(task.status)}</b>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <span className="empty-panel muted">No blocked or failed work</span>
+          )}
+        </section>
+
+        <section className="dashboard-panel">
+          <div className="panel-head">
+            <div>
+              <span className="eyebrow">Activity</span>
+              <h2>Latest events</h2>
+            </div>
+          </div>
+          <div className="dashboard-events">
+            {events.slice(0, 6).map((event) => (
+              <div key={event.id}>
+                <span className="muted">{event.ts.slice(11, 19)}</span>
+                <p>{event.narrative ?? event.kind}</p>
+              </div>
+            ))}
+            {events.length === 0 && <span className="empty-panel muted">No events yet</span>}
+          </div>
+        </section>
+      </div>
+    </main>
   );
 }
 
@@ -2125,6 +2808,78 @@ const KIND_ICON: Record<AttentionItem["kind"], string> = {
   jira_sync: "🎫",
 };
 
+function OperationsSnapshot({
+  attentionCount,
+  runningCount,
+  queuedCount,
+  activeProjectCount,
+  reviewCount,
+  prsAwaitingMerge,
+  blockedCount,
+  failedCount,
+  agentCount,
+  mainOnline,
+  schedulerEnabled,
+}: {
+  attentionCount: number;
+  runningCount: number;
+  queuedCount: number;
+  activeProjectCount: number;
+  reviewCount: number;
+  prsAwaitingMerge: number;
+  blockedCount: number;
+  failedCount: number;
+  agentCount: number;
+  mainOnline: boolean;
+  schedulerEnabled: boolean;
+}) {
+  const riskCount = blockedCount + failedCount;
+  const items = [
+    {
+      label: "Needs You",
+      value: attentionCount,
+      detail: attentionCount === 1 ? "decision waiting" : "decisions waiting",
+      tone: attentionCount > 0 ? "warn" : "good",
+    },
+    {
+      label: "Active Work",
+      value: runningCount,
+      detail: `${queuedCount} queued · ${activeProjectCount} active project${activeProjectCount === 1 ? "" : "s"}`,
+      tone: "accent",
+    },
+    {
+      label: "Review Lane",
+      value: reviewCount,
+      detail: `${prsAwaitingMerge} approved PR${prsAwaitingMerge === 1 ? "" : "s"} awaiting merge`,
+      tone: prsAwaitingMerge > 0 ? "good" : "neutral",
+    },
+    {
+      label: "Risk",
+      value: riskCount,
+      detail: `${blockedCount} blocked · ${failedCount} failed`,
+      tone: riskCount > 0 ? "danger" : "good",
+    },
+    {
+      label: "Agent Fleet",
+      value: agentCount,
+      detail: `${mainOnline ? "main online" : "main offline"} · ${schedulerEnabled ? "auto on" : "auto off"}`,
+      tone: mainOnline ? "accent" : "warn",
+    },
+  ];
+
+  return (
+    <section className="ops-snapshot" aria-label="Operations snapshot">
+      {items.map((item) => (
+        <div key={item.label} className={`ops-tile tone-${item.tone}`}>
+          <span className="ops-label">{item.label}</span>
+          <b>{item.value}</b>
+          <span className="ops-detail">{item.detail}</span>
+        </div>
+      ))}
+    </section>
+  );
+}
+
 /**
  * The pinned "Needs You" queue. Always shown on the board: a severity-colored
  * row per action when non-empty, collapsed to a single reassuring line when
@@ -2188,161 +2943,6 @@ function AttentionPanel({
         </div>
       ))}
     </section>
-  );
-}
-
-/**
- * The live-agent list. The MAIN orchestrator is pinned at the top as a
- * prominent entry — Caleb jumps into its terminal constantly — with its
- * open-terminal action emphasized and no kill button (killing the
- * orchestrator from the dashboard is a footgun). Worker and reviewer
- * sub-agents list below as compact rows that keep their kill buttons.
- */
-function AgentList({
-  agents,
-  panes,
-  onOpenTerminal,
-  onAction,
-}: {
-  agents: Agent[];
-  panes: Record<number, ParsedPane>;
-  onOpenTerminal: (agentId: number) => void;
-  onAction: (fn: () => Promise<unknown>) => Promise<void>;
-}) {
-  // At most one respond pane open at a time — mirrors the single-panel model
-  // used elsewhere and keeps every waiting row compact until asked to expand.
-  const [respondId, setRespondId] = useState<number | null>(null);
-  const main = agents.find((a) => a.kind === "main");
-  const workers = agents.filter((a) => a.kind !== "main");
-  const toggleRespond = (id: number) =>
-    setRespondId((cur) => (cur === id ? null : id));
-
-  return (
-    <section className="agents">
-      {main ? (
-        <AgentEntry
-          agent={main}
-          prominent
-          pane={panes[main.id]}
-          expanded={respondId === main.id}
-          onToggleRespond={() => toggleRespond(main.id)}
-          onOpenTerminal={onOpenTerminal}
-          onAction={onAction}
-        />
-      ) : (
-        <div className="agent-entry main empty">
-          <span className="muted">No main agent — spawn one above</span>
-        </div>
-      )}
-
-      <div className="agents-workers">
-        <div className="agents-section-label muted">
-          Workers <span>{workers.length}</span>
-        </div>
-        {workers.map((a) => (
-          <AgentEntry
-            key={a.id}
-            agent={a}
-            pane={panes[a.id]}
-            expanded={respondId === a.id}
-            onToggleRespond={() => toggleRespond(a.id)}
-            onOpenTerminal={onOpenTerminal}
-            onAction={onAction}
-          />
-        ))}
-        {workers.length === 0 && (
-          <span className="muted">No worker agents</span>
-        )}
-      </div>
-    </section>
-  );
-}
-
-/**
- * One agent row. Stays a compact single line for every state; a waiting_input
- * agent is marked with a thin yellow left border + "waiting" badge, and its
- * inline respond pane (see AgentPane) is revealed on demand via "respond" so
- * it never expands the layout on its own. The main orchestrator (`prominent`)
- * gets an emphasized terminal button and no kill button.
- */
-function AgentEntry({
-  agent,
-  prominent = false,
-  pane,
-  expanded,
-  onToggleRespond,
-  onOpenTerminal,
-  onAction,
-}: {
-  agent: Agent;
-  prominent?: boolean;
-  pane: ParsedPane | undefined;
-  expanded: boolean;
-  onToggleRespond: () => void;
-  onOpenTerminal: (agentId: number) => void;
-  onAction: (fn: () => Promise<unknown>) => Promise<void>;
-}) {
-  const waiting = agent.state === "waiting_input";
-  const label = prominent
-    ? "Main agent"
-    : `a${agent.id}${
-        agent.task_id
-          ? ` · #${agent.task_id}`
-          : agent.kind === "reviewer"
-            ? " · review"
-            : ""
-      }`;
-  return (
-    <div
-      className={`agent-entry${prominent ? " main" : ""}${waiting ? " waiting" : ""}`}
-    >
-      <div className="agent-entry-row">
-        <span
-          className="dot"
-          style={{ background: STATE_COLORS[agent.state] ?? "#8b949e" }}
-        />
-        <b>{label}</b>
-        <span className="muted agent-state">
-          {AGENT_STATE_LABEL[agent.state] ?? agent.state} · {agent.provider} ·{" "}
-          {agent.model ?? "default"}
-          {agent.reasoning_effort ? ` · ${agent.reasoning_effort}` : ""}
-        </span>
-        {waiting && <span className="waiting-badge">Waiting</span>}
-        {waiting && (
-          <button onClick={onToggleRespond}>
-            {expanded ? "Hide" : "Respond"}
-          </button>
-        )}
-        <button
-          className={prominent ? "primary" : ""}
-          onClick={() => onOpenTerminal(agent.id)}
-        >
-          Terminal
-        </button>
-        {!prominent && (
-          <button
-            className="danger"
-            onClick={() =>
-              onAction(() =>
-                api("POST", `/api/agents/${agent.id}/kill`, {
-                  requeue: agent.kind === "worker",
-                }),
-              )
-            }
-          >
-            Kill
-          </button>
-        )}
-      </div>
-      {waiting && expanded && (
-        <AgentPane
-          agentId={agent.id}
-          pane={pane}
-          onAction={onAction}
-          onOpenTerminal={() => onOpenTerminal(agent.id)}
-        />
-      )}
-    </div>
   );
 }
 
