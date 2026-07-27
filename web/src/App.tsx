@@ -756,6 +756,14 @@ function TaskCard({
             Review round {Math.min(task.review_cycles + 1, reviewMax)}/{reviewMax}
           </span>
         )}
+        {task.review_mode === "light" && (
+          <span
+            className="chip"
+            title="Light review: the reviewer reads the diff and checks the claims, but does not independently re-run verification. Set at triage for docs/thresholds/runbooks."
+          >
+            Light review
+          </span>
+        )}
         {task.model && <span className="chip">{task.model}</span>}
         {task.reasoning_effort && <span className="chip">{task.reasoning_effort}</span>}
         <span className="chip">{task.worker_provider}</span>

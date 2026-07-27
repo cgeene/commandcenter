@@ -75,6 +75,8 @@ const TEMPLATES: Record<string, Template> = {
   },
   "review.verdict_superseded": (e, p) =>
     `${taskRef(e)}'s approval was superseded by a new push (${clip(p.new_head, 12)}) — re-drafting and re-reviewing`,
+  "review.delta_unavailable": (e, p) =>
+    `${taskRef(e)} is being re-reviewed in full — the previously reviewed commit (${clip(p.from, 12)}) is no longer on the branch`,
   "review.skipped_no_pr": (e, p) => {
     const commits = p.branch_has_commits ? " (branch has commits)" : "";
     return `Skipped auto-review of ${taskRef(e)} — repo task has no PR to review${commits}; review it manually if needed`;

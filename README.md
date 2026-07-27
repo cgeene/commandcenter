@@ -121,7 +121,9 @@ A task carries a `title`, `prompt`, `workspace_kind`, canonical `repo`/root,
 `2`), worker provider/model, Codex `reasoning_effort` (default `high`), an
 optional `verify_cmd`, and an optional `blocked_by` (another task id — it won't
 become ready until its blocker is `done`). `open_pr` (default on) controls whether
-a PR is expected. Each task also snapshots the effective publication mode when
+a PR is expected, and `review_mode` (`full` by default, or `light` for
+documentation/threshold/runbook work) controls how deep the adversarial review
+goes. Each task also snapshots the effective publication mode when
 it is created, so changing the local default never changes work already in
 flight. Statuses:
 
