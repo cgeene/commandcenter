@@ -526,13 +526,30 @@ export async function handleHookEvent(
       // delegation nor the escalation timer fires (same mechanism as the
       // in-review suppression above).
       //
-      // Genuine questions are unaffected: backgroundParked() returns null for a
-      // pending permission menu, an AskUserQuestion menu, an unsent composer
-      // draft, or any pane it cannot read, all of which fall through to the
-      // normal wait path even with background work running. The Stop-hook check
-      // keeps this to workers that really finished a turn, and the park window
-      // bounds how long a wedged worker can stay quiet.
-      if (agent.kind === "worker" && isIdlePrompt && stopFiredForLatestTurn(agentId)) {
+      // What this does NOT catch, stated plainly: a worker that ends its turn
+      // asking a FREE-TEXT question while background work is still running is
+      // suppressed too, for up to MAX_BACKGROUND_PARK_MS, and while suppressed it
+      // is invisible to both the escalation watchdog and Needs You (each keys on
+      // waiting_input). Only *structured* asks are excluded — backgroundParked()
+      // returns null for a pending permission menu, an AskUserQuestion menu, an
+      // unsent composer draft, or any pane it cannot read. There is deliberately
+      // no free-text-question heuristic: parsePane's parseQuestion needs a ╭…╮
+      // bordered box the modern rule-framed composer never renders, and a
+      // guessed-at signal here would either fire always or never, reintroducing
+      // exactly the noise this suppression removes. The park window is the
+      // backstop for that case.
+      //
+      // The state guard is load-bearing, not redundant with the Stop check: an
+      // agent already in waiting_input must never be pulled back to idle, or a
+      // repeat idle_prompt whose pane now reads as parked (first capture raced or
+      // failed, or a draft was cleared between the two) would silently cancel an
+      // escalation that was already counting down.
+      if (
+        agent.kind === "worker" &&
+        isIdlePrompt &&
+        agent.state !== "waiting_input" &&
+        stopFiredForLatestTurn(agentId)
+      ) {
         const parked = backgroundParked(agent);
         if (parked && withinBackgroundParkWindow(agentId)) {
           updateAgent(agentId, { state: "idle" });

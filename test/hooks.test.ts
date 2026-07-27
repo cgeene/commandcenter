@@ -976,6 +976,37 @@ describe("idle-prompt suppression for workers parked on background work", () => 
     expect(kinds).not.toContain("waiting.suppressed_active_monitor");
   });
 
+  it("never demotes an already-waiting agent to idle (a counting-down escalation must survive)", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    const { listEvents, latestAgentEventTs } = await import("../src/db/events.js");
+    await liveIdleMain();
+    const { agent } = await setup({ tmux_target: WORKER_TARGET });
+
+    // First idle_prompt: the pane read fails (no background counts visible), so
+    // the worker legitimately enters waiting_input and the escalation clock —
+    // which the scheduler derives from this wait's hook event — starts running.
+    paneByTarget.set(WORKER_TARGET, workerPane(null));
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+    await handleHookEvent(agent.id, IDLE_PROMPT);
+    expect(getAgent(agent.id)?.state).toBe("waiting_input");
+    const waitStart = latestAgentEventTs(agent.id, ["hook.notification"]);
+    expect(waitStart).toBeTruthy();
+
+    // Repeat idle_prompt for the same wait, and this time the pane DOES read as
+    // parked (the earlier capture raced, or a draft was cleared between the two).
+    // Suppressing now would silently cancel the in-flight escalation.
+    paneByTarget.set(WORKER_TARGET, workerPane("1 shell, 1 monitor"));
+    await handleHookEvent(agent.id, IDLE_PROMPT);
+
+    expect(getAgent(agent.id)?.state).toBe("waiting_input"); // NOT demoted to idle
+    const kinds = listEvents(40).map((e) => e.kind);
+    expect(kinds).not.toContain("waiting.suppressed_active_monitor");
+    // The wait episode the watchdog keys on is still on record, so the
+    // escalate-to-human timer remains armed.
+    expect(latestAgentEventTs(agent.id, ["hook.notification"])).toBeTruthy();
+  });
+
   it("stops suppressing once the park window is exhausted", async () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");
     const { getAgent, updateAgent } = await import("../src/db/agents.js");
