@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { parsePane } from "../src/daemon/pane.js";
+import {
+  clearComposer,
+  draftComposer,
+  ghostComposer,
+  noComposer,
+  wideClearComposer,
+  wideDraftComposer,
+} from "./fixtures/pane.js";
 
 const ESC = String.fromCharCode(27);
 
@@ -423,6 +431,120 @@ describe("parsePane — ghost-text vs real input in the rule-framed composer", (
       "this is a very long line of typed but unsubmitted " +
         "text that keeps going onto a second physical line",
     );
+  });
+});
+
+/**
+ * How the composer frame renders depends on the pane's width, and the daemon has
+ * to read it at whatever width the pane happens to be (web-terminal viewers
+ * attach and detach; tmux sizes the window to its smallest client). The live
+ * orchestrator pane produced both of these on the same day:
+ *
+ *   131 cols:  "─────────…───── Manage Claude orchestrator … ──"
+ *    51 cols:  " Manage Claude orchestrator task queue and workers"  (zero `─`)
+ *              "──"                                                 (wrapped tail)
+ *
+ * Matching only a border that starts with a run of `─` misses the narrow form
+ * entirely, so the input line is never found. And because "no draft found" and
+ * "no composer found" used to be the same answer, that came back as "nothing
+ * typed" and a worker notification was typed into — and submitted with — a
+ * human's half-written message. These cases pin both widths and both halves of
+ * that distinction.
+ */
+describe("parsePane — composer detection across pane widths", () => {
+  const DRAFT = [
+    "custom-hostnames will be team-platform.",
+    "nylas-data-lake will also be team platform.",
+    "unicorn-",
+  ] as const;
+  const JOINED =
+    "custom-hostnames will be team-platform. " +
+    "nylas-data-lake will also be team platform. unicorn-";
+
+  describe("51 columns — label fills its own row, borders wrap", () => {
+    it("sees a human draft", () => {
+      const parsed = parsePane(draftComposer("actually hold on, let me rethink"));
+      expect(parsed.composer_found).toBe(true);
+      expect(parsed.unsubmitted_input).toBe("actually hold on, let me rethink");
+    });
+
+    it("sees every line of a multi-line draft, not just the marker row", () => {
+      // The exact draft that got clobbered: the notification landed after
+      // "unicorn-" and submitted the merged text as the human's turn.
+      const parsed = parsePane(draftComposer(...DRAFT));
+      expect(parsed.composer_found).toBe(true);
+      expect(parsed.unsubmitted_input).toBe(JOINED);
+    });
+
+    it("keeps a draft whose trailing newline leaves a blank row", () => {
+      const parsed = parsePane(draftComposer("first thought", "", "second thought"));
+      expect(parsed.composer_found).toBe(true);
+      expect(parsed.unsubmitted_input).toBe("first thought second thought");
+    });
+
+    it("reports an empty composer as found and empty", () => {
+      const parsed = parsePane(clearComposer());
+      expect(parsed.composer_found).toBe(true);
+      expect(parsed.unsubmitted_input).toBeNull();
+    });
+
+    it("still treats ghost text as empty", () => {
+      const parsed = parsePane(ghostComposer());
+      expect(parsed.composer_found).toBe(true);
+      expect(parsed.unsubmitted_input).toBeNull();
+    });
+  });
+
+  describe("131 columns — label embedded in the top rule", () => {
+    it("sees a multi-line draft", () => {
+      const parsed = parsePane(wideDraftComposer(...DRAFT));
+      expect(parsed.composer_found).toBe(true);
+      expect(parsed.unsubmitted_input).toBe(JOINED);
+    });
+
+    it("reports an empty composer as found and empty", () => {
+      const parsed = parsePane(wideClearComposer());
+      expect(parsed.composer_found).toBe(true);
+      expect(parsed.unsubmitted_input).toBeNull();
+    });
+  });
+
+  describe("nothing there", () => {
+    it("reports composer_found=false when no input line is on screen", () => {
+      const parsed = parsePane(noComposer());
+      expect(parsed.composer_found).toBe(false);
+      expect(parsed.unsubmitted_input).toBeNull();
+    });
+
+    it("does not mistake a rule pair in the agent's own output for a composer", () => {
+      const parsed = parsePane(
+        [
+          "─".repeat(60),
+          "  Summary of the rollout plan",
+          "  Ship behind a flag first.",
+          "─".repeat(60),
+        ].join("\n"),
+      );
+      expect(parsed.composer_found).toBe(false);
+      expect(parsed.unsubmitted_input).toBeNull();
+    });
+
+    it("does not read a scrollback echo of a submitted message as a live draft", () => {
+      // Detection anchors on the bottom rule and walks up; agent output between
+      // that rule and an old "❯ …" row must stop the walk, or a message the
+      // human already sent would read as a draft and wedge delivery shut.
+      const parsed = parsePane(
+        [
+          "❯ an already submitted message",
+          "",
+          "⏺ Here is the answer",
+          "  continued prose",
+          "─".repeat(60),
+        ].join("\n"),
+      );
+      expect(parsed.composer_found).toBe(false);
+      expect(parsed.unsubmitted_input).toBeNull();
+    });
   });
 });
 

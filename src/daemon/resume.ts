@@ -2,7 +2,25 @@ import { getAgent, updateAgent } from "../db/agents.js";
 import { logEvent } from "../db/events.js";
 import { sendEnter, sendText, windowExists } from "./tmux.js";
 
-export type ResumeOutcome = "sent" | "not_live" | "waiting_input";
+export type ResumeOutcome = "sent" | "not_live" | "waiting_input" | "deferred";
+
+/**
+ * Last-moment checks around the keystrokes themselves, for callers that must
+ * not disturb whatever is already in the pane.
+ *
+ * Reading the pane and typing into it are two separate tmux round trips, so a
+ * caller that checks "is this composer empty?" and then calls resumeAgent has
+ * left a window in which a human keystroke can land. These hooks close it:
+ * `beforeType` runs immediately before the send-keys, after every other check
+ * resumeAgent makes, and `beforeSubmit` runs once the text is in the pane but
+ * before Enter. Either returning false yields the "deferred" outcome — with
+ * `beforeType` nothing was typed at all, and with `beforeSubmit` the text is
+ * left in the composer unsent rather than being submitted on top of a draft.
+ */
+export interface SendGuard {
+  beforeType?: () => boolean;
+  beforeSubmit?: () => boolean;
+}
 
 /**
  * The one way to inject text into an agent's interactive session.
@@ -25,7 +43,7 @@ export type ResumeOutcome = "sent" | "not_live" | "waiting_input";
 export async function resumeAgent(
   agentId: number,
   text: string,
-  opts?: { interrupt?: boolean },
+  opts?: { interrupt?: boolean; guard?: SendGuard },
 ): Promise<ResumeOutcome> {
   const agent = getAgent(agentId);
   if (
@@ -37,9 +55,16 @@ export async function resumeAgent(
     return "not_live";
   }
   if (agent.state === "waiting_input" && !opts?.interrupt) return "waiting_input";
+  // Deliberately the last thing before the keystrokes, so a guard sees the pane
+  // as close to "now" as tmux allows.
+  if (opts?.guard?.beforeType && !opts.guard.beforeType()) return "deferred";
 
+  const beforeSubmit = opts?.guard?.beforeSubmit;
+  let submitted: boolean;
   try {
-    await sendText(agent.tmux_target, text);
+    submitted = beforeSubmit
+      ? await sendText(agent.tmux_target, text, { beforeSubmit })
+      : await sendText(agent.tmux_target, text);
   } catch (err) {
     // window died between the check and the send
     logEvent("agent.send_failed", {
@@ -49,6 +74,10 @@ export async function resumeAgent(
     });
     return "not_live";
   }
+
+  // Typed but held back by beforeSubmit: the text sits in the composer unsent,
+  // so nothing was delivered and no state transition has happened.
+  if (submitted === false) return "deferred";
 
   // Re-read: sendText awaits ≥300ms and hooks share the event loop, so a
   // Stop/Notification/kill may have landed since the snapshot. Never

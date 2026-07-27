@@ -153,6 +153,16 @@ const TEMPLATES: Record<string, Template> = {
     `Skipped a repeat idle ping from ${worker(e)} — already delegated this turn`,
   "notification.queued": (e) =>
     `Held ${worker(e)}'s notification — main agent's prompt was busy`,
+  "notification.submit_withheld": (_e, p) =>
+    p.reason === "permission"
+      ? "Held back a message mid-send — a permission menu opened in the main agent's prompt"
+      : "Held back a message mid-send — something else appeared in the main agent's prompt",
+  "main.delivery_blocked": (_e, p) =>
+    p.reason === "unreadable"
+      ? "Cannot read the main agent's prompt — holding deliveries"
+      : "Main agent has an unsubmitted draft — holding deliveries",
+  "main.delivery_blocked_escalated": (_e, p) =>
+    `Paged the human — ${p.reason === "unreadable" ? "the main agent's prompt is unreadable" : "an unsubmitted draft is blocking delivery"} after ${Number(p.attempts) || 0} attempts`,
   "notification.flushed": (_e, p) => {
     const n = Number(p.count) || 0;
     return `Delivered ${n} queued notification${n === 1 ? "" : "s"} to the main agent`;

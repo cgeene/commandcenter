@@ -81,6 +81,15 @@ export interface ParsedPane {
   pending_permission: PendingPermission | null;
   pending_question: string | null;
   unsubmitted_input: string | null;
+  /**
+   * Whether the input line itself was positively located in this capture.
+   *
+   * `unsubmitted_input === null` alone is ambiguous: it means either "the
+   * composer is empty" or "the composer could not be found at all". Callers
+   * that are about to TYPE into the pane must not conflate those — see
+   * notifqueue.promptClarity, which treats a composer it cannot see as unsafe.
+   */
+  composer_found: boolean;
   background_activity: BackgroundActivity | null;
   raw: string;
 }
@@ -188,70 +197,136 @@ function parsePlainPermission(lines: string[]): PendingPermission | null {
   return { question: questionLines.join(" "), options };
 }
 
-// A full-width horizontal rule (U+2500). Current Claude Code versions frame
-// the composer between two of these rather than a rounded box; the input line
-// is a bare "❯ …" between them, with no side borders to unwrap.
-const RULE_RE = /^\s*─{8,}\s*$/;
 // Strip the "❯" marker and the whitespace after it. In the live TUI
 // that separator is a non-breaking space (U+00A0); JS `\s` matches it.
 const MARKER_RE = /^❯\s*(.*)$/;
 
-/** Text sitting after the input marker that hasn't been sent yet — may wrap
- *  across multiple physical lines at pane width. Ghost-text suggestions
- *  (rendered dim) are excluded; only default-styled text a human actually
- *  typed counts. Tries the current rule-framed composer first, then the older
- *  box-bordered layout. `styled` retains ANSI (for the dim check); `plain` is
- *  the same lines with ANSI stripped (for structural detection). */
-function parseUnsubmittedInput(styled: string[], plain: string[]): string | null {
+/**
+ * Current Claude Code frames the input line between two horizontal rules of
+ * U+2500 rather than in a rounded box, and paints a session label into the top
+ * one. How that renders depends entirely on the pane's width, and the same live
+ * orchestrator pane produces both of these:
+ *
+ *   131 cols:  "──────────…────── Manage Claude orchestrator … ──"
+ *    51 cols:  " Manage Claude orchestrator task queue and workers"
+ *              "──"
+ *
+ * At narrow widths the label consumes the whole row — ZERO rule glyphs on it —
+ * and the rules that follow wrap onto their own row. The bottom rule wraps the
+ * same way (a full-width row, then a short tail). So no per-row predicate can
+ * recognize the TOP border at every width, and requiring one is what left a
+ * real draft invisible on the actual pane the incident happened on.
+ *
+ * Detection therefore anchors on the BOTTOM border, whose rows are pure rule
+ * glyphs at any width, and walks up from it — see parseRuleComposer.
+ */
+
+/** A row that is nothing but rule glyphs. Count is deliberately not part of the
+ *  test: a wrapped border's tail is only a couple of glyphs wide. */
+function isRuleRow(trimmed: string): boolean {
+  return trimmed.length > 0 && /^─+$/.test(trimmed);
+}
+
+/** A rule row with the label embedded in it — the wide-pane form of the top
+ *  border. Used only as a stop when scanning upward. */
+function isLabelledRuleRow(trimmed: string): boolean {
+  const rules = trimmed.match(/─/g)?.length ?? 0;
+  if (rules < 2) return false;
+  const label = trimmed.replace(/^─+/, "").replace(/─+$/, "");
+  return !label.includes("─");
+}
+
+/** Rows the agent's own output starts with. A row beginning with one of these
+ *  is transcript text, never part of the composer — it is the stop that keeps
+ *  the upward scan from reaching a scrollback echo of an already-submitted
+ *  "❯ …" message and reporting it as a live draft. */
+const OUTPUT_BULLET_RE = /^[⏺✻⎿]/;
+
+/** How far above the bottom border to look. Generous enough for a long draft
+ *  (or a ~600-char injected message) wrapped at a narrow pane width, bounded so
+ *  a composer-less pane can't drag the scan through the whole transcript. */
+const MAX_COMPOSER_SCAN_ROWS = 40;
+
+/**
+ * What the input line holds. `null` (rather than a `text: null` read) means the
+ * composer could not be located at all — a distinction callers about to type
+ * into the pane depend on (see ParsedPane.composer_found).
+ */
+interface ComposerRead {
+  /** Typed-but-unsent text, or null when the composer is empty. */
+  text: string | null;
+}
+
+/** Read the input line: the current rule-framed composer, else the older
+ *  box-bordered layout. Ghost-text suggestions (rendered dim) are excluded;
+ *  only default-styled text a human actually typed counts. `styled` retains
+ *  ANSI (for the dim check); `plain` is the same lines with ANSI stripped (for
+ *  structural detection). */
+function readComposer(styled: string[], plain: string[]): ComposerRead | null {
   return parseRuleComposer(styled, plain) ?? parseBoxComposer(plain);
 }
 
-/** Current layout: a bare "❯ …" line between two full-width `─` rules. */
-function parseRuleComposer(styled: string[], plain: string[]): string | null {
-  let bottom = -1;
-  for (let i = plain.length - 1; i >= 0; i--) {
-    if (RULE_RE.test(plain[i])) {
-      bottom = i;
-      break;
-    }
-  }
-  if (bottom < 1) return null;
-  let top = -1;
-  for (let i = bottom - 1; i >= 0; i--) {
-    if (RULE_RE.test(plain[i])) {
-      top = i;
-      break;
-    }
-  }
-  if (top === -1) return null;
+/**
+ * Current layout: a "❯ …" input line above a horizontal rule, its text wrapping
+ * across as many physical rows as it needs.
+ *
+ * Anchored on the bottom border rather than on a pair of borders, because the
+ * top border is unrecognizable at narrow widths (see the note above): find the
+ * last pure-rule row plus the contiguous rule rows above it (one wrapped
+ * border), then walk upward to the input marker. Everything collected on the way
+ * is the draft's own wrapped rows. Nothing above the marker has to be
+ * identified at all, which is what makes this width-independent.
+ */
+function parseRuleComposer(styled: string[], plain: string[]): ComposerRead | null {
+  const trimmed = plain.map((line) => line.trim());
 
-  // The region between the two rules must actually hold the composer marker,
-  // otherwise this is some other rule-delimited block, not the input line.
-  let seenMarker = false;
-  const parts: string[] = [];
-  for (let i = top + 1; i < bottom; i++) {
-    const pTrim = plain[i].trim();
-    if (pTrim === "") continue;
-    const styledLine = styled[i] ?? plain[i];
-    if (pTrim.startsWith("❯")) {
-      seenMarker = true;
-      // A menu cursor ("❯ 1. Yes") is not the free-text input line.
-      const after = pTrim.replace(/^❯\s*/, "");
-      if (/^\d{1,2}[.)]\s/.test(after)) continue;
-      const real = MARKER_RE.exec(visibleNonGhost(styledLine).trim());
-      if (real && real[1].trim()) parts.push(real[1].trim());
-    } else {
-      // A wrapped continuation of the typed text.
-      const real = visibleNonGhost(styledLine).trim();
-      if (real) parts.push(real);
+  let border = -1;
+  for (let i = trimmed.length - 1; i >= 0; i--) {
+    if (isRuleRow(trimmed[i])) {
+      border = i;
+      break;
     }
   }
-  if (!seenMarker) return null;
-  return parts.length > 0 ? parts.join(" ") : null;
+  if (border < 1) return null;
+  // A border wider than the pane wraps, so its tail is a rule row of its own.
+  while (border > 0 && isRuleRow(trimmed[border - 1])) border--;
+
+  const rows: number[] = [];
+  let marker = -1;
+  for (
+    let i = border - 1;
+    i >= 0 && border - i <= MAX_COMPOSER_SCAN_ROWS;
+    i--
+  ) {
+    const t = trimmed[i];
+    // A blank row inside the composer is a newline the human typed and has not
+    // filled in yet — skip it, but don't let it end the draft.
+    if (t === "") continue;
+    // Reaching the top border, another rule, or agent output means there is no
+    // input line here: this rule was something else (a rule the agent printed).
+    if (isRuleRow(t) || isLabelledRuleRow(t) || OUTPUT_BULLET_RE.test(t)) break;
+    rows.unshift(i);
+    if (t.startsWith("❯")) {
+      marker = i;
+      break;
+    }
+  }
+  if (marker === -1) return null;
+  // A menu cursor ("❯ 1. Yes") is not the free-text input line.
+  if (/^\d{1,2}[.)]\s/.test(trimmed[marker].replace(/^❯\s*/, ""))) return null;
+
+  const parts: string[] = [];
+  for (const i of rows) {
+    const visible = visibleNonGhost(styled[i] ?? plain[i]).trim();
+    const text =
+      i === marker ? (MARKER_RE.exec(visible)?.[1] ?? "").trim() : visible;
+    if (text) parts.push(text);
+  }
+  return { text: parts.length > 0 ? parts.join(" ") : null };
 }
 
 /** Older layout: "❯ …" inside a rounded box, bordered by `│` on both sides. */
-function parseBoxComposer(lines: string[]): string | null {
+function parseBoxComposer(lines: string[]): ComposerRead | null {
   const unwrapped = lines.map(unwrap);
   let start = -1;
   let firstText = "";
@@ -276,7 +351,7 @@ function parseBoxComposer(lines: string[]): string | null {
     if (!u.bordered || u.content === "" || u.content.startsWith("❯")) break;
     parts.push(u.content);
   }
-  return parts.length > 0 ? parts.join(" ") : null;
+  return { text: parts.length > 0 ? parts.join(" ") : null };
 }
 
 function findCodexInput(
@@ -430,11 +505,13 @@ export function parsePane(
   // Claude: reject dim ghost-text suggestions (styled lines) so an idle
   // composer's autosuggestion is not mistaken for real typed input (#30).
   // Codex: its own input scan already distinguishes real input.
-  const unsubmitted_input = pending_permission
-    ? null
-    : provider === "codex"
-      ? codexInput?.text || null
-      : parseUnsubmittedInput(ansiLines, lines);
+  const composer: ComposerRead | null =
+    provider === "codex"
+      ? codexInput
+        ? { text: codexInput.text || null }
+        : null
+      : readComposer(ansiLines, lines);
+  const unsubmitted_input = pending_permission ? null : composer?.text ?? null;
   const pending_question = pending_permission
     ? null
     : provider === "codex" && codexInput
@@ -452,6 +529,7 @@ export function parsePane(
     pending_permission,
     pending_question,
     unsubmitted_input,
+    composer_found: composer !== null,
     background_activity,
     raw,
   };

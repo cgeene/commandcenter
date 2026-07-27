@@ -2,17 +2,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { clearComposer } from "./fixtures/pane.js";
 
 const sendText = vi.fn(async () => {});
-// Controls what the main's pane looks like to the prompt-clear gate. Empty =
-// idle/clear (delivery allowed); a draft with an unsubmitted line = busy.
-let paneText = "";
+// Controls what the main's pane looks like to the prompt-clear gate. An empty
+// composer allows delivery; a draft on the input line, or a capture that can't
+// be read at all, blocks it.
+let paneText = clearComposer();
 
 vi.mock("../src/daemon/tmux.js", () => ({
   windowExists: () => true,
   capturePane: () => {
-    // mainPromptClear fails closed on a capture error, so this models a main
-    // whose prompt cannot be confirmed clear (busy / mid-draft).
+    // The gate fails closed on a capture error, so this models a main whose
+    // prompt cannot be confirmed clear (busy / mid-draft).
     if (paneText === "__BUSY__") throw new Error("prompt not clear");
     return paneText;
   },
@@ -26,7 +28,7 @@ beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-orchestration-"));
   process.env.CC_DATA_DIR = tmpDir;
   sendText.mockClear();
-  paneText = "";
+  paneText = clearComposer();
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
 });
@@ -61,6 +63,8 @@ describe("main-first task delegation", () => {
     expect(sendText).toHaveBeenCalledWith(
       main.tmux_target,
       expect.stringContaining("never spawn the parent"),
+      // Main-agent delivery is guarded (composer re-checked before Enter).
+      expect.objectContaining({ beforeSubmit: expect.any(Function) }),
     );
     expect(listEvents(10).map((event) => event.kind)).toContain(
       "task.delegated_to_main",
@@ -329,7 +333,8 @@ describe("main-first task delegation", () => {
       open_pr: false,
     });
 
-    paneText = ""; // prompt is clear; only the working state blocks delivery
+    // Composer is empty; only the working state blocks delivery.
+    paneText = clearComposer();
     expect(await delegateTaskToMain(task.id)).toBe(false);
     expect(sendText).not.toHaveBeenCalled();
     const kinds = listEvents(10).map((e) => e.kind);

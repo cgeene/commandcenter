@@ -150,11 +150,23 @@ export function windowExists(target: string): boolean {
  * Send a prompt to a running interactive session. Literal-mode text and the
  * Enter key are sent separately with a small gap — sending them together is
  * the classic send-keys race where the REPL swallows the newline.
+ *
+ * `beforeSubmit` runs in that gap, once the text is in the pane but before it
+ * is submitted, and returning false leaves it sitting there unsent. That is the
+ * last checkpoint at which an injected message can still be stopped from
+ * merging into something a human typed in the meantime. Resolves true when the
+ * text was submitted, false when it was typed but deliberately not submitted.
  */
-export async function sendText(target: string, text: string): Promise<void> {
+export async function sendText(
+  target: string,
+  text: string,
+  opts: { beforeSubmit?: () => boolean } = {},
+): Promise<boolean> {
   tmux("send-keys", "-t", target, "-l", text);
   await new Promise((r) => setTimeout(r, 300));
+  if (opts.beforeSubmit && !opts.beforeSubmit()) return false;
   tmux("send-keys", "-t", target, "Enter");
+  return true;
 }
 
 /**

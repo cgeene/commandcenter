@@ -2,30 +2,52 @@ import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import {
+  clearComposer,
+  draftComposer,
+  noComposer,
+  permissionMenu,
+  wrappedComposer,
+} from "./fixtures/pane.js";
 
-const sendText = vi.fn(async () => {});
 /** Pane content keyed by tmux target — lets a worker's pane differ from the
  *  main agent's, which the shared single-string mock in hooks.test can't. */
 const panes = new Map<string, string>();
+
+/**
+ * Stands in for tmux send-keys, faithfully enough to exercise the guard: the
+ * text lands in the pane, `beforeSubmit` runs, and Enter only follows if it
+ * agrees. `onType` lets a test simulate a keystroke arriving in exactly the
+ * window between the composer check and the send.
+ */
+let onType: ((target: string, text: string) => void) | null = null;
+const sendText = vi.fn(
+  async (
+    target: string,
+    text: string,
+    opts?: { beforeSubmit?: () => boolean },
+  ): Promise<boolean> => {
+    onType?.(target, text);
+    if (opts?.beforeSubmit && !opts.beforeSubmit()) return false;
+    return true;
+  },
+);
 
 vi.mock("../src/daemon/tmux.js", () => ({
   windowExists: () => true,
   listWindowIds: () => [...panes.keys()],
   listLiveWindowIds: () => [...panes.keys()],
-  sendText: (...args: unknown[]) => sendText(...args),
+  sendText: (...args: unknown[]) =>
+    (sendText as unknown as (...a: unknown[]) => Promise<boolean>)(...args),
   capturePane: (target: string) => panes.get(target) ?? "",
 }));
 
 let tmpDir: string;
 
 // An empty, idle composer — no unsubmitted draft, no menu.
-const CLEAR_PROMPT = ["╭──────────╮", "│ ❯        │", "╰──────────╯"].join("\n");
+const CLEAR_PROMPT = clearComposer();
 // The human has started typing a message but not submitted it.
-const HUMAN_DRAFT = [
-  "╭──────────────────────────────╮",
-  "│ ❯ hey can you also check the  │",
-  "╰──────────────────────────────╯",
-].join("\n");
+const HUMAN_DRAFT = draftComposer("hey can you also check the");
 
 const MAIN = "cc:@main";
 const W1 = "cc:@w1";
@@ -37,12 +59,15 @@ beforeEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   panes.clear();
+  onType = null;
   sendText.mockClear();
-  sendText.mockImplementation(async () => {});
   const { __clearAutoNudgeCountsForTests } = await import("../src/daemon/hooks.js");
   __clearAutoNudgeCountsForTests();
-  const { __clearFlushBackoffForTests } = await import("../src/daemon/notifqueue.js");
+  const { __clearFlushBackoffForTests, __clearUnreadableLogForTests } = await import(
+    "../src/daemon/notifqueue.js"
+  );
   __clearFlushBackoffForTests();
+  __clearUnreadableLogForTests();
 });
 
 afterEach(async () => {
@@ -120,6 +145,200 @@ describe("delegateToMain — deliver vs queue", () => {
     const { listEvents } = await import("../src/db/events.js");
     expect(listEvents(20).map((e) => e.kind)).toContain("notification.queued");
   });
+});
+
+/**
+ * The recurrence these cover: delivery merged into a human's half-typed
+ * multi-line message and submitted the wreckage as their turn. Every way that
+ * can happen must end with the characters the human typed still on screen and
+ * the notification still queued.
+ *
+ * Note the two outcomes are not equally tidy. When the draft is seen up front
+ * nothing is typed at all and the pane is untouched. When a keystroke wins the
+ * race the notification is already in the composer and only Enter is withheld,
+ * so the human keeps everything they typed but has to delete the injection by
+ * hand — better than the alternatives (submitting the merge, or re-typing a
+ * draft reconstructed from wrapped rows), not invisible.
+ */
+describe("delegateToMain — a human's typed characters are never lost", () => {
+  it("preserves a multi-line draft verbatim and queues the notification", async () => {
+    const { main, worker } = await setup("idle");
+    const draft = draftComposer(
+      "custom-hostnames will be team-platform.",
+      "nylas-data-lake will also be team platform.",
+      "unicorn-",
+    );
+    panes.set(MAIN, draft);
+
+    await notifyWorker(worker.id, "which region?");
+
+    // Nothing was typed into the pane at all, so the draft is byte-identical.
+    expect(sendText).not.toHaveBeenCalled();
+    expect(panes.get(MAIN)).toBe(draft);
+    const { countQueuedNotifications } = await import("../src/db/notifications.js");
+    expect(countQueuedNotifications(main.id)).toBe(1);
+
+    // And it is delivered once the human submits and the composer clears.
+    panes.set(MAIN, CLEAR_PROMPT);
+    const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
+    expect(await flushMainQueue(main.id, { force: true })).toBe("flushed");
+    expect(String(sendText.mock.calls[0][1])).toContain("which region?");
+    expect(countQueuedNotifications(main.id)).toBe(0);
+  });
+
+  it("does not submit when a keystroke lands between the check and the send", async () => {
+    const { main, worker } = await setup("idle");
+    panes.set(MAIN, CLEAR_PROMPT);
+    // The composer is clear when checked, then the human's first keystrokes land
+    // in the window before Enter — with the notification already in the pane, so
+    // both texts coexist exactly as they would on screen.
+    onType = (target, text) => {
+      panes.set(target, draftComposer(`${text}wait, hold on`));
+    };
+
+    await notifyWorker(worker.id, "which region?");
+
+    // Typed, but Enter withheld: nothing was submitted on the human's behalf.
+    expect(sendText).toHaveBeenCalledOnce();
+    expect(await sendText.mock.results[0].value).toBe(false);
+    const { listEvents } = await import("../src/db/events.js");
+    const kinds = listEvents(20).map((e) => e.kind);
+    expect(kinds).not.toContain("waiting.delegated");
+    // Withholding is a distinct, diagnosable outcome, not a silent no-op.
+    expect(kinds).toContain("notification.submit_withheld");
+    const { countQueuedNotifications } = await import("../src/db/notifications.js");
+    expect(countQueuedNotifications(main.id)).toBe(1);
+    // The human's characters are still on screen for them to finish or fix.
+    expect(panes.get(MAIN)).toContain("wait, hold on");
+    // The main was not marked as working off a turn that never started.
+    const { getAgent } = await import("../src/db/agents.js");
+    expect(getAgent(main.id)?.state).toBe("idle");
+  });
+
+  it("refuses to submit into a permission menu that popped in the send window", async () => {
+    const { main, worker } = await setup("idle");
+    panes.set(MAIN, CLEAR_PROMPT);
+    // A menu renders no composer at all, so a composer_found check alone would
+    // fall through and press Enter — which confirms the highlighted option.
+    onType = (target) => {
+      panes.set(target, permissionMenu());
+    };
+
+    await notifyWorker(worker.id, "which region?");
+
+    expect(await sendText.mock.results[0].value).toBe(false);
+    const { listEvents } = await import("../src/db/events.js");
+    const withheld = listEvents(20).filter(
+      (e) => e.kind === "notification.submit_withheld",
+    );
+    expect(withheld.length).toBe(1);
+    expect(JSON.parse(withheld[0].payload!).reason).toBe("permission");
+    const { countQueuedNotifications } = await import("../src/db/notifications.js");
+    expect(countQueuedNotifications(main.id)).toBe(1);
+  });
+
+  // The check that runs on EVERY real delivery: at beforeSubmit the composer
+  // holds the ~600-char notification, read back as trimmed physical rows joined
+  // with " ". Comparing collapsed whitespace makes a hard wrap mid-word look
+  // like foreign content, which would withhold Enter on every delivery and
+  // strand the message in the prompt.
+  for (const wrap of ["word", "hard"] as const) {
+    it(`submits normally when the typed message ${wrap}-wraps in the composer`, async () => {
+      const { main, worker } = await setup("idle");
+      panes.set(MAIN, CLEAR_PROMPT);
+      onType = (target, text) => {
+        panes.set(target, wrappedComposer(text, { width: 127, wrap }));
+      };
+
+      await notifyWorker(worker.id, "which region?");
+
+      expect(sendText).toHaveBeenCalledOnce();
+      expect(await sendText.mock.results[0].value).toBe(true);
+      const { listEvents } = await import("../src/db/events.js");
+      const kinds = listEvents(20).map((e) => e.kind);
+      expect(kinds).toContain("waiting.delegated");
+      expect(kinds).not.toContain("notification.submit_withheld");
+      const { countQueuedNotifications } = await import("../src/db/notifications.js");
+      expect(countQueuedNotifications(main.id)).toBe(0);
+    });
+  }
+
+  it("queues rather than guessing when the composer cannot be read at all", async () => {
+    const { main, worker } = await setup("idle");
+    // A pane with no recognizable input line — a mid-turn capture, or a TUI
+    // whose chrome the parser no longer knows. "I can't see a draft" must not
+    // be read as "there is no draft".
+    panes.set(MAIN, noComposer());
+
+    await notifyWorker(worker.id, "which region?");
+
+    expect(sendText).not.toHaveBeenCalled();
+    const { countQueuedNotifications } = await import("../src/db/notifications.js");
+    expect(countQueuedNotifications(main.id)).toBe(1);
+    // Blocking indefinitely on an unreadable pane must not be silent.
+    const { listEvents } = await import("../src/db/events.js");
+    const blocked = listEvents(20).filter((e) => e.kind === "main.delivery_blocked");
+    expect(blocked.length).toBe(1);
+    expect(JSON.parse(blocked[0].payload!).reason).toBe("unreadable");
+
+    // Recognizable again → delivered, nothing lost.
+    panes.set(MAIN, CLEAR_PROMPT);
+    const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
+    expect(await flushMainQueue(main.id, { force: true })).toBe("flushed");
+    expect(countQueuedNotifications(main.id)).toBe(0);
+  });
+});
+
+/**
+ * Neither blocking reason clears on its own — a draft needs the human, and an
+ * unreadable composer needs a code change — so each must be bounded and paged
+ * rather than deferring forever behind a log line.
+ */
+describe("delegateToMain — blocked delivery is bounded and paged", () => {
+  for (const [reason, pane] of [
+    ["draft", () => HUMAN_DRAFT],
+    ["unreadable", () => noComposer()],
+  ] as const) {
+    it(`escalates once per streak when delivery stays blocked on a ${reason}`, async () => {
+      const { main, worker } = await setup("idle");
+      panes.set(MAIN, pane());
+      await notifyWorker(worker.id);
+
+      const { BLOCKED_ESCALATE_AFTER, flushMainQueue } = await import(
+        "../src/daemon/notifqueue.js"
+      );
+      const { listEvents } = await import("../src/db/events.js");
+      const paged = () =>
+        listEvents(80).filter((e) => e.kind === "main.delivery_blocked_escalated");
+      // Diagnosable from the very first attempt, not only at the threshold.
+      expect(
+        listEvents(80).filter((e) => e.kind === "main.delivery_blocked").length,
+      ).toBe(1);
+
+      // The delegate attempt above was the first; retry up to the threshold.
+      for (let i = 1; i < BLOCKED_ESCALATE_AFTER - 1; i++) {
+        await flushMainQueue(main.id, { force: true });
+      }
+      expect(paged().length).toBe(0);
+
+      expect(await flushMainQueue(main.id, { force: true })).toBe("deferred");
+      expect(paged().length).toBe(1);
+      const payload = JSON.parse(paged()[0].payload!);
+      expect(payload.attempts).toBe(BLOCKED_ESCALATE_AFTER);
+      expect(payload.reason).toBe(reason);
+
+      // Paged once per streak, not on every subsequent retry.
+      await flushMainQueue(main.id, { force: true });
+      expect(paged().length).toBe(1);
+
+      // A delivery getting through resets the streak.
+      panes.set(MAIN, CLEAR_PROMPT);
+      expect(await flushMainQueue(main.id, { force: true })).toBe("flushed");
+      panes.set(MAIN, pane());
+      await flushMainQueue(main.id, { force: true });
+      expect(paged().length).toBe(1);
+    });
+  }
 });
 
 describe("flushMainQueue — batching and re-check", () => {

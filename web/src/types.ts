@@ -219,6 +219,9 @@ export interface ParsedPane {
   pending_permission: PendingPermission | null;
   pending_question: string | null;
   unsubmitted_input: string | null;
+  /** Whether the input line itself was located. `unsubmitted_input === null`
+   *  with this false means "composer not found", not "composer empty". */
+  composer_found: boolean;
   background_activity: BackgroundActivity | null;
   raw: string;
 }
