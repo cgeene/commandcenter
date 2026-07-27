@@ -549,6 +549,183 @@ describe("parsePane — composer detection across pane widths", () => {
 });
 
 /**
+ * Background-work counts come from Claude Code's bottom status bar. The bars
+ * below were captured live from a daemon worker (Claude Code v2.1.220) on
+ * 2026-07-27 while running background shells and Monitor watches, e.g.
+ *   "  ⏵⏵ don't ask on · 1 shell, 1 monitor · esc to interrupt · ↓ to manage"
+ *   "  ⏵⏵ don't ask on · 3 shells, 2 monitors · esc to interrupt · ↓ to manage"
+ * The separator is U+00B7 and the counts occupy one whole segment.
+ */
+function statusBar(indicator: string | null): string {
+  const segments = [
+    "⏵⏵ don't ask on",
+    ...(indicator ? [indicator] : []),
+    "esc to interrupt",
+    "← for agents",
+    "↓ to manage",
+  ];
+  return `  ${segments.join(" · ")}`;
+}
+
+/** A rule-framed empty composer capped by `bar` as the last rendered row. */
+function paneWithStatusBar(bar: string, transcript: string[] = []): string {
+  return [
+    ...transcript,
+    RULE,
+    `${DEFFG}❯${NBSP}`,
+    RULE,
+    bar,
+  ].join("\n");
+}
+
+describe("parsePane — background shell / monitor status-bar indicator", () => {
+  it("reads a single shell and monitor from the status bar", () => {
+    const parsed = parsePane(paneWithStatusBar(statusBar("1 shell, 1 monitor")));
+    expect(parsed.background_activity).toEqual({ shells: 1, monitors: 1 });
+  });
+
+  it("reads pluralised counts", () => {
+    const parsed = parsePane(paneWithStatusBar(statusBar("3 shells, 2 monitors")));
+    expect(parsed.background_activity).toEqual({ shells: 3, monitors: 2 });
+  });
+
+  it("reads a shells-only and a monitors-only bar", () => {
+    expect(
+      parsePane(paneWithStatusBar(statusBar("2 shells"))).background_activity,
+    ).toEqual({ shells: 2, monitors: 0 });
+    expect(
+      parsePane(paneWithStatusBar(statusBar("1 monitor"))).background_activity,
+    ).toEqual({ shells: 0, monitors: 1 });
+  });
+
+  it("is null when the status bar reports no background work", () => {
+    const parsed = parsePane(paneWithStatusBar(statusBar(null)));
+    expect(parsed.background_activity).toBeNull();
+  });
+
+  // Agents DO quote this indicator in prose — the pane this parser was written
+  // against contained the literal string "· N shell(s), N monitor". What rejects
+  // that is POSITION alone: only the bottom-most non-blank row is read.
+  it("ignores the indicator quoted in transcript prose above the bar", () => {
+    const parsed = parsePane(
+      paneWithStatusBar(statusBar(null), [
+        "⏺ Confirmed the status-bar signal: · 1 shell, 1 monitor · is what renders.",
+        "  ⎿  the status-bar '· 2 shells, 3 monitors ·' indicators via parsePane",
+        "",
+      ]),
+    );
+    expect(parsed.background_activity).toBeNull();
+  });
+
+  // Same prose one row closer, directly beneath the composer rule. This is the
+  // regression guard for STATUS_BAR_LOOKBACK: widening it by even one row turns
+  // these into false positives, and a false positive silences a real wait for the
+  // whole park window while invisible to the watchdog and Needs You.
+  it("ignores prose sitting immediately below the composer, not on the bar row", () => {
+    for (const prose of [
+      "⏺ Confirmed: · 1 shell, 1 monitor · is what renders.",
+      "·-separated segment: ⏵⏵ don't ask on · 3 shells, 2 monitors · esc to interrupt · ↓ to manage.",
+    ]) {
+      const pane = [RULE, `${DEFFG}❯${NBSP}`, RULE, prose, statusBar(null)].join("\n");
+      expect(parsePane(pane).background_activity, prose).toBeNull();
+    }
+  });
+
+  // KNOWN LIMITATION, pinned deliberately rather than left to be discovered.
+  // The whole-segment rule does NOT reject prose — these lines really do parse as
+  // counts — so if prose ever IS the bottom-most non-blank row, it registers. In
+  // a live TUI that cannot happen while the composer and bar are painted, and a
+  // worker whose TUI is unpainted is not asking a question either. If this ever
+  // needs closing, the fix is a stronger positional/structural anchor (e.g. the
+  // row must follow a composer rule or box border) — NOT a chrome-anchor check
+  // like "must contain '↓ to manage'", which the second line below defeats.
+  it("KNOWN LIMITATION: prose as the bottom-most row is read as a status bar", () => {
+    expect(
+      parsePane("⏺ Confirmed: · 1 shell, 1 monitor · is what renders.")
+        .background_activity,
+    ).toEqual({ shells: 1, monitors: 1 });
+    expect(
+      parsePane(
+        "·-separated segment: ⏵⏵ don't ask on · 3 shells, 2 monitors · esc to interrupt · ↓ to manage.",
+      ).background_activity,
+    ).toEqual({ shells: 3, monitors: 2 });
+  });
+
+  it("ignores a partly-matching segment (prose sharing the bar's line)", () => {
+    const parsed = parsePane(
+      paneWithStatusBar(`  ⏵⏵ don't ask on · about 2 shells maybe · ← for agents`),
+    );
+    expect(parsed.background_activity).toBeNull();
+  });
+
+  it("ignores a bare count line that is not an interpunct-separated bar", () => {
+    const parsed = parsePane(paneWithStatusBar("1 shell, 1 monitor"));
+    expect(parsed.background_activity).toBeNull();
+  });
+
+  it("still reports a permission menu alongside running background work", () => {
+    const parsed = parsePane(
+      [
+        fixture(
+          [
+            "CORNER_TL DASHES CORNER_TR",
+            "PIPE Run the packer build? PIPE",
+            "PIPE  PIPE",
+            "PIPE CURSOR 1. Yes PIPE",
+            "PIPE   2. No PIPE",
+            "CORNER_BL DASHES CORNER_BR",
+          ].join("\n"),
+        ),
+        statusBar("1 monitor"),
+      ].join("\n"),
+    );
+    expect(parsed.pending_permission?.options).toEqual([
+      { n: 1, label: "Yes" },
+      { n: 2, label: "No" },
+    ]);
+    expect(parsed.background_activity).toEqual({ shells: 0, monitors: 1 });
+  });
+
+  // The bar this suppression actually reads is the IDLE one — the hook fires
+  // after the worker's turn ends, at which point "esc to interrupt" is gone and
+  // the trailing segment can read "← 1 agent" instead of "← for agents". Both
+  // shapes were captured live while idle with background work still running, and
+  // are why the parser keys on segment structure rather than any chrome wording.
+  it("reads the indicator off an IDLE status bar (no 'esc to interrupt')", () => {
+    expect(
+      parsePane(
+        paneWithStatusBar("  ⏵⏵ don't ask on · 2 shells · ← for agents · ↓ to manage"),
+      ).background_activity,
+    ).toEqual({ shells: 2, monitors: 0 });
+    expect(
+      parsePane(
+        paneWithStatusBar("  ⏵⏵ don't ask on · 1 monitor · ← 1 agent · ↓ to manage"),
+      ).background_activity,
+    ).toEqual({ shells: 0, monitors: 1 });
+  });
+
+  // The bar grows segments as context appears (a "PR #61" segment shows up once
+  // a PR is associated), so the scan must find the counts wherever they sit
+  // rather than assuming a fixed position. Captured live while idle.
+  it("finds the counts on a bar carrying extra unrelated segments", () => {
+    const parsed = parsePane(
+      paneWithStatusBar(
+        "  ⏵⏵ don't ask on · PR #61 · 1 shell, 1 monitor · ← 1 agent · ↓ to manage",
+      ),
+    );
+    expect(parsed.background_activity).toEqual({ shells: 1, monitors: 1 });
+  });
+
+  it("does not claim the Claude-only indicator for a Codex pane", () => {
+    const parsed = parsePane(
+      paneWithStatusBar(statusBar("1 shell, 1 monitor")),
+      "codex",
+    );
+    expect(parsed.background_activity).toBeNull();
+  });
+});
+
+/**
  * Fixtures above spell out box-drawing chars as readable placeholder tokens
  * (CORNER_TL, PIPE, CURSOR, …) so they're easy to eyeball and diff — this
  * swaps them for the real Unicode glyphs Claude Code's TUI renders before

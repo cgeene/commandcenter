@@ -209,6 +209,11 @@ export interface PendingPermission {
   options: PaneOption[];
 }
 
+export interface BackgroundActivity {
+  shells: number;
+  monitors: number;
+}
+
 export interface ParsedPane {
   target: string;
   pending_permission: PendingPermission | null;
@@ -217,6 +222,7 @@ export interface ParsedPane {
   /** Whether the input line itself was located. `unsubmitted_input === null`
    *  with this false means "composer not found", not "composer empty". */
   composer_found: boolean;
+  background_activity: BackgroundActivity | null;
   raw: string;
 }
 

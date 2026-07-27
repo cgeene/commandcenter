@@ -84,6 +84,39 @@ describe("humanizeEvent", () => {
     expect(s).toBe("Auto-nudged worker 22 (transient API stall)");
   });
 
+  it("waiting.suppressed_active_monitor pluralizes each count independently", () => {
+    const s = humanizeEvent(
+      ev({
+        kind: "waiting.suppressed_active_monitor",
+        agent_id: 7,
+        payload: JSON.stringify({ shells: 1, monitors: 2 }),
+      }),
+    );
+    expect(s).toBe(
+      "worker 7 parked between turns — 1 shell + 2 monitors still running, no ping needed",
+    );
+  });
+
+  it("waiting.suppressed_active_monitor omits a zero count", () => {
+    const s = humanizeEvent(
+      ev({
+        kind: "waiting.suppressed_active_monitor",
+        agent_id: 4,
+        payload: JSON.stringify({ shells: 0, monitors: 1 }),
+      }),
+    );
+    expect(s).toBe("worker 4 parked between turns — 1 monitor still running, no ping needed");
+  });
+
+  it("waiting.suppressed_active_monitor falls back when counts are missing", () => {
+    const s = humanizeEvent(
+      ev({ kind: "waiting.suppressed_active_monitor", agent_id: 9, payload: null }),
+    );
+    expect(s).toBe(
+      "worker 9 parked between turns — background work still running, no ping needed",
+    );
+  });
+
   it("cron.skipped names the cron and reason", () => {
     const s = humanizeEvent(
       ev({ kind: "cron.skipped", payload: JSON.stringify({ name: "slack-triage", reason: "previous run still open" }) }),
