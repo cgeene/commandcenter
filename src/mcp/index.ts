@@ -12,6 +12,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { REASONING_EFFORTS } from "../reasoning.js";
+import {
+  PUBLICATION_FIELDS,
+  compactTask,
+  echoedFields,
+  shapeTask,
+  shapeTaskList,
+  shapeTaskPayload,
+} from "./compact.js";
 
 const ROLE =
   process.env.CC_ROLE === "main" || process.env.CC_ROLE === "reviewer"
@@ -49,6 +57,17 @@ const REVIEW_MODE_SCHEMA = z
     "how hard the adversarial reviewer works (default 'full'). 'light' = a diff-scoped read with no independent re-verification: use ONLY for documentation, threshold, and runbook changes. NEVER for prod-mutating work or code-logic changes, however small. When in doubt, leave it 'full'.",
   );
 
+// Read tools default to a compact projection; these opt back into more.
+const verboseArg = z
+  .boolean()
+  .optional()
+  .describe("return the full task record (prompt, untruncated result_summary, review notes)");
+const fieldsArg = z
+  .array(z.string())
+  .max(60)
+  .optional()
+  .describe("exact task fields to return; wins over verbose. `id` is always included");
+
 const server = new McpServer({ name: "cc", version: "0.2.0" });
 
 // ---- shared tools ----
@@ -57,7 +76,7 @@ server.registerTool(
   "add_task",
   {
     description:
-      "Add a main-orchestrated task to the queue. For portfolio decomposition, create repo children with parent_task_id. Workers: use this only to file follow-up work you should not do yourself.",
+      "Add a main-orchestrated task to the queue. For portfolio decomposition, create repo children with parent_task_id. Workers: use this only to file follow-up work you should not do yourself. Returns the compact task record (the prompt you just supplied is not echoed back).",
     inputSchema: {
       title: z.string(),
       prompt: z.string(),
@@ -118,12 +137,14 @@ server.registerTool(
     }
     if (workspaceKind === "repo" && !repo) throw new Error("repo is required");
     return asText(
-      await call("POST", "/api/tasks", {
-        ...args,
-        repo,
-        workspace_kind: workspaceKind ?? "repo",
-        agent_id: process.env.CC_AGENT_ID ? Number(process.env.CC_AGENT_ID) : undefined,
-      }),
+      compactTask(
+        await call("POST", "/api/tasks", {
+          ...args,
+          repo,
+          workspace_kind: workspaceKind ?? "repo",
+          agent_id: process.env.CC_AGENT_ID ? Number(process.env.CC_AGENT_ID) : undefined,
+        }),
+      ),
     );
   },
 );
@@ -307,11 +328,13 @@ if (ROLE === "reviewer") {
     },
     async ({ verdict, notes }) =>
       asText(
-        await call("POST", `/api/tasks/${MY_TASK_ID}/verdict`, {
-          agent_id: process.env.CC_AGENT_ID ? Number(process.env.CC_AGENT_ID) : undefined,
-          verdict,
-          notes,
-        }),
+        compactTask(
+          await call("POST", `/api/tasks/${MY_TASK_ID}/verdict`, {
+            agent_id: process.env.CC_AGENT_ID ? Number(process.env.CC_AGENT_ID) : undefined,
+            verdict,
+            notes,
+          }),
+        ),
       ),
   );
 }
@@ -323,14 +346,15 @@ if (ROLE === "worker") {
     "update_my_task",
     {
       description:
-        "Update your own task: set result_summary when done, pr_url after opening a PR, or move status to blocked/review.",
+        "Update your own task: set result_summary when done, pr_url after opening a PR, or move status to blocked/review. Returns the compact task record; use get_my_task if you need the full one back.",
       inputSchema: {
         status: z.enum(["blocked", "review"]).optional(),
         result_summary: z.string().optional(),
         pr_url: z.string().url().optional().describe("the PR you opened for this task"),
       },
     },
-    async (args) => asText(await call("PATCH", `/api/tasks/${MY_TASK_ID}`, args)),
+    async (args) =>
+      asText(compactTask(await call("PATCH", `/api/tasks/${MY_TASK_ID}`, args))),
   );
 
   server.registerTool(
@@ -342,10 +366,12 @@ if (ROLE === "worker") {
     },
     async ({ reason }) =>
       asText(
-        await call("PATCH", `/api/tasks/${MY_TASK_ID}`, {
-          status: "blocked",
-          result_summary: `BLOCKED: ${reason}`,
-        }),
+        compactTask(
+          await call("PATCH", `/api/tasks/${MY_TASK_ID}`, {
+            status: "blocked",
+            result_summary: `BLOCKED: ${reason}`,
+          }),
+        ),
       ),
   );
 }
@@ -356,20 +382,23 @@ if (ROLE === "main") {
   server.registerTool(
     "list_tasks",
     {
-      description: "List tasks. ready=true → queued tasks with no open blockers.",
+      description:
+        "List tasks. ready=true → queued tasks with no open blockers. Rows are minimal by default (id, title, status, priority, agent_id, blocked_by, pr_state, review_verdict, updated_at) — pass fields for other columns, or verbose=true for full records (expensive: every prompt and result summary).",
       inputSchema: {
         status: z.string().optional(),
         ready: z.boolean().optional(),
         dispatch_mode: z.enum(["direct", "orchestrated"]).optional(),
+        verbose: verboseArg,
+        fields: fieldsArg,
       },
     },
-    async ({ status, ready, dispatch_mode }) => {
+    async ({ status, ready, dispatch_mode, verbose, fields }) => {
       const params = new URLSearchParams();
       if (ready) params.set("ready", "true");
       else if (status) params.set("status", status);
       if (dispatch_mode) params.set("dispatch_mode", dispatch_mode);
       const qs = params.size > 0 ? `?${params.toString()}` : "";
-      return asText(await call("GET", `/api/tasks${qs}`));
+      return asText(shapeTaskList(await call("GET", `/api/tasks${qs}`), { verbose, fields }));
     },
   );
 
@@ -401,15 +430,20 @@ if (ROLE === "main") {
 
   server.registerTool(
     "get_task",
-    { description: "Fetch one task by id.", inputSchema: { id: z.number().int() } },
-    async ({ id }) => asText(await call("GET", `/api/tasks/${id}`)),
+    {
+      description:
+        "Fetch one task by id. Compact by default: core fields plus a truncated result_summary, without the prompt or review notes. TRIAGE REQUIRES get_task(id, verbose: true) — that is the only way to read the task's full prompt. fields returns an exact subset.",
+      inputSchema: { id: z.number().int(), verbose: verboseArg, fields: fieldsArg },
+    },
+    async ({ id, verbose, fields }) =>
+      asText(shapeTask(await call("GET", `/api/tasks/${id}`), { verbose, fields })),
   );
 
   server.registerTool(
     "update_task",
     {
       description:
-        "Update a task (status, priority, worker provider, model, reasoning effort, review mode, prompt, result_summary...).",
+        "Update a task (status, priority, worker provider, model, reasoning effort, review mode, prompt, result_summary...). Returns the compact task record plus whichever fields you changed — the values you just sent are otherwise not echoed back; use get_task(id, verbose: true) if you need to re-read the whole thing.",
       inputSchema: {
         id: z.number().int(),
         status: z
@@ -439,14 +473,25 @@ if (ROLE === "main") {
         review_mode: REVIEW_MODE_SCHEMA,
       },
     },
-    async ({ id, ...fields }) => asText(await call("PATCH", `/api/tasks/${id}`, fields)),
+    // Echo the compact record PLUS whatever this call changed, so a field
+    // outside the core (verify_cmd, …) is still visible as the confirmation
+    // that the update landed — the same mechanism confirm_human_publication
+    // uses for the publication columns. echoedFields keeps the bulk (the
+    // prompt the caller just sent) out of the echo.
+    async ({ id, ...fields }) =>
+      asText(
+        compactTask(
+          await call("PATCH", `/api/tasks/${id}`, fields),
+          echoedFields(Object.keys(fields)),
+        ),
+      ),
   );
 
   server.registerTool(
     "cancel_task",
     {
       description:
-        "Close a task from ANY state: kills its live worker/reviewer and marks it cancelled (terminal, idempotent). Returns any open tasks still blocked on it — those need re-pointing or cancelling too.",
+        "Close a task from ANY state: kills its live worker/reviewer and marks it cancelled (terminal, idempotent). Returns the compact task plus any open tasks still blocked on it (as minimal rows) — those need re-pointing or cancelling too.",
       inputSchema: {
         task_id: z.number().int(),
         rm_worktree: z
@@ -463,10 +508,12 @@ if (ROLE === "main") {
     },
     async ({ task_id, rm_worktree, discard_unpublished }) =>
       asText(
-        await call("POST", `/api/tasks/${task_id}/cancel`, {
-          rm_worktree,
-          discard_unpublished,
-        }),
+        shapeTaskPayload(
+          await call("POST", `/api/tasks/${task_id}/cancel`, {
+            rm_worktree,
+            discard_unpublished,
+          }),
+        ),
       ),
   );
 
@@ -474,7 +521,7 @@ if (ROLE === "main") {
     "confirm_human_publication",
     {
       description:
-        "After the human reviews, commits, and publishes a Human-publishes task, verify that the committed tree exactly matches the reviewer-approved snapshot, mark its PR ready, and record it. This never commits, pushes, or creates a PR.",
+        "After the human reviews, commits, and publishes a Human-publishes task, verify that the committed tree exactly matches the reviewer-approved snapshot, mark its PR ready, and record it. This never commits, pushes, or creates a PR. Returns the compact task record plus publication_mode/publication_state.",
       inputSchema: {
         task_id: z.number().int().positive(),
         pr_url: z
@@ -487,19 +534,25 @@ if (ROLE === "main") {
     },
     async ({ task_id, pr_url }) =>
       asText(
-        await call("POST", `/api/tasks/${task_id}/publication`, {
-          ...(pr_url ? { pr_url } : {}),
-        }),
+        // publication_* is omitted from the compact core, but it IS what this
+        // call changes — echo it so the caller can see the new state.
+        compactTask(
+          await call("POST", `/api/tasks/${task_id}/publication`, {
+            ...(pr_url ? { pr_url } : {}),
+          }),
+          PUBLICATION_FIELDS,
+        ),
       ),
   );
 
   server.registerTool(
     "claim_task",
     {
-      description: "Atomically claim a queued task without spawning a worker yet.",
+      description:
+        "Atomically claim a queued task without spawning a worker yet. Returns the compact task record.",
       inputSchema: { id: z.number().int() },
     },
-    async ({ id }) => asText(await call("POST", `/api/tasks/${id}/claim`)),
+    async ({ id }) => asText(compactTask(await call("POST", `/api/tasks/${id}/claim`))),
   );
 
   server.registerTool(
@@ -518,7 +571,7 @@ if (ROLE === "main") {
         fresh: z.boolean().optional().describe("force a fresh session instead of resuming"),
       },
     },
-    async (args) => asText(await call("POST", "/api/agents", args)),
+    async (args) => asText(shapeTaskPayload(await call("POST", "/api/agents", args))),
   );
 
   server.registerTool(
@@ -608,11 +661,13 @@ if (ROLE === "main") {
     },
     async ({ task_id, model, provider, reasoning_effort }) =>
       asText(
-        await call("POST", `/api/tasks/${task_id}/reviewer`, {
-          model,
-          provider,
-          reasoning_effort,
-        }),
+        shapeTaskPayload(
+          await call("POST", `/api/tasks/${task_id}/reviewer`, {
+            model,
+            provider,
+            reasoning_effort,
+          }),
+        ),
       ),
   );
 
