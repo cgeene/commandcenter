@@ -94,6 +94,13 @@ afterEach(async () => {
   closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
   delete process.env.CC_DATA_DIR;
+  // The git work in these tests is synchronous, so this worker's event loop
+  // can sit blocked for tens of seconds at a time. Node runs the timers phase
+  // before the poll phase, so vitest's fixed 60s worker->main RPC timer can
+  // fire on a reply that was already delivered but not yet read, failing the
+  // run with 'Timeout calling "onTaskUpdate"'. Yield a macrotask so those
+  // replies get drained between tests.
+  await new Promise((resolve) => setImmediate(resolve));
 });
 
 describe("review_mode — the per-task field", () => {
