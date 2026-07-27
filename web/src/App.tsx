@@ -2669,15 +2669,52 @@ function SettingsView() {
  */
 function DocsView() {
   const [docs, setDocs] = useState<Doc[]>([]);
+  const [searchResults, setSearchResults] = useState<Doc[] | null>(null);
   const [selected, setSelected] = useState<DocWithContent | null>(null);
   const [loading, setLoading] = useState(false);
+  const [searching, setSearching] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [projectFilter, setProjectFilter] = useState("");
+  const [tagFilter, setTagFilter] = useState("");
 
   useEffect(() => {
     api<Doc[]>("GET", "/api/docs")
       .then(setDocs)
       .catch((e) => setError(String(e instanceof Error ? e.message : e)));
   }, []);
+
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) {
+      setSearchResults(null);
+      setSearching(false);
+      return;
+    }
+
+    let cancelled = false;
+    const handle = window.setTimeout(() => {
+      const params = new URLSearchParams({ q, limit: "50" });
+      if (projectFilter) params.set("project", projectFilter);
+      setSearching(true);
+      setError(null);
+      api<Doc[]>("GET", `/api/docs?${params.toString()}`)
+        .then((rows) => {
+          if (!cancelled) setSearchResults(rows);
+        })
+        .catch((e) => {
+          if (!cancelled) setError(String(e instanceof Error ? e.message : e));
+        })
+        .finally(() => {
+          if (!cancelled) setSearching(false);
+        });
+    }, 180);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(handle);
+    };
+  }, [query, projectFilter]);
 
   const open = async (id: number) => {
     setLoading(true);
@@ -2691,29 +2728,61 @@ function DocsView() {
     }
   };
 
-  // Group by project, preserving the API's updated_at-desc order.
-  const order: string[] = [];
-  const byProject = new Map<string, Doc[]>();
-  for (const d of docs) {
-    let bucket = byProject.get(d.project);
-    if (!bucket) {
-      bucket = [];
-      byProject.set(d.project, bucket);
-      order.push(d.project);
-    }
-    bucket.push(d);
-  }
+  const tagsOf = (d: Pick<Doc, "tags">): string[] =>
+    d.tags?.split(",").map((t) => t.trim()).filter(Boolean) ?? [];
 
-  const attachments: string[] = selected?.attachments
-    ? (JSON.parse(selected.attachments) as string[])
-    : [];
+  const byProject = new Map<string, { count: number; updated: string }>();
+  const byTag = new Map<string, number>();
+  for (const d of docs) {
+    const project = byProject.get(d.project);
+    byProject.set(d.project, {
+      count: (project?.count ?? 0) + 1,
+      updated: project && project.updated > d.updated_at ? project.updated : d.updated_at,
+    });
+    for (const tag of tagsOf(d)) byTag.set(tag, (byTag.get(tag) ?? 0) + 1);
+  }
+  const projects = Array.from(byProject, ([project, meta]) => ({ project, ...meta }))
+    .sort((a, b) => b.updated.localeCompare(a.updated));
+  const tags = Array.from(byTag, ([tag, count]) => ({ tag, count }))
+    .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
+
+  const sourceDocs = searchResults ?? docs;
+  const filteredDocs = sourceDocs.filter((d) => {
+    if (projectFilter && d.project !== projectFilter) return false;
+    if (tagFilter && !tagsOf(d).includes(tagFilter)) return false;
+    if (searchResults) return true;
+    const q = query.trim().toLowerCase();
+    if (!q) return true;
+    return [d.title, d.summary ?? "", d.project, d.slug, d.tags ?? ""]
+      .join(" ")
+      .toLowerCase()
+      .includes(q);
+  });
+  const visibleDocs = searchResults
+    ? filteredDocs
+    : [...filteredDocs].sort((a, b) =>
+        b.updated_at.localeCompare(a.updated_at) || b.id - a.id,
+      );
+  const resultLabel =
+    query.trim() || projectFilter || tagFilter
+      ? `${visibleDocs.length} result${visibleDocs.length === 1 ? "" : "s"}`
+      : `${docs.length} doc${docs.length === 1 ? "" : "s"}`;
+
+  let attachments: string[] = [];
+  if (selected?.attachments) {
+    try {
+      attachments = JSON.parse(selected.attachments) as string[];
+    } catch {
+      attachments = [];
+    }
+  }
 
   // The API already returns the body without frontmatter, but parse defensively
   // so a doc whose body still embeds a YAML block renders as a compact header
   // rather than a raw `---` block above the prose.
   const parsed = selected ? parseFrontmatter(selected.content) : null;
   const fmTags = parsed?.data.tags;
-  const tags: string[] = selected?.tags
+  const selectedTags: string[] = selected?.tags
     ? selected.tags.split(",").map((t) => t.trim()).filter(Boolean)
     : Array.isArray(fmTags)
       ? fmTags
@@ -2722,30 +2791,119 @@ function DocsView() {
         : [];
 
   return (
-    <main>
+    <main className="docs-page">
       <div className="docs-view">
-        <aside className="docs-list">
-          {order.map((project) => (
-            <div key={project} className="docs-group">
-              <h3>{project}</h3>
-              {byProject.get(project)!.map((d) => (
-                <button
-                  key={d.id}
-                  className={`docs-item ${selected?.id === d.id ? "active" : ""}`}
-                  onClick={() => open(d.id)}
-                >
-                  <span className="docs-item-title">{d.title}</span>
-                  {d.summary && (
-                    <span className="docs-item-summary muted">{d.summary}</span>
-                  )}
-                </button>
-              ))}
+        <aside className="docs-sidebar">
+          <div className="docs-library-head">
+            <span className="eyebrow">Docs Library</span>
+            <h2>Knowledge base</h2>
+            <span className="muted">{resultLabel}</span>
+          </div>
+
+          <label className="docs-search">
+            <span>Search</span>
+            <input
+              type="search"
+              placeholder="Search titles, tags, summaries, and bodies…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </label>
+
+          <div className="docs-filter-section">
+            <div className="docs-filter-head">
+              <span>Projects</span>
+              {projectFilter && <button onClick={() => setProjectFilter("")}>All</button>}
             </div>
-          ))}
-          {docs.length === 0 && !error && (
-            <span className="muted">No docs yet</span>
+            <button
+              className={`docs-project ${projectFilter === "" ? "active" : ""}`}
+              onClick={() => setProjectFilter("")}
+            >
+              <span>All projects</span>
+              <b>{docs.length}</b>
+            </button>
+            {projects.map((p) => (
+              <button
+                key={p.project}
+                className={`docs-project ${projectFilter === p.project ? "active" : ""}`}
+                onClick={() => setProjectFilter(p.project)}
+              >
+                <span>{p.project}</span>
+                <b>{p.count}</b>
+              </button>
+            ))}
+          </div>
+
+          {tags.length > 0 && (
+            <div className="docs-filter-section">
+              <div className="docs-filter-head">
+                <span>Tags</span>
+                {tagFilter && <button onClick={() => setTagFilter("")}>Clear</button>}
+              </div>
+              <div className="docs-tags">
+                {tags.slice(0, 24).map((t) => (
+                  <button
+                    key={t.tag}
+                    className={tagFilter === t.tag ? "active" : ""}
+                    onClick={() => setTagFilter((cur) => (cur === t.tag ? "" : t.tag))}
+                  >
+                    {t.tag} <span>{t.count}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
           )}
         </aside>
+
+        <section className="docs-results">
+          <div className="docs-results-head">
+            <div>
+              <span className="eyebrow">{searching ? "Searching" : "Results"}</span>
+              <h2>{projectFilter || "All docs"}</h2>
+            </div>
+            {(query || projectFilter || tagFilter) && (
+              <button
+                onClick={() => {
+                  setQuery("");
+                  setProjectFilter("");
+                  setTagFilter("");
+                }}
+              >
+                Reset
+              </button>
+            )}
+          </div>
+          <div className="docs-list">
+            {visibleDocs.map((d) => (
+              <button
+                key={d.id}
+                className={`docs-item ${selected?.id === d.id ? "active" : ""}`}
+                onClick={() => open(d.id)}
+              >
+                <span className="docs-item-kicker">
+                  {d.project} · {d.updated_at.slice(0, 10)}
+                </span>
+                <span className="docs-item-title">{d.title}</span>
+                {d.summary && (
+                  <span className="docs-item-summary muted">{d.summary}</span>
+                )}
+                {tagsOf(d).length > 0 && (
+                  <span className="docs-item-tags">
+                    {tagsOf(d).slice(0, 4).map((tag) => (
+                      <span key={tag}>{tag}</span>
+                    ))}
+                  </span>
+                )}
+              </button>
+            ))}
+            {visibleDocs.length === 0 && !error && (
+              <span className="muted">
+                {docs.length === 0 ? "No docs yet" : "No docs match the current filters"}
+              </span>
+            )}
+          </div>
+        </section>
+
         <section className="docs-body">
           {error && <div className="error">{error}</div>}
           {loading && <span className="muted">Loading…</span>}
@@ -2760,9 +2918,9 @@ function DocsView() {
                   {selected.project} · v{selected.version} · updated{" "}
                   {selected.updated_at.slice(0, 10)}
                 </span>
-                {tags.length > 0 && (
+                {selectedTags.length > 0 && (
                   <div className="chips">
-                    {tags.map((t) => (
+                    {selectedTags.map((t) => (
                       <span key={t} className="chip">
                         {t}
                       </span>
