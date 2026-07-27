@@ -36,7 +36,6 @@ async function main(): Promise<void> {
   const base = process.env.CC_URL ?? "http://127.0.0.1:4711";
   const workspaceKind = process.env.CC_WORKSPACE_KIND;
   const publicationMode = process.env.CC_PUBLICATION_MODE;
-  const role = process.env.CC_ROLE;
   const decision = codexPermissionDecision(payload, {
     taskId: process.env.CC_TASK_ID,
     workspaceKind:
@@ -48,7 +47,6 @@ async function main(): Promise<void> {
     publicationMode: isPublicationMode(publicationMode)
       ? publicationMode
       : "agent",
-    role: role === "reviewer" ? "reviewer" : "worker",
   });
   if (agentId) {
     try {

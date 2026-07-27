@@ -48,7 +48,8 @@ pointing at `cc-mcp` with a `CC_ROLE` env var. The toolset is scoped by role
 Center's isolated profile. In the default publication mode, `PreToolUse` denies
 publishing outside the exact task branch even after remembered approvals and
 `PermissionRequest` auto-approves that one canonical push. Human-publication
-workers and all reviewers instead deny commit/push/merge and PR mutations.
+sessions instead deny commit/push/merge and PR mutations. Agent-publication
+sessions retain the existing provider-specific worker and reviewer policies.
 Worker identity comes from process environment, keeping the hook hash stable
 for one-time trust. A daemon outage never blocks the agent, while the local
 publishing policy remains enforced by the hook.
@@ -139,7 +140,8 @@ publishes** branch changes only the publication portion:
                           daemon verifies clean committed
                           and pushed tree == approved snapshot
                                        |
-                               PR sync / completion
+                         PR marked ready, then snapshot
+                          released and task confirmed
 ```
 
 The mode is a local runtime default stored in SQLite and copied onto each new

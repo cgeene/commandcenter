@@ -15,7 +15,6 @@ export interface CodexPolicyContext {
   taskId?: string;
   workspaceKind?: "repo" | "portfolio" | "scratch";
   publicationMode?: PublicationMode;
-  role?: "worker" | "reviewer";
 }
 
 interface GitInvocation {
@@ -299,7 +298,7 @@ function bashDecision(
   depth = 0,
 ): CodexPermissionDecision | undefined {
   if (depth > 4) {
-    return context.publicationMode === "human" || context.role === "reviewer"
+    return context.publicationMode === "human"
       ? { behavior: "deny", message: HUMAN_MESSAGE }
       : undefined;
   }
@@ -316,8 +315,7 @@ function bashDecision(
   for (const argv of segments) {
     const git = parseGitInvocation(argv);
     const prVerb = ghPrVerb(argv);
-    const humanOnly =
-      context.publicationMode === "human" || context.role === "reviewer";
+    const humanOnly = context.publicationMode === "human";
     if (
       humanOnly &&
       ((git &&
@@ -400,8 +398,8 @@ function legacyAgentDecision(
 }
 
 /** Enforce the selected publication boundary without changing agent-mode
- * behavior: normal workers can publish only their exact task branch; human
- * mode and reviewers cannot publish through Bash or GitHub MCP writes. */
+ * behavior: agent mode retains the legacy task-branch policy; human mode
+ * denies publishing through Bash or GitHub MCP writes. */
 export function codexPermissionDecision(
   payload: CodexPermissionPayload,
   contextOrTaskId: CodexPolicyContext | string | undefined,
@@ -414,13 +412,11 @@ export function codexPermissionDecision(
           taskId: contextOrTaskId,
           workspaceKind: legacyWorkspaceKind,
           publicationMode: "agent",
-          role: "worker",
         };
   if (!["PreToolUse", "PermissionRequest"].includes(payload.hook_event_name ?? "")) {
     return undefined;
   }
-  const humanOnly =
-    context.publicationMode === "human" || context.role === "reviewer";
+  const humanOnly = context.publicationMode === "human";
   if (!humanOnly) return legacyAgentDecision(payload, context);
   if (humanOnly && githubMcpMutation(payload.tool_name ?? "")) {
     return { behavior: "deny", message: HUMAN_MESSAGE };

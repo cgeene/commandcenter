@@ -442,17 +442,28 @@ if (ROLE === "main") {
           .boolean()
           .optional()
           .describe("also remove the task's worktree (uncommitted work is lost; the branch survives)"),
+        discard_unpublished: z
+          .boolean()
+          .optional()
+          .describe(
+            "required with rm_worktree to intentionally destroy reviewer-approved Human-publishes work",
+          ),
       },
     },
-    async ({ task_id, rm_worktree }) =>
-      asText(await call("POST", `/api/tasks/${task_id}/cancel`, { rm_worktree })),
+    async ({ task_id, rm_worktree, discard_unpublished }) =>
+      asText(
+        await call("POST", `/api/tasks/${task_id}/cancel`, {
+          rm_worktree,
+          discard_unpublished,
+        }),
+      ),
   );
 
   server.registerTool(
     "confirm_human_publication",
     {
       description:
-        "After the human reviews, commits, and publishes a Human-publishes task, verify that the committed tree exactly matches the reviewer-approved snapshot and record its PR. This never commits, pushes, or creates a PR.",
+        "After the human reviews, commits, and publishes a Human-publishes task, verify that the committed tree exactly matches the reviewer-approved snapshot, mark its PR ready, and record it. This never commits, pushes, or creates a PR.",
       inputSchema: {
         task_id: z.number().int().positive(),
         pr_url: z

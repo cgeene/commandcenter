@@ -722,8 +722,7 @@ export function spawnReviewer(
       : undefined;
   const dir = isScratch
     ? validateScratchWorkspace(task.repo) // review the workspace dir read-only
-    : task.publication_mode === "human" &&
-        task.publication_state !== "published"
+    : humanSnapshotReview
       ? task.review_snapshot_base && task.review_snapshot_tree
         ? createSnapshotReviewWorktree(
             task.repo,
@@ -780,10 +779,11 @@ export function spawnReviewer(
     });
   } else {
     // Codex reviewer: same isolated CODEX_HOME profile/hooks/policy as a Codex
-    // worker (workspace-write / on-request / network_access=false; push+merge
-    // denied by codex-policy). Its detached worktree is throwaway, so the
-    // Claude reviewer's Edit/Write deny is unnecessary. Role is baked as
-    // "reviewer" so the cc MCP scopes to the reviewer toolset.
+    // worker (workspace-write / on-request / network_access=false). Human
+    // publication denies publishing; agent publication retains the pre-mode
+    // policy. Its detached worktree is throwaway, so the Claude reviewer's
+    // Edit/Write deny is unnecessary. Role is baked as "reviewer" solely so
+    // the cc MCP scopes to the reviewer toolset.
     const config = writeCodexConfig();
     runtimeConfigPath = config.profileFile;
     const requiredMcpEnv = config.inheritedMcpEnvVars ?? [];
@@ -870,16 +870,54 @@ export function spawnMain(model?: string): Agent {
  * blocked on this one — a cancelled blocker never becomes 'done', so the
  * caller should surface those to the human.
  */
+export class TaskCancellationValidationError extends Error {}
+
+function approvedUnpublishedHumanWork(task: Task): boolean {
+  return (
+    task.publication_mode === "human" &&
+    task.workspace_kind === "repo" &&
+    task.publication_state === "awaiting_human" &&
+    task.review_verdict === "approve"
+  );
+}
+
+function removeTaskWorkspace(taskId: number): void {
+  const task = getTask(taskId)!;
+  if (!task.worktree) return;
+  if (task.workspace_kind === "scratch") {
+    removeScratchWorkspace(task.worktree);
+  } else {
+    removeWorktree(task.repo, task.worktree);
+  }
+  updateTask(taskId, { worktree: null });
+}
+
 export function cancelTask(
   taskId: number,
-  opts?: { rmWorktree?: boolean },
+  opts?: { rmWorktree?: boolean; discardUnpublished?: boolean },
 ): { task: Task; killed_agents: number[]; open_dependents: Task[] } {
   const task = getTask(taskId);
   if (!task) throw new Error(`task ${taskId} not found`);
+  if (opts?.discardUnpublished && !opts.rmWorktree) {
+    throw new TaskCancellationValidationError(
+      "discard_unpublished requires rm_worktree",
+    );
+  }
+  const preserveApprovedWork = approvedUnpublishedHumanWork(task);
+  if (preserveApprovedWork && opts?.rmWorktree && !opts.discardUnpublished) {
+    throw new TaskCancellationValidationError(
+      "approved unpublished work would be lost; cancel without removing the worktree, or explicitly discard unpublished work",
+    );
+  }
 
   const killed: number[] = [];
   if (task.status !== "cancelled") {
-    if (task.review_snapshot_tree) clearReviewSnapshot(task.id);
+    if (
+      task.review_snapshot_tree &&
+      (!preserveApprovedWork || opts?.discardUnpublished)
+    ) {
+      clearReviewSnapshot(task.id);
+    }
     for (const a of listAgents({ live: true })) {
       if (a.task_id !== taskId || a.kind === "main") continue;
       // reviewer worktrees are throwaway — always reap them with the agent
@@ -888,22 +926,21 @@ export function cancelTask(
     }
     // killAgent(worker, rmWorktree) already cleared task.worktree; this
     // covers a leftover worktree with no live agent attached.
-    if (opts?.rmWorktree) {
-      const fresh = getTask(taskId)!;
-      if (fresh.worktree) {
-        if (fresh.workspace_kind === "scratch") {
-          removeScratchWorkspace(fresh.worktree);
-        } else {
-          removeWorktree(fresh.repo, fresh.worktree);
-        }
-        updateTask(taskId, { worktree: null });
-      }
-    }
+    if (opts?.rmWorktree) removeTaskWorkspace(taskId);
     updateTask(taskId, { status: "cancelled" });
     logEvent("task.cancelled", {
       taskId,
-      payload: { from: task.status, killed_agents: killed },
+      payload: {
+        from: task.status,
+        killed_agents: killed,
+        approved_snapshot_retained:
+          preserveApprovedWork && !opts?.discardUnpublished,
+        unpublished_work_discarded: Boolean(opts?.discardUnpublished),
+      },
     });
+  } else if (opts?.rmWorktree) {
+    if (task.review_snapshot_tree) clearReviewSnapshot(task.id);
+    removeTaskWorkspace(taskId);
   }
   return {
     task: getTask(taskId)!,

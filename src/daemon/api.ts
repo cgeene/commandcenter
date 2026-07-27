@@ -88,6 +88,7 @@ import {
   spawnMain,
   spawnReviewer,
   spawnWorker,
+  TaskCancellationValidationError,
 } from "./spawn.js";
 import { resumeAgent, submitPending } from "./resume.js";
 import { capturePane, clearInputLine, windowExists } from "./tmux.js";
@@ -623,15 +624,23 @@ export function buildApp(): Hono {
           .optional(),
       })
       .parse(await c.req.json().catch(() => ({})));
-    return c.json(confirmHumanPublication(id, body.pr_url));
+    return c.json(await confirmHumanPublication(id, body.pr_url));
   });
 
   app.post("/api/tasks/:id/cancel", async (c) => {
     const id = Number(c.req.param("id"));
-    const body = (await c.req.json().catch(() => ({}))) as {
-      rm_worktree?: boolean;
-    };
-    return c.json(cancelTask(id, { rmWorktree: body.rm_worktree }));
+    const body = z
+      .object({
+        rm_worktree: z.boolean().optional(),
+        discard_unpublished: z.boolean().optional(),
+      })
+      .parse(await c.req.json().catch(() => ({})));
+    return c.json(
+      cancelTask(id, {
+        rmWorktree: body.rm_worktree,
+        discardUnpublished: body.discard_unpublished,
+      }),
+    );
   });
 
   app.post("/api/tasks/:id/claim", (c) => {
@@ -1464,6 +1473,9 @@ export function buildApp(): Hono {
       return c.json({ error: err.message }, 400);
     }
     if (err instanceof PublicationValidationError) {
+      return c.json({ error: err.message }, 409);
+    }
+    if (err instanceof TaskCancellationValidationError) {
       return c.json({ error: err.message }, 409);
     }
     // Do not expose stack traces, local paths, command output, or provider

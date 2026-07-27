@@ -2829,11 +2829,17 @@ function TaskPanel({
             <button
               className="danger"
               onClick={() => {
-                const retained = task.workspace_kind === "repo"
-                  ? "the branch survives"
-                  : task.workspace_kind === "scratch"
-                    ? "scratch files are retained until cleanup"
-                    : "existing child tasks are not cancelled automatically";
+                const approvedHumanWork =
+                  task.publication_mode === "human" &&
+                  task.publication_state === "awaiting_human" &&
+                  task.review_verdict === "approve";
+                const retained = approvedHumanWork
+                  ? "the approved snapshot and worktree are retained for recovery"
+                  : task.workspace_kind === "repo"
+                    ? "the branch survives"
+                    : task.workspace_kind === "scratch"
+                      ? "scratch files are retained until cleanup"
+                      : "existing child tasks are not cancelled automatically";
                 if (!confirm(`Cancel task #${task.id}? Live agents are killed; ${retained}.`)) return;
                 void onAction(() => api("POST", `/api/tasks/${task.id}/cancel`, {}));
               }}

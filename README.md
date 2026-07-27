@@ -178,8 +178,13 @@ For Human publishes, Command Center refuses the final confirmation unless the
 worktree is clean, the committed tree exactly matches the approved snapshot,
 and the same tree is present on the task's `origin/agent/task-N` branch. If the
 files change after approval, that approval is superseded and a new review is
-required. The default remains Agent publishes for existing and new installations
-unless a user explicitly changes this local setting.
+required. When a PR is expected, confirmation marks it ready for review before
+releasing the pinned snapshot; a GitHub failure leaves the approval and snapshot
+intact so confirmation can be retried. Ordinary cancellation also retains this
+approved, unpublished worktree. Destructive cleanup requires both
+`--rm-worktree` and the explicit `--discard-unpublished` acknowledgement. The
+default remains Agent publishes for existing and new installations unless a
+user explicitly changes this local setting.
 
 ### Worktree isolation & branch hygiene
 
@@ -444,7 +449,7 @@ running. Full reference: [`docs/cli.md`](docs/cli.md).
 |---|---|
 | `agp task add <title> …` | File a main-orchestrated task (`-w` workspace, `-r` repo, `-p` prompt, `-v` verify, `--provider`, `-m` model, `-P` priority, `-b` blocked-by). |
 | `agp task ls` / `task show <id>` / `task diff <id>` | List / inspect a task / show its branch diff. |
-| `agp task cancel <id>` | Close a task from any state; kills its live agents. |
+| `agp task cancel <id>` | Close a task from any state; kills its live agents. Approved unpublished Human-publishes work is retained unless destructive cleanup is explicitly acknowledged. |
 | `agp main` | Spawn the Claude orchestrator (one at a time). |
 | `agp agent ls` / `agent peek <id>` / `agent send <id> …` | List agents / view a terminal without attaching / send text into a session. |
 | `agp attach <id>` | Attach to an agent's tmux window (detach with `Ctrl-b d`). |

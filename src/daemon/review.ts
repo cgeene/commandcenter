@@ -556,11 +556,12 @@ export async function handleVerdict(
 export class PublicationValidationError extends Error {}
 
 /** Confirm the human committed the exact reviewer-approved tree and completed
- * the requested publication step. No Git mutation occurs here. */
-export function confirmHumanPublication(
+ * the requested publication step. The approved snapshot remains pinned until
+ * any expected PR has been marked ready successfully. */
+export async function confirmHumanPublication(
   taskId: number,
   prUrl?: string,
-): Task {
+): Promise<Task> {
   const task = getTask(taskId);
   if (!task) throw new PublicationValidationError("task not found");
   if (
@@ -582,12 +583,26 @@ export function confirmHumanPublication(
   if (task.open_pr !== 0 && !effectivePrUrl) {
     throw new PublicationValidationError("pull request URL is required");
   }
+  if (task.open_pr !== 0 && effectivePrUrl) {
+    try {
+      await markPrReady(effectivePrUrl);
+    } catch {
+      throw new PublicationValidationError(
+        "the published pull request could not be marked ready; the approved snapshot is still retained",
+      );
+    }
+    logEvent("pr.marked_ready", {
+      taskId: task.id,
+      payload: { pr_url: effectivePrUrl, source: "human publication" },
+    });
+  }
   const approvedHead = branchHeadSha(task);
   clearReviewSnapshot(task.id);
   const updated = updateTask(task.id, {
     status: task.open_pr === 0 ? "done" : "review",
     publication_state: "published",
     review_head_sha: approvedHead,
+    ...(task.open_pr !== 0 ? { pr_is_draft: 0 } : {}),
     ...(effectivePrUrl ? { pr_url: effectivePrUrl } : {}),
   })!;
   logEvent("publication.human_confirmed", {

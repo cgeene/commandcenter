@@ -355,7 +355,6 @@ export async function handleHookEvent(
                 taskId: policyTask ? String(policyTask.id) : undefined,
                 workspaceKind: policyTask?.workspace_kind,
                 publicationMode: policyTask?.publication_mode ?? "agent",
-                role: agent.kind === "reviewer" ? "reviewer" : "worker",
               });
             })()
           : undefined;

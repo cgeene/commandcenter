@@ -36,6 +36,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
+  const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+  _setGhRunner(null);
   closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -137,6 +139,8 @@ describe("provider publication boundaries", () => {
       role: "worker" as const,
     };
     const agent = { ...human, publicationMode: "agent" as const };
+    const agentReviewer = { ...agent, role: "reviewer" as const };
+    const humanReviewer = { ...human, role: "reviewer" as const };
 
     expect(codexPermissionDecision(payload("git commit -m x"), human)?.behavior)
       .toBe("deny");
@@ -192,6 +196,13 @@ describe("provider publication boundaries", () => {
         payload("echo $(git push -u origin agent/task-12)"),
         agent,
       )?.behavior,
+    ).toBe("deny");
+    expect(
+      codexPermissionDecision(payload("gh api repos/x/y/pulls/1"), agentReviewer),
+    ).toBeUndefined();
+    expect(
+      codexPermissionDecision(payload("gh api repos/x/y/pulls/1"), humanReviewer)
+        ?.behavior,
     ).toBe("deny");
   });
 });
@@ -255,7 +266,7 @@ describe("immutable review snapshot", () => {
     const diff = taskDiff(captured);
     expect(diff.diff).toContain("two");
     expect(diff.diff).toContain("new.txt");
-  });
+  }, 15_000);
 
   it("runs reviewer approval before human commit and validates the exact committed tree", async () => {
     const { repo, task } = await setupHumanTask();
@@ -274,28 +285,72 @@ describe("immutable review snapshot", () => {
       review_verdict: "approve",
       publication_state: "awaiting_human",
     });
-    expect(() =>
-      confirmHumanPublication(task.id, "https://github.com/x/y/pull/1")
-    ).toThrow(/commit and push the unchanged approved working tree/);
+    await expect(
+      confirmHumanPublication(task.id, "https://github.com/x/y/pull/1"),
+    ).rejects.toThrow(/commit and push the unchanged approved working tree/);
 
     git(repo, "add", "-A");
     git(repo, "commit", "-m", "feat: human commit");
-    expect(() =>
-      confirmHumanPublication(task.id, "https://github.com/x/y/pull/1")
-    ).toThrow(/commit and push the unchanged approved working tree/);
+    await expect(
+      confirmHumanPublication(task.id, "https://github.com/x/y/pull/1"),
+    ).rejects.toThrow(/commit and push the unchanged approved working tree/);
     git(repo, "push", "-u", "origin", `agent/task-${task.id}`);
-    const published = confirmHumanPublication(
+    const ghCalls: string[][] = [];
+    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+    _setGhRunner(async (args) => {
+      ghCalls.push(args);
+      return args[1] === "view" ? "feat: human commit" : "";
+    });
+    const published = await confirmHumanPublication(
       task.id,
       "https://github.com/x/y/pull/1",
     );
     expect(published).toMatchObject({
       status: "review",
       publication_state: "published",
+      pr_is_draft: 0,
       pr_url: "https://github.com/x/y/pull/1",
       review_snapshot_base: null,
       review_snapshot_tree: null,
     });
-  });
+    expect(ghCalls[0]).toEqual([
+      "pr",
+      "ready",
+      "https://github.com/x/y/pull/1",
+    ]);
+  }, 15_000);
+
+  it("retains the approved snapshot when the draft PR cannot be marked ready", async () => {
+    const { repo, task } = await setupHumanTask();
+    const { captureReviewSnapshot } = await import(
+      "../src/daemon/reviewsnapshot.js"
+    );
+    const { confirmHumanPublication, handleVerdict } = await import(
+      "../src/daemon/review.js"
+    );
+    const { getTask } = await import("../src/db/tasks.js");
+    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+    const captured = captureReviewSnapshot(task.id);
+    await handleVerdict(task.id, 99, "approve", "snapshot is correct");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-m", "feat: human commit");
+    git(repo, "push", "-u", "origin", `agent/task-${task.id}`);
+    _setGhRunner(async () => {
+      throw new Error("GitHub unavailable");
+    });
+
+    await expect(
+      confirmHumanPublication(task.id, "https://github.com/x/y/pull/1"),
+    ).rejects.toThrow(/could not be marked ready/);
+    expect(getTask(task.id)).toMatchObject({
+      status: "review",
+      publication_state: "awaiting_human",
+      review_verdict: "approve",
+      review_snapshot_base: captured.review_snapshot_base,
+      review_snapshot_tree: captured.review_snapshot_tree,
+      pr_url: null,
+    });
+  }, 15_000);
 
   it("returns rejected snapshots to the uncommitted worker loop", async () => {
     const { task } = await setupHumanTask();
