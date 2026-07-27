@@ -50,6 +50,7 @@ import {
   REVIEWER_TOOL_ALLOW,
   WORKER_TOOL_ALLOW,
 } from "./permissions.js";
+import { resolveReviewDelta } from "./reviewstate.js";
 import { findProviderTranscript } from "./transcript.js";
 import { killWindow, newWindow, windowExists } from "./tmux.js";
 import {
@@ -638,12 +639,17 @@ export function spawnWorker(
   }
 }
 
-/**
- * Spawn an adversarial reviewer for a task in `review`. Fresh context on
- * purpose — same inputs as the worker, none of its conversation. Own
- * detached worktree so it can run code without touching the worker's tree;
- * file-editing tools denied so it can only judge, not fix.
- */
+/** A completed review round whose verdict a later push superseded. Passed in
+ *  so the next reviewer can scope itself to the delta past `fromSha`. */
+export interface PriorReviewRound {
+  /** Branch SHA the superseded round judged. */
+  fromSha: string;
+  /** Its verdict, as recorded before it was cleared ("approve"). */
+  verdict: string;
+  /** Its review_notes, before the supersede marker was appended. */
+  notes: string | null;
+}
+
 export interface ReviewerSpawnOptions {
   /** Override the reviewer model (Claude slug for a Claude reviewer, Codex slug
    *  for a Codex reviewer). */
@@ -653,8 +659,18 @@ export interface ReviewerSpawnOptions {
   provider?: string;
   /** Codex reviewer reasoning effort (ignored for a Claude reviewer). */
   reasoningEffort?: ReasoningEffort;
+  /** Scope this round to what changed since a superseded verdict. Ignored when
+   *  the old SHA is no longer an ancestor of the tip (rebase/force-push) — that
+   *  falls back to a full review. */
+  priorRound?: PriorReviewRound;
 }
 
+/**
+ * Spawn an adversarial reviewer for a task in `review`. Fresh context on
+ * purpose — same inputs as the worker, none of its conversation. Own
+ * detached worktree so it can run code without touching the worker's tree;
+ * file-editing tools denied so it can only judge, not fix.
+ */
 export function spawnReviewer(
   taskId: number,
   opts?: ReviewerSpawnOptions,
@@ -716,9 +732,17 @@ export function spawnReviewer(
     provider === "claude"
       ? resolveReviewerModel(task, opts?.model)
       : opts?.model;
+  // A light review is a scoped diff read, not an investigation, so a Codex
+  // reviewer runs it at low effort unless the caller asked for something else.
+  // (The Claude spawn path has no per-agent effort knob; its light-mode saving
+  // comes from the prompt alone.)
+  const light = task.review_mode === "light";
   const reasoningEffort =
     provider === "codex"
-      ? reasoningEffortForProvider("codex", opts?.reasoningEffort)
+      ? reasoningEffortForProvider(
+          "codex",
+          opts?.reasoningEffort ?? (light ? "low" : undefined),
+        )
       : undefined;
   const dir = isScratch
     ? validateScratchWorkspace(task.repo) // review the workspace dir read-only
@@ -750,10 +774,40 @@ export function spawnReviewer(
     task_id: taskId,
   });
 
+  // Delta-scoped re-review: only when the previously reviewed SHA is still an
+  // ancestor of the tip. A rebase/force-push rewrote what that round judged, so
+  // its findings can't be carried forward — fall back to a full re-review and
+  // say so in the log, since the round costs full price.
+  // Never for a human-publication snapshot review: what that reviewer judges is
+  // a pinned working tree, not the branch tip, so a branch-range diff would
+  // describe something other than the candidate in front of it.
+  const priorRound = opts?.priorRound;
+  const delta =
+    priorRound && !humanSnapshotReview
+      ? resolveReviewDelta(task, priorRound.fromSha)
+      : null;
+  if (priorRound && !delta) {
+    logEvent("review.delta_unavailable", {
+      taskId,
+      payload: {
+        from: priorRound.fromSha,
+        reason: "prior reviewed sha is not an ancestor of the current tip",
+      },
+    });
+  }
+
   const tag = `task-${taskId}-review`;
   fs.mkdirSync(promptsDir(), { recursive: true });
   const promptFile = path.join(promptsDir(), `${tag}.md`);
-  fs.writeFileSync(promptFile, buildReviewerPrompt(task));
+  fs.writeFileSync(
+    promptFile,
+    buildReviewerPrompt(
+      task,
+      delta && priorRound
+        ? { prior: { verdict: priorRound.verdict, notes: priorRound.notes, delta } }
+        : undefined,
+    ),
+  );
 
   let command: string;
   let runtimeConfigPath: string;
@@ -817,7 +871,15 @@ export function spawnReviewer(
   logEvent("reviewer.spawned", {
     agentId: agent.id,
     taskId,
-    payload: { target, provider, model, reasoning_effort: reasoningEffort, worktree: dir },
+    payload: {
+      target,
+      provider,
+      model,
+      reasoning_effort: reasoningEffort,
+      worktree: dir,
+      review_mode: task.review_mode,
+      scope: delta ? "delta" : "full",
+    },
   });
   return { agent: getAgent(agent.id)!, task: getTask(taskId)! };
 }

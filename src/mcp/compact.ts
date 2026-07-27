@@ -26,11 +26,17 @@ export const COMPACT_TASK_FIELDS = [
   "parent_task_id",
   "worker_provider",
   "model",
+  // Same argument as worker_provider: triage has to preserve the effort a task
+  // was created with, so it must survive the compact projection.
+  "reasoning_effort",
   "agent_id",
   "branch",
   "blocked_by",
   "review_verdict",
   "review_cycles",
+  // How deep the adversarial review goes. Small, and the orchestrator sets it
+  // at triage, so it has to be readable without asking for verbose.
+  "review_mode",
   "pr_url",
   "pr_state",
   "pr_checks",
@@ -60,6 +66,24 @@ export const TASK_ROW_FIELDS = [
  * because it is the field that call changes.
  */
 export const PUBLICATION_FIELDS = ["publication_mode", "publication_state"] as const;
+
+/**
+ * Fields never appended to a mutation echo, however the caller changed them:
+ * they are exactly the bulk that compaction exists to keep out of the
+ * orchestrator's context, and the caller just supplied the value anyway.
+ * result_summary needs no entry — it is in the core and always truncated.
+ */
+export const BULKY_FIELDS = ["prompt", "review_notes"] as const;
+
+/**
+ * Which of the fields a mutation changed should be appended to its compact
+ * echo. Confirming a field outside the core (verify_cmd, review_mode, …)
+ * actually landed is worth a few tokens; replaying a 100k-character prompt is
+ * not.
+ */
+export function echoedFields(changed: readonly string[]): string[] {
+  return changed.filter((f) => !(BULKY_FIELDS as readonly string[]).includes(f));
+}
 
 export interface ShapeOptions {
   /** Return the untouched record (previous behavior). */
