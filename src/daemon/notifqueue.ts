@@ -7,6 +7,7 @@ import {
   listQueuedNotifications,
   type QueuedNotification,
 } from "../db/notifications.js";
+import type { AgentProvider } from "../providers.js";
 import { notify } from "./notify.js";
 import { parsePane } from "./pane.js";
 import { resumeAgent } from "./resume.js";
@@ -70,21 +71,91 @@ export function buildDelegateMessage(
   return `[commandcenter] ${items.length} workers are waiting for input — ${list}. peek_worker(<id>) each to see what it's asking, then unblock what you can via send_to_worker (for a numbered menu send just the digit). Escalate to the human ONLY for genuine human calls: credentials, a judgment call that's theirs, or approval for something destructive/outside the worktree. Each is paged automatically if unresolved within ${escalateMinutes}m.`;
 }
 
+/** Why the main's composer is (or isn't) safe to type into. Everything except
+ *  "clear" defers delivery; the variants exist so the reason is diagnosable. */
+export type PromptClarity = "clear" | "draft" | "permission" | "unreadable";
+
 /**
- * True only when the main's composer is safe to inject into: no unsubmitted
- * human draft and no pending permission menu. Capturing the pane is the only
- * way to see a draft the human is mid-typing — agent.state alone can't. A
- * capture failure is treated as "not clear" (fail closed toward queuing).
+ * Inspect the main's composer. Capturing the pane is the only way to see a draft
+ * the human is mid-typing — agent.state alone can't.
+ *
+ * Only a composer we can positively SEE, and see to be empty, counts as clear.
+ * "I found no draft" is not the same claim as "I found an empty input line",
+ * and conflating them is exactly how this gate failed in the wild: Claude Code
+ * started painting a label into the composer's top border, the pane parser
+ * stopped recognizing the frame, every read came back "no draft", and a worker
+ * notification was typed into — and submitted with — a human's half-written
+ * message. An unparseable capture is therefore "unreadable", never "clear".
  */
-export function mainPromptClear(target: string): boolean {
+export function promptClarity(
+  target: string,
+  provider: AgentProvider = "claude",
+): PromptClarity {
+  let pane;
   try {
     // Styled capture so a dim ghost-text suggestion in the main's composer is
     // not mistaken for a human draft (which would wrongly block delivery).
-    const pane = parsePane(capturePane(target, PANE_TAIL_LINES, { escapes: true }));
-    return pane.unsubmitted_input === null && pane.pending_permission === null;
+    pane = parsePane(capturePane(target, PANE_TAIL_LINES, { escapes: true }), provider);
   } catch {
-    return false;
+    return "unreadable";
   }
+  if (pane.pending_permission) return "permission";
+  if (!pane.composer_found) return "unreadable";
+  return pane.unsubmitted_input === null ? "clear" : "draft";
+}
+
+/** An "unreadable" composer blocks delivery indefinitely, so it must not be
+ *  silent — but it is re-tested on every retry, so log it sparsely. */
+const unreadableLoggedAt = new Map<number, number>();
+const UNREADABLE_LOG_INTERVAL_MS = 10 * 60_000;
+
+function logUnreadableComposer(mainId: number, provider: AgentProvider): void {
+  const nowMs = Date.now();
+  const last = unreadableLoggedAt.get(mainId);
+  if (last !== undefined && nowMs - last < UNREADABLE_LOG_INTERVAL_MS) return;
+  unreadableLoggedAt.set(mainId, nowMs);
+  logEvent("main.composer_unreadable", {
+    agentId: mainId,
+    payload: { provider },
+  });
+}
+
+/** Test-only: the throttle is process-global but agent ids reset per db. */
+export function __clearUnreadableLogForTests(): void {
+  unreadableLoggedAt.clear();
+}
+
+function normalizeComposerText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Run once the message is in the composer but before Enter: it must hold
+ * nothing but that message. A keystroke can land in the milliseconds between
+ * reading the composer and typing into it, and submitting then would merge the
+ * human's words into the notification and send the wreckage as their turn.
+ * Leaving it unsubmitted instead keeps every character they typed on screen for
+ * them to fix.
+ *
+ * Deliberately conservative: only positively foreign content withholds the
+ * submit. A capture we cannot read, or a composer showing some subset of the
+ * message (clipped by pane height, re-wrapped), submits as before.
+ */
+function composerHoldsOnly(
+  target: string,
+  provider: AgentProvider,
+  message: string,
+): boolean {
+  let pane;
+  try {
+    pane = parsePane(capturePane(target, PANE_TAIL_LINES, { escapes: true }), provider);
+  } catch {
+    return true;
+  }
+  if (!pane.composer_found) return true;
+  const seen = normalizeComposerText(pane.unsubmitted_input ?? "");
+  if (seen === "") return true;
+  return normalizeComposerText(message).includes(seen);
 }
 
 /** Find the one live main agent with a tmux window, whatever its state. */
@@ -96,13 +167,18 @@ function liveMain(): Agent | undefined {
 
 /**
  * The ONE gated primitive for injecting text into the main agent's composer.
- * Delivers `message` only when the prompt is genuinely safe to type into — no
- * unsubmitted human draft and no pending permission menu (mainPromptClear) —
- * and, unless `allowWorking` is set, only when the main is idle so a delivery
- * never fires mid-turn. Returns "delivered" on a confirmed send; "deferred" on
- * a busy/mid-draft prompt, a lost race (the main started a turn or went waiting
- * between the check and the send), or a dead window — in which case the caller
- * keeps the item queued for the next Stop/idle/watchdog retry.
+ * Delivers `message` only when the prompt is genuinely safe to type into — an
+ * input line we can see, holding nothing, with no permission menu up
+ * (promptClarity) — and, unless `allowWorking` is set, only when the main is
+ * idle so a delivery never fires mid-turn. Returns "delivered" on a confirmed
+ * send; "deferred" on a busy/mid-draft/unreadable prompt, a lost race, or a
+ * dead window — in which case the caller keeps the item queued for the next
+ * Stop/idle/watchdog retry.
+ *
+ * The clarity check runs inside resumeAgent's guard rather than here, so it
+ * happens immediately before the keystrokes instead of several tmux round trips
+ * earlier, and a second check between the keystrokes and Enter refuses to submit
+ * a composer that has picked up anything besides this message.
  *
  * Every path that writes to the main's prompt — task-triage delegation
  * (orchestration.ts), real-time worker-wait delegation and its flush (below),
@@ -118,10 +194,19 @@ export async function deliverToMainIfClear(
   const stateOk = opts.allowWorking
     ? ["working", "idle"].includes(main.state)
     : main.state === "idle";
-  if (!main.tmux_target || !stateOk || !mainPromptClear(main.tmux_target)) {
-    return "deferred";
-  }
-  const outcome = await resumeAgent(main.id, message);
+  const target = main.tmux_target;
+  if (!target || !stateOk) return "deferred";
+
+  const outcome = await resumeAgent(main.id, message, {
+    guard: {
+      beforeType: () => {
+        const clarity = promptClarity(target, main.provider);
+        if (clarity === "unreadable") logUnreadableComposer(main.id, main.provider);
+        return clarity === "clear";
+      },
+      beforeSubmit: () => composerHoldsOnly(target, main.provider, message),
+    },
+  });
   return outcome === "sent" ? "delivered" : "deferred";
 }
 

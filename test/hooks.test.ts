@@ -18,9 +18,14 @@ vi.mock("../src/daemon/tmux.js", () => ({
 
 let tmpDir: string;
 
+// An empty composer. The marker is the "❯" the TUI actually renders: the pane
+// parser identifies the input line by that glyph, so a fixture using a plain
+// ">" models a pane with NO composer on it, which is no longer treated as a
+// clear prompt (an input line we cannot see is not an input line we know to be
+// empty — see notifqueue.promptClarity).
 const PROMPT_BOX = [
   "╭──────────────────────────────────────────────────────────╮",
-  "│ >                                                          │",
+  "│ ❯                                                          │",
   "╰──────────────────────────────────────────────────────────╯",
 ].join("\n");
 
@@ -146,6 +151,9 @@ describe("hook events", () => {
     expect(sendText).toHaveBeenCalledWith(
       "cc:@2",
       expect.stringContaining(`peek_worker(${worker.id})`),
+      // Main-agent delivery is guarded: the composer is re-checked between the
+      // keystrokes and Enter so a racing keystroke can't be submitted with it.
+      expect.objectContaining({ beforeSubmit: expect.any(Function) }),
     );
     expect(listEvents(20).map((event) => event.kind)).toContain(
       "waiting.delegated",
@@ -243,6 +251,9 @@ describe("hook events", () => {
     expect(sendText).toHaveBeenCalledWith(
       "cc:@2",
       expect.stringContaining(`peek_worker(${worker.id})`),
+      // Main-agent delivery is guarded: the composer is re-checked between the
+      // keystrokes and Enter so a racing keystroke can't be submitted with it.
+      expect.objectContaining({ beforeSubmit: expect.any(Function) }),
     );
     expect(getAgent(main.id)?.state).toBe("working");
     expect(
@@ -690,7 +701,7 @@ describe("transient API error auto-nudge", () => {
 
     // Worker finishes cleanly — the stall streak is over.
     updateTask(task.id, { result_summary: "done" });
-    paneContent = "⏺ All set, wrapping up.\n\n╭──╮\n│ >│\n╰──╯";
+    paneContent = "⏺ All set, wrapping up.\n\n╭──╮\n│ ❯│\n╰──╯";
     await handleHookEvent(agent.id, { hook_event_name: "Stop" });
 
     // Requeue the task and hit the same stall again — should nudge, not escalate.
@@ -727,7 +738,7 @@ describe("transient API error auto-nudge", () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");
     const { getAgent } = await import("../src/db/agents.js");
     const { agent } = await setup({ tmux_target: "cc:@1" });
-    paneContent = "⏺ Needs your input on something.\n\n╭──╮\n│ >│\n╰──╯";
+    paneContent = "⏺ Needs your input on something.\n\n╭──╮\n│ ❯│\n╰──╯";
 
     await handleHookEvent(agent.id, {
       hook_event_name: "Notification",

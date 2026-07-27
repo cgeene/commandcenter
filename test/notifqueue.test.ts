@@ -2,30 +2,46 @@ import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { clearComposer, draftComposer, noComposer } from "./fixtures/pane.js";
 
-const sendText = vi.fn(async () => {});
 /** Pane content keyed by tmux target — lets a worker's pane differ from the
  *  main agent's, which the shared single-string mock in hooks.test can't. */
 const panes = new Map<string, string>();
+
+/**
+ * Stands in for tmux send-keys, faithfully enough to exercise the guard: the
+ * text lands in the pane, `beforeSubmit` runs, and Enter only follows if it
+ * agrees. `onType` lets a test simulate a keystroke arriving in exactly the
+ * window between the composer check and the send.
+ */
+let onType: ((target: string, text: string) => void) | null = null;
+const sendText = vi.fn(
+  async (
+    target: string,
+    text: string,
+    opts?: { beforeSubmit?: () => boolean },
+  ): Promise<boolean> => {
+    onType?.(target, text);
+    if (opts?.beforeSubmit && !opts.beforeSubmit()) return false;
+    return true;
+  },
+);
 
 vi.mock("../src/daemon/tmux.js", () => ({
   windowExists: () => true,
   listWindowIds: () => [...panes.keys()],
   listLiveWindowIds: () => [...panes.keys()],
-  sendText: (...args: unknown[]) => sendText(...args),
+  sendText: (...args: unknown[]) =>
+    (sendText as unknown as (...a: unknown[]) => Promise<boolean>)(...args),
   capturePane: (target: string) => panes.get(target) ?? "",
 }));
 
 let tmpDir: string;
 
 // An empty, idle composer — no unsubmitted draft, no menu.
-const CLEAR_PROMPT = ["╭──────────╮", "│ ❯        │", "╰──────────╯"].join("\n");
+const CLEAR_PROMPT = clearComposer();
 // The human has started typing a message but not submitted it.
-const HUMAN_DRAFT = [
-  "╭──────────────────────────────╮",
-  "│ ❯ hey can you also check the  │",
-  "╰──────────────────────────────╯",
-].join("\n");
+const HUMAN_DRAFT = draftComposer("hey can you also check the");
 
 const MAIN = "cc:@main";
 const W1 = "cc:@w1";
@@ -37,12 +53,15 @@ beforeEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   panes.clear();
+  onType = null;
   sendText.mockClear();
-  sendText.mockImplementation(async () => {});
   const { __clearAutoNudgeCountsForTests } = await import("../src/daemon/hooks.js");
   __clearAutoNudgeCountsForTests();
-  const { __clearFlushBackoffForTests } = await import("../src/daemon/notifqueue.js");
+  const { __clearFlushBackoffForTests, __clearUnreadableLogForTests } = await import(
+    "../src/daemon/notifqueue.js"
+  );
   __clearFlushBackoffForTests();
+  __clearUnreadableLogForTests();
 });
 
 afterEach(async () => {
@@ -119,6 +138,85 @@ describe("delegateToMain — deliver vs queue", () => {
     expect(countQueuedNotifications(main.id)).toBe(1);
     const { listEvents } = await import("../src/db/events.js");
     expect(listEvents(20).map((e) => e.kind)).toContain("notification.queued");
+  });
+});
+
+/**
+ * The recurrence these cover: delivery merged into a human's half-typed
+ * multi-line message and submitted the wreckage as their turn. Three ways that
+ * can happen, all of which must end with the draft intact and the notification
+ * still queued for later.
+ */
+describe("delegateToMain — a human draft is never destroyed", () => {
+  it("preserves a multi-line draft verbatim and queues the notification", async () => {
+    const { main, worker } = await setup("idle");
+    const draft = draftComposer(
+      "custom-hostnames will be team-platform.",
+      "nylas-data-lake will also be team platform.",
+      "unicorn-",
+    );
+    panes.set(MAIN, draft);
+
+    await notifyWorker(worker.id, "which region?");
+
+    // Nothing was typed into the pane at all, so the draft is byte-identical.
+    expect(sendText).not.toHaveBeenCalled();
+    expect(panes.get(MAIN)).toBe(draft);
+    const { countQueuedNotifications } = await import("../src/db/notifications.js");
+    expect(countQueuedNotifications(main.id)).toBe(1);
+
+    // And it is delivered once the human submits and the composer clears.
+    panes.set(MAIN, CLEAR_PROMPT);
+    const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
+    expect(await flushMainQueue(main.id, { force: true })).toBe("flushed");
+    expect(String(sendText.mock.calls[0][1])).toContain("which region?");
+    expect(countQueuedNotifications(main.id)).toBe(0);
+  });
+
+  it("does not submit when a keystroke lands between the check and the send", async () => {
+    const { main, worker } = await setup("idle");
+    panes.set(MAIN, CLEAR_PROMPT);
+    // The composer is clear when checked, then the human starts typing in the
+    // window before Enter — the notification is already in the pane by then.
+    onType = (target, text) => {
+      panes.set(target, draftComposer(`${text} wait, hold on`));
+    };
+
+    await notifyWorker(worker.id, "which region?");
+
+    // Typed, but Enter withheld: nothing was submitted on the human's behalf.
+    expect(sendText).toHaveBeenCalledOnce();
+    expect(await sendText.mock.results[0].value).toBe(false);
+    const { listEvents } = await import("../src/db/events.js");
+    expect(listEvents(20).map((e) => e.kind)).not.toContain("waiting.delegated");
+    const { countQueuedNotifications } = await import("../src/db/notifications.js");
+    expect(countQueuedNotifications(main.id)).toBe(1);
+    // The main was not marked as working off a turn that never started.
+    const { getAgent } = await import("../src/db/agents.js");
+    expect(getAgent(main.id)?.state).toBe("idle");
+  });
+
+  it("queues rather than guessing when the composer cannot be read at all", async () => {
+    const { main, worker } = await setup("idle");
+    // A pane with no recognizable input line — a mid-turn capture, or a TUI
+    // whose chrome the parser no longer knows. "I can't see a draft" must not
+    // be read as "there is no draft".
+    panes.set(MAIN, noComposer());
+
+    await notifyWorker(worker.id, "which region?");
+
+    expect(sendText).not.toHaveBeenCalled();
+    const { countQueuedNotifications } = await import("../src/db/notifications.js");
+    expect(countQueuedNotifications(main.id)).toBe(1);
+    // Blocking indefinitely on an unreadable pane must not be silent.
+    const { listEvents } = await import("../src/db/events.js");
+    expect(listEvents(20).map((e) => e.kind)).toContain("main.composer_unreadable");
+
+    // Recognizable again → delivered, nothing lost.
+    panes.set(MAIN, CLEAR_PROMPT);
+    const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
+    expect(await flushMainQueue(main.id, { force: true })).toBe("flushed");
+    expect(countQueuedNotifications(main.id)).toBe(0);
   });
 });
 

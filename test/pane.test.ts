@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { parsePane } from "../src/daemon/pane.js";
+import {
+  clearComposer,
+  draftComposer,
+  ghostComposer,
+  noComposer,
+} from "./fixtures/pane.js";
 
 const ESC = String.fromCharCode(27);
 
@@ -423,6 +429,76 @@ describe("parsePane — ghost-text vs real input in the rule-framed composer", (
       "this is a very long line of typed but unsubmitted " +
         "text that keeps going onto a second physical line",
     );
+  });
+});
+
+/**
+ * The composer's top border carries a label in current Claude Code builds:
+ *
+ *   ──────────────── Manage Claude orchestrator task queue and workers ──
+ *
+ * Requiring a border to be a line of nothing but `─` silently stopped the input
+ * line from being found at all. Because "no draft found" and "no composer
+ * found" were the same answer, every pane read came back "nothing typed" and a
+ * worker notification was typed into — and submitted with — a human's
+ * half-written message. These cases pin both halves: the labelled frame parses,
+ * and an absent composer is reported as absent rather than as empty.
+ */
+describe("parsePane — labelled composer border", () => {
+  it("sees a human draft through a labelled top border", () => {
+    const parsed = parsePane(draftComposer("actually hold on, let me rethink"));
+    expect(parsed.composer_found).toBe(true);
+    expect(parsed.unsubmitted_input).toBe("actually hold on, let me rethink");
+  });
+
+  it("sees every line of a multi-line draft, not just the marker row", () => {
+    // The exact draft that got clobbered: the notification landed after
+    // "unicorn-" and submitted the merged text as the human's turn.
+    const parsed = parsePane(
+      draftComposer(
+        "custom-hostnames will be team-platform.",
+        "nylas-data-lake will also be team platform.",
+        "unicorn-",
+      ),
+    );
+    expect(parsed.composer_found).toBe(true);
+    expect(parsed.unsubmitted_input).toBe(
+      "custom-hostnames will be team-platform. " +
+        "nylas-data-lake will also be team platform. unicorn-",
+    );
+  });
+
+  it("reports an empty labelled-border composer as found and empty", () => {
+    const parsed = parsePane(clearComposer());
+    expect(parsed.composer_found).toBe(true);
+    expect(parsed.unsubmitted_input).toBeNull();
+  });
+
+  it("still treats ghost text in a labelled-border composer as empty", () => {
+    const parsed = parsePane(ghostComposer());
+    expect(parsed.composer_found).toBe(true);
+    expect(parsed.unsubmitted_input).toBeNull();
+  });
+
+  it("reports composer_found=false when no input line is on screen", () => {
+    const parsed = parsePane(noComposer());
+    expect(parsed.composer_found).toBe(false);
+    expect(parsed.unsubmitted_input).toBeNull();
+  });
+
+  it("does not mistake a rule pair in the agent's own output for a composer", () => {
+    // Two rules with prose between them: not adjacent to a marker, so it must
+    // not be reported as a composer holding that prose as a "draft".
+    const parsed = parsePane(
+      [
+        "─".repeat(60),
+        "  Summary of the rollout plan",
+        "  Ship behind a flag first.",
+        "─".repeat(60),
+      ].join("\n"),
+    );
+    expect(parsed.composer_found).toBe(false);
+    expect(parsed.unsubmitted_input).toBeNull();
   });
 });
 
