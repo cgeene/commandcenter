@@ -6,6 +6,7 @@ import {
   codexBin,
   codexHome,
   codexProfile,
+  dataDir,
   promptsDir,
 } from "../config.js";
 import {
@@ -114,6 +115,7 @@ function buildWorkerPrompt(task: Task, branch: string | null): string {
       : [
           "Dependencies: node_modules may already be present here — the platform seeds a new worktree from a shared cache whenever the branch leaves the lockfiles untouched. If it is there, use it as-is and do NOT run `npm install`/`npm ci`; if it is absent (your branch changes a lockfile, or the cache was cold), install normally.",
         ]),
+    "Never control Command Center's terminal infrastructure directly: do not invoke tmux kill/respawn/send-keys commands or signal tmux processes. Use the cc MCP lifecycle tools or report_blocked when terminal control is required.",
     "Your task counts as complete only once you set result_summary. Stopping without it flags the task as incomplete, not done.",
     "Do NOT run multi-agent self-review workflows (e.g. the code-review skill's dynamic workflow) on your own diff — the platform runs an independent adversarial review on every PR/result, so self-review duplicates it at significant token cost. Your verification commands (typecheck/tests/build) are your quality gate.",
     "Anything you start in the background (`&`, `nohup`, a dev server, a watcher, a synthetic load generator) must be stopped before you finish — cleanup you leave for after you stop will not run. Prefer your harness's managed background-process facility over a bare `&`.",
@@ -273,16 +275,16 @@ function buildWorkerAsk(_task: Task): string[] {
   return [...DANGEROUS_PUSH_ASK];
 }
 
-/** Reviewers run read-only: they get the same frictionless Bash catch-all so
- *  their verify/build/test never stalls, but editing and Git publishing are
- *  denied (see {@link buildReviewerDeny}). Under `dontAsk` the editing tools
- *  are absent from the allow list *and* explicitly denied. */
+/** Reviewers run read-only and deliberately do not receive the blanket Bash
+ *  permission used by implementation workers. The platform runs verify_cmd
+ *  mechanically before review; reviewers inspect that evidence, the diff,
+ *  and files through narrowly-scoped read tools. Under `dontAsk`, arbitrary
+ *  shell commands fail closed instead of prompting or mutating host state. */
 function buildReviewerAllow(_task: Task): string[] {
-  return [
-    ...REVIEWER_TOOL_ALLOW,
-    BASH_TOOL_ALLOW,
-    ...readOnlyProfileAllow(),
-  ];
+  return [...REVIEWER_TOOL_ALLOW, ...readOnlyProfileAllow()].filter(
+    (pattern) =>
+      pattern !== BASH_TOOL_ALLOW && !/^Bash\(\s*\*\s*\)$/.test(pattern),
+  );
 }
 
 function buildReviewerDeny(task?: Task): string[] {
@@ -329,6 +331,29 @@ function attachPane(agentId: number, target: string): void {
     pane_pid: paneProcess(target)?.pid ?? null,
   });
 }
+
+/**
+ * Keep provider processes off Command Center's control tmux socket.
+ *
+ * A process started inside a tmux pane inherits TMUX, which otherwise lets an
+ * agent's ordinary `tmux kill-server` target the server hosting the daemon,
+ * orchestrator, and every worker. Unsetting TMUX/TMUX_PANE and assigning a
+ * private 0700 TMUX_TMPDIR means any tmux client the provider launches can
+ * reach only that agent's own socket namespace.
+ */
+function isolateAgentTmux(agentId: number, command: string): string {
+  if (!Number.isSafeInteger(agentId) || agentId < 1) {
+    throw new Error("invalid agent id for tmux isolation");
+  }
+  const isolationRoot = path.join(dataDir(), "agent-tmux");
+  const isolationDir = path.join(isolationRoot, String(agentId));
+  fs.mkdirSync(isolationDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(isolationRoot, 0o700);
+  fs.chmodSync(isolationDir, 0o700);
+  return `env -u TMUX -u TMUX_PANE TMUX_TMPDIR=${shellQuote(isolationDir)} ${command}`;
+}
+
+export const _isolateAgentTmuxForTest = isolateAgentTmux;
 
 function buildClaudeCmd(opts: {
   model?: string;
@@ -467,6 +492,8 @@ export const _resumableSessionForTest = resumableSession;
 export const _resolveReviewerModelForTest = resolveReviewerModel;
 export const _resolveReviewerProviderForTest = resolveReviewerProvider;
 
+export class WorkerSpawnValidationError extends Error {}
+
 export function spawnWorker(
   taskId: number,
   modelOverride?: string,
@@ -480,16 +507,20 @@ export function spawnWorker(
   if (!task) throw new Error(`task ${taskId} not found`);
 
   if (task.status === "queued") {
-    if (!claimTask(taskId)) throw new Error(`task ${taskId} claim lost`);
+    if (!claimTask(taskId)) {
+      throw new WorkerSpawnValidationError(
+        `task ${taskId} was claimed by another worker`,
+      );
+    }
   } else if (task.status !== "claimed") {
-    throw new Error(
+    throw new WorkerSpawnValidationError(
       `task ${taskId} is ${task.status}; only queued/claimed tasks can be spawned`,
     );
   }
   if (task.agent_id) {
     const existing = getAgent(task.agent_id);
     if (existing && existing.state !== "dead") {
-      throw new Error(
+      throw new WorkerSpawnValidationError(
         `task ${taskId} already has live agent ${existing.id} (${existing.state})`,
       );
     }
@@ -607,7 +638,12 @@ export function spawnWorker(
             resumeSession,
             permissionMode: "dontAsk",
           });
-    target = newWindow(`t${taskId}`, dir, command, workerEnvironment);
+    target = newWindow(
+      `t${taskId}`,
+      dir,
+      isolateAgentTmux(agent.id, command),
+      workerEnvironment,
+    );
     // SessionStart is the readiness handshake. Leaving the agent in spawning
     // lets the watchdog detect missing/untrusted hooks instead of pretending a
     // worker is healthy merely because its tmux window exists.
@@ -891,7 +927,12 @@ export function spawnReviewer(
   }
   updateAgent(agent.id, { runtime_config_path: runtimeConfigPath });
 
-  const target = newWindow(`r${taskId}`, dir, command, reviewerEnvironment);
+  const target = newWindow(
+    `r${taskId}`,
+    dir,
+    isolateAgentTmux(agent.id, command),
+    reviewerEnvironment,
+  );
   // SessionStart is the readiness handshake, just as it is for workers.
   // Keeping the reviewer in spawning lets the watchdog surface a provider
   // trust prompt instead of claiming the reviewer is already healthy.
@@ -928,7 +969,9 @@ export function spawnMain(model?: string): Agent {
     state: "spawning",
   });
 
-  const settingsFile = writeSettingsFile("main", agent.id);
+  const settingsFile = writeSettingsFile("main", agent.id, {
+    deny: [...DANGEROUS_BASH_DENY],
+  });
   const mcpFile = writeMcpConfigFile("main", {
     CC_ROLE: "main",
     CC_AGENT_ID: String(agent.id),
@@ -942,7 +985,10 @@ export function spawnMain(model?: string): Agent {
   const target = newWindow(
     "main",
     resolveMainWorkspaceDir(),
-    buildClaudeCmd({ model: resolvedModel, settingsFile, mcpFile, promptFile }),
+    isolateAgentTmux(
+      agent.id,
+      buildClaudeCmd({ model: resolvedModel, settingsFile, mcpFile, promptFile }),
+    ),
   );
   // Do not report the orchestrator as working until its SessionStart hook
   // arrives. The provider may first require a one-time workspace-trust choice.

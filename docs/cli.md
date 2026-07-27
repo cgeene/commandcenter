@@ -41,7 +41,7 @@ is Claude, or the `CC_REVIEWER_PROVIDER` / `CC_REVIEWER_VARIETY` policy), and
 | `agent kill <id>` | Kill an agent's tmux window. `--requeue` puts its task back in the queue; `--rm-worktree` removes the worktree. |
 | `agent peek <id>` | Print the agent's visible terminal output. `-n/--lines <n>` (default 50). |
 | `agent send <id> <text…>` | Send a message into an agent's interactive session. |
-| `agent session <id>` | Show provider, session ID, transcript path (when available), working directory, and a copyable provider-specific resume command. |
+| `agent session <id>` | Show provider, session ID, transcript path (when available), working directory, and a copyable detached resume command. Codex commands include Command Center's isolated `CODEX_HOME`; plain `codex resume <id>` searches the wrong session store. |
 
 ## `agp attach <agentId>`
 

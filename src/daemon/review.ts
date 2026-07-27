@@ -630,6 +630,23 @@ export async function handleVerdict(
         task.publication_mode === "human" ? "editing" : task.publication_state,
     });
     logEvent("task.reopened", { taskId, payload: { reason: "review rejected" } });
+  } else if (outcome === "delivery_failed") {
+    // The worker may still be perfectly healthy. Keep the review state and
+    // association intact so a transient tmux client failure never orphans,
+    // requeues or kills a live worker. Persist the rejection as pending
+    // evidence: the reviewed HEAD is already de-duplicated, so dropping these
+    // fields would leave the task silently parked with no visible verdict.
+    updateTask(taskId, {
+      review_verdict: "reject",
+      review_notes: notes,
+      review_cycles: cycles,
+    });
+    logEvent("review.feedback_delivery_failed", {
+      taskId,
+      agentId,
+      payload: { reason: "tmux delivery unavailable" },
+    });
+    return getTask(taskId)!;
   } else {
     // A worker parked on a permission prompt can't take the notes, and the
     // prompt it's waiting on belongs to work that was just rejected — kill

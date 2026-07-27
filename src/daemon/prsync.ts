@@ -378,7 +378,7 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
     // Worker is parked on a permission prompt — injected text would answer
     // the menu, not reach the conversation. The wait is already being
     // escalated; retry on a later pass once it's unblocked.
-    if (outcome === "waiting_input") return;
+    if (outcome === "waiting_input" || outcome === "delivery_failed") return;
     if (outcome === "sent") {
       updateTask(taskId, {
         status: "in_progress",
@@ -393,7 +393,8 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
       logEvent("task.reopened", { taskId, payload: { reason: "pr feedback" } });
       return;
     }
-    // not_live: fall through to requeue
+    // not_live: fall through to requeue. A bounded delivery failure above
+    // deliberately leaves the live worker and task association untouched.
   }
 
   // notes flow into the respawn prompt, same as a reviewer rejection. Append

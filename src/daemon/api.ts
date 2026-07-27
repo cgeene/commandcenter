@@ -16,7 +16,7 @@ import {
   liveUsageEnabled,
 } from "../config.js";
 import { TASK_STATUSES, type TaskStatus } from "../db/db.js";
-import { getAgent, listAgents } from "../db/agents.js";
+import { getAgent, listAgents, type Agent } from "../db/agents.js";
 import {
   createCron,
   deleteCron,
@@ -111,13 +111,21 @@ import {
   spawnReviewer,
   spawnWorker,
   TaskCancellationValidationError,
+  WorkerSpawnValidationError,
 } from "./spawn.js";
 import { resumeAgent, submitPending } from "./resume.js";
 import {
   resumeArchivedTask,
+  resumeReviewedWorker,
+  TaskResumeLaunchError,
   TaskResumeValidationError,
 } from "./taskresume.js";
-import { capturePane, clearInputLine, windowExists } from "./tmux.js";
+import {
+  capturePane,
+  clearInputLine,
+  tmuxFailureCode,
+  windowExists,
+} from "./tmux.js";
 import { parsePane } from "./pane.js";
 import { AGENT_PROVIDERS } from "../providers.js";
 import { PUBLICATION_MODES } from "../publication.js";
@@ -150,6 +158,105 @@ const modelIdentifierSchema = z
   .min(1)
   .max(512)
   .regex(/^[a-z0-9._:/@-]+$/i, "invalid model identifier");
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+interface ManualSessionDetails {
+  agent_id: number | null;
+  provider: Agent["provider"];
+  model: string | null;
+  reasoning_effort: Agent["reasoning_effort"];
+  session_id: string;
+  transcript_path: string | null;
+  cwd: string | null;
+  resume_command: string;
+}
+
+/**
+ * A manual resume is intentionally detached from Command Center lifecycle
+ * tracking. Reusing CC_AGENT_ID or a generated Claude settings file would
+ * send SessionStart/Stop hooks into a dead/reaped agent row and corrupt the
+ * dashboard's live state. Codex still needs Command Center's isolated home to
+ * find its saved session; Claude stores sessions in its normal provider home.
+ */
+function manualSessionDetails(input: {
+  agentId?: number | null;
+  provider: Agent["provider"];
+  model?: string | null;
+  reasoningEffort?: Agent["reasoning_effort"];
+  sessionId: string;
+  transcriptPath?: string | null;
+  cwd?: string | null;
+}): ManualSessionDetails {
+  const resumeCommand =
+    input.provider === "codex"
+      ? [
+          `CODEX_HOME=${shellQuote(codexHome())}`,
+          shellQuote(codexBin()),
+          "--profile",
+          shellQuote(codexProfile()),
+          ...(input.model ? ["--model", shellQuote(input.model)] : []),
+          ...(input.reasoningEffort
+            ? [
+                "--config",
+                shellQuote(
+                  `model_reasoning_effort="${input.reasoningEffort}"`,
+                ),
+              ]
+            : []),
+          // Keep inherited/local MCP access while detaching the Command
+          // Center lifecycle server from the dead historical agent row.
+          "--config",
+          shellQuote("mcp_servers.cc.enabled=false"),
+          ...(input.cwd ? ["--cd", shellQuote(input.cwd)] : []),
+          "resume",
+          shellQuote(input.sessionId),
+        ].join(" ")
+      : [
+          shellQuote(claudeBin()),
+          "--resume",
+          shellQuote(input.sessionId),
+        ].join(" ");
+  return {
+    agent_id: input.agentId ?? null,
+    provider: input.provider,
+    model: input.model ?? null,
+    reasoning_effort: input.reasoningEffort ?? null,
+    session_id: input.sessionId,
+    transcript_path: input.transcriptPath ?? null,
+    cwd: input.cwd ?? null,
+    resume_command: resumeCommand,
+  };
+}
+
+function taskSessionDetails(task: Task): ManualSessionDetails | undefined {
+  if (!task.session_id) return undefined;
+  const provider = task.session_provider ?? task.worker_provider;
+  const historicalAgent = listAgents()
+    .filter(
+      (agent) =>
+        agent.kind === "worker" &&
+        agent.task_id === task.id &&
+        agent.provider === provider &&
+        agent.session_id === task.session_id,
+    )
+    .at(-1);
+  return manualSessionDetails({
+    agentId: historicalAgent?.id ?? null,
+    provider,
+    model:
+      historicalAgent?.model ??
+      (provider === task.worker_provider ? task.model : null),
+    reasoningEffort:
+      historicalAgent?.reasoning_effort ??
+      (provider === task.worker_provider ? task.reasoning_effort : null),
+    sessionId: task.session_id,
+    transcriptPath: historicalAgent?.transcript_path ?? null,
+    cwd: task.worktree,
+  });
+}
 const hookPayloadSchema = z
   .object({
     hook_event_name: z.string().min(1).max(64).optional(),
@@ -215,6 +322,10 @@ const spawnSchema = z.object({
 const resumeTaskSchema = z.object({
   instructions: z.string().trim().max(20_000).optional(),
   agent_id: z.number().int().positive().optional(),
+});
+
+const resumeWorkerSchema = resumeTaskSchema.extend({
+  fresh: z.boolean().optional(),
 });
 
 export function buildApp(): Hono {
@@ -409,6 +520,16 @@ export function buildApp(): Hono {
   app.get("/api/tasks/:id", (c) => {
     const task = getTask(Number(c.req.param("id")));
     return task ? c.json(task) : c.json({ error: "not found" }, 404);
+  });
+
+  app.get("/api/tasks/:id/session", (c) => {
+    const task = getTask(Number(c.req.param("id")));
+    if (!task) return c.json({ error: "not found" }, 404);
+    const session = taskSessionDetails(task);
+    if (!session) {
+      return c.json({ error: "task has no recorded session yet" }, 409);
+    }
+    return c.json(session);
   });
 
   app.patch("/api/tasks/:id", async (c) => {
@@ -613,6 +734,43 @@ export function buildApp(): Hono {
     return c.json(result);
   });
 
+  app.post("/api/tasks/:id/resume-worker", async (c) => {
+    const id = Number(c.req.param("id"));
+    if (!Number.isSafeInteger(id) || id < 1) {
+      return c.json({ error: "invalid task id" }, 400);
+    }
+    if (!getTask(id)) return c.json({ error: "not found" }, 404);
+    const body = resumeWorkerSchema.parse(
+      await c.req.json().catch(() => ({})),
+    );
+    try {
+      return c.json(
+        await resumeReviewedWorker(id, {
+          instructions: body.instructions,
+          actorAgentId: body.agent_id,
+          fresh: body.fresh,
+        }),
+        201,
+      );
+    } catch (error) {
+      const task = getTask(id);
+      if (
+        error instanceof TaskResumeLaunchError &&
+        task?.dispatch_mode === "orchestrated"
+      ) {
+        try {
+          await delegateTaskToMain(id);
+        } catch {
+          logEvent("task.awaiting_main", {
+            taskId: id,
+            payload: { reason: "resume worker launch failed" },
+          });
+        }
+      }
+      throw error;
+    }
+  });
+
   app.post("/api/tasks/:id/delegate", async (c) => {
     const id = Number(c.req.param("id"));
     const task = getTask(id);
@@ -774,11 +932,25 @@ export function buildApp(): Hono {
   app.get("/api/agents/:id/peek", (c) => {
     const agent = getAgent(Number(c.req.param("id")));
     if (!agent) return c.json({ error: "not found" }, 404);
-    if (!agent.tmux_target || !windowExists(agent.tmux_target)) {
+    if (!agent.tmux_target) {
       return c.json({ error: "no live tmux window" }, 409);
     }
     const lines = Number(c.req.query("lines") ?? 50);
-    return c.json({ target: agent.tmux_target, content: capturePane(agent.tmux_target, lines) });
+    try {
+      return c.json({
+        target: agent.tmux_target,
+        content: capturePane(agent.tmux_target, lines),
+      });
+    } catch (error) {
+      if (
+        ["session_absent", "target_missing"].includes(
+          tmuxFailureCode(error),
+        )
+      ) {
+        return c.json({ error: "no live tmux window" }, 409);
+      }
+      return c.json({ error: "tmux pane unavailable" }, 503);
+    }
   });
 
   // Structured read of what a waiting_input agent's pane is showing — lets
@@ -786,14 +958,25 @@ export function buildApp(): Hono {
   app.get("/api/agents/:id/pane", (c) => {
     const agent = getAgent(Number(c.req.param("id")));
     if (!agent) return c.json({ error: "not found" }, 404);
-    if (!agent.tmux_target || !windowExists(agent.tmux_target)) {
+    if (!agent.tmux_target) {
       return c.json({ error: "no live tmux window" }, 409);
     }
     const lines = Number(c.req.query("lines") ?? 60);
     // Styled capture so the parser can drop dim ghost-text (Claude) / rotating
     // suggestions (Codex); provider selects the right parsing path.
-    const raw = capturePane(agent.tmux_target, lines, { escapes: true });
-    return c.json({ target: agent.tmux_target, ...parsePane(raw, agent.provider) });
+    try {
+      const raw = capturePane(agent.tmux_target, lines, { escapes: true });
+      return c.json({ target: agent.tmux_target, ...parsePane(raw, agent.provider) });
+    } catch (error) {
+      if (
+        ["session_absent", "target_missing"].includes(
+          tmuxFailureCode(error),
+        )
+      ) {
+        return c.json({ error: "no live tmux window" }, 409);
+      }
+      return c.json({ error: "tmux pane unavailable" }, 503);
+    }
   });
 
   app.post("/api/agents/:id/send", async (c) => {
@@ -802,7 +985,10 @@ export function buildApp(): Hono {
     const { text } = z.object({ text: z.string().min(1) }).parse(await c.req.json());
     // interrupt: a send to a waiting agent IS the answer to its question
     const outcome = await resumeAgent(agent.id, text, { interrupt: true });
-    if (outcome !== "sent") return c.json({ error: "no live tmux window" }, 409);
+    if (outcome === "not_live") return c.json({ error: "no live tmux window" }, 409);
+    if (outcome !== "sent") {
+      return c.json({ error: "tmux message delivery failed" }, 503);
+    }
     // A human or the orchestrator delivered real input — any transient-error
     // stall streak this agent was on is over.
     resetAutoNudgeCount(agent.id);
@@ -816,20 +1002,34 @@ export function buildApp(): Hono {
     const agent = getAgent(Number(c.req.param("id")));
     if (!agent) return c.json({ error: "not found" }, 404);
     const outcome = await submitPending(agent.id);
-    if (outcome !== "sent") return c.json({ error: "no live tmux window" }, 409);
+    if (outcome === "not_live") return c.json({ error: "no live tmux window" }, 409);
+    if (outcome !== "sent") {
+      return c.json({ error: "tmux input delivery failed" }, 503);
+    }
     resetAutoNudgeCount(agent.id);
     logEvent("agent.input_submitted", { agentId: agent.id, taskId: agent.task_id ?? undefined });
     return c.json({ ok: true });
   });
 
   // "clear it" on an unsubmitted-input banner: Ctrl-U, never a silent submit.
-  app.post("/api/agents/:id/clear-input", (c) => {
+  app.post("/api/agents/:id/clear-input", async (c) => {
     const agent = getAgent(Number(c.req.param("id")));
     if (!agent) return c.json({ error: "not found" }, 404);
-    if (!agent.tmux_target || !windowExists(agent.tmux_target)) {
+    if (!agent.tmux_target) {
       return c.json({ error: "no live tmux window" }, 409);
     }
-    clearInputLine(agent.tmux_target);
+    try {
+      await clearInputLine(agent.tmux_target);
+    } catch (error) {
+      if (
+        ["session_absent", "target_missing"].includes(
+          tmuxFailureCode(error),
+        )
+      ) {
+        return c.json({ error: "no live tmux window" }, 409);
+      }
+      return c.json({ error: "tmux input delivery failed" }, 503);
+    }
     logEvent("agent.input_cleared", { agentId: agent.id, taskId: agent.task_id ?? undefined });
     return c.json({ ok: true });
   });
@@ -866,65 +1066,18 @@ export function buildApp(): Hono {
     if (!agent.session_id) {
       return c.json({ error: "agent has no recorded session yet" }, 409);
     }
-    const quote = (value: string) => `'${value.replaceAll("'", `'\\''`)}'`;
-    const taskIdEnv = agent.task_id
-      ? ` CC_TASK_ID=${quote(String(agent.task_id))}`
-      : "";
     const sessionTask = agent.task_id ? getTask(agent.task_id) : undefined;
-    const command =
-      agent.provider === "codex"
-        ? [
-            `CC_URL=${quote(baseUrl())}`,
-            `CC_ROLE=${quote(agent.kind)}`,
-            `CC_AGENT_ID=${quote(String(agent.id))}${taskIdEnv}`,
-            ...(sessionTask
-              ? [
-                  `CC_TASK_BRANCH=${quote(sessionTask.branch ?? "")}`,
-                  `CC_WORKSPACE_KIND=${quote(sessionTask.workspace_kind)}`,
-                  `CC_PUBLICATION_MODE=${quote(sessionTask.publication_mode)}`,
-                ]
-              : []),
-            `CODEX_HOME=${quote(codexHome())}`,
-            quote(codexBin()),
-            "--profile",
-            quote(codexProfile()),
-            ...(agent.model ? ["--model", quote(agent.model)] : []),
-            ...(agent.reasoning_effort
-              ? [
-                  "--config",
-                  quote(`model_reasoning_effort="${agent.reasoning_effort}"`),
-                ]
-              : []),
-            "resume",
-            quote(agent.session_id),
-          ].join(" ")
-        : (() => {
-            const tag =
-              agent.kind === "main"
-                ? "main"
-                : `task-${agent.task_id}${agent.kind === "reviewer" ? "-review" : ""}`;
-            const mcpFile = path.join(dataDir(), "mcp", `${tag}.json`);
-            return [
-              quote(claudeBin()),
-              "--resume",
-              quote(agent.session_id),
-              ...(agent.runtime_config_path
-                ? ["--settings", quote(agent.runtime_config_path)]
-                : []),
-              "--mcp-config",
-              quote(mcpFile),
-            ].join(" ");
-          })();
-    return c.json({
-      agent_id: agent.id,
-      provider: agent.provider,
-      model: agent.model,
-      reasoning_effort: agent.reasoning_effort,
-      session_id: agent.session_id,
-      transcript_path: agent.transcript_path,
-      cwd: agent.task_id ? getTask(agent.task_id)?.worktree ?? null : null,
-      resume_command: command,
-    });
+    return c.json(
+      manualSessionDetails({
+        agentId: agent.id,
+        provider: agent.provider,
+        model: agent.model,
+        reasoningEffort: agent.reasoning_effort,
+        sessionId: agent.session_id,
+        transcriptPath: agent.transcript_path,
+        cwd: sessionTask?.worktree ?? null,
+      }),
+    );
   });
 
   app.post("/api/main", async (c) => {
@@ -1690,6 +1843,12 @@ export function buildApp(): Hono {
       return c.json({ error: err.message }, 409);
     }
     if (err instanceof TaskResumeValidationError) {
+      return c.json({ error: err.message }, 409);
+    }
+    if (err instanceof TaskResumeLaunchError) {
+      return c.json({ error: err.message }, 503);
+    }
+    if (err instanceof WorkerSpawnValidationError) {
       return c.json({ error: err.message }, 409);
     }
     // Do not expose stack traces, local paths, command output, or provider

@@ -62,6 +62,9 @@ export function buildReviewerPrompt(
       : [
           "- Dependencies may already be installed here: the platform seeds a new worktree from a shared node_modules cache whenever the branch leaves the lockfiles untouched. If node_modules is present, use it as-is and do NOT run `npm install`/`npm ci` — it costs minutes you don't need to spend, and depending on how the tree was materialized an install can write through into the cache the whole fleet shares. If node_modules is absent, this branch changed a lockfile (or the cache was cold) and installing is the right move.",
         ]),
+    "- Independently verify the worker's claims: run relevant tests, builds, typechecks, and other read-only Bash commands when useful. Do not edit the implementation or publish Git changes.",
+    "- Never control host process/session infrastructure directly. In particular, do not invoke tmux kill/respawn/send-keys commands or signal tmux processes. Use only the cc MCP lifecycle tools for agent inspection and control.",
+    "- If tmux behavior itself must be examined, reason from the implementation or use a fake tmux binary in an isolated test supplied by the repository; never touch a real/default tmux socket.",
     "- If this task's deliverable is research/discovery documentation, the worker was told to save it to the internal doc store (not the repo). Use list_docs and get_doc to read what it actually saved and verify the doc deliverable — a claimed doc that is missing, empty, or off-spec in the store is a defect.",
     task.publication_mode === "human" && task.review_snapshot_tree
       ? "- This installation uses HUMAN PUBLICATION: no commit or PR should exist yet. Their absence is expected, not a defect. Judge the immutable snapshot itself."

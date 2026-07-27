@@ -73,6 +73,12 @@ describe("provider worker spawn failure", () => {
     expect(String(newWindow.mock.calls[0]?.[2])).toContain(
       "--config 'model_reasoning_effort=\"high\"'",
     );
+    const command = String(newWindow.mock.calls[0]?.[2]);
+    const isolationDir = path.join(tmpDir, "agent-tmux", "1");
+    expect(command).toContain(
+      `env -u TMUX -u TMUX_PANE TMUX_TMPDIR='${isolationDir}'`,
+    );
+    expect(fs.statSync(isolationDir).mode & 0o777).toBe(0o700);
     expect(getTask(task.id)).toMatchObject({
       status: "queued",
       agent_id: null,

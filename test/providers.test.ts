@@ -401,6 +401,32 @@ describe("Codex runtime isolation", () => {
       "--config 'model_reasoning_effort=\"max\"'",
     );
     expect(session.resume_command).toContain("resume 'codex-123'");
+    expect(session.resume_command).toContain(
+      "--config 'mcp_servers.cc.enabled=false'",
+    );
+    expect(session.resume_command).toContain(
+      `CODEX_HOME='${process.env.CC_CODEX_HOME}'`,
+    );
+    expect(session.resume_command).not.toContain("CC_AGENT_ID");
+    expect(session.resume_command).not.toContain("CC_TASK_ID");
+
+    const taskSessionResponse = await app.request(
+      `/api/tasks/${task.id}/session`,
+    );
+    expect(taskSessionResponse.status).toBe(200);
+    const taskSession = (await taskSessionResponse.json()) as {
+      agent_id: number;
+      provider: string;
+      session_id: string;
+      resume_command: string;
+    };
+    expect(taskSession).toMatchObject({
+      agent_id: agent.id,
+      provider: "codex",
+      session_id: "codex-123",
+      resume_command: session.resume_command,
+    });
+
     const transcriptResponse = await app.request(`/api/agents/${agent.id}/transcript`);
     expect(transcriptResponse.status).toBe(200);
     expect(
@@ -426,6 +452,51 @@ describe("Codex runtime isolation", () => {
       tool_input: { description: "needs network for git push" },
     });
     expect(getAgent(agent.id)?.state).toBe("waiting_input");
+  });
+
+  it("builds a detached Claude resume command without dead-agent hooks", async () => {
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, updateAgent } = await import("../src/db/agents.js");
+    const { buildApp } = await import("../src/daemon/api.js");
+    const task = createTask({
+      title: "archived Claude task",
+      prompt: "x",
+      repo: "/repo",
+      worker_provider: "claude",
+    });
+    const agent = createAgent({
+      kind: "worker",
+      provider: "claude",
+      state: "dead",
+      task_id: task.id,
+      runtime_config_path: "/tmp/dead-agent-settings.json",
+    });
+    updateAgent(agent.id, {
+      session_id: "claude-session",
+      transcript_path: "/tmp/claude-session.jsonl",
+    });
+    updateTask(task.id, {
+      status: "done",
+      agent_id: null,
+      session_id: "claude-session",
+      session_provider: "claude",
+    });
+
+    const response = await buildApp().request(
+      `/api/tasks/${task.id}/session`,
+    );
+    expect(response.status).toBe(200);
+    const details = (await response.json()) as {
+      agent_id: number;
+      resume_command: string;
+    };
+    expect(details.agent_id).toBe(agent.id);
+    expect(details.resume_command).toBe(
+      "'claude' --resume 'claude-session'",
+    );
+    expect(details.resume_command).not.toContain("--settings");
+    expect(details.resume_command).not.toContain("--mcp-config");
+    expect(details.resume_command).not.toContain("CC_AGENT_ID");
   });
 });
 
@@ -494,6 +565,29 @@ describe("Codex worker permission policy", () => {
         },
       )?.behavior,
     ).toBe("deny");
+  });
+
+  it("denies destructive tmux control before task-scoped policy checks", async () => {
+    const { codexPermissionDecision } = await import("../src/codex-policy.js");
+    const payload = (command: string) => ({
+      hook_event_name: "PermissionRequest",
+      tool_name: "Bash",
+      tool_input: { command },
+    });
+    for (const command of [
+      "tmux kill-server",
+      "/opt/homebrew/bin/tmux -L cc kill-session -t cc",
+      "git status && tmux send-keys -t cc:main Enter",
+      "pkill -f tmux",
+      "killall tmux",
+    ]) {
+      const decision = codexPermissionDecision(payload(command), undefined, "repo");
+      expect(decision).toMatchObject({ behavior: "deny" });
+      expect(decision?.message).not.toContain(command);
+    }
+    expect(
+      codexPermissionDecision(payload("tmux list-windows"), "12", "repo"),
+    ).toBeUndefined();
   });
 });
 

@@ -11,6 +11,15 @@ export interface CodexPermissionDecision {
   message?: string;
 }
 
+function mutatesHostTmux(command: string): boolean {
+  return (
+    /\btmux\b[\s\S]*\b(?:kill-(?:server|session|window|pane)|respawn-(?:window|pane)|send-keys)\b/i.test(
+      command,
+    ) ||
+    /\b(?:pkill|killall)\b[\s\S]*\btmux\b/i.test(command)
+  );
+}
+
 export interface CodexPolicyContext {
   taskId?: string;
   taskBranch?: string;
@@ -423,12 +432,22 @@ export function codexPermissionDecision(
   if (!["PreToolUse", "PermissionRequest"].includes(payload.hook_event_name ?? "")) {
     return undefined;
   }
+  const command = payload.tool_input?.command;
+  if (
+    payload.tool_name === "Bash" &&
+    typeof command === "string" &&
+    mutatesHostTmux(command)
+  ) {
+    return {
+      behavior: "deny",
+      message: "Agent sessions may not control Command Center's terminal infrastructure.",
+    };
+  }
   const humanOnly = context.publicationMode === "human";
   if (!humanOnly) return legacyAgentDecision(payload, context);
   if (humanOnly && githubMcpMutation(payload.tool_name ?? "")) {
     return { behavior: "deny", message: HUMAN_MESSAGE };
   }
-  const command = payload.tool_input?.command;
   if (payload.tool_name !== "Bash" || typeof command !== "string") return undefined;
   return bashDecision(command, context);
 }

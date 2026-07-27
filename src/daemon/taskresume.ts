@@ -8,7 +8,7 @@ import {
   type Task,
 } from "../db/tasks.js";
 import { clearReviewSnapshot } from "./reviewsnapshot.js";
-import { killAgent } from "./spawn.js";
+import { killAgent, spawnWorker } from "./spawn.js";
 import { findProviderTranscript } from "./transcript.js";
 import { markPrDraft } from "./prdraft.js";
 import { git, removeWorktree } from "./worktree.js";
@@ -23,6 +23,7 @@ const ARCHIVED_STATUSES = new Set(["done", "cancelled"]);
 const TERMINAL_PR_STATES = new Set(["merged", "closed"]);
 
 export class TaskResumeValidationError extends Error {}
+export class TaskResumeLaunchError extends Error {}
 
 export interface TaskResumeResult {
   task: Task;
@@ -33,8 +34,217 @@ export interface TaskResumeResult {
   open_dependents: Task[];
 }
 
+export interface ReviewedWorkerResumeResult {
+  task: Task;
+  agent: ReturnType<typeof spawnWorker>["agent"];
+  previous_status: "review";
+  previous_agent_id: number | null;
+  session_mode: "same_provider_session" | "fresh_session";
+}
+
 function resumedBranch(task: Task, attempt: number): string {
   return `agent/task-${task.id}-resume-${attempt}`;
+}
+
+function sameProviderSessionAvailable(task: Task): boolean {
+  const priorAgent = listAgents()
+    .filter(
+      (agent) =>
+        agent.kind === "worker" &&
+        agent.task_id === task.id &&
+        agent.provider === task.worker_provider &&
+        agent.session_id === task.session_id,
+    )
+    .at(-1);
+  const sameProvider =
+    task.session_provider === task.worker_provider ||
+    (task.session_provider === null && task.worker_provider === "claude");
+  return Boolean(
+    task.session_id &&
+      sameProvider &&
+      findProviderTranscript(
+        task.worker_provider,
+        task.session_id,
+        priorAgent?.transcript_path,
+      ),
+  );
+}
+
+async function returnOpenPrToDraft(task: Task): Promise<boolean> {
+  const terminalPr = Boolean(
+    task.pr_state && TERMINAL_PR_STATES.has(task.pr_state),
+  );
+  if (terminalPr) {
+    throw new TaskResumeValidationError(
+      "the pull request is already closed; wait for the task to archive, then resume the archived task",
+    );
+  }
+  const mustRedraft =
+    task.open_pr !== 0 &&
+    Boolean(task.pr_url) &&
+    task.pr_is_draft === 0;
+  if (!mustRedraft) return false;
+  try {
+    await markPrDraft(task.pr_url!);
+  } catch {
+    throw new TaskResumeValidationError(
+      "the existing pull request could not be returned to draft; the task was not resumed",
+    );
+  }
+  return true;
+}
+
+/**
+ * Reopen a reviewer-approved task whose worker is no longer live, then
+ * immediately spawn a managed worker on the same task/worktree/session.
+ *
+ * Resuming can change the reviewed tree, so the old approval is invalidated
+ * before the worker starts. Prior result/review context is appended to the
+ * prompt so a missing provider transcript still has a complete handoff.
+ */
+export async function resumeReviewedWorker(
+  taskId: number,
+  opts?: {
+    instructions?: string;
+    actorAgentId?: number;
+    fresh?: boolean;
+  },
+): Promise<ReviewedWorkerResumeResult> {
+  let task = getTask(taskId);
+  if (!task) throw new TaskResumeValidationError("task not found");
+  const actor = opts?.actorAgentId
+    ? getAgent(opts.actorAgentId)
+    : undefined;
+  if (task.status !== "review" || task.review_verdict !== "approve") {
+    throw new TaskResumeValidationError(
+      `task ${task.id} is not an approved task awaiting publication`,
+    );
+  }
+  if (task.workspace_kind === "portfolio") {
+    throw new TaskResumeValidationError(
+      "portfolio tasks have no single worker session to resume",
+    );
+  }
+  const liveTaskAgent = listAgents({ live: true }).find(
+    (agent) => agent.task_id === task!.id && agent.kind !== "main",
+  );
+  if (liveTaskAgent) {
+    throw new TaskResumeValidationError(
+      `task ${task.id} still has a live ${liveTaskAgent.kind}`,
+    );
+  }
+
+  const instructions = opts?.instructions?.trim();
+  const priorContext = [
+    "",
+    "---",
+    "",
+    "## Human-requested worker resume after approval",
+    "",
+    "The previous automated approval is being invalidated because this worker may change the approved result.",
+    task.result_summary
+      ? `Previously approved result:\n${task.result_summary}`
+      : "Previously approved result: none recorded.",
+    task.review_notes
+      ? `Previous review notes:\n${task.review_notes}`
+      : "Previous review notes: none recorded.",
+    instructions
+      ? `New instructions from the human:\n${instructions}`
+      : "New instructions from the human: resume the same worker, review the existing result, and continue from where it stopped.",
+  ].join("\n\n");
+  const prompt = `${task.prompt.trimEnd()}${priorContext}`;
+  if (prompt.length > MAX_TASK_PROMPT_LENGTH) {
+    throw new TaskResumeValidationError(
+      "the task plus resume instructions exceed the task prompt limit",
+    );
+  }
+
+  const returnedToDraft = await returnOpenPrToDraft(task);
+
+  // markPrDraft is asynchronous. Re-read and revalidate before mutating so two
+  // concurrent resume requests cannot both reopen and spawn this task.
+  task = getTask(taskId)!;
+  if (task.status !== "review" || task.review_verdict !== "approve") {
+    throw new TaskResumeValidationError(
+      "the task changed while its worker was being resumed; refresh and try again",
+    );
+  }
+  if (
+    listAgents({ live: true }).some(
+      (agent) => agent.task_id === task!.id && agent.kind !== "main",
+    )
+  ) {
+    throw new TaskResumeValidationError(
+      "the task acquired a live agent while its worker was being resumed",
+    );
+  }
+
+  const sessionAvailable = sameProviderSessionAvailable(task);
+  const previousAgentId = task.agent_id;
+  if (task.review_snapshot_tree) clearReviewSnapshot(task.id);
+  updateTask(task.id, {
+    prompt,
+    status: "queued",
+    agent_id: null,
+    result_summary: null,
+    review_verdict: null,
+    review_notes: null,
+    review_cycles: 0,
+    review_head_sha: null,
+    review_result_hash: null,
+    review_snapshot_base: null,
+    review_snapshot_tree: null,
+    publication_state:
+      task.publication_mode === "human" && task.workspace_kind === "repo"
+        ? "editing"
+        : task.publication_state,
+    ...(returnedToDraft ? { pr_is_draft: 1 } : {}),
+  });
+  logEvent("task.worker_resume_requested", {
+    taskId: task.id,
+    agentId: actor?.kind === "main" ? actor.id : undefined,
+    payload: {
+      from: "review",
+      approval_invalidated: true,
+      session_preserved: Boolean(task.session_id),
+    },
+  });
+
+  let spawned: ReturnType<typeof spawnWorker>;
+  try {
+    spawned = spawnWorker(task.id, undefined, { fresh: opts?.fresh });
+  } catch {
+    logEvent("task.worker_resume_failed", {
+      taskId: task.id,
+      payload: {
+        reason: "worker launch failed",
+        task_status: getTask(task.id)?.status,
+      },
+    });
+    throw new TaskResumeLaunchError(
+      "the task was safely reopened, but its worker could not start; it remains queued for retry",
+    );
+  }
+  logEvent("task.worker_resumed", {
+    taskId: task.id,
+    agentId: spawned.agent.id,
+    payload: {
+      previous_agent_id: previousAgentId,
+      session_mode:
+        sessionAvailable && !opts?.fresh
+          ? "same_provider_session"
+          : "fresh_session",
+    },
+  });
+  return {
+    ...spawned,
+    previous_status: "review",
+    previous_agent_id: previousAgentId,
+    session_mode:
+      sessionAvailable && !opts?.fresh
+        ? "same_provider_session"
+        : "fresh_session",
+  };
 }
 
 /**
@@ -91,20 +301,7 @@ export async function resumeArchivedTask(
   const terminalPr = Boolean(
     task.pr_state && TERMINAL_PR_STATES.has(task.pr_state),
   );
-  const mustRedraft =
-    !terminalPr &&
-    task.open_pr !== 0 &&
-    Boolean(task.pr_url) &&
-    task.pr_is_draft === 0;
-  if (mustRedraft) {
-    try {
-      await markPrDraft(task.pr_url!);
-    } catch {
-      throw new TaskResumeValidationError(
-        "the existing pull request could not be returned to draft; resume was not started",
-      );
-    }
-  }
+  const mustRedraft = terminalPr ? false : await returnOpenPrToDraft(task);
   if (
     terminalPr &&
     task.workspace_kind === "repo" &&
@@ -195,27 +392,7 @@ export async function resumeArchivedTask(
   const actor = opts?.actorAgentId
     ? getAgent(opts.actorAgentId)
     : undefined;
-  const priorAgent = listAgents()
-    .filter(
-      (agent) =>
-        agent.kind === "worker" &&
-        agent.task_id === task.id &&
-        agent.provider === task.worker_provider &&
-        agent.session_id === task.session_id,
-    )
-    .at(-1);
-  const sameProvider =
-    task.session_provider === task.worker_provider ||
-    (task.session_provider === null && task.worker_provider === "claude");
-  const sessionAvailable = Boolean(
-    task.session_id &&
-      sameProvider &&
-      findProviderTranscript(
-        task.worker_provider,
-        task.session_id,
-        priorAgent?.transcript_path,
-      ),
-  );
+  const sessionAvailable = sameProviderSessionAvailable(task);
   logEvent("task.archived_resumed", {
     taskId: task.id,
     agentId: actor?.id,

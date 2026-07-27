@@ -42,7 +42,7 @@ pointing at `cc-mcp` with a `CC_ROLE` env var. The toolset is scoped by role
 - **Reviewer:** `get_my_task`, `get_task_diff`, `submit_review`.
 - **Main (orchestrator):** the full set — `list_tasks`, `get_task`,
   `list_repositories`, `update_task`, `claim_task`, `cancel_task`, `resume_task`,
-  `spawn_worker`, `spawn_reviewer`,
+  `resume_worker`, `spawn_worker`, `spawn_reviewer`,
   `list_agents`, `peek_worker`, `send_to_worker`, `kill_worker`, `get_task_diff`,
   `confirm_human_publication`, `read_worker_transcript`, `escalate`,
   `recent_events`, `forget`.
@@ -242,10 +242,13 @@ When a task reaches `review` with commits, an independent reviewer is spawned
 (auto, if `auto_review` is on; or `agp review <id>` / the main agent's
 `spawn_reviewer`). It is a **fresh** `claude` session in its own detached
 worktree at the task's branch, with `Edit`, `Write`, `NotebookEdit`,
-`git commit`, and `git push` **denied**. It gets the same *inputs* as the worker
-(task prompt, branch, claimed summary) but **none of its conversation** —
-independence is the point — and is prompted to find reasons to **reject**. It
-calls `submit_review(approve|reject, notes)`:
+`git commit`, and `git push` **denied** and no blanket Bash permission. The
+platform runs `verify_cmd` before spawning the reviewer; the reviewer checks
+that recorded evidence, the diff, and repository files through narrowly scoped
+read tools. It gets the same *inputs* as the worker (task prompt, branch,
+claimed summary) but **none of its conversation** — independence is the point
+— and is prompted to find reasons to **reject**. It calls
+`submit_review(approve|reject, notes)`:
 
 - **reject** → notes go back into the worker's session (or a respawn prompt);
   task returns to `in_progress`. If the PR had already been flipped to ready
@@ -309,6 +312,20 @@ live from tasks/agents/events on every request.
   archived result/review/PR context embedded in the revised prompt is the
   fresh-session handoff. Terminal PRs rotate to `agent/task-N-resume-K` so a
   follow-up cannot collide with the already-merged/closed remote branch.
+- **Approved-worker resume** — an approved task may remain in `review` after
+  its idle worker is reaped to release concurrency. `resume_worker` is the
+  single managed path back into that active task: it refuses a live worker/reviewer,
+  invalidates the approved snapshot, returns an existing ready PR to draft,
+  folds the prior result/review plus the human's follow-up into the prompt, and
+  spawns the same task/worktree with a same-provider session resume when
+  available. The dashboard derives **Terminal** from the daemon's live-agent
+  list rather than the task's historical `agent_id`; a reaped task therefore
+  shows **Resume Worker**, not a disconnected terminal.
+- **Manual provider resume** — reaping a completed worker closes its tmux process
+  to release concurrency, but Command Center retains the task/agent session id
+  and transcript metadata. The dashboard and `agp agent session <id>` produce a
+  detached provider command; Codex commands include the isolated
+  `CC_CODEX_HOME`, because plain `codex resume <id>` searches `~/.codex`.
 - **Optional Codex MCP inheritance** — `CC_CODEX_MCP_SOURCE_HOME` mirrors only
   explicit `mcp_servers` into the isolated Codex base config. Plugin-provided
   MCPs are flattened into transport entries instead of enabling the plugin or

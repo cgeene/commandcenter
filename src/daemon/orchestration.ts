@@ -32,7 +32,17 @@ function taskCreatorKind(taskId: number): Agent["kind"] | null {
   }
 }
 
+function pendingHumanWorkerResume(taskId: number): boolean {
+  const requested = latestTaskEvent(taskId, ["task.worker_resume_requested"]);
+  if (!requested) return false;
+  const spawned = latestTaskEvent(taskId, ["agent.spawned"]);
+  return !spawned || requested.id > spawned.id;
+}
+
 function taskPrompt(task: Task, creatorKind: Agent["kind"] | null): string {
+  if (pendingHumanWorkerResume(task.id)) {
+    return `[commandcenter] The human reopened approved task #${task.id}, but its managed worker launch failed and the task is queued (workspace_kind=${task.workspace_kind}). The prior approval is already invalidated and its result/review handoff is in the prompt. Call get_task(${task.id}), then spawn_worker(${task.id}); this retry will reuse the same-provider session when available. Do not create a duplicate task.`;
+  }
   const reopened = latestTaskEvent(task.id, ["task.archived_resumed"]);
   const created = latestTaskEvent(task.id, ["task.created"]);
   if (reopened && (!created || reopened.id > created.id)) {
@@ -70,7 +80,10 @@ export async function delegateTaskToMainDetailed(
   // endpoint, or the idle/SessionStart hooks and periodic scheduler that call
   // delegatePendingTaskToMain). Main already knows about it and dispatches it
   // directly; it stays queued and visible via list_tasks(ready=true).
-  if (taskCreatorKind(task.id) === "main") {
+  if (
+    taskCreatorKind(task.id) === "main" &&
+    !pendingHumanWorkerResume(task.id)
+  ) {
     return "skipped";
   }
   if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
@@ -130,12 +143,20 @@ export async function delegatePendingTaskToMain(main: Agent): Promise<boolean> {
   const pending = readyTasks("orchestrated").filter((task) => {
     // Skip main-created tasks: they need no triage, and leaving one in the
     // pending set would park it at the queue head forever (delegatePending
-    // only delivers pending[0]), starving the tasks behind it.
-    if (taskCreatorKind(task.id) === "main") return false;
+    // only delivers pending[0]), starving the tasks behind it. A failed
+    // human-requested worker resume is different: the task was reopened
+    // outside Main's current turn and still needs a managed spawn retry.
+    if (
+      taskCreatorKind(task.id) === "main" &&
+      !pendingHumanWorkerResume(task.id)
+    ) {
+      return false;
+    }
     const delegated = latestTaskEvent(task.id, ["task.delegated_to_main"]);
     const queued = latestTaskEvent(task.id, [
       "task.created",
       "task.archived_resumed",
+      "task.worker_resume_requested",
       "task.reopened",
       "task.requeued",
     ]);

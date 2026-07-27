@@ -57,14 +57,26 @@ describe("resumeAgent", () => {
     expect(sendText).not.toHaveBeenCalled();
   });
 
-  it("reports not_live when the send itself fails, without touching state", async () => {
+  it("reports delivery_failed when the send itself fails, without touching state", async () => {
     const { resumeAgent } = await import("../src/daemon/resume.js");
     const { createAgent, getAgent } = await import("../src/db/agents.js");
     const agent = createAgent({ kind: "worker", state: "idle", tmux_target: "cc:@1" });
     sendText.mockImplementationOnce(async () => {
       throw new Error("window vanished");
     });
-    // callers fall back (requeue/defer) instead of losing the message
+    // callers surface/defer the controlled failure instead of losing the message
+    expect(await resumeAgent(agent.id, "x")).toBe("delivery_failed");
+    expect(getAgent(agent.id)?.state).toBe("idle");
+  });
+
+  it("reports not_live when tmux confirms the target vanished", async () => {
+    const { resumeAgent } = await import("../src/daemon/resume.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const agent = createAgent({ kind: "worker", state: "idle", tmux_target: "cc:@1" });
+    sendText.mockRejectedValueOnce(
+      Object.assign(new Error("sanitised"), { code: "target_missing" }),
+    );
+
     expect(await resumeAgent(agent.id, "x")).toBe("not_live");
     expect(getAgent(agent.id)?.state).toBe("idle");
   });

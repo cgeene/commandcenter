@@ -20,6 +20,7 @@ import type { Task } from "../db/tasks.js";
 import { gitToplevel } from "../daemon/worktree.js";
 import { writeCodexConfig } from "../daemon/genconfig.js";
 import { countRepositoriesUnder } from "../daemon/workspaces.js";
+import { killAgent, spawnMain } from "../daemon/spawn.js";
 import { classifyGhStatus } from "./doctor.js";
 import { api } from "./client.js";
 
@@ -958,7 +959,7 @@ program
 
     const list = spawnSync(
       "tmux",
-      ["list-windows", "-t", tmuxSession(), "-F", "#{window_name}\t#{session_name}:#{window_id}"],
+      ["list-windows", "-a", "-F", "#{window_name}\t#{session_name}:#{window_id}"],
       { encoding: "utf8" },
     );
     const row = (list.stdout ?? "")
@@ -982,8 +983,11 @@ program
         if (opts.main) {
           const agents = await api<Agent[]>("GET", "/api/agents?live=true");
           const main = agents.find((a) => a.kind === "main");
-          if (main) await api("POST", `/api/agents/${main.id}/kill`, {});
-          const a = await api<Agent>("POST", "/api/main", {});
+          // The public kill endpoint intentionally refuses Main. Upgrade is a
+          // local CLI lifecycle operation, so use the same daemon primitives
+          // directly and retain the current model while replacing the process.
+          if (main) killAgent(main.id);
+          const a = spawnMain(main?.model ?? undefined);
           console.log(`main agent a${a.id} respawned in ${a.tmux_target}`);
         }
         return;
