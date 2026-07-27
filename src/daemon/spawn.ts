@@ -639,12 +639,6 @@ export function spawnWorker(
   }
 }
 
-/**
- * Spawn an adversarial reviewer for a task in `review`. Fresh context on
- * purpose — same inputs as the worker, none of its conversation. Own
- * detached worktree so it can run code without touching the worker's tree;
- * file-editing tools denied so it can only judge, not fix.
- */
 /** A completed review round whose verdict a later push superseded. Passed in
  *  so the next reviewer can scope itself to the delta past `fromSha`. */
 export interface PriorReviewRound {
@@ -671,6 +665,12 @@ export interface ReviewerSpawnOptions {
   priorRound?: PriorReviewRound;
 }
 
+/**
+ * Spawn an adversarial reviewer for a task in `review`. Fresh context on
+ * purpose — same inputs as the worker, none of its conversation. Own
+ * detached worktree so it can run code without touching the worker's tree;
+ * file-editing tools denied so it can only judge, not fix.
+ */
 export function spawnReviewer(
   taskId: number,
   opts?: ReviewerSpawnOptions,
@@ -781,15 +781,16 @@ export function spawnReviewer(
   // Never for a human-publication snapshot review: what that reviewer judges is
   // a pinned working tree, not the branch tip, so a branch-range diff would
   // describe something other than the candidate in front of it.
+  const priorRound = opts?.priorRound;
   const delta =
-    opts?.priorRound && !humanSnapshotReview
-      ? resolveReviewDelta(task, opts.priorRound.fromSha)
+    priorRound && !humanSnapshotReview
+      ? resolveReviewDelta(task, priorRound.fromSha)
       : null;
-  if (opts?.priorRound && !delta) {
+  if (priorRound && !delta) {
     logEvent("review.delta_unavailable", {
       taskId,
       payload: {
-        from: opts.priorRound.fromSha,
+        from: priorRound.fromSha,
         reason: "prior reviewed sha is not an ancestor of the current tip",
       },
     });
@@ -802,14 +803,8 @@ export function spawnReviewer(
     promptFile,
     buildReviewerPrompt(
       task,
-      delta
-        ? {
-            prior: {
-              verdict: opts!.priorRound!.verdict,
-              notes: opts!.priorRound!.notes,
-              delta,
-            },
-          }
+      delta && priorRound
+        ? { prior: { verdict: priorRound.verdict, notes: priorRound.notes, delta } }
         : undefined,
     ),
   );
