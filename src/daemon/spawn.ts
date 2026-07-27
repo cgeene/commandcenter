@@ -50,6 +50,7 @@ import {
   REVIEWER_TOOL_ALLOW,
   WORKER_TOOL_ALLOW,
 } from "./permissions.js";
+import { resolveReviewDelta } from "./reviewstate.js";
 import { findProviderTranscript } from "./transcript.js";
 import { killWindow, newWindow, windowExists } from "./tmux.js";
 import {
@@ -644,6 +645,17 @@ export function spawnWorker(
  * detached worktree so it can run code without touching the worker's tree;
  * file-editing tools denied so it can only judge, not fix.
  */
+/** A completed review round whose verdict a later push superseded. Passed in
+ *  so the next reviewer can scope itself to the delta past `fromSha`. */
+export interface PriorReviewRound {
+  /** Branch SHA the superseded round judged. */
+  fromSha: string;
+  /** Its verdict, as recorded before it was cleared ("approve"). */
+  verdict: string;
+  /** Its review_notes, before the supersede marker was appended. */
+  notes: string | null;
+}
+
 export interface ReviewerSpawnOptions {
   /** Override the reviewer model (Claude slug for a Claude reviewer, Codex slug
    *  for a Codex reviewer). */
@@ -653,6 +665,10 @@ export interface ReviewerSpawnOptions {
   provider?: string;
   /** Codex reviewer reasoning effort (ignored for a Claude reviewer). */
   reasoningEffort?: ReasoningEffort;
+  /** Scope this round to what changed since a superseded verdict. Ignored when
+   *  the old SHA is no longer an ancestor of the tip (rebase/force-push) — that
+   *  falls back to a full review. */
+  priorRound?: PriorReviewRound;
 }
 
 export function spawnReviewer(
@@ -716,9 +732,17 @@ export function spawnReviewer(
     provider === "claude"
       ? resolveReviewerModel(task, opts?.model)
       : opts?.model;
+  // A light review is a scoped diff read, not an investigation, so a Codex
+  // reviewer runs it at low effort unless the caller asked for something else.
+  // (The Claude spawn path has no per-agent effort knob; its light-mode saving
+  // comes from the prompt alone.)
+  const light = task.review_mode === "light";
   const reasoningEffort =
     provider === "codex"
-      ? reasoningEffortForProvider("codex", opts?.reasoningEffort)
+      ? reasoningEffortForProvider(
+          "codex",
+          opts?.reasoningEffort ?? (light ? "low" : undefined),
+        )
       : undefined;
   const dir = isScratch
     ? validateScratchWorkspace(task.repo) // review the workspace dir read-only
@@ -750,10 +774,41 @@ export function spawnReviewer(
     task_id: taskId,
   });
 
+  // Delta-scoped re-review: only when the previously reviewed SHA is still an
+  // ancestor of the tip. A rebase/force-push rewrote what that round judged, so
+  // its findings can't be carried forward — fall back to a full re-review and
+  // say so in the log, since the round costs full price.
+  const delta = opts?.priorRound
+    ? resolveReviewDelta(task, opts.priorRound.fromSha)
+    : null;
+  if (opts?.priorRound && !delta) {
+    logEvent("review.delta_unavailable", {
+      taskId,
+      payload: {
+        from: opts.priorRound.fromSha,
+        reason: "prior reviewed sha is not an ancestor of the current tip",
+      },
+    });
+  }
+
   const tag = `task-${taskId}-review`;
   fs.mkdirSync(promptsDir(), { recursive: true });
   const promptFile = path.join(promptsDir(), `${tag}.md`);
-  fs.writeFileSync(promptFile, buildReviewerPrompt(task));
+  fs.writeFileSync(
+    promptFile,
+    buildReviewerPrompt(
+      task,
+      delta
+        ? {
+            prior: {
+              verdict: opts!.priorRound!.verdict,
+              notes: opts!.priorRound!.notes,
+              delta,
+            },
+          }
+        : undefined,
+    ),
+  );
 
   let command: string;
   let runtimeConfigPath: string;
@@ -817,7 +872,15 @@ export function spawnReviewer(
   logEvent("reviewer.spawned", {
     agentId: agent.id,
     taskId,
-    payload: { target, provider, model, reasoning_effort: reasoningEffort, worktree: dir },
+    payload: {
+      target,
+      provider,
+      model,
+      reasoning_effort: reasoningEffort,
+      worktree: dir,
+      review_mode: task.review_mode,
+      scope: delta ? "delta" : "full",
+    },
   });
   return { agent: getAgent(agent.id)!, task: getTask(taskId)! };
 }

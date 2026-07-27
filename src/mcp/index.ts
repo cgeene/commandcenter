@@ -85,6 +85,7 @@ server.registerTool(
         .describe(
           "false = branch-only: the worker commits and pushes but must NOT open a PR (default true)",
         ),
+      review_mode: REVIEW_MODE_SCHEMA,
     },
   },
   async (args) => {
