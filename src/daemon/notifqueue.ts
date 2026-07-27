@@ -104,55 +104,65 @@ export function promptClarity(
   return pane.unsubmitted_input === null ? "clear" : "draft";
 }
 
-/** An "unreadable" composer blocks delivery indefinitely, so it must not be
- *  silent — but it is re-tested on every retry, so log it sparsely. */
-const unreadableLoggedAt = new Map<number, number>();
-const UNREADABLE_LOG_INTERVAL_MS = 10 * 60_000;
-
-function logUnreadableComposer(mainId: number, provider: AgentProvider): void {
-  const nowMs = Date.now();
-  const last = unreadableLoggedAt.get(mainId);
-  if (last !== undefined && nowMs - last < UNREADABLE_LOG_INTERVAL_MS) return;
-  unreadableLoggedAt.set(mainId, nowMs);
-  logEvent("main.composer_unreadable", {
-    agentId: mainId,
-    payload: { provider },
-  });
-}
-
 /**
- * A draft normally clears within seconds (the human submits), but a withheld
- * submit leaves the injected message merged into their draft and only they can
- * clear it — and until they do, promptClarity reports "draft" and EVERY main
- * delivery defers. So a persistent draft is escalated to the human rather than
- * deferred forever in silence. Escalates once per streak; the streak resets the
- * moment a delivery gets through.
+ * Neither reason for blocking delivery resolves on its own.
+ *
+ * "draft" needs the human: only they can submit or clear it, and a withheld
+ * submit leaves an injected message merged into it. "unreadable" needs a code
+ * change: the parser no longer recognizes the TUI's composer, exactly the
+ * failure this task exists to fix, and it is a permanent steady state until
+ * someone looks. Both therefore get the same treatment — an event on the first
+ * attempt of a streak so it is diagnosable immediately, and a page to the human
+ * once a streak reaches the threshold, so "bounded retry with eventual delivery"
+ * cannot degrade into deferring forever behind a log line.
+ *
+ * "permission" is excluded: a main parked on its own permission prompt is
+ * already surfaced (hooks.ts pages the human and parks the agent).
  */
-export const DRAFT_BLOCKED_ESCALATE_AFTER = 10;
-const draftBlockedCounts = new Map<number, number>();
+export const BLOCKED_ESCALATE_AFTER = 10;
+type BlockedReason = "draft" | "unreadable";
+const blockedStreaks = new Map<number, { reason: BlockedReason; attempts: number }>();
 
-function noteDraftBlocked(mainId: number): void {
-  const attempts = (draftBlockedCounts.get(mainId) ?? 0) + 1;
-  draftBlockedCounts.set(mainId, attempts);
-  if (attempts !== DRAFT_BLOCKED_ESCALATE_AFTER) return;
-  logEvent("main.draft_blocking_delivery", {
+function noteDeliveryBlocked(
+  mainId: number,
+  reason: BlockedReason,
+  provider: AgentProvider,
+): void {
+  const prev = blockedStreaks.get(mainId);
+  const attempts = prev?.reason === reason ? prev.attempts + 1 : 1;
+  blockedStreaks.set(mainId, { reason, attempts });
+
+  if (attempts === 1) {
+    logEvent("main.delivery_blocked", { agentId: mainId, payload: { reason, provider } });
+    return;
+  }
+  if (attempts !== BLOCKED_ESCALATE_AFTER) return;
+  logEvent("main.delivery_blocked_escalated", {
     agentId: mainId,
-    payload: { attempts },
+    payload: { reason, attempts },
   });
   notify(
     "Orchestrator prompt is blocked",
-    `An unsubmitted draft in a${mainId}'s prompt has deferred ${attempts} deliveries. ` +
-      `Submit or clear it so queued worker notifications can reach the orchestrator. ` +
-      `(If it contains a "[commandcenter]" message merged into your text, that was an ` +
-      `injection held back rather than submitted over you — delete it and send the rest.)`,
-    { priority: "default", tags: "warning" },
+    reason === "draft"
+      ? `An unsubmitted draft in a${mainId}'s prompt has deferred ${attempts} deliveries. ` +
+          `Submit or clear it so queued worker notifications can reach the orchestrator. ` +
+          `(If a "[commandcenter]" message is merged into your text, that was an injection ` +
+          `held back rather than submitted over you — delete it and send the rest.)`
+      : `Command Center cannot read a${mainId}'s composer, so it has deferred ${attempts} ` +
+          `deliveries and will keep deferring. The pane parser probably no longer matches ` +
+          `the provider's TUI — worker notifications and task triage are not reaching the ` +
+          `orchestrator until that is fixed.`,
+    { priority: reason === "unreadable" ? "high" : "default", tags: "warning" },
   );
 }
 
-/** Test-only: both maps are process-global but agent ids reset per db. */
+function noteDeliveryUnblocked(mainId: number): void {
+  blockedStreaks.delete(mainId);
+}
+
+/** Test-only: the streak map is process-global but agent ids reset per db. */
 export function __clearUnreadableLogForTests(): void {
-  unreadableLoggedAt.clear();
-  draftBlockedCounts.clear();
+  blockedStreaks.clear();
 }
 
 /**
@@ -200,7 +210,13 @@ function submitVerdict(
     return "submit";
   }
   if (pane.pending_permission) return "permission";
-  if (!pane.composer_found) return "submit";
+  if (!pane.composer_found) {
+    // Anomalous: the composer was read successfully moments ago at beforeType.
+    // Submitting is still the lesser risk (see above), but it is worth knowing
+    // about — a steady stream of these means the parser is losing the pane.
+    logEvent("main.composer_unreadable_mid_send", { payload: { provider } });
+    return "submit";
+  }
   const seen = squashWhitespace(pane.unsubmitted_input ?? "");
   // `includes` also covers a composer clipped by pane height or still mid-repaint
   // (a subset of the message); "" is a substring of anything.
@@ -250,9 +266,10 @@ export async function deliverToMainIfClear(
     guard: {
       beforeType: () => {
         const clarity = promptClarity(target, main.provider);
-        if (clarity === "unreadable") logUnreadableComposer(main.id, main.provider);
-        if (clarity === "draft") noteDraftBlocked(main.id);
-        if (clarity === "clear") draftBlockedCounts.delete(main.id);
+        if (clarity === "clear") noteDeliveryUnblocked(main.id);
+        else if (clarity !== "permission") {
+          noteDeliveryBlocked(main.id, clarity, main.provider);
+        }
         return clarity === "clear";
       },
       beforeSubmit: () => {

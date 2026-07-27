@@ -149,11 +149,18 @@ describe("delegateToMain — deliver vs queue", () => {
 
 /**
  * The recurrence these cover: delivery merged into a human's half-typed
- * multi-line message and submitted the wreckage as their turn. Three ways that
- * can happen, all of which must end with the draft intact and the notification
- * still queued for later.
+ * multi-line message and submitted the wreckage as their turn. Every way that
+ * can happen must end with the characters the human typed still on screen and
+ * the notification still queued.
+ *
+ * Note the two outcomes are not equally tidy. When the draft is seen up front
+ * nothing is typed at all and the pane is untouched. When a keystroke wins the
+ * race the notification is already in the composer and only Enter is withheld,
+ * so the human keeps everything they typed but has to delete the injection by
+ * hand — better than the alternatives (submitting the merge, or re-typing a
+ * draft reconstructed from wrapped rows), not invisible.
  */
-describe("delegateToMain — a human draft is never destroyed", () => {
+describe("delegateToMain — a human's typed characters are never lost", () => {
   it("preserves a multi-line draft verbatim and queues the notification", async () => {
     const { main, worker } = await setup("idle");
     const draft = draftComposer(
@@ -256,42 +263,6 @@ describe("delegateToMain — a human draft is never destroyed", () => {
     });
   }
 
-  it("escalates to the human once a draft has blocked delivery for too long", async () => {
-    const { main, worker } = await setup("idle");
-    panes.set(MAIN, HUMAN_DRAFT);
-    await notifyWorker(worker.id);
-
-    const { DRAFT_BLOCKED_ESCALATE_AFTER, flushMainQueue } = await import(
-      "../src/daemon/notifqueue.js"
-    );
-    const { listEvents } = await import("../src/db/events.js");
-    const blocked = () =>
-      listEvents(60).filter((e) => e.kind === "main.draft_blocking_delivery");
-
-    // The delegate attempt above was the first; retry up to the threshold.
-    for (let i = 1; i < DRAFT_BLOCKED_ESCALATE_AFTER - 1; i++) {
-      await flushMainQueue(main.id, { force: true });
-    }
-    expect(blocked().length).toBe(0);
-
-    expect(await flushMainQueue(main.id, { force: true })).toBe("deferred");
-    expect(blocked().length).toBe(1);
-    expect(JSON.parse(blocked()[0].payload!).attempts).toBe(
-      DRAFT_BLOCKED_ESCALATE_AFTER,
-    );
-
-    // Escalates once per streak, not on every subsequent retry.
-    await flushMainQueue(main.id, { force: true });
-    expect(blocked().length).toBe(1);
-
-    // A delivery getting through resets the streak.
-    panes.set(MAIN, CLEAR_PROMPT);
-    expect(await flushMainQueue(main.id, { force: true })).toBe("flushed");
-    panes.set(MAIN, HUMAN_DRAFT);
-    await flushMainQueue(main.id, { force: true });
-    expect(blocked().length).toBe(1);
-  });
-
   it("queues rather than guessing when the composer cannot be read at all", async () => {
     const { main, worker } = await setup("idle");
     // A pane with no recognizable input line — a mid-turn capture, or a TUI
@@ -306,7 +277,9 @@ describe("delegateToMain — a human draft is never destroyed", () => {
     expect(countQueuedNotifications(main.id)).toBe(1);
     // Blocking indefinitely on an unreadable pane must not be silent.
     const { listEvents } = await import("../src/db/events.js");
-    expect(listEvents(20).map((e) => e.kind)).toContain("main.composer_unreadable");
+    const blocked = listEvents(20).filter((e) => e.kind === "main.delivery_blocked");
+    expect(blocked.length).toBe(1);
+    expect(JSON.parse(blocked[0].payload!).reason).toBe("unreadable");
 
     // Recognizable again → delivered, nothing lost.
     panes.set(MAIN, CLEAR_PROMPT);
@@ -314,6 +287,58 @@ describe("delegateToMain — a human draft is never destroyed", () => {
     expect(await flushMainQueue(main.id, { force: true })).toBe("flushed");
     expect(countQueuedNotifications(main.id)).toBe(0);
   });
+});
+
+/**
+ * Neither blocking reason clears on its own — a draft needs the human, and an
+ * unreadable composer needs a code change — so each must be bounded and paged
+ * rather than deferring forever behind a log line.
+ */
+describe("delegateToMain — blocked delivery is bounded and paged", () => {
+  for (const [reason, pane] of [
+    ["draft", () => HUMAN_DRAFT],
+    ["unreadable", () => noComposer()],
+  ] as const) {
+    it(`escalates once per streak when delivery stays blocked on a ${reason}`, async () => {
+      const { main, worker } = await setup("idle");
+      panes.set(MAIN, pane());
+      await notifyWorker(worker.id);
+
+      const { BLOCKED_ESCALATE_AFTER, flushMainQueue } = await import(
+        "../src/daemon/notifqueue.js"
+      );
+      const { listEvents } = await import("../src/db/events.js");
+      const paged = () =>
+        listEvents(80).filter((e) => e.kind === "main.delivery_blocked_escalated");
+      // Diagnosable from the very first attempt, not only at the threshold.
+      expect(
+        listEvents(80).filter((e) => e.kind === "main.delivery_blocked").length,
+      ).toBe(1);
+
+      // The delegate attempt above was the first; retry up to the threshold.
+      for (let i = 1; i < BLOCKED_ESCALATE_AFTER - 1; i++) {
+        await flushMainQueue(main.id, { force: true });
+      }
+      expect(paged().length).toBe(0);
+
+      expect(await flushMainQueue(main.id, { force: true })).toBe("deferred");
+      expect(paged().length).toBe(1);
+      const payload = JSON.parse(paged()[0].payload!);
+      expect(payload.attempts).toBe(BLOCKED_ESCALATE_AFTER);
+      expect(payload.reason).toBe(reason);
+
+      // Paged once per streak, not on every subsequent retry.
+      await flushMainQueue(main.id, { force: true });
+      expect(paged().length).toBe(1);
+
+      // A delivery getting through resets the streak.
+      panes.set(MAIN, CLEAR_PROMPT);
+      expect(await flushMainQueue(main.id, { force: true })).toBe("flushed");
+      panes.set(MAIN, pane());
+      await flushMainQueue(main.id, { force: true });
+      expect(paged().length).toBe(1);
+    });
+  }
 });
 
 describe("flushMainQueue — batching and re-check", () => {

@@ -1,60 +1,119 @@
 /**
- * Pane captures shaped like the real Claude Code TUI, for tests that exercise
- * the composer and the anti-clobber delivery gate.
+ * Pane captures for tests that exercise the composer and the anti-clobber gate.
  *
- * Assembled from an actual `tmux capture-pane -e` of a live orchestrator pane
- * (Claude Code 2.1.x, 2026-07-27), including the detail that broke draft
- * detection in the wild: the TUI paints a session label INTO the composer's top
- * border, so that row is not a line of pure `─`. Fixtures that spell the
- * composer out approximately (a bare `>` in a box, an empty string) cannot
- * catch that class of regression, which is why these mirror a capture verbatim.
+ * Both forms below are transcribed byte-for-byte from `tmux capture-pane -p -e`
+ * of the SAME live orchestrator pane (cc:@490, Claude Code 2.1.x, 2026-07-27) at
+ * two different widths, because how the composer frame renders depends entirely
+ * on pane width and the daemon has to read it at whatever width the pane happens
+ * to be. Web-terminal viewers attach and detach, and tmux sizes the window to
+ * its smallest client, so the width moves around during normal use.
+ *
+ * At 51 columns (`clearComposer`, `draftComposer`) the session label fills the
+ * top border's row completely — zero rule glyphs on it — and the rules wrap onto
+ * the next row; the bottom border wraps the same way:
+ *
+ *    " Manage Claude orchestrator task queue and workers"
+ *    "──"
+ *    "❯<NBSP>"
+ *    "───────────────…───" (51)
+ *    "──"
+ *    "  ⏵⏵ accept edits on · ← for agents"
+ *
+ * At 131 columns (`wideClearComposer`, `wideDraftComposer`) the label sits
+ * inside the top rule with a long run of glyphs before it, on one unwrapped row.
+ * A parser that handles only the wide form reports "no composer" on the narrow
+ * pane — which is not "no draft", and must never be read as one.
  *
  * ESC bytes are assembled from char codes so no source file holds a raw control
- * character.
+ * character. NBSP (U+00A0) is the marker separator the live TUI emits.
  */
 
 const ESC = String.fromCharCode(27);
+const NBSP = String.fromCharCode(0xa0);
 
-/** The composer's top border with the label the TUI embeds in it. */
-const TITLED_TOP =
+// ── 51-column form, transcribed from rows 34-39 of the live capture ──────────
+const NARROW_WIDTH = 51;
+const NARROW_LABEL_ROW =
+  `${ESC}[38;5;16m${ESC}[48;5;37m Manage Claude orchestrator task queue and workers`;
+const NARROW_LABEL_TAIL = `${ESC}[38;5;37m${ESC}[49m──${ESC}[39m`;
+const NARROW_BOTTOM = `${ESC}[38;5;37m${"─".repeat(NARROW_WIDTH)}`;
+const NARROW_BOTTOM_TAIL = `──${ESC}[39m`;
+const NARROW_STATUS =
+  `  ${ESC}[38;5;147m⏵⏵ accept edits on${ESC}[38;5;246m · ← for agents${ESC}[39m`;
+
+function narrowFrame(composerRows: string[]): string {
+  return [
+    `${ESC}[38;5;231m⏺${ESC}[39m Filed the clobber recurrence as #156.`,
+    "",
+    `${ESC}[38;5;246m✻${ESC}[39m ${ESC}[38;5;246mCrunched for 24s${ESC}[39m`,
+    "",
+    NARROW_LABEL_ROW,
+    NARROW_LABEL_TAIL,
+    ...composerRows,
+    NARROW_BOTTOM,
+    NARROW_BOTTOM_TAIL,
+    NARROW_STATUS,
+    "",
+  ].join("\n");
+}
+
+/** Nothing typed: the input line is on screen and empty (51 cols). */
+export function clearComposer(): string {
+  return narrowFrame([`❯${NBSP}`]);
+}
+
+/** Empty, but showing a dim ghost-text suggestion — still nothing typed. The
+ *  live capture this mirrors had exactly this shape. */
+export function ghostComposer(text = "ok #66 review approved? can I merge it?"): string {
+  return narrowFrame([`❯${NBSP}${ESC}[2m${text}${ESC}[0m`]);
+}
+
+/**
+ * A human draft in the composer (51 cols). The first line sits on the marker row
+ * and any further lines are continuation rows, exactly as a multi-line draft
+ * renders. Typed text is default-styled, which is what tells it from ghost text.
+ */
+export function draftComposer(...lines: string[]): string {
+  const [first, ...rest] = lines;
+  return narrowFrame([
+    `❯${NBSP}${first}`,
+    ...rest.map((line) => `  ${line}`),
+  ]);
+}
+
+// ── 131-column form, transcribed from the same pane earlier the same day ─────
+const WIDE_WIDTH = 127;
+const WIDE_TITLED_TOP =
   `${ESC}[38;5;37m${"─".repeat(78)}${ESC}[38;5;16m${ESC}[48;5;37m` +
   ` Manage Claude orchestrator task queue and workers ${ESC}[38;5;37m${ESC}[49m──`;
-const BOTTOM = `${ESC}[38;5;37m${"─".repeat(127)}`;
-const STATUS =
+const WIDE_BOTTOM = `${ESC}[38;5;37m${"─".repeat(WIDE_WIDTH)}`;
+const WIDE_STATUS =
   `${ESC}[39m  ${ESC}[38;5;147m⏵⏵ accept edits on` +
   `${ESC}[38;5;246m (shift+tab to cycle) · ← for agents${ESC}[39m`;
 
-function frame(rows: string[]): string {
+function wideFrame(composerRows: string[]): string {
   return [
     `${ESC}[38;5;231m⏺${ESC}[39m Anything else before I merge?`,
     "",
     `${ESC}[38;5;246m✻${ESC}[39m ${ESC}[38;5;246mWorked for 2m 28s${ESC}[39m`,
     "",
-    TITLED_TOP,
-    ...rows,
-    BOTTOM,
-    STATUS,
+    WIDE_TITLED_TOP,
+    ...composerRows,
+    WIDE_BOTTOM,
+    WIDE_STATUS,
     "",
   ].join("\n");
 }
 
-/** Nothing typed: the input line is on screen and empty. */
-export function clearComposer(): string {
-  return frame([`${ESC}[38;5;239m${ESC}[48;5;237m❯ `]);
+/** Nothing typed, at 131 cols (label embedded in the top rule). */
+export function wideClearComposer(): string {
+  return wideFrame([`${ESC}[38;5;239m${ESC}[48;5;237m❯ `]);
 }
 
-/** Empty, but showing a dim ghost-text suggestion — still nothing typed. */
-export function ghostComposer(text = "how are the workers doing?"): string {
-  return frame([`${ESC}[39m❯ ${ESC}[2m${text}${ESC}[0m`]);
-}
-
-/**
- * A human draft in the composer. The first line sits on the marker row and any
- * further lines are continuation rows, exactly as a multi-line draft renders.
- */
-export function draftComposer(...lines: string[]): string {
+/** A human draft at 131 cols. */
+export function wideDraftComposer(...lines: string[]): string {
   const [first, ...rest] = lines;
-  return frame([
+  return wideFrame([
     `${ESC}[38;5;239m${ESC}[48;5;237m❯ ${ESC}[38;5;231m${first} ${ESC}[39m`,
     ...rest.map((line) => `  ${ESC}[38;5;231m${line} ${ESC}[39m`),
   ]);
@@ -63,14 +122,15 @@ export function draftComposer(...lines: string[]): string {
 /**
  * Wrap `text` into composer rows the way the TUI lays a long message out, so a
  * test can render what is actually on screen after send-keys types a ~600-char
- * notification in. `wrap: "hard"` breaks at exactly `width` characters — mid-word,
- * which the live pane demonstrably does — and `wrap: "word"` breaks at spaces.
+ * notification in. `wrap: "hard"` breaks at exactly `width` characters —
+ * mid-word, which the live pane demonstrably does — and `wrap: "word"` breaks at
+ * spaces.
  */
 export function wrappedComposer(
   text: string,
   opts: { width?: number; wrap?: "word" | "hard" } = {},
 ): string {
-  const width = opts.width ?? 120;
+  const width = opts.width ?? NARROW_WIDTH;
   const rows: string[] = [];
   if (opts.wrap === "word") {
     let row = "";
