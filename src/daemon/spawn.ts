@@ -778,9 +778,13 @@ export function spawnReviewer(
   // ancestor of the tip. A rebase/force-push rewrote what that round judged, so
   // its findings can't be carried forward — fall back to a full re-review and
   // say so in the log, since the round costs full price.
-  const delta = opts?.priorRound
-    ? resolveReviewDelta(task, opts.priorRound.fromSha)
-    : null;
+  // Never for a human-publication snapshot review: what that reviewer judges is
+  // a pinned working tree, not the branch tip, so a branch-range diff would
+  // describe something other than the candidate in front of it.
+  const delta =
+    opts?.priorRound && !humanSnapshotReview
+      ? resolveReviewDelta(task, opts.priorRound.fromSha)
+      : null;
   if (opts?.priorRound && !delta) {
     logEvent("review.delta_unavailable", {
       taskId,

@@ -300,7 +300,10 @@ export async function maybeAutoReview(taskId: number): Promise<void> {
   if (task.review_verdict === "approve") {
     // No git signal (scratch) or HEAD unchanged since approval: still current.
     if (!headSha || headSha === task.review_head_sha) return;
-    if (task.review_head_sha) {
+    // Human-publication tasks are excluded: their "sha" is a snapshot tree, not
+    // a commit, so there is no commit range to scope a re-review to. (Their
+    // supersession is handled above and clears the verdict before this point.)
+    if (task.review_head_sha && !humanRepo) {
       prior = {
         fromSha: task.review_head_sha,
         verdict: "approve",

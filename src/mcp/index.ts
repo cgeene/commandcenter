@@ -40,6 +40,15 @@ function asText(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }] };
 }
 
+/** How hard the adversarial reviewer works. The orchestrator sets this at
+ *  triage from what the task IS — never from what the diff turns out to be. */
+const REVIEW_MODE_SCHEMA = z
+  .enum(["full", "light"])
+  .optional()
+  .describe(
+    "how hard the adversarial reviewer works (default 'full'). 'light' = a diff-scoped read with no independent re-verification: use ONLY for documentation, threshold, and runbook changes. NEVER for prod-mutating work or code-logic changes, however small. When in doubt, leave it 'full'.",
+  );
+
 const server = new McpServer({ name: "cc", version: "0.2.0" });
 
 // ---- shared tools ----
@@ -400,7 +409,7 @@ if (ROLE === "main") {
     "update_task",
     {
       description:
-        "Update a task (status, priority, worker provider, model, reasoning effort, prompt, result_summary...).",
+        "Update a task (status, priority, worker provider, model, reasoning effort, review mode, prompt, result_summary...).",
       inputSchema: {
         id: z.number().int(),
         status: z
@@ -427,6 +436,7 @@ if (ROLE === "main") {
           .describe(
             "false = branch-only: the worker commits and pushes but must NOT open a PR",
           ),
+        review_mode: REVIEW_MODE_SCHEMA,
       },
     },
     async ({ id, ...fields }) => asText(await call("PATCH", `/api/tasks/${id}`, fields)),
