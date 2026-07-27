@@ -16,6 +16,11 @@ export const WORKSPACE_KINDS = ["repo", "portfolio", "scratch"] as const;
 export type WorkspaceKind = (typeof WORKSPACE_KINDS)[number];
 export const DISPATCH_MODES = ["direct", "orchestrated"] as const;
 export type DispatchMode = (typeof DISPATCH_MODES)[number];
+/** How hard the adversarial reviewer works on this task. 'full' re-verifies
+ *  everything independently; 'light' is a diff-scoped read for doc/threshold/
+ *  runbook work. Chosen at triage, never inferred from the diff. */
+export const REVIEW_MODES = ["full", "light"] as const;
+export type ReviewMode = (typeof REVIEW_MODES)[number];
 
 export interface Task {
   id: number;
@@ -41,6 +46,7 @@ export interface Task {
   review_verdict: string | null;
   review_notes: string | null;
   review_cycles: number;
+  review_mode: ReviewMode; // 'full' (default) | 'light' — see REVIEW_MODES
   review_head_sha: string | null; // branch HEAD SHA the last reviewer judged (NULL for scratch)
   review_result_hash: string | null; // hash of result_summary at that reviewer's spawn
   pr_url: string | null;
@@ -86,6 +92,15 @@ export interface NewTask {
   open_pr?: boolean;
   auto_review?: boolean;
   publication_mode?: PublicationMode;
+  review_mode?: ReviewMode;
+}
+
+function parseReviewMode(value: unknown, fallback: ReviewMode = "full"): ReviewMode {
+  if (value === undefined || value === null) return fallback;
+  if (!REVIEW_MODES.includes(value as ReviewMode)) {
+    throw new Error(`invalid review mode: ${String(value)}`);
+  }
+  return value as ReviewMode;
 }
 
 export function createTask(t: NewTask): Task {
@@ -95,8 +110,8 @@ export function createTask(t: NewTask): Task {
     t.publication_mode ?? resolveWorkerPublicationMode();
   const info = db
     .prepare(
-      `INSERT INTO tasks (title, prompt, repo, workspace_kind, dispatch_mode, parent_task_id, priority, worker_provider, model, reasoning_effort, blocked_by, verify_cmd, cron_id, open_pr, auto_review, publication_mode, publication_state)
-       VALUES (@title, @prompt, @repo, @workspace_kind, @dispatch_mode, @parent_task_id, @priority, @worker_provider, @model, @reasoning_effort, @blocked_by, @verify_cmd, @cron_id, @open_pr, @auto_review, @publication_mode, @publication_state)`,
+      `INSERT INTO tasks (title, prompt, repo, workspace_kind, dispatch_mode, parent_task_id, priority, worker_provider, model, reasoning_effort, blocked_by, verify_cmd, cron_id, open_pr, auto_review, review_mode, publication_mode, publication_state)
+       VALUES (@title, @prompt, @repo, @workspace_kind, @dispatch_mode, @parent_task_id, @priority, @worker_provider, @model, @reasoning_effort, @blocked_by, @verify_cmd, @cron_id, @open_pr, @auto_review, @review_mode, @publication_mode, @publication_state)`,
     )
     .run({
       title: t.title,
@@ -114,6 +129,7 @@ export function createTask(t: NewTask): Task {
       cron_id: t.cron_id ?? null,
       open_pr: t.open_pr === false ? 0 : 1,
       auto_review: t.auto_review === false ? 0 : 1,
+      review_mode: parseReviewMode(t.review_mode),
       publication_mode: publicationMode,
       publication_state:
         publicationMode === "human" &&
@@ -326,6 +342,7 @@ const UPDATABLE = new Set([
   "review_verdict",
   "review_notes",
   "review_cycles",
+  "review_mode",
   "review_head_sha",
   "review_result_hash",
   "pr_url",
@@ -392,6 +409,11 @@ export function updateTask(
     !isPublicationState(fields.publication_state)
   ) {
     throw new Error(`invalid publication state: ${fields.publication_state}`);
+  }
+  // review_mode is NOT NULL in SQLite: a null here would fail the constraint
+  // at write time, so reject it (and any unknown value) up front.
+  if (fields.review_mode !== undefined && !REVIEW_MODES.includes(fields.review_mode)) {
+    throw new Error(`invalid review mode: ${String(fields.review_mode)}`);
   }
   const sets = keys.map((k) => `${k} = @${k}`).join(", ");
   getDb()

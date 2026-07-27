@@ -14,9 +14,12 @@ vi.setConfig({ testTimeout: 30_000 });
 // returns a fake agent; killAgent is a no-op. Everything else in the loop
 // (git HEAD detection, PR re-draft via prdraft, DB writes, events) runs for
 // real.
-const spawnReviewer = vi.fn((_taskId: number) => ({ agent: { id: 999 }, task: {} }));
+const spawnReviewer = vi.fn((_taskId: number, _opts?: unknown) => ({
+  agent: { id: 999 },
+  task: {},
+}));
 vi.mock("../src/daemon/spawn.js", () => ({
-  spawnReviewer: (id: number) => spawnReviewer(id),
+  spawnReviewer: (id: number, opts?: unknown) => spawnReviewer(id, opts),
   killAgent: () => {},
 }));
 
@@ -28,7 +31,10 @@ beforeEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   spawnReviewer.mockClear();
-  spawnReviewer.mockImplementation((_taskId: number) => ({ agent: { id: 999 }, task: {} }));
+  spawnReviewer.mockImplementation((_taskId: number, _opts?: unknown) => ({
+    agent: { id: 999 },
+    task: {},
+  }));
 });
 
 afterEach(async () => {
@@ -364,6 +370,44 @@ describe("verdict invalidation — the premature-merge fix", () => {
     expect(spawnReviewer).toHaveBeenCalledOnce();
     expect(kinds).toContain("review.round_started");
     expect(t.review_head_sha).toBe(repo.headSha);
+  });
+
+  it("hands the next round the superseded verdict and the sha it judged", async () => {
+    const { maybeAutoReview } = await import("../src/daemon/review.js");
+    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+    _setGhRunner(async () => "");
+    const repo = makeRepo(15);
+    const reviewed = repo.headSha;
+    repo.commitMore(); // a push lands after the approval
+    const id = await reviewTask(15, repo.repo, repo.branch, {
+      review_verdict: "approve",
+      review_notes: "looked good at the time",
+      review_head_sha: reviewed,
+      pr_url: "https://github.com/x/y/pull/15",
+      pr_is_draft: 0,
+    });
+
+    await maybeAutoReview(id);
+
+    // the reviewer is scoped to the delta past what the superseded round saw,
+    // and gets its notes verbatim (before the supersede marker is appended)
+    expect(spawnReviewer).toHaveBeenCalledWith(id, {
+      priorRound: {
+        fromSha: reviewed,
+        verdict: "approve",
+        notes: "looked good at the time",
+      },
+    });
+  });
+
+  it("a first round (nothing superseded) is spawned unscoped", async () => {
+    const { maybeAutoReview } = await import("../src/daemon/review.js");
+    const repo = makeRepo(16);
+    const id = await reviewTask(16, repo.repo, repo.branch);
+
+    await maybeAutoReview(id);
+
+    expect(spawnReviewer).toHaveBeenCalledWith(id, undefined);
   });
 
   it("an approval whose HEAD is unchanged is NOT disturbed", async () => {

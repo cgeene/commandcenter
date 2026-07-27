@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   review_verdict TEXT,
   review_notes   TEXT,
   review_cycles  INTEGER NOT NULL DEFAULT 0,
+  review_mode    TEXT NOT NULL DEFAULT 'full',
   review_head_sha TEXT,
   review_result_hash TEXT,
   pr_url         TEXT,
@@ -265,6 +266,13 @@ function migrate(db: Database.Database): void {
   }
   if (!cols.includes("review_snapshot_tree")) {
     db.exec("ALTER TABLE tasks ADD COLUMN review_snapshot_tree TEXT");
+  }
+  // review_mode: how hard the adversarial reviewer works. 'full' (default,
+  // and what every existing row keeps) is the independent re-verification
+  // pass; 'light' is a diff-scoped read for doc/threshold/runbook tasks. Set
+  // explicitly at triage — never inferred from the diff.
+  if (!cols.includes("review_mode")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN review_mode TEXT NOT NULL DEFAULT 'full'");
   }
   if (!cols.includes("pr_state")) {
     db.exec("ALTER TABLE tasks ADD COLUMN pr_state TEXT");

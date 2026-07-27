@@ -70,6 +70,7 @@ import {
   getTask,
   listTasks,
   readyTasks,
+  REVIEW_MODES,
   updateTask,
   WORKSPACE_KINDS,
   type Task,
@@ -116,6 +117,7 @@ import {
 const providerSchema = z.enum(AGENT_PROVIDERS);
 const reasoningEffortSchema = z.enum(REASONING_EFFORTS);
 const workspaceKindSchema = z.enum(WORKSPACE_KINDS);
+const reviewModeSchema = z.enum(REVIEW_MODES);
 const dispatchModeSchema = z.enum(DISPATCH_MODES);
 const modelIdentifierSchema = z
   .string()
@@ -154,6 +156,7 @@ const newTaskSchema = z.object({
   blocked_by: z.number().int().positive().optional(),
   verify_cmd: z.string().max(4096).optional(),
   open_pr: z.boolean().optional(),
+  review_mode: reviewModeSchema.optional(),
   // Identity of the agent filing this task (via the MCP add_task tool).
   // Absent for human submissions (dashboard/CLI). Unknown ids are ignored.
   agent_id: z.number().int().positive().optional(),
@@ -173,6 +176,7 @@ const updateTaskSchema = z.object({
   result_summary: z.string().max(100_000).nullable().optional(),
   pr_url: z.string().url().nullable().optional(),
   open_pr: z.boolean().optional(),
+  review_mode: reviewModeSchema.optional(),
 });
 
 const spawnSchema = z.object({
@@ -332,6 +336,7 @@ export function buildApp(): Hono {
         blocked_by: body.blocked_by,
         verify_cmd: body.verify_cmd,
         open_pr: workspaceKind === "repo" ? body.open_pr : false,
+        review_mode: body.review_mode,
       });
     } catch (error) {
       if (allocatedScratch) {

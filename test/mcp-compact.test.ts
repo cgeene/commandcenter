@@ -6,6 +6,7 @@ import {
   TASK_ROW_FIELDS,
   TRUNCATION_MARKER,
   compactTask,
+  echoedFields,
   projectTask,
   shapeTask,
   shapeTaskList,
@@ -71,6 +72,7 @@ function fullTask(over: Partial<FakeTask> = {}): FakeTask {
     review_verdict: "approve",
     review_notes: "N".repeat(2500),
     review_cycles: 1,
+    review_mode: "full",
     review_head_sha: "deadbeef",
     review_result_hash: "cafebabe",
     pr_url: "https://github.com/o/r/pull/9",
@@ -150,6 +152,24 @@ describe("task projections", () => {
     expect(Object.keys(out)).toEqual([...COMPACT_TASK_FIELDS, ...PUBLICATION_FIELDS]);
     expect(out.publication_state).toBe("published");
     expect(out).not.toHaveProperty("review_snapshot_tree");
+  });
+
+  it("keeps the fields triage must preserve when it re-dispatches a task", () => {
+    const out = compactTask(fullTask()) as Record<string, unknown>;
+    // effort and review depth are set at creation/triage; losing them to
+    // compaction means silently re-creating a task with different settings
+    expect(out).toHaveProperty("worker_provider");
+    expect(out).toHaveProperty("reasoning_effort");
+    expect(out).toHaveProperty("review_mode");
+  });
+
+  it("echoedFields keeps changed fields but drops the bulk", () => {
+    expect(echoedFields(["verify_cmd", "review_mode"])).toEqual([
+      "verify_cmd",
+      "review_mode",
+    ]);
+    expect(echoedFields(["prompt", "review_notes"])).toEqual([]);
+    expect(echoedFields(["prompt", "status"])).toEqual(["status"]);
   });
 
   it("is an allow-list: a column added later stays out until listed", () => {
@@ -328,14 +348,32 @@ describe("main-role tools", () => {
     expect(fetchCalls.at(-1)?.path).toBe("/api/tasks?status=queued&dispatch_mode=orchestrated");
   });
 
-  it("update_task echoes only the compact record", async () => {
+  it("update_task never echoes the bulk it was just handed", async () => {
     const out = await callTool("update_task", { id: 42, prompt: "a new prompt" });
     expect(Object.keys(out)).toEqual([...COMPACT_TASK_FIELDS]);
+    expect(out).not.toHaveProperty("prompt");
     expect(fetchCalls.at(-1)).toMatchObject({
       method: "PATCH",
       path: "/api/tasks/42",
       body: { prompt: "a new prompt" },
     });
+  });
+
+  it("update_task appends a changed field that sits outside the compact core", async () => {
+    const out = await callTool("update_task", { id: 42, verify_cmd: "npm run check" });
+    expect(Object.keys(out)).toEqual([...COMPACT_TASK_FIELDS, "verify_cmd"]);
+    expect(out.verify_cmd).toBe("npm test"); // echoed from the daemon's response
+  });
+
+  it("update_task appends only the non-bulky changed fields", async () => {
+    const out = await callTool("update_task", {
+      id: 42,
+      prompt: "a new prompt",
+      verify_cmd: "npm run check",
+      priority: 1,
+    });
+    // priority is already in the core, so it is not appended twice
+    expect(Object.keys(out)).toEqual([...COMPACT_TASK_FIELDS, "verify_cmd"]);
   });
 
   it("add_task echoes only the compact record", async () => {
