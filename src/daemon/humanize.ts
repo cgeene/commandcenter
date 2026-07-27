@@ -138,6 +138,15 @@ const TEMPLATES: Record<string, Template> = {
   "waiting.delegated": (e) => `Delegated ${worker(e)}'s question to the main agent`,
   "waiting.suppressed_in_review": (e) =>
     `${worker(e)} finished and idled — ${taskRef(e)} is in review, no ping needed`,
+  "waiting.suppressed_active_monitor": (e, p) => {
+    const parts: string[] = [];
+    const shells = Number(p.shells) || 0;
+    const monitors = Number(p.monitors) || 0;
+    if (shells) parts.push(`${shells} shell${shells === 1 ? "" : "s"}`);
+    if (monitors) parts.push(`${monitors} monitor${monitors === 1 ? "" : "s"}`);
+    const what = parts.length > 0 ? parts.join(" + ") : "background work";
+    return `${worker(e)} parked between turns — ${what} still running, no ping needed`;
+  },
   "waiting.idle_redelegate_throttled": (e) =>
     `Skipped a repeat idle ping from ${worker(e)} — already delegated this turn`,
   "notification.queued": (e) =>

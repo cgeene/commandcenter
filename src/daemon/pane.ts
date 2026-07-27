@@ -71,10 +71,17 @@ export interface PendingPermission {
   options: PaneOption[];
 }
 
+/** Background work the provider reports as still running for this session. */
+export interface BackgroundActivity {
+  shells: number;
+  monitors: number;
+}
+
 export interface ParsedPane {
   pending_permission: PendingPermission | null;
   pending_question: string | null;
   unsubmitted_input: string | null;
+  background_activity: BackgroundActivity | null;
   raw: string;
 }
 
@@ -313,6 +320,57 @@ function parseCodexQuestion(lines: string[], inputIndex: number): string | null 
   return question || null;
 }
 
+// Claude Code's bottom status bar reports still-running background work as one
+// of its interpunct-delimited segments, e.g.
+//   "⏵⏵ don't ask on · 3 shells, 2 monitors · esc to interrupt · ↓ to manage"
+// Requiring a WHOLE segment of the bottom-most bar to consist of nothing but
+// those counts is the load-bearing signal here, the same way both-side box
+// borders are for permission menus: an agent's own transcript text can easily
+// quote "· 2 shells ·" in prose (the pane this parser was written against did
+// exactly that), but prose is not the final rendered row and its interpunct
+// runs are not bare count segments.
+const STATUS_SEPARATOR = "·";
+// How many non-blank rows up from the bottom may hold the status bar. It is
+// normally the last one; the slack absorbs a version that paints a hint row
+// beneath it without letting the scan reach ordinary transcript text.
+const STATUS_BAR_LOOKBACK = 3;
+const BACKGROUND_ITEM_RE = /^(\d{1,3})\s+(shells?|monitors?)$/;
+
+/** Counts of background shells / Monitor watches the status bar says are still
+ *  running, or null when the bar shows none (or isn't present at all). */
+function parseBackgroundActivity(lines: string[]): BackgroundActivity | null {
+  let inspected = 0;
+  for (let i = lines.length - 1; i >= 0 && inspected < STATUS_BAR_LOOKBACK; i--) {
+    const line = lines[i].trim();
+    if (line === "") continue;
+    inspected++;
+
+    const segments = line.split(STATUS_SEPARATOR).map((s) => s.trim());
+    // A real status bar is a multi-segment bar; a lone segment means this is
+    // ordinary text that merely happens to contain an interpunct.
+    if (segments.length < 2) continue;
+
+    let shells = 0;
+    let monitors = 0;
+    let found = false;
+    for (const segment of segments) {
+      const items = segment.split(",").map((s) => s.trim());
+      const matches = items.map((item) => BACKGROUND_ITEM_RE.exec(item));
+      // Every comma-separated item must be a count. A segment that is only
+      // partly counts is prose, not the indicator.
+      if (matches.some((m) => m === null)) continue;
+      for (const m of matches) {
+        const n = Number(m![1]);
+        if (m![2].startsWith("shell")) shells += n;
+        else monitors += n;
+      }
+      found = true;
+    }
+    if (found && shells + monitors > 0) return { shells, monitors };
+  }
+  return null;
+}
+
 /** The agent's last assistant text before the (empty or not) input box. */
 function parseQuestion(lines: string[]): string | null {
   let boxTop = -1;
@@ -369,5 +427,18 @@ export function parsePane(
       ? parseCodexQuestion(lines, codexInput.index)
       : parseQuestion(lines);
 
-  return { pending_permission, pending_question, unsubmitted_input, raw };
+  // Claude-only: the counts come from Claude Code's own status-bar chrome.
+  // Codex is left null rather than guessed at — nothing reads this for Codex
+  // (it has no idle Notification hook at all), so a wrong guess would be
+  // strictly worse than no signal.
+  const background_activity =
+    provider === "codex" ? null : parseBackgroundActivity(lines);
+
+  return {
+    pending_permission,
+    pending_question,
+    unsubmitted_input,
+    background_activity,
+    raw,
+  };
 }

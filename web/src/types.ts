@@ -197,11 +197,17 @@ export interface PendingPermission {
   options: PaneOption[];
 }
 
+export interface BackgroundActivity {
+  shells: number;
+  monitors: number;
+}
+
 export interface ParsedPane {
   target: string;
   pending_permission: PendingPermission | null;
   pending_question: string | null;
   unsubmitted_input: string | null;
+  background_activity: BackgroundActivity | null;
   raw: string;
 }
 

@@ -16,7 +16,7 @@ import {
   flushMainQueue,
 } from "./notifqueue.js";
 import { notify } from "./notify.js";
-import { parsePane } from "./pane.js";
+import { parsePane, type BackgroundActivity } from "./pane.js";
 import { resumeAgent } from "./resume.js";
 import { maybeAutoReview } from "./review.js";
 import { killAgent } from "./spawn.js";
@@ -113,6 +113,26 @@ function idleRedelegateThrottled(agentId: number): boolean {
   return false;
 }
 
+/** How long a worker may keep being silently parked on its own background work
+ *  before the normal wait path is allowed through again. Monitor's own ceiling
+ *  is 60m for a non-persistent watch, and a `persistent: true` monitor or a
+ *  background shell has no ceiling at all — without this bound, a worker that
+ *  genuinely wedged behind one would never reach anybody, because an agent left
+ *  in "idle" is examined by neither the escalation watchdog (waiting_input
+ *  only) nor the stall detector (working only). Generous on purpose: expiring
+ *  early would just reintroduce the noise this suppression exists to remove. */
+const MAX_BACKGROUND_PARK_MS = 90 * 60_000;
+
+/** When the current uninterrupted run of background-park suppressions began,
+ *  per agent. In-memory like the maps above: losing it on a daemon restart
+ *  grants one more park window, which is the safe direction to fail in. */
+const backgroundParkSince = new Map<number, number>();
+
+/** Test-only: this map outlives the per-test in-memory db (see above). */
+export function __clearBackgroundParkForTests(): void {
+  backgroundParkSince.clear();
+}
+
 interface StallCheck {
   nudged: boolean;
   error: string | null;
@@ -154,6 +174,47 @@ async function tryAutoNudge(agent: Agent): Promise<StallCheck> {
     payload: { error, attempt: count + 1 },
   });
   return { nudged: true, error };
+}
+
+/**
+ * Read the worker's pane and report the background work still running for it,
+ * but only when nothing in that pane is actually asking for input.
+ *
+ * Returns null — i.e. "treat this as an ordinary wait" — whenever the pane
+ * cannot be read or shows a real question. Failing to null is what keeps this
+ * from ever swallowing a genuine prompt: an unreadable pane falls straight
+ * through to the normal, well-worn delegation path.
+ */
+function backgroundParked(agent: Agent): BackgroundActivity | null {
+  if (!agent.tmux_target || !windowExists(agent.tmux_target)) return null;
+  try {
+    // Styled capture: distinguishing a real composer draft from Claude's dim
+    // ghost-text suggestion needs the ANSI (see pane.ts visibleNonGhost).
+    // Without it every idle composer looks like a human mid-draft below.
+    const pane = parsePane(
+      capturePane(agent.tmux_target, PANE_TAIL_LINES, { escapes: true }),
+      agent.provider,
+    );
+    if (!pane.background_activity) return null;
+    // A numbered permission / AskUserQuestion menu is a decision someone has to
+    // make, and text sitting unsent in the composer means a human is mid-type.
+    // Background work running alongside either does not make it self-resolving.
+    if (pane.pending_permission || pane.unsubmitted_input) return null;
+    return pane.background_activity;
+  } catch {
+    return null;
+  }
+}
+
+/** True while this agent may still be suppressed for background work, starting
+ *  the streak clock on the first call of a run. */
+function withinBackgroundParkWindow(agentId: number): boolean {
+  const since = backgroundParkSince.get(agentId);
+  if (since === undefined) {
+    backgroundParkSince.set(agentId, Date.now());
+    return true;
+  }
+  return Date.now() - since < MAX_BACKGROUND_PARK_MS;
 }
 
 function now(): string {
@@ -444,6 +505,37 @@ export async function handleHookEvent(
           });
           break;
         }
+      }
+
+      // A worker that parks between turns while a Monitor watch or a background
+      // shell is still running is not waiting on anybody: the completion event
+      // re-wakes it on its own — that is the entire point of Monitor. Handing
+      // that to the orchestrator costs a round-trip for a guaranteed no-op, and
+      // if the orchestrator is busy it can end up paging a human about a worker
+      // that is simply waiting on its own build. Keep it idle so neither the
+      // delegation nor the escalation timer fires (same mechanism as the
+      // in-review suppression above).
+      //
+      // Genuine questions are unaffected: backgroundParked() returns null for a
+      // pending permission menu, an AskUserQuestion menu, an unsent composer
+      // draft, or any pane it cannot read, all of which fall through to the
+      // normal wait path even with background work running. The Stop-hook check
+      // keeps this to workers that really finished a turn, and the park window
+      // bounds how long a wedged worker can stay quiet.
+      if (agent.kind === "worker" && isIdlePrompt && stopFiredForLatestTurn(agentId)) {
+        const parked = backgroundParked(agent);
+        if (parked && withinBackgroundParkWindow(agentId)) {
+          updateAgent(agentId, { state: "idle" });
+          logEvent("waiting.suppressed_active_monitor", {
+            agentId,
+            taskId: agent.task_id ?? undefined,
+            payload: { shells: parked.shells, monitors: parked.monitors },
+          });
+          break;
+        }
+        // Nothing running any more (or the window has run out) — the next park
+        // is a fresh episode, and an expired one escalates normally below.
+        backgroundParkSince.delete(agentId);
       }
 
       const wasAlreadyWaiting = agent.state === "waiting_input";
