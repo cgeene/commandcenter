@@ -10,6 +10,10 @@ import {
   worktreesDir,
 } from "../config.js";
 import { type AgentProvider, isAgentProvider } from "../providers.js";
+import {
+  isPublicationMode,
+  type PublicationMode,
+} from "../publication.js";
 
 export interface SchedulerConfig {
   /** Master switch — the dashboard kill switch flips this. */
@@ -123,6 +127,8 @@ export interface AgentSettings {
   default_reviewer_provider: AgentProvider | null;
   /** Cross-model adversarial review toggle (overrides CC_REVIEWER_VARIETY). */
   reviewer_variety: boolean | null;
+  /** Who commits and publishes worker changes. null keeps the built-in agent default. */
+  worker_publication_mode: PublicationMode | null;
 }
 
 export const AGENT_SETTINGS_DEFAULTS: AgentSettings = {
@@ -130,6 +136,7 @@ export const AGENT_SETTINGS_DEFAULTS: AgentSettings = {
   default_worker_provider: null,
   default_reviewer_provider: null,
   reviewer_variety: null,
+  worker_publication_mode: null,
 };
 
 export function getAgentSettings(): AgentSettings {
@@ -281,6 +288,13 @@ export function resolveReviewerProviderPin(): AgentProvider | undefined {
 export function resolveReviewerVariety(): boolean {
   const stored = getAgentSettings().reviewer_variety;
   return stored ?? reviewerVarietyEnabled();
+}
+
+/** Effective publication policy for newly-created tasks. Existing tasks
+ * snapshot their policy, so changing this setting never mutates work in flight. */
+export function resolveWorkerPublicationMode(): PublicationMode {
+  const stored = getAgentSettings().worker_publication_mode;
+  return isPublicationMode(stored) ? stored : "agent";
 }
 
 /** Effective worktrees base dir. Read at worktree-create time. */

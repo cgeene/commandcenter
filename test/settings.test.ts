@@ -52,6 +52,7 @@ describe("settings store round-trip", () => {
       default_worker_provider: null,
       default_reviewer_provider: null,
       reviewer_variety: null,
+      worker_publication_mode: null,
     });
 
     settings.setAgentSettings({ default_main_model: "opus" });
@@ -133,7 +134,11 @@ describe("settings API validation", () => {
     const res = await app.request("/api/settings/agents", {
       method: "PATCH",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ default_main_model: "opus", reviewer_variety: true }),
+      body: JSON.stringify({
+        default_main_model: "opus",
+        reviewer_variety: true,
+        worker_publication_mode: "human",
+      }),
     });
     expect(res.status).toBe(200);
 
@@ -141,6 +146,8 @@ describe("settings API validation", () => {
     expect(get.agents.stored.default_main_model).toBe("opus");
     expect(get.agents.effective.default_main_model).toBe("opus");
     expect(get.agents.stored.reviewer_variety).toBe(true);
+    expect(get.agents.stored.worker_publication_mode).toBe("human");
+    expect(get.agents.effective.worker_publication_mode).toBe("human");
   });
 
   it("rejects a model outside the allow-list", async () => {
@@ -159,6 +166,16 @@ describe("settings API validation", () => {
       method: "PATCH",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ default_worker_provider: "gemini" }),
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects an invalid publication mode", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const res = await buildApp().request("/api/settings/agents", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ worker_publication_mode: "automatic" }),
     });
     expect(res.status).toBe(400);
   });

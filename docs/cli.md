@@ -17,7 +17,7 @@ agp <group> <command> [options]
 | `task show <id>` | Full task detail as JSON. |
 | `task update <id>` | Update fields: `-s/--status`, `-P/--priority`, `--provider <claude\|codex>`, `-m/--model`, `-e/--effort`, `--result <summary>`. Provider changes are rejected while the task has a live agent. |
 | `task claim <id>` | Atomically claim a queued task. |
-| `task cancel <id>` | Close a task from any state (kills its live worker/reviewer). `--rm-worktree` also removes the worktree (uncommitted work is lost). Reports any tasks left dangling by `blocked_by`. |
+| `task cancel <id>` | Close a task from any state (kills its live worker/reviewer). `--rm-worktree` also removes the worktree (uncommitted work is lost). Approved unpublished Human-publishes work is retained; destructive cleanup requires `--rm-worktree --discard-unpublished`. Reports any tasks left dangling by `blocked_by`. |
 | `task diff <id>` | Show the diff on the task's branch. `--stat` for stat + commits only. |
 
 ## `agp review <taskId>`

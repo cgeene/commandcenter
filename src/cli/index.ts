@@ -163,12 +163,19 @@ task
   .command("cancel <id>")
   .description("close a task from any state (kills its live worker/reviewer)")
   .option("--rm-worktree", "also remove the worktree (uncommitted work is lost)")
+  .option(
+    "--discard-unpublished",
+    "with --rm-worktree, explicitly discard approved Human-publishes work",
+  )
   .action(async (id: string, opts) => {
     const r = await api<{
       task: Task;
       killed_agents: number[];
       open_dependents: Task[];
-    }>("POST", `/api/tasks/${id}/cancel`, { rm_worktree: opts.rmWorktree });
+    }>("POST", `/api/tasks/${id}/cancel`, {
+      rm_worktree: opts.rmWorktree,
+      discard_unpublished: opts.discardUnpublished,
+    });
     const killed = r.killed_agents.length
       ? ` (killed ${r.killed_agents.map((a) => `a${a}`).join(", ")})`
       : "";
