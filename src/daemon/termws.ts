@@ -17,6 +17,12 @@ function viewerPrefix(agentId: number): string {
   return `ccv-${agentId}-`;
 }
 
+/** Matches every generation of viewer session name (`ccv-<agentId>-<hash>`). */
+const VIEWER_SESSION_RE = /^ccv-\d+-/;
+
+/** Unattached viewer sessions older than this are presumed leaked. */
+const STALE_VIEWER_MS = 60 * 60_000;
+
 async function killSession(name: string): Promise<void> {
   await tmux("kill-session", "-t", name);
 }
@@ -38,6 +44,126 @@ async function pruneAgentViewers(agentId: number): Promise<void> {
   );
 }
 
+/**
+ * Create the grouped tmux session a single browser viewer attaches to, and
+ * point it at the agent's window.
+ */
+export async function createViewerSession(
+  viewer: string,
+  session: string,
+  windowId: string,
+): Promise<void> {
+  // destroy-unattached must NOT be set here — see armViewerSelfDestruct.
+  await tmux("new-session", "-d", "-t", session, "-s", viewer);
+  // No tmux chrome in the browser: xterm.js renders only the pane.
+  await tmux("set-option", "-t", viewer, "status", "off");
+  // Mouse mode: wheel/touch scroll enters tmux copy-mode (scrollback lives
+  // in tmux, not xterm.js — swiping back down to the bottom exits it).
+  await tmux("set-option", "-t", viewer, "mouse", "on");
+  await tmux("select-window", "-t", `${viewer}:${windowId}`);
+  // Size the shared window to whichever client used it last (i.e. the
+  // browser), instead of clamping to the smallest attached client.
+  await tmux(
+    "set-option",
+    "-w",
+    "-t",
+    `${viewer}:${windowId}`,
+    "window-size",
+    "latest",
+  );
+}
+
+const ARM_POLL_MS = 200;
+const ARM_TIMEOUT_MS = 15_000;
+
+/**
+ * Flag the viewer session destroy-unattached once its client is actually
+ * attached, so tmux reaps it the moment that client detaches — covering
+ * disconnects the daemon never observes (killed browser tab behind a sleeping
+ * websocket proxy, daemon crash, failed kill-session).
+ *
+ * The option must not be set a moment earlier: tmux (observed on 3.7b) reaps
+ * every option-flagged unattached session whenever ANY client disconnects
+ * from the server — including one-shot command clients like the watchdog's
+ * capture-pane — so arming before the attach completes can destroy the
+ * session under its own attaching client. Hence the poll for an observed
+ * attach. Scoped to THIS viewer session only — destroy-unattached on the
+ * primary session would tear down every agent window whenever no client is
+ * attached, which for a headless fleet is the normal state.
+ *
+ * Resolves true once armed; false when the viewer disappeared first (already
+ * cleaned up) or never attached within the timeout — those leaks are bounded
+ * by the disconnect cleanup and the stale-viewer sweep.
+ */
+export async function armViewerSelfDestruct(viewer: string): Promise<boolean> {
+  const deadline = Date.now() + ARM_TIMEOUT_MS;
+  for (;;) {
+    let out: string;
+    try {
+      // Colon-separated: session names cannot contain colons, and tmux
+      // downgrades a literal tab in format output to `_` under a non-UTF-8
+      // client locale, which would silently break this parse.
+      out = await tmuxOutput(
+        "list-sessions",
+        "-F",
+        "#{session_name}:#{session_attached}",
+      );
+    } catch {
+      return false; // no tmux server — nothing left to arm
+    }
+    const row = out
+      .split("\n")
+      .map((line) => line.split(":"))
+      .find(([name]) => name === viewer);
+    if (!row) return false;
+    if (row[1] !== "0") {
+      try {
+        await tmux("set-option", "-t", viewer, "destroy-unattached", "on");
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, ARM_POLL_MS));
+  }
+}
+
+/**
+ * Kill unattached `ccv-*` viewer sessions older than an hour. New viewers are
+ * self-cleaning via destroy-unattached (above); this sweep catches sessions
+ * left behind by a daemon that predates the option, and ones orphaned between
+ * new-session and the PTY attach. The hour of grace guarantees a viewer that
+ * is still mid-attach is never swept out from under its client.
+ */
+export async function sweepStaleViewerSessions(
+  nowMs = Date.now(),
+): Promise<string[]> {
+  let out = "";
+  try {
+    // Colon-separated for the same reason as in armViewerSelfDestruct.
+    out = await tmuxOutput(
+      "list-sessions",
+      "-F",
+      "#{session_name}:#{session_attached}:#{session_created}",
+    );
+  } catch {
+    return []; // no tmux server, or unobservable — nothing to sweep
+  }
+  const stale = out
+    .split("\n")
+    .map((line) => line.split(":"))
+    .filter(([name, attached, created]) => {
+      if (!name || !VIEWER_SESSION_RE.test(name)) return false;
+      if (attached !== "0") return false;
+      const createdMs = Number(created) * 1000;
+      return Number.isFinite(createdMs) && nowMs - createdMs >= STALE_VIEWER_MS;
+    })
+    .map(([name]) => name);
+  await Promise.all(stale.map((name) => killSession(name).catch(() => {})));
+  return stale;
+}
+
 function normalizedSize(size?: { cols: number; rows: number }): {
   cols: number;
   rows: number;
@@ -56,7 +182,9 @@ function normalizedSize(size?: { cols: number; rows: number }): {
  * Each viewer gets its own *grouped* tmux session (new-session -t) attached
  * via a PTY: grouped sessions share windows but keep an independent current
  * window and size, so watching one agent doesn't yank other viewers (or the
- * desktop tmux client) around. The viewer session is killed on disconnect.
+ * desktop tmux client) around. The viewer session is killed on disconnect,
+ * with `destroy-unattached on` as the backstop for disconnects the daemon
+ * never sees.
  *
  * Client protocol: {"t":"i","d":"<keys>"} input, {"t":"r","cols":N,"rows":N}
  * resize. Server sends raw terminal output as text frames.
@@ -83,23 +211,7 @@ export async function attachTerminal(
     // without delivering a close event; pruning by agent keeps the latest drawer
     // authoritative and bounds tmux/PTY handles.
     await pruneAgentViewers(agentId);
-    await tmux("new-session", "-d", "-t", session, "-s", viewer);
-    // No tmux chrome in the browser: xterm.js renders only the pane.
-    await tmux("set-option", "-t", viewer, "status", "off");
-    // Mouse mode: wheel/touch scroll enters tmux copy-mode (scrollback lives
-    // in tmux, not xterm.js — swiping back down to the bottom exits it).
-    await tmux("set-option", "-t", viewer, "mouse", "on");
-    await tmux("select-window", "-t", `${viewer}:${windowId}`);
-    // Size the shared window to whichever client used it last (i.e. the
-    // browser), instead of clamping to the smallest attached client.
-    await tmux(
-      "set-option",
-      "-w",
-      "-t",
-      `${viewer}:${windowId}`,
-      "window-size",
-      "latest",
-    );
+    await createViewerSession(viewer, session, windowId);
   } catch {
     ws.send("\r\n[commandcenter] failed to create viewer session\r\n");
     ws.close();
@@ -125,6 +237,10 @@ export async function attachTerminal(
     ws.close();
     return;
   }
+
+  // Fire-and-forget: if arming never succeeds, the disconnect cleanup below
+  // and the periodic stale-viewer sweep still bound the leak.
+  void armViewerSelfDestruct(viewer);
 
   let closed = false;
   let alive = true;

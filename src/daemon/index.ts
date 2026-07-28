@@ -11,6 +11,7 @@ import {
 } from "../config.js";
 import { getDb } from "../db/db.js";
 import { migrateDocsToFrontmatter } from "../db/docs.js";
+import { logEvent } from "../db/events.js";
 import { buildApp } from "./api.js";
 import { startCostSync } from "./costsync.js";
 import { startJiraSync } from "./jirasync.js";
@@ -19,7 +20,7 @@ import { startLiveUsageSync } from "./usagelive.js";
 import { startPrSync } from "./prsync.js";
 import { startScheduler } from "./scheduler.js";
 import { registerStatic } from "./static.js";
-import { attachTerminal } from "./termws.js";
+import { attachTerminal, sweepStaleViewerSessions } from "./termws.js";
 import { initVersion } from "./version.js";
 
 getDb(); // open + migrate up front so failures are loud at startup
@@ -106,6 +107,22 @@ startJiraSync();
 // with CC_ANTHROPIC_ADMIN_KEY, the org billing cost report.
 startLiveUsageSync();
 startCostSync();
+
+// Viewer sessions self-destruct on detach (destroy-unattached), but sessions
+// created by an older daemon — or orphaned before their client ever attached —
+// need reaping. Sweep at startup (a restart clears any backlog immediately)
+// and then periodically.
+const runViewerSweep = () => {
+  sweepStaleViewerSessions()
+    .then((swept) => {
+      if (swept.length > 0) {
+        logEvent("viewer.swept", { payload: { count: swept.length, sessions: swept } });
+      }
+    })
+    .catch(() => {});
+};
+runViewerSweep();
+setInterval(runViewerSweep, 15 * 60_000);
 
 // Live terminal: /ws/term/<agentId> bridges xterm.js <-> tmux via a PTY.
 const wss = new WebSocketServer({ noServer: true });
