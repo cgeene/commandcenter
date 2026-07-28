@@ -140,7 +140,15 @@ server.registerTool(
         .optional()
         .describe("Codex reasoning effort; defaults to high"),
       worker_provider: z.enum(["claude", "codex"]).optional(),
-      priority: z.number().int().min(0).max(4).optional(),
+      priority: z
+        .number()
+        .int()
+        .min(0)
+        .max(4)
+        .optional()
+        .describe(
+          "0 = most urgent, 4 = least (default 2). Advisory for a worker: a worker-filed follow-up is granted at most priority 3, or its filer's own priority when that is lower, and the orchestrator promotes it at triage if it is genuinely urgent. Check the returned `priority` for what was granted.",
+        ),
       blocked_by: BLOCKED_BY_SCHEMA.optional(),
       verify_cmd: z.string().optional(),
       open_pr: z

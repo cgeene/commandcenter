@@ -23,18 +23,33 @@ import { getTask, type Task } from "../db/tasks.js";
  */
 export type TriageFlavor = "new" | "archived_resume" | "worker_resume_retry";
 
-/** Kind of the agent that created a task, from its task.created event
- *  (null when a human filed it via the dashboard/CLI). */
-export function taskCreatorKind(taskId: number): Agent["kind"] | null {
+/** Payload of a task's creation event, or null when it is absent/unparseable. */
+function taskCreationPayload(taskId: number): Record<string, unknown> | null {
   const created = latestTaskEvent(taskId, ["task.created"]);
   if (!created?.payload) return null;
   try {
-    const payload = JSON.parse(created.payload) as { creator_kind?: unknown };
-    const kind = payload.creator_kind;
-    return kind === "main" || kind === "worker" || kind === "reviewer" ? kind : null;
+    const payload = JSON.parse(created.payload) as unknown;
+    return typeof payload === "object" && payload !== null
+      ? (payload as Record<string, unknown>)
+      : null;
   } catch {
     return null;
   }
+}
+
+/** Kind of the agent that created a task, from its task.created event
+ *  (null when a human filed it via the dashboard/CLI). */
+export function taskCreatorKind(taskId: number): Agent["kind"] | null {
+  const kind = taskCreationPayload(taskId)?.creator_kind;
+  return kind === "main" || kind === "worker" || kind === "reviewer" ? kind : null;
+}
+
+/** The priority a worker asked for when the filing policy overruled it (see
+ *  src/lib/task-priority.ts), else null. The request is the input to the
+ *  promote-or-not decision, so triage has to see it. */
+function clampedPriorityRequest(taskId: number): number | null {
+  const requested = taskCreationPayload(taskId)?.requested_priority;
+  return typeof requested === "number" ? requested : null;
 }
 
 /** The human reopened an approved task but its managed worker launch failed, so
@@ -66,7 +81,13 @@ export function triagePrompt(task: Task, creatorKind: Agent["kind"] | null): str
         creatorKind === "worker"
           ? `worker-filed follow-up task #${task.id}`
           : `human-submitted task #${task.id}`;
-      return `[commandcenter] New ${descriptor} is awaiting your triage (workspace_kind=${task.workspace_kind}). Call get_task(${task.id}, verbose: true) — the compact default omits the prompt — study its full prompt, validate the scope and execution settings, then dispatch it. For portfolio tasks, never spawn the parent: mark it in_progress, use list_repositories, create per-repository child tasks with parent_task_id=${task.id}, preserve the parent's selected provider/model/reasoning effort unless you deliberately document an override, and spawn those isolated children. For scratch tasks, spawn the task directly and review its result/transcript rather than expecting a Git diff.`;
+      const requested =
+        creatorKind === "worker" ? clampedPriorityRequest(task.id) : null;
+      const clampNote =
+        requested === null
+          ? ""
+          : ` The filing worker asked for priority ${requested}; worker-filed work is capped, so it was queued at ${task.priority} — promote it yourself if that request is justified.`;
+      return `[commandcenter] New ${descriptor} is awaiting your triage (workspace_kind=${task.workspace_kind}).${clampNote} Call get_task(${task.id}, verbose: true) — the compact default omits the prompt — study its full prompt, validate the scope and execution settings, then dispatch it. For portfolio tasks, never spawn the parent: mark it in_progress, use list_repositories, create per-repository child tasks with parent_task_id=${task.id}, preserve the parent's selected provider/model/reasoning effort unless you deliberately document an override, and spawn those isolated children. For scratch tasks, spawn the task directly and review its result/transcript rather than expecting a Git diff.`;
     }
   }
 }
@@ -80,8 +101,14 @@ export function triagePrompt(task: Task, creatorKind: Agent["kind"] | null): str
  * spawn_worker retry step, and a duplicate task is exactly what those sentences
  * exist to prevent. `taskId` that no longer resolves is treated as collapsible —
  * the flush drops such rows as stale before composing anything.
+ *
+ * An ordinary new task whose worker-requested priority was overruled is held out
+ * of the collapse for the same reason: the compact list carries ids and nothing
+ * else, so collapsing it would silently drop the one thing that tells the
+ * orchestrator this task may deserve promoting.
  */
 export function batchableTriagePrompt(taskId: number | null): boolean {
   if (taskId == null || !getTask(taskId)) return true;
-  return triageFlavor(taskId) === "new";
+  if (triageFlavor(taskId) !== "new") return false;
+  return clampedPriorityRequest(taskId) === null;
 }
