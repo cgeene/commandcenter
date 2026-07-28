@@ -245,10 +245,6 @@ export interface SchedulerInfo {
   status: { live_workers: number; spawns_today: number };
 }
 
-/** Runtime settings surfaced by the Settings tab (GET /api/settings).
- *  `stored` holds explicit overrides (null = unset → env/default fallback);
- *  `effective` is the resolved value actually in use. The ntfy token is a
- *  secret — only its presence (`ntfy_token_set`) ever crosses the boundary. */
 /* ---- spend / quota ---- */
 
 export interface UsageMeter {
@@ -322,6 +318,10 @@ export interface UsagePayload {
   quota: { monthly_quota_usd: number | null; cycle_reset_day: number };
 }
 
+/** Runtime settings surfaced by the Settings tab (GET /api/settings).
+ *  `stored` holds explicit overrides (null = unset → env/default fallback);
+ *  `effective` is the resolved value actually in use. The ntfy token is a
+ *  secret — only its presence (`ntfy_token_set`) ever crosses the boundary. */
 export interface AppSettings {
   agents: {
     stored: {

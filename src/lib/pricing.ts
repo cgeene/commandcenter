@@ -44,7 +44,11 @@ const EPOCH = "0000-01-01";
  * actually in effect. Cache rates are derived from input at the published
  * multipliers (read 0.1x, 5m write 1.25x, 1h write 2x).
  *
- * Last checked: 2026-07-28 against platform.claude.com/docs/en/about-claude/pricing.
+ * Rates here are the STANDARD ones. Fast mode bills roughly double and leaves
+ * no marker in the transcript, so a fast-mode day is estimated low; the Tokens
+ * tab says so rather than pretending otherwise.
+ *
+ * Last checked: 2026-07-27 against platform.claude.com/docs/en/about-claude/pricing.
  */
 export const PRICE_SCHEDULE: Readonly<Record<string, readonly PricePoint[]>> = {
   "claude-fable-5": [{ from: EPOCH, input: 10, output: 50 }],

@@ -3693,7 +3693,15 @@ function TokensView({
               Per-day and per-model figures are a <b>local estimate</b> from session
               transcripts priced against a static rate table — not billing data. They cover
               only work this daemon ran, so they will read lower than the org figure above,
-              which also counts interactive Claude Code sessions.
+              which also counts interactive Claude Code sessions.{" "}
+              {/* Fast mode roughly doubles the per-token rate and leaves no marker in
+                  the transcript, so there is no way to detect it here. Saying so
+                  matters: it is a ~2x undercount on exactly the heaviest days, and an
+                  unstated one would make this gauge read as truth. */}
+              They also assume standard rates: <b>fast mode</b> bills about twice as much
+              (Opus 5 at $10/$50 per Mtok against the standard $5/$25) and isn&rsquo;t
+              recorded in the transcript, so on days you used it the estimate is a floor,
+              not a total.
               {usage.local.tracked_since
                 ? ` Daily tracking starts ${usage.local.tracked_since}.`
                 : " No daily burn recorded yet — tracking starts at the next agent Stop."}
