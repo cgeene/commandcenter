@@ -609,6 +609,10 @@ dd { font-family: var(--font-mono); word-break: break-all; }
 }
 .compose-input:focus { outline: none; border-color: var(--border-strong); }
 .compose button { flex: none; padding: 7px 12px; }
+/* Socket down: nothing can be written to the pty, so say so rather than letting
+   a tap on Send look like it worked. The buffer is kept, not cleared. */
+.compose.offline .compose-input { border-color: rgba(255, 107, 107, 0.45); }
+.compose.offline .compose-input::placeholder { color: var(--red); }
 
 .transcript { overflow-y: auto; padding: var(--panel-pad); }
 .msg { margin-bottom: var(--space-5); }

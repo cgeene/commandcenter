@@ -48,7 +48,15 @@ const MARKER_RE = /^\s*❯/;
  * src/lib/terminal-compose.ts). The finished buffer reaches the pty as a single
  * write when the operator sends it.
  */
-function ComposeBar({ send }: { send: (data: string) => void }) {
+function ComposeBar({
+  send,
+  connected,
+}: {
+  /** Writes to the pty. Returns false if the socket wasn't open, i.e. nothing
+   *  was written — the buffer must survive that. */
+  send: (data: string) => boolean;
+  connected: boolean;
+}) {
   const [text, setText] = useState("");
   // Whether a send also presses Enter. On by default (the common case: say
   // something to a worker and submit it); off for typing into a prompt you
@@ -91,10 +99,16 @@ function ComposeBar({ send }: { send: (data: string) => void }) {
     return () => ro.disconnect();
   }, [autosize]);
 
-  const flush = (submit: boolean) => {
-    const payload = composePayload(text, submit);
-    if (payload === null) return; // empty buffer: nothing to send, nothing to clear
-    send(payload);
+  const payload = composePayload(text, submitOnSend);
+  const sendable = payload !== null && connected;
+
+  /** Clear the field ONLY once the bytes are actually on the wire. The socket
+   *  dies silently when a phone locks or the tab is backgrounded — and nothing
+   *  reconnects it — so clearing on a failed write would destroy a message the
+   *  operator just spent a minute dictating, with "sent" looking identical to
+   *  "dropped". */
+  const flush = () => {
+    if (payload === null || !send(payload)) return;
     setText("");
     inputRef.current?.focus(); // keep the virtual keyboard up for the next line
   };
@@ -104,14 +118,16 @@ function ComposeBar({ send }: { send: (data: string) => void }) {
   const keepFocus = (e: { preventDefault: () => void }) => e.preventDefault();
 
   return (
-    <div className="compose">
+    <div className={`compose${connected ? "" : " offline"}`}>
       <textarea
         ref={inputRef}
         className="compose-input"
         aria-label="Compose message"
         rows={1}
         value={text}
-        placeholder={submitOnSend ? "Message…" : "Message… (no ⏎)"}
+        placeholder={
+          connected ? (submitOnSend ? "Message…" : "Message… (⏎ = newline)") : "Disconnected"
+        }
         // Deliberately NOT disabling any of these: they are the whole point of
         // the compose bar. autoCorrect/autoCapitalize are non-standard but are
         // what iOS Safari reads.
@@ -124,22 +140,32 @@ function ComposeBar({ send }: { send: (data: string) => void }) {
           // Mid-composition Enter belongs to the IME/autocorrect candidate,
           // never to us.
           if (e.nativeEvent.isComposing) return;
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault(); // Shift+Enter still inserts a literal newline
-            flush(submitOnSend);
+          // With the ⏎ toggle OFF, Enter inserts a literal newline and only the
+          // Send button ships the buffer. That's the only way to type a newline
+          // on a phone, whose keyboard can't produce Shift+Enter — and it makes
+          // enterKeyHint="enter" tell the truth.
+          if (e.key === "Enter" && !e.shiftKey && submitOnSend) {
+            e.preventDefault();
+            flush();
           }
         }}
       />
       <button
         className={`compose-newline${submitOnSend ? " on" : ""}`}
         aria-pressed={submitOnSend}
-        title={submitOnSend ? "Send with Enter" : "Send without Enter"}
+        title={submitOnSend ? "Enter sends and submits" : "Enter inserts a newline; Send sends"}
         onMouseDown={keepFocus}
         onClick={() => setSubmitOnSend((v) => !v)}
       >
         ⏎
       </button>
-      <button className="primary" onMouseDown={keepFocus} onClick={() => flush(submitOnSend)}>
+      <button
+        className="primary"
+        disabled={!sendable}
+        title={connected ? undefined : "Terminal disconnected — reopen the drawer to reconnect"}
+        onMouseDown={keepFocus}
+        onClick={flush}
+      >
         Send
       </button>
     </div>
@@ -152,10 +178,17 @@ export function Terminal({ agentId }: { agentId: number }) {
   // Compose bar on by default on touch devices only; an explicit toggle is
   // remembered per browser.
   const [compose, setCompose] = useState(() => composeBarEnabled(localStorage, touchDevice()));
+  // Whether the pty socket is up. Nothing reconnects it (a close is terminal
+  // until the drawer is reopened), so the compose bar has to be able to see the
+  // difference between "sent" and "went nowhere".
+  const [connected, setConnected] = useState(false);
 
-  const send = (d: string) => {
+  /** Write to the pty. Returns whether the bytes actually went out. */
+  const send = (d: string): boolean => {
     const ws = wsRef.current;
-    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ t: "i", d }));
+    if (ws?.readyState !== WebSocket.OPEN) return false;
+    ws.send(JSON.stringify({ t: "i", d }));
+    return true;
   };
 
   useEffect(() => {
@@ -183,9 +216,14 @@ export function Terminal({ agentId }: { agentId: number }) {
       `${proto}//${location.host}/ws/term/${agentId}?cols=${term.cols}&rows=${term.rows}`,
     );
     wsRef.current = ws;
+    setConnected(false); // a swap to another agent starts closed again
 
     ws.onmessage = (e) => term.write(typeof e.data === "string" ? e.data : "");
-    ws.onclose = () => term.write("\r\n[disconnected]\r\n");
+    ws.onopen = () => setConnected(true);
+    ws.onclose = () => {
+      setConnected(false);
+      term.write("\r\n[disconnected]\r\n");
+    };
 
     const dataSub = term.onData((d) => {
       if (ws.readyState === WebSocket.OPEN) {
@@ -329,7 +367,7 @@ export function Terminal({ agentId }: { agentId: number }) {
           agentId in place, deliberately, so the effect above tears the old
           websocket down) — without a key React would reuse the ComposeBar and
           an unsent draft for agent A would be sent into agent B's pty. */}
-      {compose && <ComposeBar key={agentId} send={send} />}
+      {compose && <ComposeBar key={agentId} send={send} connected={connected} />}
     </div>
   );
 }
