@@ -2,6 +2,7 @@ import { listAgents } from "../db/agents.js";
 import { countEventsToday, latestTaskEventId, logEvent } from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { getTask, listTasks, updateTask, type Task } from "../db/tasks.js";
+import { noteReworkOverCap } from "./capacity.js";
 import { notifyEvent } from "./notify.js";
 import { markPrDraft, markPrReady } from "./prdraft.js";
 import { resumeAgent } from "./resume.js";
@@ -630,6 +631,10 @@ export async function handleVerdict(
         task.publication_mode === "human" ? "editing" : task.publication_state,
     });
     logEvent("task.reopened", { taskId, payload: { reason: "review rejected" } });
+    // The worker was parked in review (cap-exempt) and is now working again, so
+    // it re-enters the concurrency count. Rework is a continuation, never
+    // refused for capacity — but record it when the fleet is pushed over the cap.
+    noteReworkOverCap(taskId, task.agent_id!);
   } else if (outcome === "delivery_failed") {
     // The notes were not delivered, so leaving the task in review would park
     // it permanently: the reviewed HEAD is deduplicated and no review-state

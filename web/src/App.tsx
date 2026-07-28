@@ -455,7 +455,11 @@ export function App() {
             {scheduler && (
               <button
                 className={scheduler.config.enabled ? "sched-on" : ""}
-                title={`workers ${scheduler.status.live_workers}/${scheduler.config.max_concurrent} · spawns today ${scheduler.status.spawns_today}/${scheduler.config.daily_spawn_limit}`}
+                title={`workers ${scheduler.status.live_workers}/${scheduler.config.max_concurrent}${
+                  scheduler.status.parked_workers
+                    ? ` (+${scheduler.status.parked_workers} parked in review)`
+                    : ""
+                } · spawns today ${scheduler.status.spawns_today}/${scheduler.config.daily_spawn_limit}`}
                 onClick={() =>
                   act(() =>
                     api("PATCH", "/api/scheduler", {
@@ -940,6 +944,7 @@ function signalTitle(kind: string, payload: Record<string, unknown>): string {
     "delivery.delivered": "Delivery sent",
     "delivery.expired": "Delivery expired",
     "scheduler.capacity_blocked": "Scheduler at capacity",
+    "scheduler.worker_over_cap": "Workers over cap (rework)",
     "scheduler.spawned": "Scheduler spawned",
     "scheduler.spawn_error": "Scheduler failed",
     "scheduler.budget_reached": "Spawn budget reached",

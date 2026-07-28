@@ -593,7 +593,13 @@ interface SchedulerInfo {
     escalate_minutes: number;
     reap_after_minutes: number;
   };
-  status: { live_workers: number; spawns_today: number };
+  status: {
+    /** workers occupying a slot — comparable to max_concurrent */
+    live_workers: number;
+    /** live workers parked in review; exempt from the cap */
+    parked_workers?: number;
+    spawns_today: number;
+  };
 }
 
 const scheduler = program
@@ -605,8 +611,11 @@ async function printSchedulerStatus(): Promise<void> {
   const hours = config.active_hours
     ? `${config.active_hours.start}:00-${config.active_hours.end}:00`
     : "always";
+  const parked = status.parked_workers
+    ? ` (+${status.parked_workers} parked in review)`
+    : "";
   console.log(
-    `scheduler: ${config.enabled ? "ON" : "OFF"} · workers ${status.live_workers}/${config.max_concurrent} · spawns today ${status.spawns_today}/${config.daily_spawn_limit} · window ${hours} · stall ${config.stall_minutes}m · auto-review ${config.auto_review ? "on" : "off"} · escalate ${config.escalate_minutes}m · reap ${config.reap_after_minutes}m`,
+    `scheduler: ${config.enabled ? "ON" : "OFF"} · workers ${status.live_workers}/${config.max_concurrent}${parked} · spawns today ${status.spawns_today}/${config.daily_spawn_limit} · window ${hours} · stall ${config.stall_minutes}m · auto-review ${config.auto_review ? "on" : "off"} · escalate ${config.escalate_minutes}m · reap ${config.reap_after_minutes}m`,
   );
 }
 

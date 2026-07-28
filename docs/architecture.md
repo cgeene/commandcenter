@@ -286,6 +286,43 @@ invalidates. If that commit is no longer an ancestor of the branch tip (a rebase
 or force-push rewrote it), nothing can be carried forward — the round falls back
 to a full re-review and logs `review.delta_unavailable`.
 
+## Worker concurrency
+
+`max_concurrent` (default **3**) caps the workers doing **active work**, not the
+workers that happen to be alive. `src/daemon/capacity.ts` owns that accounting
+and every consumer goes through it — the scheduler's auto-spawn pass, the
+`GET /api/scheduler` status the CLI and dashboard render, the Needs You panel's
+"scheduler stalled" item, and the orchestrator's standing prompt.
+
+Counted:
+
+- workers on `claimed` / `in_progress` tasks, including a rework round after a
+  rejection;
+- a worker with no task yet (a manual or mid-spawn agent);
+- a worker idling on a finished or blocked task until the watchdog reaps it —
+  a real squatter, so it stays visible to the cap rather than being forgiven.
+
+Exempt — **parked in review**: a worker whose task is in `review` has handed the
+work to the reviewer and owns no further state change until a verdict lands. It
+stays alive for exactly one reason: a rejection can then be delivered into its
+existing session, which is much cheaper than a respawn. Counting those idle
+workers took the fleet to zero throughput during review waves — every slot held
+by a parked worker while triaged tasks queued. The exemption ignores agent state,
+so a missed Stop hook or a permission prompt cannot silently re-consume a slot
+the reviewer is responsible for releasing.
+
+When a rejection is delivered into a parked worker, its task returns to
+`in_progress` and the worker re-enters the count. Rework is a continuation of
+work already in flight, so it is never refused for capacity; if it pushes the
+fleet past the cap, `scheduler.worker_over_cap` is logged so the temporary
+over-cap is visible rather than mysterious. It resolves itself as the round
+finishes.
+
+Parked workers still cost a live provider process. The stronger fix is
+park-and-resume — kill the worker at review submission and resume its session on
+rejection — which the `resume_worker` machinery is a step toward; until then the
+exemption trades idle processes for throughput.
+
 ## The web dashboard
 
 A React SPA (`web/`) built by Vite and served by the daemon at

@@ -1,6 +1,7 @@
 import { dismissedKeys } from "../db/attention.js";
 import { listAgents } from "../db/agents.js";
 import { liveUsageEnabled } from "../config.js";
+import { workerSlots } from "./capacity.js";
 import {
   countEventsToday,
   earliestEventTsAfter,
@@ -298,7 +299,9 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   if (cfg.enabled) {
     const ready = readyTasks();
     if (ready.length > 0) {
-      const liveWorkers = agents.filter((a) => a.kind === "worker");
+      // Same accounting as the scheduler's auto-spawn pass: workers parked in
+      // review are exempt, so they are never named as the blockage.
+      const { counted: liveWorkers } = workerSlots({ agents, tasks });
 
       // capacity: all slots taken. Anchor to the FIRST capacity_blocked event
       // of the current episode (since the last successful spawn) so the age is

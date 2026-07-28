@@ -254,7 +254,13 @@ export interface SchedulerConfig {
 
 export interface SchedulerInfo {
   config: SchedulerConfig;
-  status: { live_workers: number; spawns_today: number };
+  status: {
+    /** workers occupying a slot — comparable to max_concurrent */
+    live_workers: number;
+    /** live workers parked in review; exempt from the cap */
+    parked_workers?: number;
+    spawns_today: number;
+  };
 }
 
 /* ---- spend / quota ---- */
