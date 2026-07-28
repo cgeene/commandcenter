@@ -2,7 +2,7 @@ import { listAgents } from "../db/agents.js";
 import { countEventsToday, latestTaskEventId, logEvent } from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { getTask, listTasks, updateTask, type Task } from "../db/tasks.js";
-import { notify } from "./notify.js";
+import { notifyEvent } from "./notify.js";
 import { markPrDraft, markPrReady } from "./prdraft.js";
 import { resumeAgent } from "./resume.js";
 import {
@@ -25,6 +25,50 @@ import {
  *  Runtime-configurable via the scheduler settings; this reads the live value. */
 export function reviewMaxCycles(): number {
   return getSchedulerConfig().review_max_cycles;
+}
+
+/**
+ * The one push that means "Caleb, act now".
+ *
+ * A task ENTERING review means the automatic adversarial reviewer is about to
+ * run — nothing is asked of a human then. What is worth a phone buzz is the
+ * other end of that loop: the reviewer approved AND the PR is open and out of
+ * draft, so it is genuinely mergeable. (For human-publication tasks there is no
+ * PR yet; the approved working tree is what's waiting.)
+ *
+ * Both callers re-derive this from standing task state — handleVerdict on the
+ * approve edge, and the prsync sweep every couple of minutes — so it is latched
+ * on the SHA the approval covers. A re-poll can never re-fire it; a superseded
+ * approval that is later re-approved against a new SHA gets a new key and does.
+ *
+ * Safe to call with any task: everything that isn't approved-and-ready no-ops.
+ */
+export function notifyApprovedReady(task: Task): void {
+  if (task.review_verdict !== "approve") return;
+  const awaitingHuman =
+    task.publication_mode === "human" &&
+    task.workspace_kind === "repo" &&
+    task.publication_state === "awaiting_human";
+  const prReady =
+    task.open_pr !== 0 && Boolean(task.pr_url) && task.pr_is_draft === 0;
+  if (!awaitingHuman && !prReady) return;
+  // review_head_sha is the SHA (or snapshot tree) the approval covers.
+  const once = `task:${task.id}:approved_ready:${task.review_head_sha ?? "nosha"}`;
+  if (awaitingHuman) {
+    notifyEvent(
+      "review_approved_ready",
+      `task #${task.id} reviewed & approved — your turn to publish`,
+      `${task.title}\nThe reviewer approved the uncommitted working tree. Inspect it, then commit, push, and record the PR in Command Center.`,
+      { tags: "white_check_mark,eyes", taskId: task.id, once },
+    );
+    return;
+  }
+  notifyEvent(
+    "review_approved_ready",
+    `task #${task.id} reviewed & approved — PR ready to merge`,
+    `${task.title}\n${task.pr_url}\nInternal review passed and the PR is out of draft. Merge it, or request changes on GitHub.`,
+    { tags: "white_check_mark", taskId: task.id, once },
+  );
 }
 
 export interface TaskDiff {
@@ -115,10 +159,11 @@ function withinReviewBudget(task: Task): boolean {
     countEventsToday("scheduler.spawned") + countEventsToday("reviewer.auto_spawned");
   if (spent < cfg.daily_spawn_limit) return true;
   logEvent("reviewer.budget_skipped", { taskId: task.id });
-  notify(
-    `task #${task.id} NOT auto-reviewed`,
-    `${task.title} — daily spawn budget exhausted; review manually or agp review ${task.id}`,
-    { priority: "high", tags: "moneybag" },
+  notifyEvent(
+    "capacity_or_budget",
+    `task #${task.id} was not auto-reviewed`,
+    `${task.title} — today's spawn budget is exhausted, so no reviewer started. Nothing is lost; it reviews tomorrow, or run \`agp review ${task.id}\` now.`,
+    { priority: "high", tags: "moneybag", taskId: task.id },
   );
   return false;
 }
@@ -161,10 +206,16 @@ function exhaustLoop(task: Task, rounds: number): void {
     taskId: task.id,
     payload: { rounds, max: reviewMaxCycles() },
   });
-  notify(
-    `task #${task.id} — review loop exhausted after ${rounds} rounds`,
-    `${task.title} — human decision needed. Last reviewer notes: ${(task.review_notes ?? "").slice(0, 200)}`,
-    { priority: "high", tags: "rotating_light" },
+  notifyEvent(
+    "review_exhausted",
+    `task #${task.id} blocked — review loop exhausted after ${rounds} rounds`,
+    `${task.title}\nThe automatic review⇄fix loop ran out of rounds without converging. Decide: steer it, requeue it, or close it. Last reviewer notes: ${(task.review_notes ?? "").slice(0, 200)}`,
+    {
+      priority: "high",
+      tags: "rotating_light",
+      taskId: task.id,
+      once: `task:${task.id}:review_exhausted:${rounds}`,
+    },
   );
 }
 
@@ -187,10 +238,16 @@ async function supersedeApproval(task: Task, headSha: string): Promise<void> {
         taskId: task.id,
         payload: { pr_url: task.pr_url, error: msg, reason: "superseded approval" },
       });
-      notify(
-        `task #${task.id} — stale approval, but PR is STILL READY`,
-        `${task.title} — new commits landed after approval and 'gh pr ready --undo' failed: ${msg}\nConvert it back to a draft manually so an un-reviewed HEAD isn't merged:\n${task.pr_url}`,
-        { priority: "high", tags: "rotating_light" },
+      notifyEvent(
+        "pr_state_mismatch",
+        `task #${task.id} — stale approval, but the PR still shows READY`,
+        `${task.title}\nNew commits landed after the approval and 'gh pr ready --undo' failed: ${msg}\nConvert it back to a draft yourself so an un-reviewed HEAD isn't merged:\n${task.pr_url}`,
+        {
+          priority: "high",
+          tags: "rotating_light",
+          taskId: task.id,
+          once: `task:${task.id}:redraft_failed:${headSha}`,
+        },
       );
     }
   }
@@ -408,11 +465,7 @@ export async function handleVerdict(
         review_head_sha: approvedSha,
         publication_state: "awaiting_human",
       });
-      notify(
-        `task #${taskId} approved — your review is next`,
-        `${task.title} — inspect the uncommitted changes in GitHub Desktop, then commit, push, and record the PR in Command Center`,
-        { tags: "white_check_mark,eyes" },
-      );
+      notifyApprovedReady(getTask(taskId)!);
       return getTask(taskId)!;
     }
 
@@ -439,10 +492,11 @@ export async function handleVerdict(
         taskId,
         payload: { reason: "approved (no PR to merge)" },
       });
-      notify(
-        `task #${taskId} auto-completed`,
-        `${task.title} — approved by reviewer, no PR to merge`,
-        { tags: "tada" },
+      notifyEvent(
+        "task_completed",
+        `task #${taskId} done`,
+        `${task.title} — approved by the reviewer; there was no PR to merge, so it completed itself. Nothing needed from you.`,
+        { tags: "tada", taskId },
       );
       return getTask(taskId)!;
     }
@@ -467,18 +521,25 @@ export async function handleVerdict(
           agentId,
           payload: { pr_url: task.pr_url, error: msg },
         });
-        notify(
-          `task #${taskId} approved but PR is STILL A DRAFT`,
-          `${task.title} — 'gh pr ready' failed: ${msg}\nMark it ready manually or it won't surface for merge:\n${task.pr_url}`,
-          { priority: "high", tags: "rotating_light" },
+        notifyEvent(
+          "pr_state_mismatch",
+          `task #${taskId} approved but its PR is STILL A DRAFT`,
+          `${task.title}\n'gh pr ready' failed: ${msg}\nMark it ready yourself or it won't surface for merge:\n${task.pr_url}`,
+          {
+            priority: "high",
+            tags: "rotating_light",
+            taskId,
+            agentId,
+            once: `task:${taskId}:ready_failed:${approvedSha ?? "nosha"}`,
+          },
         );
       }
     }
-    notify(
-      `task #${taskId} approved by reviewer`,
-      `${task.title} — ready for your final review/merge${task.pr_url ? `\n${task.pr_url}` : ""}`,
-      { tags: "white_check_mark" },
-    );
+    // The push that used to fire here ("approved by reviewer") is now emitted
+    // by notifyApprovedReady, which additionally requires the PR to actually be
+    // out of draft — so the message can honestly say it is ready to merge. If
+    // markPrReady failed above, the pr_state_mismatch push covers it instead.
+    notifyApprovedReady(getTask(taskId)!);
     return getTask(taskId)!;
   }
 
@@ -500,10 +561,17 @@ export async function handleVerdict(
         agentId,
         payload: { pr_url: task.pr_url, error: msg },
       });
-      notify(
-        `task #${taskId} rejected but PR is STILL READY`,
-        `${task.title} — 'gh pr ready --undo' failed: ${msg}\nConvert it back to a draft manually so it isn't merged by mistake:\n${task.pr_url}`,
-        { priority: "high", tags: "rotating_light" },
+      notifyEvent(
+        "pr_state_mismatch",
+        `task #${taskId} rejected but its PR still shows READY`,
+        `${task.title}\n'gh pr ready --undo' failed: ${msg}\nConvert it back to a draft yourself so it isn't merged by mistake:\n${task.pr_url}`,
+        {
+          priority: "high",
+          tags: "rotating_light",
+          taskId,
+          agentId,
+          once: `task:${taskId}:redraft_failed:round${task.review_cycles + 1}`,
+        },
       );
     }
   }
@@ -525,10 +593,17 @@ export async function handleVerdict(
       agentId,
       payload: { rounds: cycles, max: reviewMaxCycles() },
     });
-    notify(
-      `task #${taskId} — review loop exhausted after ${cycles} rounds`,
-      `${task.title} — human decision needed. Last reviewer notes: ${notes.slice(0, 200)}`,
-      { priority: "high", tags: "rotating_light" },
+    notifyEvent(
+      "review_exhausted",
+      `task #${taskId} blocked — review loop exhausted after ${cycles} rounds`,
+      `${task.title}\nThe reviewer rejected it ${cycles} times without the loop converging. Decide: steer it, requeue it, or close it. Last reviewer notes: ${notes.slice(0, 200)}`,
+      {
+        priority: "high",
+        tags: "rotating_light",
+        taskId,
+        agentId,
+        once: `task:${taskId}:review_exhausted:${cycles}`,
+      },
     );
     return getTask(taskId)!;
   }
@@ -633,12 +708,13 @@ export async function confirmHumanPublication(
     taskId: task.id,
     payload: { has_pr: Boolean(effectivePrUrl), open_pr: task.open_pr !== 0 },
   });
-  notify(
+  notifyEvent(
+    "task_completed",
     task.open_pr === 0
       ? `task #${task.id} published`
       : `task #${task.id} publication recorded`,
-    task.title,
-    { tags: "white_check_mark" },
+    `${task.title} — you published it; Command Center has recorded it. Nothing further needed.`,
+    { tags: "white_check_mark", taskId: task.id },
   );
   return updated;
 }

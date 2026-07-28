@@ -277,9 +277,11 @@ export interface AppSettings {
     };
   };
   notifications: {
-    stored: { ntfy_url: string | null };
+    /** `events` holds ONLY explicit per-event overrides; a key that is absent
+     *  follows the built-in default from `notify_event_choices`. */
+    stored: { ntfy_url: string | null; events: Record<string, boolean> };
     ntfy_token_set: boolean;
-    effective: { ntfy_url: string | null };
+    effective: { ntfy_url: string | null; events: Record<string, boolean> };
   };
   jira: {
     stored: JiraConfig;
@@ -291,6 +293,24 @@ export interface AppSettings {
   };
   model_choices: string[];
   provider_choices: AgentProvider[];
+  /** The push-notification catalog (src/notify-events.ts), in display order. */
+  notify_event_choices: NotifyEventSpec[];
+  notify_category_choices: NotifyCategorySpec[];
+}
+
+/** One switchable push event. Mirrors the daemon's NotifyEventSpec. */
+export interface NotifyEventSpec {
+  key: string;
+  category: string;
+  label: string;
+  description: string;
+  default_enabled: boolean;
+}
+
+export interface NotifyCategorySpec {
+  key: string;
+  label: string;
+  blurb: string;
 }
 
 /** Per-repo JIRA config (opt-in, default OFF). Mirrors the daemon JiraRepoConfig. */

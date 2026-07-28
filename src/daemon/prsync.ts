@@ -8,8 +8,8 @@ import {
   updateTask,
   type Task,
 } from "../db/tasks.js";
-import { notify } from "./notify.js";
-import { reviewLoopSweep, reviewMaxCycles } from "./review.js";
+import { notifyEvent } from "./notify.js";
+import { notifyApprovedReady, reviewLoopSweep, reviewMaxCycles } from "./review.js";
 import { resumeAgent } from "./resume.js";
 import { killAgent } from "./spawn.js";
 import { git, removeWorktree } from "./worktree.js";
@@ -264,7 +264,12 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
       taskId,
       payload: { pr_url: task.pr_url, reason: "PR merged" },
     });
-    notify(`task #${taskId} auto-completed — PR merged`, task.title, { tags: "tada" });
+    notifyEvent(
+      "task_completed",
+      `task #${taskId} done — you merged its PR`,
+      `${task.title}\nThe task, its worker, and its worktree are cleaned up. Nothing needed from you.`,
+      { tags: "tada", taskId },
+    );
     return;
   }
 
@@ -278,12 +283,26 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
       review_notes: `PR closed without merging: ${task.pr_url}`,
     });
     logEvent("pr.closed", { taskId, payload: { pr_url: task.pr_url } });
-    notify(`task #${taskId} blocked — PR closed without merge`, task.title, {
-      priority: "high",
-      tags: "x",
-    });
+    notifyEvent(
+      "task_blocked",
+      `task #${taskId} blocked — its PR was closed without merging`,
+      `${task.title}\n${task.pr_url}\nThe branch and worktree are kept. Decide whether to salvage the work or close the task.`,
+      {
+        priority: "high",
+        tags: "x",
+        taskId,
+        once: `task:${taskId}:blocked:pr_closed`,
+      },
+    );
     return;
   }
+
+  // OPEN and already approved internally: the "ready to merge" push is derived
+  // from standing state, not from the approve edge alone, so it still lands if
+  // the PR only left draft after the verdict (e.g. `gh pr ready` failed at
+  // approve time and was fixed by hand). notifyApprovedReady is latched on the
+  // approved SHA, so this two-minute re-poll never re-fires it.
+  notifyApprovedReady(task);
 
   // OPEN: forward new human feedback. pr_feedback_at is the high-water mark;
   // null means the PR was just created — everything so far is feedback.
@@ -439,10 +458,11 @@ export function recordSyncFailure(taskId: number, error: string): void {
       taskId,
       payload: { error, fails, pr_url: task.pr_url },
     });
-    notify(
+    notifyEvent(
+      "sync_broken",
       `PR sync broken — task #${taskId}`,
-      `${task.title} — ${fails} consecutive sync failures: ${error}`,
-      { priority: "high", tags: "warning" },
+      `${task.title} — ${fails} consecutive sync failures: ${error}\nThe board's PR state is going stale; no work is lost.`,
+      { priority: "high", tags: "warning", taskId },
     );
   }
 }

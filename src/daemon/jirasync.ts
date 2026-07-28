@@ -22,7 +22,7 @@ import {
   type JiraIssueView,
   type JiraTransition,
 } from "./jira.js";
-import { notify } from "./notify.js";
+import { notifyEvent } from "./notify.js";
 import { enforcePrTitle } from "./prdraft.js";
 
 /**
@@ -127,10 +127,11 @@ export function recordJiraSyncFailure(taskId: number, error: string): void {
       taskId,
       payload: { error, fails, jira_key: task.jira_key },
     });
-    notify(
+    notifyEvent(
+      "sync_broken",
       `JIRA sync broken — task #${taskId}`,
-      `${task.title} — ${fails} consecutive sync failures: ${error}`,
-      { priority: "high", tags: "warning" },
+      `${task.title} — ${fails} consecutive sync failures: ${error}\nThe ticket's state is going stale; no work is lost.`,
+      { priority: "high", tags: "warning", taskId },
     );
   }
 }

@@ -8,7 +8,7 @@ import {
   type QueuedNotification,
 } from "../db/notifications.js";
 import type { AgentProvider } from "../providers.js";
-import { notify } from "./notify.js";
+import { notifyEvent } from "./notify.js";
 import { parsePane } from "./pane.js";
 import { resumeAgent } from "./resume.js";
 import { capturePane, windowExists } from "./tmux.js";
@@ -141,8 +141,9 @@ function noteDeliveryBlocked(
     agentId: mainId,
     payload: { reason, attempts },
   });
-  notify(
-    "Orchestrator prompt is blocked",
+  notifyEvent(
+    "escalation",
+    "Orchestrator prompt is blocked — only you can clear it",
     reason === "draft"
       ? `An unsubmitted draft in a${mainId}'s prompt has deferred ${attempts} deliveries. ` +
           `Submit or clear it so queued worker notifications can reach the orchestrator. ` +
@@ -152,7 +153,11 @@ function noteDeliveryBlocked(
           `deliveries and will keep deferring. The pane parser probably no longer matches ` +
           `the provider's TUI — worker notifications and task triage are not reaching the ` +
           `orchestrator until that is fixed.`,
-    { priority: reason === "unreadable" ? "high" : "default", tags: "warning" },
+    {
+      priority: reason === "unreadable" ? "high" : "default",
+      tags: "warning",
+      agentId: mainId,
+    },
   );
 }
 
@@ -301,7 +306,17 @@ export async function delegateToMain(worker: Agent, message: string): Promise<vo
   const who = label({ worker_id: worker.id, task_id: worker.task_id });
 
   if (!main || !main.tmux_target) {
-    notify(`${who} needs input`, message, { priority: "high", tags: "warning" });
+    notifyEvent(
+      "escalation",
+      `${who} needs your input`,
+      `${message}\nThere is no live orchestrator to hand this to, so it is yours — peek or attach to unblock it.`,
+      {
+        priority: "high",
+        tags: "warning",
+        agentId: worker.id,
+        taskId: worker.task_id,
+      },
+    );
     return;
   }
 

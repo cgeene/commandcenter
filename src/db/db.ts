@@ -216,6 +216,19 @@ CREATE TABLE IF NOT EXISTS queued_notifications (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- One row per push that must never be sent twice for the same situation, e.g.
+-- "task #164 is approved and its PR is ready". The prsync sweep re-evaluates
+-- that condition every two minutes, so without a latch the same push would fire
+-- forever. The key embeds whatever makes the situation distinct (usually the
+-- approved SHA or round number), so a genuinely NEW occurrence gets a new key
+-- and pushes again. See src/daemon/notify.ts.
+CREATE TABLE IF NOT EXISTS notify_latches (
+  key        TEXT PRIMARY KEY,
+  event      TEXT NOT NULL,
+  task_id    INTEGER,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
 `;

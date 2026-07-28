@@ -15,7 +15,7 @@ import {
   deliverToMainIfClear,
   flushMainQueue,
 } from "./notifqueue.js";
-import { notify } from "./notify.js";
+import { notifyEvent } from "./notify.js";
 import { parsePane, type BackgroundActivity } from "./pane.js";
 import { resumeAgent } from "./resume.js";
 import { maybeAutoReview } from "./review.js";
@@ -474,7 +474,12 @@ export async function handleHookEvent(
         // A real main-agent permission or elicitation is the escalation: it
         // must remain a human decision and is never delegated to a model.
         updateAgent(agentId, { state: "waiting_input" });
-        notify(`${who} needs input`, msg, { priority: "high", tags: "warning" });
+        notifyEvent(
+          "escalation",
+          `the orchestrator (${who}) needs your decision`,
+          `${msg}\nOnly you can answer this — it is deliberately never delegated to another model. Answer it in Command Center.`,
+          { priority: "high", tags: "warning", agentId, taskId: agent.task_id },
+        );
         break;
       }
 
@@ -680,12 +685,18 @@ async function reviewerStopped(agent: Agent): Promise<void> {
     taskId: agent.task_id ?? undefined,
   });
   if (prior === 0) {
-    notify(
+    notifyEvent(
+      "worker_stalled",
       `reviewer a${agent.id} stopped without a verdict`,
       stall.error
         ? `task #${agent.task_id} — auto-recovery gave up after ${MAX_AUTO_NUDGES} attempts (last seen: ${stall.error}); peek to see why, or kill it and re-spawn a reviewer`
         : `task #${agent.task_id} — peek to see why, or kill it and re-spawn a reviewer`,
-      { priority: "high", tags: "warning" },
+      {
+        priority: "high",
+        tags: "warning",
+        agentId: agent.id,
+        taskId: agent.task_id,
+      },
     );
   }
 }
@@ -710,10 +721,11 @@ function completeIfReviewDisabled(task: Task, agentId: number): boolean {
     agentId,
     payload: { reason: "review disabled" },
   });
-  notify(
-    `task #${task.id} auto-completed`,
-    `${task.title} — review disabled, no PR to merge`,
-    { tags: "tada" },
+  notifyEvent(
+    "task_completed",
+    `task #${task.id} done`,
+    `${task.title} — review is disabled for it and there was no PR to merge, so it completed itself. Nothing needed from you.`,
+    { tags: "tada", taskId: task.id, agentId },
   );
   return true;
 }
@@ -753,22 +765,32 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
       if (completeIfReviewDisabled(task, agent.id)) return;
       updateTask(task.id, { status: "review" });
       logEvent("task.review", { taskId: task.id, agentId: agent.id });
-      notify(
-        `task #${task.id} ready for review`,
-        fresh!.pr_url ? `${task.title}\n${fresh!.pr_url}` : task.title,
-        { tags: "eyes" },
+      // NOT "ready for review" — nothing is asked of a human here. The task is
+      // handed to the automatic adversarial reviewer; the human-facing push
+      // happens at the other end of that loop (review.notifyApprovedReady).
+      notifyEvent(
+        "task_review_entered",
+        `task #${task.id} entering automatic review`,
+        `${task.title}${fresh!.pr_url ? `\n${fresh!.pr_url}` : ""}\nThe adversarial reviewer runs next — no action needed unless it approves or blocks.`,
+        { tags: "eyes", taskId: task.id, agentId: agent.id },
       );
       await maybeAutoReview(task.id);
     } else {
       const prior = countTaskEvents(task.id, "task.stopped_incomplete");
       logEvent("task.stopped_incomplete", { taskId: task.id, agentId: agent.id });
       if (prior === 0) {
-        notify(
+        notifyEvent(
+          "worker_stalled",
           `a${agent.id} stopped without completing #${task.id}`,
           stall.error
             ? `${task.title} — no result set; auto-recovery gave up after ${MAX_AUTO_NUDGES} attempts (last seen: ${stall.error}); peek, steer, or requeue`
             : `${task.title} — no result set; peek, steer, or requeue`,
-          { priority: "high", tags: "warning" },
+          {
+            priority: "high",
+            tags: "warning",
+            taskId: task.id,
+            agentId: agent.id,
+          },
         );
       }
     }
@@ -803,10 +825,11 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     logEvent("verify.passed", { taskId: task.id, agentId: agent.id });
     if (completeIfReviewDisabled(current, agent.id)) return;
     updateTask(task.id, { status: "review" });
-    notify(
-      `task #${task.id} ready for review`,
-      `${task.title} — verify passed${current.pr_url ? `\n${current.pr_url}` : ""}`,
-      { tags: "eyes,white_check_mark" },
+    notifyEvent(
+      "task_review_entered",
+      `task #${task.id} entering automatic review`,
+      `${task.title} — verify passed${current.pr_url ? `\n${current.pr_url}` : ""}\nThe adversarial reviewer runs next — no action needed unless it approves or blocks.`,
+      { tags: "eyes,white_check_mark", taskId: task.id, agentId: agent.id },
     );
     await maybeAutoReview(task.id);
     return;
@@ -845,10 +868,17 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
       agentId: agent.id,
       payload: { reason: "verification failed repeatedly" },
     });
-    notify(
-      `task #${task.id} blocked`,
-      `${task.title} — verification failed repeatedly${stallNote}`,
-      { priority: "high", tags: "rotating_light" },
+    notifyEvent(
+      "task_blocked",
+      `task #${task.id} blocked — verification keeps failing`,
+      `${task.title}\n\`${task.verify_cmd}\` failed ${priorFails + 1} times and the worker could not fix it${stallNote}. It will not retry on its own — steer it, requeue it, or fix the verify command.`,
+      {
+        priority: "high",
+        tags: "rotating_light",
+        taskId: task.id,
+        agentId: agent.id,
+        once: `task:${task.id}:blocked:verify:${priorFails + 1}`,
+      },
     );
   }
 }
