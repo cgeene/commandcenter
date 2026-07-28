@@ -376,6 +376,51 @@ describe("main-role tools", () => {
     expect(Object.keys(out)).toEqual([...COMPACT_TASK_FIELDS, "verify_cmd"]);
   });
 
+  it("update_task exposes blocked_by so sequencing can be persisted", async () => {
+    const schema = registered.get("update_task")!.config.inputSchema!;
+    expect(Object.keys(schema)).toContain("blocked_by");
+  });
+
+  it("update_task forwards blocked_by and reports what the blocker means", async () => {
+    respond = (path, method) =>
+      method === "PATCH" ? fullTask({ blocked_by: 9 }) : fullTask({ id: 9, status: "done" });
+    const out = await callTool("update_task", { id: 42, blocked_by: 9 });
+
+    expect(fetchCalls[0]).toMatchObject({
+      method: "PATCH",
+      path: "/api/tasks/42",
+      body: { blocked_by: 9 },
+    });
+    // blocked_by is already in the compact core, so only the advisory is extra
+    expect(Object.keys(out)).toEqual([...COMPACT_TASK_FIELDS, "blocker"]);
+    expect(out.blocked_by).toBe(9);
+    expect(out.blocker).toMatchObject({ id: 9, status: "done", effect: "already-satisfied" });
+    expect(fetchCalls.at(-1)).toMatchObject({ method: "GET", path: "/api/tasks/9" });
+  });
+
+  it("update_task flags a blocker that can never become done", async () => {
+    respond = (path, method) =>
+      method === "PATCH"
+        ? fullTask({ blocked_by: 9 })
+        : fullTask({ id: 9, status: "cancelled" });
+    const out = await callTool("update_task", { id: 42, blocked_by: 9 });
+    expect(out.blocker).toMatchObject({ effect: "never-satisfied" });
+    expect(out.blocker.note).toMatch(/never become done/);
+  });
+
+  it("update_task clears blocked_by without an advisory lookup", async () => {
+    respond = () => fullTask({ blocked_by: null });
+    const out = await callTool("update_task", { id: 42, blocked_by: null });
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]).toMatchObject({
+      method: "PATCH",
+      path: "/api/tasks/42",
+      body: { blocked_by: null },
+    });
+    expect(out).not.toHaveProperty("blocker");
+    expect(out.blocked_by).toBeNull();
+  });
+
   it("add_task echoes only the compact record", async () => {
     const out = await callTool("add_task", {
       title: "t",
