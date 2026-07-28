@@ -1,7 +1,8 @@
 import { getAgent, listAgents, type Agent } from "../db/agents.js";
 import { latestTaskEvent, logEvent } from "../db/events.js";
+import { clearTriageQueueForTask } from "../db/notifications.js";
 import { getTask, readyTasks, type Task } from "../db/tasks.js";
-import { deliverToMainIfClear } from "./notifqueue.js";
+import { deliverToMainIfClear, queueDelivery } from "./notifqueue.js";
 import { windowExists } from "./tmux.js";
 
 function availableMain(preferred?: Agent): Agent | undefined {
@@ -39,14 +40,25 @@ function taskPrompt(task: Task, creatorKind: Agent["kind"] | null): string {
   return `[commandcenter] New ${descriptor} is awaiting your triage (workspace_kind=${task.workspace_kind}). Call get_task(${task.id}, verbose: true) — the compact default omits the prompt — study its full prompt, validate the scope and execution settings, then dispatch it. For portfolio tasks, never spawn the parent: mark it in_progress, use list_repositories, create per-repository child tasks with parent_task_id=${task.id}, preserve the parent's selected provider/model/reasoning effort unless you deliberately document an override, and spawn those isolated children. For scratch tasks, spawn the task directly and review its result/transcript rather than expecting a Git diff.`;
 }
 
-/** Deliver a newly-created orchestrated task to Claude main, or leave it queued. */
-export async function delegateTaskToMain(
+/**
+ * What became of a triage delegation attempt.
+ *
+ * "queued" is the distinction that matters to the human: the ping was accepted
+ * and persisted, but the main's composer was busy so it will arrive later. It
+ * used to be indistinguishable from "skipped", which is how a "Notify Claude
+ * Main" click could look like a plain failure — or, worse, like nothing at all.
+ */
+export type DelegateOutcome = "delivered" | "queued" | "already_queued" | "skipped";
+
+/** Deliver a newly-created orchestrated task to Claude main, or persist the
+ *  ping for the queue flush to deliver once the main's prompt is clear. */
+export async function delegateTaskToMainDetailed(
   taskId: number,
   preferredMain?: Agent,
-): Promise<boolean> {
+): Promise<DelegateOutcome> {
   const task = getTask(taskId);
   if (!task || task.dispatch_mode !== "orchestrated" || task.status !== "queued") {
-    return false;
+    return "skipped";
   }
   // A task main filed itself must never trigger a triage ping back to main —
   // on ANY route (immediate POST, PATCH re-queue, the manual /delegate
@@ -54,38 +66,57 @@ export async function delegateTaskToMain(
   // delegatePendingTaskToMain). Main already knows about it and dispatches it
   // directly; it stays queued and visible via list_tasks(ready=true).
   if (taskCreatorKind(task.id) === "main") {
-    return false;
+    return "skipped";
   }
   if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
-    return false;
+    return "skipped";
   }
   const main = availableMain(preferredMain);
   if (!main) {
     logEvent("task.awaiting_main", { taskId });
-    return false;
+    return "skipped";
   }
   // Never merge the triage prompt into the human's mid-typed draft or fire it
   // mid-turn: deliver only when the main is idle with a genuinely clear prompt
   // (the same gate every main-delivery path shares — see deliverToMainIfClear).
-  // Otherwise leave the task queued — the main's idle/Stop hooks and the
-  // scheduler's periodic delegatePendingTaskToLiveMain retry it.
-  const delivered = await deliverToMainIfClear(
-    main,
-    taskPrompt(task, taskCreatorKind(task.id)),
-  );
+  const message = taskPrompt(task, taskCreatorKind(task.id));
+  const delivered = await deliverToMainIfClear(main, message);
   if (delivered !== "delivered") {
     logEvent("task.awaiting_main", {
       taskId,
       payload: { main_agent_id: main.id, reason: "main_prompt_busy" },
     });
-    return false;
+    // Persist the ping instead of relying purely on re-derivation from task
+    // state. The state-derived retry (delegatePendingTaskToMain) only ever
+    // delivers the OLDEST pending task, so a deliberate ping for a task further
+    // down the queue could wait behind everything in front of it — and before
+    // this row existed there was no record that a delivery was owed at all, so
+    // a daemon restart erased the request without a trace.
+    const created = queueDelivery({
+      mainId: main.id,
+      taskId: task.id,
+      message,
+      origin: "task_triage",
+      reason: "main_prompt_busy",
+    });
+    return created ? "queued" : "already_queued";
   }
+  // Delivered live — drop any earlier queued copy so the flush cannot repeat it.
+  clearTriageQueueForTask(task.id);
   logEvent("task.delegated_to_main", {
     taskId,
     agentId: main.id,
     payload: { workspace_kind: task.workspace_kind },
   });
-  return true;
+  return "delivered";
+}
+
+/** Boolean form: true only when the triage prompt actually reached the main. */
+export async function delegateTaskToMain(
+  taskId: number,
+  preferredMain?: Agent,
+): Promise<boolean> {
+  return (await delegateTaskToMainDetailed(taskId, preferredMain)) === "delivered";
 }
 
 /** On main startup/idle, re-deliver the oldest task that still needs triage. */
