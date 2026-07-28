@@ -125,7 +125,17 @@ a PR is expected, and `review_mode` (`full` by default, or `light` for
 documentation/threshold/runbook work) controls how deep the adversarial review
 goes. Each task also snapshots the effective publication mode when
 it is created, so changing the local default never changes work already in
-flight. Statuses:
+flight.
+
+Priority is advisory when a **worker** files a follow-up task: a worker-filed
+task is granted at most priority `3`, or its filer's own priority when that is
+lower, so a follow-up can never jump ahead of work the human and the
+orchestrator already sequenced. The priority the worker asked for is kept in the
+`task.created` event and surfaced in the triage prompt, so the orchestrator can
+promote it deliberately. Tasks filed by the orchestrator or a human are
+unaffected.
+
+Statuses:
 
 ```
 queued → claimed → in_progress → blocked / review → done / failed

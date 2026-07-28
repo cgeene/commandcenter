@@ -16,20 +16,33 @@ function availableMain(preferred?: Agent): Agent | undefined {
   );
 }
 
-/** Kind of the agent that created a task, from its task.created event
- *  (null when a human filed it via the dashboard/CLI). */
-function taskCreatorKind(taskId: number): Agent["kind"] | null {
+/** Payload of a task's creation event, or null when it is absent/unparseable. */
+function taskCreationPayload(taskId: number): Record<string, unknown> | null {
   const created = latestTaskEvent(taskId, ["task.created"]);
   if (!created?.payload) return null;
   try {
-    const payload = JSON.parse(created.payload) as { creator_kind?: unknown };
-    const kind = payload.creator_kind;
-    return kind === "main" || kind === "worker" || kind === "reviewer"
-      ? kind
+    const payload = JSON.parse(created.payload) as unknown;
+    return typeof payload === "object" && payload !== null
+      ? (payload as Record<string, unknown>)
       : null;
   } catch {
     return null;
   }
+}
+
+/** Kind of the agent that created a task, from its task.created event
+ *  (null when a human filed it via the dashboard/CLI). */
+function taskCreatorKind(taskId: number): Agent["kind"] | null {
+  const kind = taskCreationPayload(taskId)?.creator_kind;
+  return kind === "main" || kind === "worker" || kind === "reviewer" ? kind : null;
+}
+
+/** The priority a worker asked for when it was overruled by the filing policy
+ *  (see src/lib/task-priority.ts), so triage still sees the worker's own
+ *  urgency signal and can promote the task deliberately. */
+function clampedPriorityRequest(taskId: number): number | null {
+  const requested = taskCreationPayload(taskId)?.requested_priority;
+  return typeof requested === "number" ? requested : null;
 }
 
 function pendingHumanWorkerResume(taskId: number): boolean {
@@ -52,7 +65,13 @@ function taskPrompt(task: Task, creatorKind: Agent["kind"] | null): string {
     creatorKind === "worker"
       ? `worker-filed follow-up task #${task.id}`
       : `human-submitted task #${task.id}`;
-  return `[commandcenter] New ${descriptor} is awaiting your triage (workspace_kind=${task.workspace_kind}). Call get_task(${task.id}, verbose: true) — the compact default omits the prompt — study its full prompt, validate the scope and execution settings, then dispatch it. For portfolio tasks, never spawn the parent: mark it in_progress, use list_repositories, create per-repository child tasks with parent_task_id=${task.id}, preserve the parent's selected provider/model/reasoning effort unless you deliberately document an override, and spawn those isolated children. For scratch tasks, spawn the task directly and review its result/transcript rather than expecting a Git diff.`;
+  const requested =
+    creatorKind === "worker" ? clampedPriorityRequest(task.id) : null;
+  const clampNote =
+    requested === null
+      ? ""
+      : ` The filing worker asked for priority ${requested}; worker-filed work is capped, so it was queued at ${task.priority} — promote it yourself if that request is justified.`;
+  return `[commandcenter] New ${descriptor} is awaiting your triage (workspace_kind=${task.workspace_kind}).${clampNote} Call get_task(${task.id}, verbose: true) — the compact default omits the prompt — study its full prompt, validate the scope and execution settings, then dispatch it. For portfolio tasks, never spawn the parent: mark it in_progress, use list_repositories, create per-repository child tasks with parent_task_id=${task.id}, preserve the parent's selected provider/model/reasoning effort unless you deliberately document an override, and spawn those isolated children. For scratch tasks, spawn the task directly and review its result/transcript rather than expecting a Git diff.`;
 }
 
 /**
