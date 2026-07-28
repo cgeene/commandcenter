@@ -149,6 +149,9 @@ describe("transcript reader", () => {
       output: 100,
       cache_read: 100,
       cache_creation: 0,
+      // Codex reports no prompt-cache writes at all, so neither TTL bucket
+      // ever fills for a Codex session.
+      cache_creation_1h: 0,
       total: 1000,
     });
   });

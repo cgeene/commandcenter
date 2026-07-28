@@ -44,11 +44,12 @@ export interface ModelSpend {
   priced: boolean;
 }
 
-const ZERO: TokenCounts = {
+const ZERO: Required<TokenCounts> = {
   input_tokens: 0,
   output_tokens: 0,
   cache_read: 0,
   cache_creation: 0,
+  cache_creation_1h: 0,
 };
 
 /**
@@ -75,39 +76,47 @@ export function recordTokenSample(
   const day = dayKey(now);
 
   const readMark = db.prepare(
-    `SELECT input_tokens, output_tokens, cache_read, cache_creation
+    `SELECT input_tokens, output_tokens, cache_read, cache_creation, cache_creation_1h
        FROM token_samples WHERE session_id = ? AND model = ?`,
   );
   const writeMark = db.prepare(
     `INSERT INTO token_samples
-       (session_id, model, input_tokens, output_tokens, cache_read, cache_creation, sampled_at)
-     VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+       (session_id, model, input_tokens, output_tokens, cache_read, cache_creation,
+        cache_creation_1h, sampled_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
      ON CONFLICT(session_id, model) DO UPDATE SET
        input_tokens = excluded.input_tokens,
        output_tokens = excluded.output_tokens,
        cache_read = excluded.cache_read,
        cache_creation = excluded.cache_creation,
+       cache_creation_1h = excluded.cache_creation_1h,
        sampled_at = excluded.sampled_at`,
   );
   const addDay = db.prepare(
     `INSERT INTO token_daily
-       (day, agent_kind, model, input_tokens, output_tokens, cache_read, cache_creation)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+       (day, agent_kind, model, input_tokens, output_tokens, cache_read, cache_creation,
+        cache_creation_1h)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(day, agent_kind, model) DO UPDATE SET
        input_tokens = input_tokens + excluded.input_tokens,
        output_tokens = output_tokens + excluded.output_tokens,
        cache_read = cache_read + excluded.cache_read,
-       cache_creation = cache_creation + excluded.cache_creation`,
+       cache_creation = cache_creation + excluded.cache_creation,
+       cache_creation_1h = cache_creation_1h + excluded.cache_creation_1h`,
   );
 
   db.transaction(() => {
     for (const [model, cumulative] of totals) {
-      const prev = (readMark.get(sessionId, model) as TokenCounts | undefined) ?? ZERO;
-      const delta: TokenCounts = {
+      const prev = (readMark.get(sessionId, model) as Required<TokenCounts> | undefined) ?? ZERO;
+      const delta: Required<TokenCounts> = {
         input_tokens: Math.max(0, cumulative.input_tokens - prev.input_tokens),
         output_tokens: Math.max(0, cumulative.output_tokens - prev.output_tokens),
         cache_read: Math.max(0, cumulative.cache_read - prev.cache_read),
         cache_creation: Math.max(0, cumulative.cache_creation - prev.cache_creation),
+        cache_creation_1h: Math.max(
+          0,
+          (cumulative.cache_creation_1h ?? 0) - prev.cache_creation_1h,
+        ),
       };
       // Always advance the watermark, even on a no-op delta: a cumulative total
       // that shrank should re-baseline rather than replay on the next sample.
@@ -118,6 +127,7 @@ export function recordTokenSample(
         cumulative.output_tokens,
         cumulative.cache_read,
         cumulative.cache_creation,
+        cumulative.cache_creation_1h ?? 0,
       );
       if (totalTokens(delta) === 0) continue;
       addDay.run(
@@ -128,6 +138,9 @@ export function recordTokenSample(
         delta.output_tokens,
         delta.cache_read,
         delta.cache_creation,
+        // Can't exceed the same sample's total write delta, whatever the
+        // upstream numbers did.
+        Math.min(delta.cache_creation_1h, delta.cache_creation),
       );
     }
   })();
@@ -137,7 +150,8 @@ export function recordTokenSample(
 export function dayBuckets(start: string, end: string): DayBucket[] {
   return getDb()
     .prepare(
-      `SELECT day, agent_kind, model, input_tokens, output_tokens, cache_read, cache_creation
+      `SELECT day, agent_kind, model, input_tokens, output_tokens, cache_read, cache_creation,
+              cache_creation_1h
          FROM token_daily WHERE day >= ? AND day < ? ORDER BY day`,
     )
     .all(start, end) as DayBucket[];
@@ -146,7 +160,8 @@ export function dayBuckets(start: string, end: string): DayBucket[] {
 export function allBuckets(): DayBucket[] {
   return getDb()
     .prepare(
-      `SELECT day, agent_kind, model, input_tokens, output_tokens, cache_read, cache_creation
+      `SELECT day, agent_kind, model, input_tokens, output_tokens, cache_read, cache_creation,
+              cache_creation_1h
          FROM token_daily ORDER BY day`,
     )
     .all() as DayBucket[];
@@ -168,7 +183,7 @@ export function summarizeByDay(buckets: DayBucket[]): DaySpend[] {
     const row = byDay.get(b.day) ?? { day: b.day, tokens: 0, cost_usd: 0, unpriced_tokens: 0 };
     const tokens = totalTokens(b);
     row.tokens += tokens;
-    if (normalizeModel(b.model)) row.cost_usd += estimateCostUsd(b, b.model);
+    if (normalizeModel(b.model)) row.cost_usd += estimateCostUsd(b, b.model, b.day);
     else row.unpriced_tokens += tokens;
     byDay.set(b.day, row);
   }
@@ -183,12 +198,8 @@ export function summarizeByModel(buckets: DayBucket[]): ModelSpend[] {
       byModel.get(b.model) ??
       { model: b.model, tokens: 0, cost_usd: 0, priced: normalizeModel(b.model) !== undefined };
     row.tokens += totalTokens(b);
-    if (row.priced) row.cost_usd += estimateCostUsd(b, b.model);
+    if (row.priced) row.cost_usd += estimateCostUsd(b, b.model, b.day);
     byModel.set(b.model, row);
   }
   return [...byModel.values()].sort((a, b) => b.tokens - a.tokens);
-}
-
-export function totalCostUsd(buckets: DayBucket[]): number {
-  return buckets.reduce((sum, b) => sum + estimateCostUsd(b, b.model), 0);
 }

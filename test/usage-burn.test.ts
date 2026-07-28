@@ -38,11 +38,18 @@ afterEach(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-const counts = (input: number, output: number, cacheRead = 0, cacheCreation = 0) => ({
+const counts = (
+  input: number,
+  output: number,
+  cacheRead = 0,
+  cacheCreation = 0,
+  cacheCreation1h = 0,
+) => ({
   input_tokens: input,
   output_tokens: output,
   cache_read: cacheRead,
   cache_creation: cacheCreation,
+  cache_creation_1h: cacheCreation1h,
 });
 
 describe("token_daily migration", () => {
@@ -68,7 +75,43 @@ describe("token_daily migration", () => {
       "output_tokens",
       "cache_read",
       "cache_creation",
+      "cache_creation_1h",
     ]);
+  });
+
+  it("adds cache_creation_1h to burn tables created before the column existed", async () => {
+    const { getDb, closeDb } = await import("../src/db/db.js");
+    // Recreate the pre-column shape, then let migrate() run on reopen.
+    const db = getDb();
+    db.exec("DROP TABLE token_daily; DROP TABLE token_samples");
+    db.exec(`CREATE TABLE token_daily (
+      day TEXT NOT NULL, agent_kind TEXT NOT NULL, model TEXT NOT NULL,
+      input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read INTEGER NOT NULL DEFAULT 0, cache_creation INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, agent_kind, model))`);
+    db.exec(`CREATE TABLE token_samples (
+      session_id TEXT NOT NULL, model TEXT NOT NULL,
+      input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read INTEGER NOT NULL DEFAULT 0, cache_creation INTEGER NOT NULL DEFAULT 0,
+      sampled_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+      PRIMARY KEY (session_id, model))`);
+    db.prepare(
+      "INSERT INTO token_daily (day, agent_kind, model, cache_creation) VALUES ('2026-07-01','worker','claude-opus-5', 42)",
+    ).run();
+    closeDb();
+
+    const fresh = getDb();
+    for (const table of ["token_daily", "token_samples"]) {
+      const cols = (fresh.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(
+        (c) => c.name,
+      );
+      expect(cols, table).toContain("cache_creation_1h");
+    }
+    // Existing rows survive and default to zero (priced at the cheaper rate).
+    const row = fresh
+      .prepare("SELECT cache_creation, cache_creation_1h FROM token_daily")
+      .get() as { cache_creation: number; cache_creation_1h: number };
+    expect(row).toEqual({ cache_creation: 42, cache_creation_1h: 0 });
   });
 
   it("is idempotent — re-opening the database preserves recorded burn", async () => {
@@ -168,6 +211,26 @@ describe("delta bucketing", () => {
     expect(allBuckets()[0].input_tokens).toBe(1200);
   });
 
+  it("carries the 1-hour cache-write subset through to the day bucket", async () => {
+    const { recordTokenSample, allBuckets } = await import("../src/db/tokens.js");
+    const day = new Date("2026-07-20T09:00:00Z");
+    recordTokenSample("s1", "worker", new Map([["claude-opus-5", counts(0, 0, 0, 1000, 800)]]), day);
+    recordTokenSample("s1", "worker", new Map([["claude-opus-5", counts(0, 0, 0, 2500, 2000)]]), day);
+
+    const row = allBuckets()[0];
+    expect(row.cache_creation).toBe(2500);
+    expect(row.cache_creation_1h).toBe(2000);
+  });
+
+  it("never records a 1h subset larger than the write delta it belongs to", async () => {
+    const { recordTokenSample, allBuckets } = await import("../src/db/tokens.js");
+    const day = new Date("2026-07-20T09:00:00Z");
+    // Nonsensical upstream: more 1h tokens than total writes.
+    recordTokenSample("s1", "worker", new Map([["claude-opus-5", counts(0, 0, 0, 100, 900)]]), day);
+    const row = allBuckets()[0];
+    expect(row.cache_creation_1h).toBeLessThanOrEqual(row.cache_creation);
+  });
+
   it("records nothing for an empty sample", async () => {
     const { recordTokenSample, allBuckets } = await import("../src/db/tokens.js");
     recordTokenSample("s1", "worker", new Map());
@@ -251,6 +314,45 @@ describe("per-model transcript sums", () => {
     fs.mkdirSync(process.env.CC_CLAUDE_PROJECTS, { recursive: true });
   });
 
+  it("reads the cache-write TTL split when the transcript provides it", async () => {
+    // Shape verified against a live JSONL: the flat total is mirrored by a
+    // `cache_creation` object breaking it down by TTL, and real sessions are
+    // overwhelmingly 1h — which bills at 2x, not 1.25x.
+    const dir = path.join(process.env.CC_CLAUDE_PROJECTS!, "-x-repo");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, `${SID}.jsonl`),
+      JSON.stringify({
+        type: "assistant",
+        message: {
+          model: "claude-opus-4-8",
+          usage: {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 20276,
+            cache_creation: {
+              ephemeral_1h_input_tokens: 20276,
+              ephemeral_5m_input_tokens: 0,
+            },
+          },
+        },
+      }),
+    );
+    const { sessionTokensByModel } = await import("../src/daemon/transcript.js");
+    const t = sessionTokensByModel(SID, "fallback").get("claude-opus-4-8")!;
+    expect(t.cache_creation).toBe(20276);
+    expect(t.cache_creation_1h).toBe(20276);
+  });
+
+  it("reports no 1h portion when only the flat total is present", async () => {
+    writeTranscript([{ model: "claude-opus-4-8", inp: 100, out: 10 }]);
+    const { sessionTokensByModel } = await import("../src/daemon/transcript.js");
+    const t = sessionTokensByModel(SID, "fallback").get("claude-opus-4-8")!;
+    expect(t.cache_creation).toBe(5);
+    expect(t.cache_creation_1h).toBe(0);
+  });
+
   it("splits a mixed-model session by the model that served each turn", async () => {
     writeTranscript([
       { model: "claude-opus-4-8", inp: 1000, out: 100 },
@@ -332,6 +434,24 @@ describe("live usage poller", () => {
     });
     const state = await mod.refreshLiveUsage();
     expect(state.error).toBe("HTTP 503");
+    expect(state.usage?.headline?.percent).toBe(57);
+    mod._setUsageFetch(null);
+    mod._setCredentialReader(null);
+  });
+
+  it("awaits an async credential reader", async () => {
+    // The real reader shells out to `security`, which must never run
+    // synchronously — a locked keychain would otherwise block the event loop
+    // (daemon startup and every HTTP request, including /api/usage/refresh).
+    const mod = await import("../src/daemon/usagelive.js");
+    mod._resetLiveUsageState();
+    mod._setCredentialReader(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      return { token: "t", expires_at: Date.now() + 3_600_000 };
+    });
+    mod._setUsageFetch(async () => OK_PAYLOAD);
+    const state = await mod.refreshLiveUsage();
+    expect(state.error).toBeNull();
     expect(state.usage?.headline?.percent).toBe(57);
     mod._setUsageFetch(null);
     mod._setCredentialReader(null);

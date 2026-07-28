@@ -10,46 +10,69 @@
  * this module produces as an estimate and label it that way in the UI.
  */
 
-/** USD per MILLION tokens for one model. */
+/** USD per MILLION tokens for one model, at one point in time. */
 export interface ModelPrice {
   input: number;
   output: number;
+  /** Reading a cached prefix: 0.1x input. */
   cache_read: number;
-  /** Writing a prompt-cache entry. Assumes the 5-minute TTL (1.25x input);
-   *  1-hour-TTL writes bill at 2x and are not distinguished in the transcript. */
-  cache_write: number;
+  /** Writing a 5-minute-TTL cache entry: 1.25x input. */
+  cache_write_5m: number;
+  /** Writing a 1-hour-TTL cache entry: 2x input. Transcripts DO distinguish
+   *  the two (usage.cache_creation.ephemeral_{1h,5m}_input_tokens), and real
+   *  sessions here are overwhelmingly 1h, so conflating them at 1.25x
+   *  understates the largest input-side line by 37.5%. */
+  cache_write_1h: number;
 }
 
+/** One rate change. `from` is the first UTC day the rate applies (inclusive). */
+interface PricePoint {
+  from: string;
+  input: number;
+  output: number;
+}
+
+/** Sentinel for "has always been this price as far as we're concerned". */
+const EPOCH = "0000-01-01";
+
 /**
- * Static price table, USD per million tokens.
+ * Static price schedule, USD per million tokens.
  *
  * ⚠️ MANUAL MAINTENANCE REQUIRED. Anthropic changes prices and ships new models
- * without notifying this repo. When a price moves or a model lands, edit this
- * map — nothing else in the codebase needs to change. Cache rates follow the
- * published multipliers: reads are 0.1x input, 5-minute writes are 1.25x input.
+ * without notifying this repo. When a price moves, append a PricePoint — do not
+ * edit the old one, so historical days keep costing at the rate that was
+ * actually in effect. Cache rates are derived from input at the published
+ * multipliers (read 0.1x, 5m write 1.25x, 1h write 2x).
  *
- * Last checked: 2026-07-27.
+ * Last checked: 2026-07-28 against platform.claude.com/docs/en/about-claude/pricing.
  */
-export const MODEL_PRICES: Readonly<Record<string, ModelPrice>> = {
-  "claude-fable-5": price(10, 50),
-  "claude-mythos-5": price(10, 50),
-  "claude-opus-5": price(5, 25),
-  "claude-opus-4-8": price(5, 25),
-  "claude-opus-4-7": price(5, 25),
-  "claude-opus-4-6": price(5, 25),
-  "claude-opus-4-5": price(5, 25),
-  "claude-sonnet-5": price(3, 15),
-  "claude-sonnet-4-6": price(3, 15),
-  "claude-sonnet-4-5": price(3, 15),
-  "claude-haiku-4-5": price(1, 5),
+export const PRICE_SCHEDULE: Readonly<Record<string, readonly PricePoint[]>> = {
+  "claude-fable-5": [{ from: EPOCH, input: 10, output: 50 }],
+  "claude-mythos-5": [{ from: EPOCH, input: 10, output: 50 }],
+  "claude-opus-5": [{ from: EPOCH, input: 5, output: 25 }],
+  "claude-opus-4-8": [{ from: EPOCH, input: 5, output: 25 }],
+  "claude-opus-4-7": [{ from: EPOCH, input: 5, output: 25 }],
+  "claude-opus-4-6": [{ from: EPOCH, input: 5, output: 25 }],
+  "claude-opus-4-5": [{ from: EPOCH, input: 5, output: 25 }],
+  // Sonnet 5 launched on introductory pricing; the standard rate takes over
+  // on 2026-09-01. Encoded rather than hardcoded so the switchover happens on
+  // its own instead of silently under-reporting from September.
+  "claude-sonnet-5": [
+    { from: EPOCH, input: 2, output: 10 },
+    { from: "2026-09-01", input: 3, output: 15 },
+  ],
+  "claude-sonnet-4-6": [{ from: EPOCH, input: 3, output: 15 }],
+  "claude-sonnet-4-5": [{ from: EPOCH, input: 3, output: 15 }],
+  "claude-haiku-4-5": [{ from: EPOCH, input: 1, output: 5 }],
 };
 
-function price(input: number, output: number): ModelPrice {
+function priceFrom(point: PricePoint): ModelPrice {
   return {
-    input,
-    output,
-    cache_read: input * 0.1,
-    cache_write: input * 1.25,
+    input: point.input,
+    output: point.output,
+    cache_read: point.input * 0.1,
+    cache_write_5m: point.input * 1.25,
+    cache_write_1h: point.input * 2,
   };
 }
 
@@ -62,18 +85,38 @@ const SLUG_ALIASES: Readonly<Record<string, string>> = {
   haiku: "claude-haiku-4-5",
 };
 
+/** A day's worth of burn is priced at the rate in effect THAT day, so a rate
+ *  change mid-cycle doesn't retroactively re-price everything before it. */
+export type PricedAt = Date | string | undefined;
+
+function asDayKey(at: PricedAt): string {
+  if (typeof at === "string") return at.slice(0, 10);
+  return dayKey(at ?? new Date());
+}
+
 /**
- * Resolve a model identifier to a price entry. Handles the short slugs the
- * dashboard stores on tasks, the full API ids the transcript records, and
- * dated/prefixed variants (`anthropic.claude-opus-5`, `claude-opus-4-5-20251101`).
+ * Resolve a model identifier to the price in effect on a given day. Handles the
+ * short slugs the dashboard stores on tasks, the full API ids the transcript
+ * records, and dated/prefixed variants (`anthropic.claude-opus-5`,
+ * `claude-opus-4-5-20251101`).
  *
  * Returns undefined for anything we can't price — notably Codex/GPT models,
  * which aren't Anthropic-billed at all. Callers must surface those tokens as
  * unpriced rather than silently costing them at zero.
  */
-export function resolveModelPrice(model: string | null | undefined): ModelPrice | undefined {
+export function resolveModelPrice(
+  model: string | null | undefined,
+  at?: PricedAt,
+): ModelPrice | undefined {
   const key = normalizeModel(model);
-  return key ? MODEL_PRICES[key] : undefined;
+  if (!key) return undefined;
+  const points = PRICE_SCHEDULE[key];
+  if (!points?.length) return undefined;
+  const day = asDayKey(at);
+  // Last point whose start day has arrived; the EPOCH entry always qualifies.
+  let chosen = points[0];
+  for (const p of points) if (p.from <= day) chosen = p;
+  return priceFrom(chosen);
 }
 
 /** Canonical price-table key for a model identifier, or undefined if unknown. */
@@ -86,10 +129,10 @@ export function normalizeModel(model: string | null | undefined): string | undef
   id = id.replace(/^anthropic\./, "");
   // Vertex-style @version separator.
   id = id.replace(/@\d+$/, "");
-  if (MODEL_PRICES[id]) return id;
+  if (PRICE_SCHEDULE[id]) return id;
   // Dated snapshot (claude-opus-4-5-20251101) → alias.
   const undated = id.replace(/-\d{8}$/, "");
-  if (MODEL_PRICES[undated]) return undated;
+  if (PRICE_SCHEDULE[undated]) return undated;
   return undefined;
 }
 
@@ -97,18 +140,31 @@ export interface TokenCounts {
   input_tokens: number;
   output_tokens: number;
   cache_read: number;
+  /** TOTAL cache-write tokens, both TTLs. */
   cache_creation: number;
+  /** The 1-hour-TTL subset of cache_creation, which bills at 2x rather than
+   *  1.25x. Absent on rows recorded before the split was tracked, in which
+   *  case the whole total is charged at the cheaper 5m rate. */
+  cache_creation_1h?: number;
 }
 
-/** Estimated USD for a token bundle at a given model's rates. */
-export function estimateCostUsd(tokens: TokenCounts, model: string | null | undefined): number {
-  const p = resolveModelPrice(model);
+/** Estimated USD for a token bundle at the rates in effect on `at`. */
+export function estimateCostUsd(
+  tokens: TokenCounts,
+  model: string | null | undefined,
+  at?: PricedAt,
+): number {
+  const p = resolveModelPrice(model, at);
   if (!p) return 0;
+  // Clamp: a malformed row must never make the 5m remainder negative.
+  const oneHour = Math.min(Math.max(tokens.cache_creation_1h ?? 0, 0), tokens.cache_creation);
+  const fiveMin = tokens.cache_creation - oneHour;
   return (
     (tokens.input_tokens * p.input +
       tokens.output_tokens * p.output +
       tokens.cache_read * p.cache_read +
-      tokens.cache_creation * p.cache_write) /
+      fiveMin * p.cache_write_5m +
+      oneHour * p.cache_write_1h) /
     1_000_000
   );
 }

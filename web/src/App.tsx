@@ -30,7 +30,7 @@ import {
 } from "../../src/lib/app-attention";
 import { Terminal } from "./Terminal";
 import { resetsIn } from "../../src/lib/usage";
-import { daysInWindow, paceTarget, projectedCycleSpend } from "../../src/lib/pricing";
+import { projectedCycleSpend } from "../../src/lib/pricing";
 import type {
   Agent,
   AppSettings,
@@ -1216,6 +1216,41 @@ function useUsage(): {
   return { usage, refresh, refreshing };
 }
 
+/**
+ * "$X of $Y this cycle" against the configured monthly quota.
+ *
+ * Rendered independently of the live feed. The live meters report plan windows
+ * as percentages (on a Team seat they carry no dollars at all), so if this bar
+ * only appeared when the live feed was DOWN, a configured quota would be
+ * invisible on the machines that matter. Percent meters and a dollar budget
+ * answer different questions and are shown together.
+ */
+function QuotaBudgetBar({ usage }: { usage: UsagePayload }) {
+  const quota = usage.quota.monthly_quota_usd;
+  if (quota === null) return null;
+  const orgTotal = usage.org.total_usd;
+  const spent = orgTotal ?? usage.local.cycle.cost_usd;
+  const pct = Math.min(100, (spent / quota) * 100);
+  return (
+    <div className="bar-row">
+      <div className="bar-label">
+        <span>
+          Budget{" "}
+          <span className="muted">
+            ({orgTotal !== null ? "org billing" : "local estimate"})
+          </span>
+        </span>
+        <b>
+          {fmtUsd(spent)} / {fmtUsd(quota)}
+        </b>
+      </div>
+      <div className="bar-track">
+        <span className={`bar-fill quota ${meterTone(pct)}`} style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
+
 /** Percent → the same red/yellow/green banding the rest of the board uses. */
 function meterTone(percent: number | null): string {
   if (percent === null) return "";
@@ -1293,6 +1328,7 @@ function SpendHeadline({
           {shown.map((m) => (
             <MeterBar key={m.key} meter={m} now={now} />
           ))}
+          <QuotaBudgetBar usage={usage} />
         </div>
         {spend?.limit_reached && (
           <p className="spend-note bad">
@@ -1458,6 +1494,7 @@ function DashboardView({
   refreshingUsage: boolean;
   onSelect: (t: Task) => void;
 }) {
+  const [spendView, setSpendView] = useState<"cycle" | "all">("cycle");
   const statusOrder = ["queued", "in_progress", "review", "blocked", "done", "failed"];
   const statusRows = statusOrder.map((status) => ({
     status,
@@ -1624,23 +1661,45 @@ function DashboardView({
             refreshing={refreshingUsage}
             compact
           />
-          {tokenRows.length > 0 && (
-            <>
-              <div className="panel-subhead muted">All-time tokens by model</div>
-              <div className="bar-list">
-                {tokenRows.map((row) => (
-                  <div key={row.label} className="bar-row">
-                    <div className="bar-label">
-                      <span>{row.label}</span>
-                      <b>{fmtTokens(row.tokens)}</b>
-                    </div>
-                    <div className="bar-track">
-                      <span className="bar-fill tokens" style={{ width: `${(row.tokens / maxTokens) * 100}%` }} />
-                    </div>
+          {/* Cycle-to-date is the default view here too — an all-time counter
+              can't tell you whether this month is on track. All-time stays one
+              click away. */}
+          <div className="view-toggle">
+            <button
+              className={spendView === "cycle" ? "sched-on" : ""}
+              onClick={() => setSpendView("cycle")}
+            >
+              This cycle
+            </button>
+            <button
+              className={spendView === "all" ? "sched-on" : ""}
+              onClick={() => setSpendView("all")}
+            >
+              All time
+            </button>
+          </div>
+          {spendView === "cycle" ? (
+            usage && usage.local.cycle.tokens > 0 ? (
+              <BurnChart usage={usage} />
+            ) : (
+              <span className="empty-panel muted">No burn recorded this cycle yet</span>
+            )
+          ) : tokenRows.length > 0 ? (
+            <div className="bar-list">
+              {tokenRows.map((row) => (
+                <div key={row.label} className="bar-row">
+                  <div className="bar-label">
+                    <span>{row.label}</span>
+                    <b>{fmtTokens(row.tokens)}</b>
                   </div>
-                ))}
-              </div>
-            </>
+                  <div className="bar-track">
+                    <span className="bar-fill tokens" style={{ width: `${(row.tokens / maxTokens) * 100}%` }} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <span className="empty-panel muted">No token usage recorded yet</span>
           )}
         </section>
 

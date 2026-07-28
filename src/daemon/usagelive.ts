@@ -1,6 +1,7 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
 import { claudeHomeDir, liveUsageEnabled } from "../config.js";
 import { logEvent } from "../db/events.js";
 import { getLiveUsageCache, setLiveUsageCache } from "../db/settings.js";
@@ -39,6 +40,10 @@ const KEYCHAIN_SERVICE = "Claude Code-credentials";
 /** The live entry's account. A second, stale entry exists under the operator's
  *  email address and a bare lookup returns THAT one — always ask by account. */
 const KEYCHAIN_ACCOUNT = "claude-code-user";
+/** Hard ceiling on the keychain lookup. A locked keychain or an un-approved
+ *  ACL makes `security` sit on a GUI prompt indefinitely; we'd rather report
+ *  the credential as unavailable and fall back to the local estimate. */
+const KEYCHAIN_TIMEOUT_MS = 5_000;
 
 interface Credential {
   token: string;
@@ -49,13 +54,14 @@ interface Credential {
 /* ---- test seams: swap the two impure edges ---- */
 
 type Fetcher = (token: string) => Promise<unknown>;
+type CredentialReader = () => Credential | undefined | Promise<Credential | undefined>;
 let fetchUsage: Fetcher = defaultFetchUsage;
-let readCredential: () => Credential | undefined = defaultReadCredential;
+let readCredential: CredentialReader = defaultReadCredential;
 
 export function _setUsageFetch(fn: Fetcher | null): void {
   fetchUsage = fn ?? defaultFetchUsage;
 }
-export function _setCredentialReader(fn: (() => Credential | undefined) | null): void {
+export function _setCredentialReader(fn: CredentialReader | null): void {
   readCredential = fn ?? defaultReadCredential;
 }
 
@@ -85,7 +91,19 @@ function parseCredential(raw: string): Credential | undefined {
   };
 }
 
-function defaultReadCredential(): Credential | undefined {
+const execFileAsync = promisify(execFile);
+
+/**
+ * Read the current OAuth credential. Fully async and hard-bounded.
+ *
+ * `security` is not a safe synchronous call: if /usr/bin/security isn't already
+ * ACL-approved for the keychain item, or the keychain is locked, macOS raises a
+ * GUI prompt and the process waits on a human. Doing that synchronously would
+ * wedge the whole event loop — blocking daemon startup and every HTTP request,
+ * including the /api/usage/refresh route that reaches this same code. So: never
+ * execFileSync, and always a timeout with a hard kill.
+ */
+async function defaultReadCredential(): Promise<Credential | undefined> {
   // macOS: the login keychain. Ask for the specific account — the bare
   // service lookup resolves to a long-dead duplicate entry.
   if (process.platform === "darwin") {
@@ -94,21 +112,22 @@ function defaultReadCredential(): Credential | undefined {
       ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
     ]) {
       try {
-        const out = execFileSync("security", args, {
+        const { stdout } = await execFileAsync("security", args, {
           encoding: "utf8",
-          stdio: ["ignore", "pipe", "ignore"],
+          timeout: KEYCHAIN_TIMEOUT_MS,
+          killSignal: "SIGKILL",
         });
-        const cred = parseCredential(out);
+        const cred = parseCredential(stdout);
         if (cred) return cred;
       } catch {
-        /* entry absent or locked — try the next lookup */
+        /* absent, locked, or timed out — try the next lookup */
       }
     }
   }
   // Linux / WSL, and macOS installs that keep credentials on disk.
   try {
     return parseCredential(
-      fs.readFileSync(path.join(claudeHomeDir(), ".credentials.json"), "utf8"),
+      await fs.promises.readFile(path.join(claudeHomeDir(), ".credentials.json"), "utf8"),
     );
   } catch {
     return undefined;
@@ -163,7 +182,7 @@ function noteFailure(reason: string): LiveUsageState {
 export async function refreshLiveUsage(): Promise<LiveUsageState> {
   if (!liveUsageEnabled()) return noteFailure("disabled by CC_LIVE_USAGE=0");
 
-  const cred = readCredential();
+  const cred = await readCredential();
   if (!cred) return noteFailure("no Claude Code credentials found on this machine");
   // Claude Code refreshes on its own cadence; if it hasn't yet, skip rather
   // than burn a guaranteed-401 request (and never refresh the token ourselves).

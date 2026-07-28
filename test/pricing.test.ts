@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  MODEL_PRICES,
+  PRICE_SCHEDULE,
   cycleWindow,
   dayKey,
   daysInWindow,
@@ -33,9 +33,51 @@ describe("model price resolution", () => {
   });
 
   it("derives cache rates from input at the published multipliers", () => {
-    const opus = MODEL_PRICES["claude-opus-5"];
+    const opus = resolveModelPrice("claude-opus-5")!;
     expect(opus.cache_read).toBeCloseTo(opus.input * 0.1, 10);
-    expect(opus.cache_write).toBeCloseTo(opus.input * 1.25, 10);
+    expect(opus.cache_write_5m).toBeCloseTo(opus.input * 1.25, 10);
+    expect(opus.cache_write_1h).toBeCloseTo(opus.input * 2, 10);
+  });
+
+  it("keeps every schedule sorted so the newest applicable rate wins", () => {
+    for (const [model, points] of Object.entries(PRICE_SCHEDULE)) {
+      const froms = points.map((p) => p.from);
+      expect(froms, model).toEqual([...froms].sort());
+    }
+  });
+});
+
+describe("scheduled rate changes", () => {
+  it("uses Sonnet 5's introductory rate before the switchover", () => {
+    const p = resolveModelPrice("claude-sonnet-5", "2026-08-31")!;
+    expect(p.input).toBe(2);
+    expect(p.output).toBe(10);
+  });
+
+  it("switches Sonnet 5 to the standard rate on 2026-09-01", () => {
+    const p = resolveModelPrice("claude-sonnet-5", "2026-09-01")!;
+    expect(p.input).toBe(3);
+    expect(p.output).toBe(15);
+  });
+
+  it("prices each day's burn at the rate in effect that day", () => {
+    const tokens = {
+      input_tokens: 1_000_000,
+      output_tokens: 0,
+      cache_read: 0,
+      cache_creation: 0,
+    };
+    expect(estimateCostUsd(tokens, "sonnet", "2026-08-15")).toBeCloseTo(2, 6);
+    expect(estimateCostUsd(tokens, "sonnet", "2026-09-15")).toBeCloseTo(3, 6);
+  });
+
+  it("accepts a Date as well as a day string", () => {
+    expect(resolveModelPrice("claude-sonnet-5", new Date("2026-09-02T00:00:00Z"))!.input).toBe(3);
+  });
+
+  it("leaves models with a single rate unaffected by the date", () => {
+    expect(resolveModelPrice("claude-opus-5", "2020-01-01")!.input).toBe(5);
+    expect(resolveModelPrice("claude-opus-5", "2030-01-01")!.input).toBe(5);
   });
 });
 
@@ -48,16 +90,57 @@ describe("cost estimation", () => {
   };
 
   it("prices each token class at its own rate", () => {
-    // Opus 5: $5 in + $25 out + $0.50 cache read + $6.25 cache write.
+    // Opus 5: $5 in + $25 out + $0.50 cache read + $6.25 cache write (5m).
     expect(estimateCostUsd(tokens, "claude-opus-5")).toBeCloseTo(36.75, 6);
   });
 
+  it("charges 1-hour cache writes at 2x, not the 5-minute 1.25x", () => {
+    // Same bundle, but the writes are all 1h TTL: $10 instead of $6.25.
+    expect(estimateCostUsd({ ...tokens, cache_creation_1h: 1_000_000 }, "claude-opus-5"))
+      .toBeCloseTo(40.5, 6);
+  });
+
+  it("splits a mixed-TTL write bundle across both rates", () => {
+    // 400k at 2x ($4.00) + 600k at 1.25x ($3.75) = $7.75 of writes.
+    const cost = estimateCostUsd(
+      {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read: 0,
+        cache_creation: 1_000_000,
+        cache_creation_1h: 400_000,
+      },
+      "claude-opus-5",
+    );
+    expect(cost).toBeCloseTo(7.75, 6);
+  });
+
+  it("falls back to the cheaper rate when the TTL split is absent", () => {
+    const withoutSplit = estimateCostUsd(
+      { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_creation: 1_000_000 },
+      "claude-opus-5",
+    );
+    expect(withoutSplit).toBeCloseTo(6.25, 6);
+  });
+
+  it("never lets a malformed 1h figure exceed or go below the total", () => {
+    const base = { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_creation: 1_000_000 };
+    // 1h larger than the total clamps to the total (all at 2x).
+    expect(estimateCostUsd({ ...base, cache_creation_1h: 9_000_000 }, "claude-opus-5"))
+      .toBeCloseTo(10, 6);
+    // Negative 1h clamps to zero (all at 1.25x).
+    expect(estimateCostUsd({ ...base, cache_creation_1h: -5 }, "claude-opus-5"))
+      .toBeCloseTo(6.25, 6);
+  });
+
   it("scales linearly below a million tokens", () => {
+    // Sonnet 5 introductory input rate is $2/MTok, so 500k = $1.00.
     const cost = estimateCostUsd(
       { input_tokens: 500_000, output_tokens: 0, cache_read: 0, cache_creation: 0 },
       "claude-sonnet-5",
+      "2026-07-27",
     );
-    expect(cost).toBeCloseTo(1.5, 6);
+    expect(cost).toBeCloseTo(1, 6);
   });
 
   it("costs an unpriceable model at zero so it can be reported separately", () => {

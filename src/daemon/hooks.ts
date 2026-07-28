@@ -686,6 +686,7 @@ function recordDailyBurn(agent: Agent, sessionId?: string): void {
           output_tokens: t.output,
           cache_read: t.cache_read,
           cache_creation: t.cache_creation,
+          cache_creation_1h: t.cache_creation_1h,
         },
       ]),
     );
