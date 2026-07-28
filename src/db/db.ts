@@ -93,6 +93,10 @@ CREATE TABLE IF NOT EXISTS agents (
   state         TEXT NOT NULL DEFAULT 'spawning',
   task_id       INTEGER REFERENCES tasks(id),
   tmux_target   TEXT,
+  -- pid of the shell tmux started in the pane. Kept so a reap that arrives
+  -- after the window has already gone can still find (and kill) processes the
+  -- agent left behind in the pane's process group.
+  pane_pid      INTEGER,
   session_id    TEXT,
   transcript_path TEXT,
   runtime_config_path TEXT,
@@ -391,6 +395,9 @@ function migrate(db: Database.Database): void {
   if (!agentCols.includes("reasoning_effort")) {
     db.exec("ALTER TABLE agents ADD COLUMN reasoning_effort TEXT");
   }
+  if (!agentCols.includes("pane_pid")) {
+    db.exec("ALTER TABLE agents ADD COLUMN pane_pid INTEGER");
+  }
   const cronCols = (db.prepare("PRAGMA table_info(crons)").all() as { name: string }[]).map(
     (c) => c.name,
   );
@@ -423,6 +430,25 @@ function migrate(db: Database.Database): void {
   if (!memCols.includes("use_count")) {
     db.exec("ALTER TABLE memories ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0");
     db.exec("ALTER TABLE memories ADD COLUMN last_used_at TEXT");
+  }
+  // The deferred-delivery queue originally held only "worker aN is waiting"
+  // pings, so a row needed no origin. Task-triage delegation now persists here
+  // too (it used to keep nothing at all, so a deferred "Notify Claude Main"
+  // click died with the daemon), and the two kinds expire on different
+  // conditions — hence `origin`. attempts/next_retry_at carry the flush backoff
+  // across a restart so a queue that was backing off does not immediately
+  // retry-storm on boot.
+  const notifCols = (
+    db.prepare("PRAGMA table_info(queued_notifications)").all() as { name: string }[]
+  ).map((c) => c.name);
+  if (!notifCols.includes("origin")) {
+    db.exec(
+      "ALTER TABLE queued_notifications ADD COLUMN origin TEXT NOT NULL DEFAULT 'worker_waiting'",
+    );
+    db.exec(
+      "ALTER TABLE queued_notifications ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+    );
+    db.exec("ALTER TABLE queued_notifications ADD COLUMN next_retry_at TEXT");
   }
 }
 

@@ -11,6 +11,9 @@ export interface Agent {
   state: AgentState;
   task_id: number | null;
   tmux_target: string | null;
+  /** Pid of the pane's shell — the handle used to clean up processes the agent
+   *  left running if its tmux window is already gone at reap time. */
+  pane_pid: number | null;
   session_id: string | null;
   transcript_path: string | null;
   runtime_config_path: string | null;
@@ -69,6 +72,7 @@ export function updateAgent(
       | "state"
       | "task_id"
       | "tmux_target"
+      | "pane_pid"
       | "session_id"
       | "transcript_path"
       | "runtime_config_path"

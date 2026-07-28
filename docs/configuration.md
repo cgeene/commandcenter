@@ -21,6 +21,9 @@ commandcenter has two kinds of configuration:
 | `CC_REPO_ROOTS` | unset | Platform-path-delimited allow-list of parent directories scanned for the repository picker (`:` on macOS/Linux). `CC_REPO_ROOT` is accepted as a single-root compatibility alias. |
 | `CC_SCRATCH_DIR` | `$CC_DATA_DIR/scratch` | Command Center-owned root for private non-Git investigation workspaces. |
 | `CC_SCRATCH_RETENTION_DAYS` | `7` | Days to retain terminal or orphaned scratch workspaces before daily cleanup; valid range 1–90. |
+| `CC_DEPCACHE_DIR` | `$CC_DATA_DIR/depcache` | Shared `node_modules` cache, keyed by repo + lockfile hash, used to start a worktree with dependencies already installed instead of paying `npm ci` per task and per review cycle. |
+| `CC_DEPCACHE_MODE` | `clone` on macOS, `off` elsewhere | How a cached tree lands in a worktree. `clone` = copy-on-write copy (APFS `cp -c`): cheap and private, so an agent that installs anyway cannot corrupt the shared cache. `symlink` = one link, cheapest, but an `npm install` in the worktree writes through into the cache — opt-in only. `off` = disabled; worktrees start bare. |
+| `CC_DEPCACHE_KEEP` | `3` | Lockfile generations kept per package root before the least-recently-used ones are evicted; valid range 1–10. |
 | `CC_CONTEXT_ROOTS` | `{}` | JSON map of `directory-prefix → CLAUDE.md path(s)` injected into the worktree of any repo whose path sits under a prefix, on top of context inferred from the repo's ancestor directories (see [`src/lib/context-roots.ts`](../src/lib/context-roots.ts)). A string value is treated as a single-element list; malformed JSON is ignored (returns `{}`) so a typo can't crash the daemon. Example: `{"/Users/me/projects/nylas":"/Users/me/notes/nylas.md","/opt/repos":["/opt/shared/CLAUDE.md"]}`. |
 | `CC_PORT` | `4711` | Daemon HTTP/WebSocket port. Bound to `127.0.0.1` only. |
 | `CC_URL` | `http://127.0.0.1:$CC_PORT` | Base URL agents and hooks use to reach the daemon. Override if you front the daemon differently. |
@@ -31,6 +34,7 @@ commandcenter has two kinds of configuration:
 | `CC_CODEX_MCP_SOURCE_HOME` | unset | Optional trusted normal Codex home whose explicit and plugin-provided MCP transports are mirrored into the isolated home; no auth/session/hook/trust state is copied. |
 | `CC_WORKER_PROVIDER` | `claude` | Default provider for newly created tasks and crons (`claude` or `codex`). |
 | `CC_TMUX_SESSION` | `cc` | tmux session name that hosts agent windows. |
+| `CC_REAP_GRACE_MS` | `3000` | Milliseconds a reaped pane's processes get between `SIGTERM` and `SIGKILL`. |
 | `CC_MAIN_MODEL` | `fable` | Default Claude model for the main orchestrator (`agp main`); override with `CC_MAIN_MODEL=opus`. |
 | `CC_REVIEWER_MODEL` | unset | Claude reviewer model override; otherwise preserve a Claude task model or use `opus` when reviewing Codex-worker output. Never applied to a Codex reviewer. |
 | `CC_REVIEWER_PROVIDER` | unset | Pin the reviewer provider (`claude` or `codex`). Overrides the variety policy; invalid values fall back to `claude`. |
@@ -91,7 +95,7 @@ button. Unknown keys fall back to the defaults below.
 | `auto_review` | `true` | Auto-spawn an adversarial reviewer when a task reaches `review`. Report-only tasks (e.g. the dreamer) are skipped. |
 | `escalate_minutes` | `5` | Minutes a worker may sit in `waiting_input` (after the main agent was asked to unblock it) before the human is paged. |
 | `attention_stale_minutes` | `10` | Minutes an agent may sit in `waiting_input` before the "Needs You" panel flags it as stale. |
-| `reap_after_minutes` | `10` | Minutes a worker on a **terminal** task (`done`/`cancelled`/`failed`) may sit idle before the watchdog auto-reaps it — kills its tmux window and frees the `max_concurrent` slot. The grace window lets a human read the terminal right after completion. |
+| `reap_after_minutes` | `10` | Minutes a worker on a **terminal** task (`done`/`cancelled`/`failed`) may sit idle before the watchdog auto-reaps it — kills its tmux window along with the pane's whole process tree, and frees the `max_concurrent` slot. The grace window lets a human read the terminal right after completion. |
 | `read_only_extra_allow` | `[]` | Extra **read-only** permission patterns appended to the baked-in read-only profile for worker/reviewer settings. |
 
 ### `read_only_extra_allow` — a safety note

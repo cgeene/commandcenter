@@ -19,7 +19,8 @@ import {
 import { flushMainQueue } from "./notifqueue.js";
 import { notifyEvent } from "./notify.js";
 import { parsePane, type PendingPermission } from "./pane.js";
-import { killAgent, spawnWorker } from "./spawn.js";
+import { killAgent, paneAgeSeconds, spawnWorker } from "./spawn.js";
+import { sweepVanishedPaneGroup, type PaneSweepResult } from "./proctree.js";
 import {
   capturePane,
   listLiveWindowIds,
@@ -42,6 +43,8 @@ export interface SchedulerDeps {
   windowIds: () => LiveWindowSnapshot;
   now: () => Date;
   pendingPermission?: (agent: Agent) => PendingPermission | null;
+  /** Kill what a vanished agent left running in its pane's process group. */
+  sweepPaneGroup?: (panePid: number, ageSec: number) => PaneSweepResult;
 }
 
 const defaultDeps: SchedulerDeps = {
@@ -49,6 +52,7 @@ const defaultDeps: SchedulerDeps = {
   kill: (id) => void killAgent(id),
   windowIds: listLiveWindowIds,
   now: () => new Date(),
+  sweepPaneGroup: sweepVanishedPaneGroup,
   pendingPermission: (agent) => {
     if (!agent.tmux_target) return null;
     try {
@@ -369,6 +373,7 @@ function recoverFalseVanishes(
 export function watchdog(deps: SchedulerDeps = defaultDeps): void {
   const cfg = getSchedulerConfig();
   const kill = deps.kill ?? ((id: number) => void killAgent(id));
+  const sweepPaneGroup = deps.sweepPaneGroup ?? sweepVanishedPaneGroup;
   const windowIds = deps.windowIds();
   const nowMs = deps.now().getTime();
 
@@ -403,10 +408,32 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
         continue;
       }
       missingWindowChecks.delete(agent.id);
-      updateAgent(agent.id, { state: "dead" });
+      // The window is gone, but whatever the agent backgrounded is not: it has
+      // been reparented to pid 1 and will run until the machine reboots. This
+      // branch never calls killAgent (the task is requeued, not cancelled), so
+      // the sweep has to happen here or nowhere. Clearing pane_pid marks the
+      // pane swept; leaving it set would let a later kill sweep it twice.
+      const sweep =
+        agent.pane_pid !== null
+          ? sweepPaneGroup(agent.pane_pid, paneAgeSeconds(agent, nowMs))
+          : null;
+      // A declined sweep means the pane is demonstrably still alive — this is a
+      // false vanish, which recoverFalseVanishes may well undo on a later pass.
+      // Keep pane_pid: recovery restores only `state`, so clearing it here
+      // would leave a live agent with no handle and permanently disarm the
+      // sweep for its eventual real death.
+      const paneHandled = sweep !== null && sweep.outcome !== "declined";
+      updateAgent(agent.id, {
+        state: "dead",
+        ...(paneHandled ? { pane_pid: null } : {}),
+      });
       logEvent("agent.vanished", {
         agentId: agent.id,
         taskId: agent.task_id ?? undefined,
+        payload:
+          sweep && sweep.killed.length > 0
+            ? { swept_pids: sweep.killed }
+            : undefined,
       });
       const task = agent.task_id ? getTask(agent.task_id) : undefined;
       if (task && ["in_progress", "claimed"].includes(task.status)) {

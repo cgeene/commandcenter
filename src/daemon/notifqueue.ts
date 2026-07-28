@@ -1,10 +1,14 @@
 import { getAgent, listAgents, type Agent } from "../db/agents.js";
 import { logEvent } from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
+import { getTask, readyTasks } from "../db/tasks.js";
 import {
   clearQueuedNotifications,
   enqueueNotification,
   listQueuedNotifications,
+  noteDeliveryAttempt,
+  pendingDeliveryMains,
+  type NotificationOrigin,
   type QueuedNotification,
 } from "../db/notifications.js";
 import type { AgentProvider } from "../providers.js";
@@ -29,9 +33,10 @@ const PANE_TAIL_LINES = 60;
  * prompt, so it is unaffected by any of this.
  */
 
-/** In-memory retry backoff for flushes deferred because the human was typing.
- *  Losing it on restart is harmless — the queued rows persist and the watchdog
- *  simply retries fresh. */
+/** Retry backoff for flushes deferred because the human was typing. Held in
+ *  memory for speed, but mirrored onto the queued rows (attempts/next_retry_at)
+ *  so a daemon restart reseeds it rather than retry-storming a prompt that was
+ *  already backing off — see resumePendingDeliveries. */
 const flushBackoff = new Map<number, { until: number; step: number }>();
 const BACKOFF_STEPS_MS = [15_000, 30_000, 60_000, 120_000, 300_000];
 
@@ -40,9 +45,76 @@ export function __clearFlushBackoffForTests(): void {
   flushBackoff.clear();
 }
 
-function bumpBackoff(mainId: number, nowMs: number): void {
+function bumpBackoff(mainId: number, nowMs: number): number {
   const step = Math.min(flushBackoff.get(mainId)?.step ?? 0, BACKOFF_STEPS_MS.length - 1);
-  flushBackoff.set(mainId, { until: nowMs + BACKOFF_STEPS_MS[step], step: step + 1 });
+  const until = nowMs + BACKOFF_STEPS_MS[step];
+  flushBackoff.set(mainId, { until, step: step + 1 });
+  noteDeliveryAttempt(mainId, new Date(until).toISOString());
+  return step;
+}
+
+/**
+ * Re-adopt the delivery queue left behind by a previous daemon process.
+ *
+ * The rows themselves have always been durable, but nothing announced them at
+ * boot and the backoff that paced their retries did not survive, so a delivery
+ * deferred just before a restart came back with no trail at all — which is how
+ * a "Notify Claude Main" click could vanish across two restarts with no error,
+ * no event and no retry. This logs the resumption and restores each main's
+ * backoff; the actual sending is the watchdog's job (scheduler.ts flushes every
+ * idle main each tick), so no delivery is attempted here against a tmux session
+ * that may not be up yet.
+ */
+export function resumePendingDeliveries(nowMs: number = Date.now()): number {
+  let resumed = 0;
+  for (const row of pendingDeliveryMains()) {
+    resumed += row.pending;
+    const until = row.next_retry_at ? Date.parse(row.next_retry_at) : NaN;
+    if (Number.isFinite(until) && until > nowMs) {
+      flushBackoff.set(row.main_id, {
+        until,
+        step: Math.min(row.attempts, BACKOFF_STEPS_MS.length - 1),
+      });
+    }
+    logEvent("delivery.resumed_on_boot", {
+      agentId: row.main_id,
+      payload: {
+        pending: row.pending,
+        attempts: row.attempts,
+        next_retry_at: row.next_retry_at,
+      },
+    });
+  }
+  return resumed;
+}
+
+/**
+ * Persist one pending delivery and leave a trail that it happened. Returns
+ * false when an equivalent delivery was already queued (a repeat click, or a
+ * worker that pinged twice) so callers can tell the human "already queued"
+ * instead of implying a fresh one was accepted.
+ */
+export function queueDelivery(n: {
+  mainId: number;
+  workerId?: number;
+  taskId?: number;
+  message: string;
+  origin: NotificationOrigin;
+  reason: string;
+}): boolean {
+  const { row, created } = enqueueNotification(n);
+  logEvent("delivery.persisted", {
+    agentId: n.mainId,
+    taskId: n.taskId,
+    payload: {
+      origin: n.origin,
+      reason: n.reason,
+      worker_id: n.workerId ?? null,
+      queued_id: row.id,
+      duplicate: !created,
+    },
+  });
+  return created;
 }
 
 function label(it: { worker_id: number | null; task_id: number | null }): string {
@@ -337,11 +409,13 @@ export async function delegateToMain(worker: Agent, message: string): Promise<vo
   // Busy, mid-draft, or raced — queue instead of clobbering; the Stop hook and
   // idle-main watchdog flush it once the prompt is clear again.
 
-  enqueueNotification({
+  queueDelivery({
     mainId: main.id,
     workerId: worker.id,
     taskId: worker.task_id ?? undefined,
     message,
+    origin: "worker_waiting",
+    reason: `main_${main.state}`,
   });
   logEvent("notification.queued", {
     agentId: worker.id,
@@ -350,14 +424,53 @@ export async function delegateToMain(worker: Agent, message: string): Promise<vo
   });
 }
 
+/**
+ * Why a queued delivery is no longer worth making, or null if it still is.
+ *
+ * Late delivery of a moot ping is worse than no delivery: it sends the
+ * orchestrator to triage a task somebody already dispatched, or to rescue a
+ * worker that is long since unblocked. Both kinds are therefore re-validated
+ * against live state at flush time, not just at enqueue time.
+ */
+function stalenessReason(
+  it: QueuedNotification,
+  readyTriageIds: Set<number>,
+): string | null {
+  if (it.origin === "task_triage") {
+    if (it.task_id == null) return "no_task";
+    const task = getTask(it.task_id);
+    if (!task) return "task_gone";
+    if (task.status !== "queued") return `task_${task.status}`;
+    if (task.dispatch_mode !== "orchestrated") return "task_not_orchestrated";
+    if (!readyTriageIds.has(task.id)) return "task_blocked";
+    return null;
+  }
+  if (it.worker_id == null) return null;
+  const worker = getAgent(it.worker_id);
+  if (!worker) return "worker_gone";
+  if (worker.state !== "waiting_input") return `worker_${worker.state}`;
+  return null;
+}
+
+/** The batched triage half of a flush. A single row carries the full triage
+ *  prompt that would have been delivered live, so it is sent verbatim; several
+ *  collapse into one compact ping rather than concatenating whole prompts. */
+export function buildTriageMessage(
+  items: Pick<QueuedNotification, "task_id" | "message">[],
+): string {
+  if (items.length === 1) return items[0].message;
+  const ids = items.map((it) => `#${it.task_id}`).join(", ");
+  return `[commandcenter] ${items.length} tasks are awaiting your triage: ${ids}. Call get_task(<id>, verbose: true) on each — the compact default omits the prompt — study the full prompt, validate the scope and execution settings, then dispatch it. For portfolio tasks, never spawn the parent: mark it in_progress, create per-repository child tasks with parent_task_id set to the parent, preserve the parent's provider/model/reasoning effort unless you deliberately document an override, and spawn those isolated children.`;
+}
+
 export type FlushResult = "flushed" | "deferred" | "empty" | "not_live";
 
 /**
- * Attempt to flush a main agent's queued notifications as one batched message.
+ * Attempt to flush a main agent's queued deliveries as one batched message.
  * Re-checks the prompt immediately before sending (the human may have started
  * typing again since the trigger) and, on a busy prompt or failed send, leaves
- * the queue intact and backs off for the watchdog to retry. Stale entries —
- * workers no longer actually waiting — are dropped rather than delivered.
+ * the queue intact and backs off for the watchdog to retry. Stale entries are
+ * dropped rather than delivered (see stalenessReason).
  *
  * `force` (the Stop-hook path) bypasses the backoff gate; the watchdog path
  * passes `nowMs` and respects it.
@@ -376,14 +489,19 @@ export async function flushMainQueue(
     return "empty";
   }
 
-  // Drop entries whose worker is no longer waiting (rescued, done, or gone) —
-  // pinging the main about a resolved worker is noise.
+  const readyTriageIds = queued.some((it) => it.origin === "task_triage")
+    ? new Set(readyTasks("orchestrated").map((t) => t.id))
+    : new Set<number>();
   const stale: number[] = [];
   const items = queued.filter((it) => {
-    if (it.worker_id == null) return true;
-    const w = getAgent(it.worker_id);
-    if (w && w.state === "waiting_input") return true;
+    const reason = stalenessReason(it, readyTriageIds);
+    if (!reason) return true;
     stale.push(it.id);
+    logEvent("delivery.expired", {
+      agentId: mainId,
+      taskId: it.task_id ?? undefined,
+      payload: { origin: it.origin, reason, worker_id: it.worker_id, queued_id: it.id },
+    });
     return false;
   });
   clearQueuedNotifications(stale);
@@ -402,24 +520,67 @@ export async function flushMainQueue(
     return "not_live";
   }
 
-  const message = buildDelegateMessage(items, getSchedulerConfig().escalate_minutes);
+  const triage = items.filter((it) => it.origin === "task_triage");
+  const waits = items.filter((it) => it.origin !== "task_triage");
+  // One send, however many pending deliveries it covers — the main is pinged
+  // once, not machine-gunned, and a partial success cannot strand half the
+  // queue behind a composer that went busy between two sends.
+  const message = [
+    triage.length > 0 ? buildTriageMessage(triage) : null,
+    waits.length > 0
+      ? buildDelegateMessage(waits, getSchedulerConfig().escalate_minutes)
+      : null,
+  ]
+    .filter((part) => part !== null)
+    .join("\n\n");
+
   // The flush fires from the main's Stop hook (just went idle) and the idle-main
   // watchdog, so allow a working main through — but still refuse a mid-draft
   // prompt. A deferred send (busy prompt or lost race) leaves the queue intact.
   const outcome = await deliverToMainIfClear(main, message, { allowWorking: true });
   if (outcome !== "delivered") {
-    bumpBackoff(mainId, nowMs);
+    const step = bumpBackoff(mainId, nowMs);
+    // First deferral of a streak only: the watchdog retries on a schedule, and
+    // an event per retry would bury the feed.
+    if (step === 0) {
+      logEvent("delivery.deferred", {
+        agentId: mainId,
+        payload: { pending: items.length, main_state: main.state },
+      });
+    }
     return "deferred";
   }
 
   clearQueuedNotifications(items.map((it) => it.id));
   flushBackoff.delete(mainId);
-  logEvent("notification.flushed", {
+  logEvent("delivery.delivered", {
     agentId: mainId,
     payload: {
       count: items.length,
-      workers: items.map((it) => it.worker_id).filter((w) => w != null),
+      triage: triage.map((it) => it.task_id).filter((t) => t != null),
+      workers: waits.map((it) => it.worker_id).filter((w) => w != null),
     },
   });
+  if (waits.length > 0) {
+    logEvent("notification.flushed", {
+      agentId: mainId,
+      payload: {
+        count: waits.length,
+        workers: waits.map((it) => it.worker_id).filter((w) => w != null),
+      },
+    });
+  }
+  // A queued triage ping that finally lands is a real delegation: record it so
+  // the state-derived retry in orchestration.delegatePendingTaskToMain sees the
+  // task as already delegated and does not deliver it a second time.
+  for (const it of triage) {
+    if (it.task_id != null) {
+      logEvent("task.delegated_to_main", {
+        taskId: it.task_id,
+        agentId: mainId,
+        payload: { via: "queue_flush" },
+      });
+    }
+  }
   return "flushed";
 }

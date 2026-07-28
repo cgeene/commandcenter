@@ -122,7 +122,7 @@ import {
   REASONING_EFFORTS,
 } from "../reasoning.js";
 import { CLAUDE_MODEL_SLUGS, providerModels } from "./provider-models.js";
-import { delegateTaskToMain } from "./orchestration.js";
+import { delegateTaskToMain, delegateTaskToMainDetailed } from "./orchestration.js";
 import {
   allocateScratchWorkspace,
   removeScratchWorkspace,
@@ -577,10 +577,14 @@ export function buildApp(): Hono {
     if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
       return c.json({ error: "task blockers are not done" }, 409);
     }
-    if (!(await delegateTaskToMain(id))) {
+    // Report what actually happened rather than collapsing "held for later" into
+    // a plain failure: a busy/mid-draft composer defers the send, and the click
+    // is persisted for the queue flush instead of being delivered now.
+    const outcome = await delegateTaskToMainDetailed(id);
+    if (outcome === "skipped") {
       return c.json({ error: "main agent is unavailable" }, 409);
     }
-    return c.json({ ok: true });
+    return c.json({ ok: true, status: outcome });
   });
 
   app.get("/api/tasks/:id/diff", (c) => {

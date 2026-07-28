@@ -12,7 +12,8 @@ vi.mock("../src/daemon/tmux.js", () => ({
   sendText: (...a: unknown[]) => sendText(...a),
   sendEnter: () => {},
   capturePane: () => "",
-  killWindow: () => {},
+  killWindow: () => [],
+  paneProcess: () => null,
 }));
 
 let tmpDir: string;

@@ -18,7 +18,8 @@ vi.mock("../src/daemon/tmux.js", () => ({
   newWindow: (name: string, cwd: string, command: string) =>
     newWindow(name, cwd, command),
   windowExists: () => false,
-  killWindow: vi.fn(),
+  killWindow: vi.fn(() => []),
+  paneProcess: () => null,
 }));
 
 vi.mock("../src/daemon/genconfig.js", () => ({
