@@ -11,8 +11,11 @@ import { execFileSync } from "node:child_process";
 // hookTimeout matters as much as testTimeout here (and is what the full suite
 // tripped over first): beforeEach builds a bare remote plus a seeded clone, and
 // that synchronous git work has been measured past vitest's 10s hook default
-// when the whole suite is running in parallel.
-vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
+// when the whole suite is running in parallel. Both budgets are generous
+// because every case here pays for real git I/O — a case measured at 9s alone
+// has been seen past 30s on a machine running several agents at once, so the
+// limit tracks machine load, not the assertions.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 
 vi.mock("../src/daemon/tmux.js", () => ({
   windowExists: () => true,
@@ -27,6 +30,17 @@ vi.mock("../src/daemon/tmux.js", () => ({
 let tmpDir: string;
 let remoteDir: string;
 let repoDir: string;
+let fetchMock: ReturnType<typeof vi.fn>;
+const realFetch = globalThis.fetch;
+
+/** Titles of the pushes dispatched so far. ntfy is configured and `fetch`
+ *  stubbed (the test/notify.test.ts pattern) so "and does NOT notify"
+ *  assertions are real rather than vacuously true for want of a URL. */
+function pushTitles(): string[] {
+  return fetchMock.mock.calls.map(
+    (call) => (call[1] as { headers: Record<string, string> }).headers.Title,
+  );
+}
 
 function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
@@ -44,6 +58,9 @@ function write(repo: string, name: string, contents: string): void {
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-freshen-"));
   process.env.CC_DATA_DIR = path.join(tmpDir, "data");
+  process.env.CC_NTFY_URL = "https://ntfy.test/cc";
+  fetchMock = vi.fn(async () => new Response("ok"));
+  globalThis.fetch = fetchMock as unknown as typeof fetch;
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   const { _resetFreshenState } = await import("../src/daemon/freshen.js");
@@ -67,6 +84,8 @@ beforeEach(async () => {
 afterEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
+  globalThis.fetch = realFetch;
+  delete process.env.CC_NTFY_URL;
   fs.rmSync(tmpDir, { recursive: true, force: true });
   // The git work here is synchronous and can block this worker's event loop for
   // seconds; yield so vitest's worker RPC replies drain (see worktree.test.ts).
@@ -329,6 +348,42 @@ describe("freshenPass — storm control", () => {
     ).toHaveLength(2); // no new attempts were made
   });
 
+  it("never halts a PR that is already up to date, however many freshens it took", async () => {
+    // The cap is on a PR that KEEPS NEEDING freshening. Three clean re-merges
+    // followed by a human who has not merged yet is the happy path, and it must
+    // not turn into "the platform stopped re-merging its PR" on the next poll.
+    const { freshenPass } = await import("../src/daemon/freshen.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const { setIntegrationSettings } = await import("../src/db/settings.js");
+    setIntegrationSettings({ freshen_max_attempts: 2 });
+    const { task, branch, tip } = await setupAgentTask({
+      file: "feature.txt",
+      contents: "feature\n",
+    });
+    // At (and over) the cap, but the branch needs nothing: main has not moved
+    // past it.
+    logEvent("pr.freshen_attempt", { taskId: task.id });
+    logEvent("pr.freshen_attempt", { taskId: task.id });
+    logEvent("pr.freshen_attempt", { taskId: task.id });
+
+    await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
+    await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
+
+    expect(git(repoDir, "rev-parse", `origin/${branch}`)).toBe(tip);
+    expect(listEvents(200).filter((e) => e.kind === "pr.freshen_halted")).toEqual([]);
+    expect(pushTitles()).toEqual([]); // and no "stopped re-merging" page
+
+    // Once main DOES move past it, the cap applies as normal.
+    advanceMain("other.txt", "other\n");
+    await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
+    expect(
+      listEvents(200).filter((e) => e.kind === "pr.freshen_halted"),
+    ).toHaveLength(1);
+    expect(pushTitles()).toEqual([
+      `task #${task.id} — stopped re-merging its PR`,
+    ]);
+  });
+
   it("queues a merge burst instead of freshening every stale PR at once", async () => {
     const { freshenPass } = await import("../src/daemon/freshen.js");
     const { setIntegrationSettings } = await import("../src/db/settings.js");
@@ -444,6 +499,42 @@ describe("mergeNudgePass", () => {
     mergeNudgePass(later);
     mergeNudgePass(later);
     expect(listEvents(50).filter((e) => e.kind === "pr.merge_nudge")).toHaveLength(1);
+    expect(pushTitles()).toEqual([
+      `task #${task.id} — approved PR waiting while its repo moves on`,
+    ]);
+  });
+
+  it("does not re-nudge for the same approval after a clean freshen moves the branch", async () => {
+    // Freshening advances review_head_sha onto its merge commit for the SAME
+    // approval, so anything SHA-keyed would page the human again per re-merge.
+    const { freshenPass, mergeNudgePass } = await import("../src/daemon/freshen.js");
+    const { createTask, getTask } = await import("../src/db/tasks.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const { task, tip } = await setupAgentTask({
+      file: "feature.txt",
+      contents: "feature\n",
+      approved: true,
+    });
+    logEvent("review.approved", { taskId: task.id });
+    createTask({ title: "next", prompt: "x", repo: repoDir });
+    const later = new Date(Date.now() + 10 * 60 * 60_000);
+
+    mergeNudgePass(later);
+    expect(listEvents(80).filter((e) => e.kind === "pr.merge_nudge")).toHaveLength(1);
+
+    advanceMain("other.txt", "other\n");
+    await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
+    // The approval really did move onto the merge commit — otherwise this test
+    // would pass for the wrong reason.
+    const fresh = getTask(task.id)!;
+    expect(fresh.review_verdict).toBe("approve");
+    expect(fresh.review_head_sha).not.toBe(tip);
+
+    mergeNudgePass(later);
+    expect(listEvents(80).filter((e) => e.kind === "pr.merge_nudge")).toHaveLength(1);
+    expect(
+      pushTitles().filter((t) => t.includes("approved PR waiting")),
+    ).toHaveLength(1);
   });
 
   it("stays silent for a draft PR, an unapproved task, or a disabled window", async () => {

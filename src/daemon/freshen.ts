@@ -269,11 +269,6 @@ async function freshenTask(
 ): Promise<FreshenOutcome> {
   const branch = task.branch!;
   const cfg = getIntegrationSettings();
-  const attempts = countTaskEvents(task.id, "pr.freshen_attempt");
-  if (attempts >= cfg.freshen_max_attempts) {
-    haltFreshening(task, attempts);
-    return "halted";
-  }
 
   let tipSha: string;
   let baseSha: string;
@@ -300,6 +295,17 @@ async function freshenTask(
     return "fresh";
   } catch {
     // Behind the default branch — freshen it.
+  }
+
+  // The cap is on freshening a PR that KEEPS NEEDING it, so it is checked only
+  // once the branch is known to be behind. Checked before this gate it would
+  // fire on the very next poll after the Nth successful freshen — announcing
+  // "the platform stopped re-merging its PR" about a branch that is perfectly
+  // fresh and merely waiting on a human merge.
+  const attempts = countTaskEvents(task.id, "pr.freshen_attempt");
+  if (attempts >= cfg.freshen_max_attempts) {
+    haltFreshening(task, attempts);
+    return "halted";
   }
 
   logEvent("pr.freshen_attempt", {
@@ -593,9 +599,15 @@ function alreadyNudged(taskId: number, key: string): boolean {
  * The conflict window IS merge latency: an approved PR that sits open while
  * other tasks in the same repo move is what creates the conflicts freshening
  * then has to repair. Merging is the human's call and is NEVER automated — this
- * only says, once, that waiting has started to cost something. The discriminator
- * in the latch/event is the approved SHA, so a genuinely new approval nudges
- * again while a re-poll never does.
+ * only says, once per approval, that waiting has started to cost something.
+ *
+ * The discriminator is the id of the `review.approved` event, NOT the approved
+ * SHA: freshening deliberately advances review_head_sha onto its merge commit
+ * for the same standing approval (see freshenTask), so a SHA-keyed nudge would
+ * mint a new key — and push again — on every clean re-merge. An event id moves
+ * only when a reviewer actually approves again, which is exactly when a second
+ * nudge is warranted. Rows old enough to have no such event fall back to a
+ * constant key, so they nudge at most once rather than once per freshen.
  */
 export function mergeNudgePass(now: Date): void {
   const cfg = getIntegrationSettings();
@@ -607,13 +619,16 @@ export function mergeNudgePass(now: Date): void {
     if (!task.pr_url || task.open_pr === 0) continue;
     if (normalizePrState(task.pr_state) !== "open") continue;
     if (task.pr_is_draft === 1) continue; // not through internal review yet
-    const approvedAt =
-      latestTaskEvent(task.id, ["review.approved"])?.ts ?? task.updated_at;
+    const approved = latestTaskEvent(task.id, ["review.approved"]);
+    // updated_at is only a fallback for rows predating the event: it is bumped
+    // by any task write (a carried-approval freshen included), so it is never
+    // the preferred anchor for either the window or the key.
+    const approvedAt = approved?.ts ?? task.updated_at;
     if (now.getTime() - Date.parse(approvedAt) < window * 60_000) continue;
     const contenders = repoContenders(task, tasks);
     if (contenders.length === 0) continue; // nothing is waiting on this merge
 
-    const key = task.review_head_sha ?? approvedAt;
+    const key = approved ? `approval:${approved.id}` : "approval";
     if (alreadyNudged(task.id, key)) continue;
     logEvent("pr.merge_nudge", {
       taskId: task.id,
