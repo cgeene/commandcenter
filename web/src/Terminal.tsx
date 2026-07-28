@@ -103,8 +103,8 @@ function ComposeBar({
   const sendable = payload !== null && connected;
 
   /** Clear the field ONLY once the bytes are actually on the wire. The socket
-   *  dies silently when a phone locks or the tab is backgrounded — and nothing
-   *  reconnects it — so clearing on a failed write would destroy a message the
+   *  can be reconnecting after a phone locks, a tab sleeps, or the daemon
+   *  restarts, so clearing on a failed write would destroy a message the
    *  operator just spent a minute dictating, with "sent" looking identical to
    *  "dropped". */
   const flush = () => {
@@ -162,7 +162,7 @@ function ComposeBar({
       <button
         className="primary"
         disabled={!sendable}
-        title={connected ? undefined : "Terminal disconnected — reopen the drawer to reconnect"}
+        title={connected ? undefined : "Terminal disconnected — reconnecting"}
         onMouseDown={keepFocus}
         onClick={flush}
       >
@@ -178,9 +178,9 @@ export function Terminal({ agentId }: { agentId: number }) {
   // Compose bar on by default on touch devices only; an explicit toggle is
   // remembered per browser.
   const [compose, setCompose] = useState(() => composeBarEnabled(localStorage, touchDevice()));
-  // Whether the pty socket is up. Nothing reconnects it (a close is terminal
-  // until the drawer is reopened), so the compose bar has to be able to see the
-  // difference between "sent" and "went nowhere".
+  // Whether the pty socket is up. The socket can disappear underneath a still
+  // mounted drawer when the tab sleeps, Vite reloads, or the daemon restarts;
+  // keep reconnecting instead of making the operator refresh the whole page.
   const [connected, setConnected] = useState(false);
 
   /** Write to the pty. Returns whether the bytes actually went out. */
@@ -207,28 +207,63 @@ export function Terminal({ agentId }: { agentId: number }) {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(ref.current);
-    fit.fit();
+    const fitTerminal = () => {
+      try {
+        fit.fit();
+      } catch {
+        // During drawer open/keyboard resize the element can briefly report
+        // unusable dimensions. The ResizeObserver below will retry.
+      }
+    };
+    fitTerminal();
 
-    // fit ran above, so cols/rows are the real dimensions — the server
-    // starts the PTY at this size and the first paint is clean.
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(
-      `${proto}//${location.host}/ws/term/${agentId}?cols=${term.cols}&rows=${term.rows}`,
-    );
-    wsRef.current = ws;
-    setConnected(false); // a swap to another agent starts closed again
+    let disposed = false;
+    let reconnectTimer: number | null = null;
 
-    ws.onmessage = (e) => term.write(typeof e.data === "string" ? e.data : "");
-    ws.onopen = () => setConnected(true);
-    ws.onclose = () => {
-      setConnected(false);
-      term.write("\r\n[disconnected]\r\n");
+    const sendResize = () => {
+      const ws = wsRef.current;
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ t: "r", cols: term.cols, rows: term.rows }));
+      }
     };
 
-    const dataSub = term.onData((d) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ t: "i", d }));
+    const connect = (attempt = 0) => {
+      if (disposed) return;
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = null;
       }
+      const ws = new WebSocket(
+        `${proto}//${location.host}/ws/term/${agentId}?cols=${term.cols}&rows=${term.rows}`,
+      );
+      wsRef.current = ws;
+      setConnected(false);
+
+      ws.onmessage = (e) => term.write(typeof e.data === "string" ? e.data : "");
+      ws.onopen = () => {
+        if (disposed) return;
+        setConnected(true);
+        sendResize();
+      };
+      ws.onerror = () => {
+        // The close event schedules the retry; this handler only prevents an
+        // unobserved websocket error from surfacing in the console.
+      };
+      ws.onclose = () => {
+        if (wsRef.current === ws) wsRef.current = null;
+        if (disposed) return;
+        setConnected(false);
+        term.write("\r\n[disconnected; reconnecting]\r\n");
+        const delay = Math.min(4000, 500 * 2 ** Math.min(attempt, 3));
+        reconnectTimer = window.setTimeout(() => connect(attempt + 1), delay);
+      };
+    };
+
+    connect();
+
+    const dataSub = term.onData((d) => {
+      send(d);
     });
 
     // Shift+Enter inserts a newline instead of submitting. handleTerminalKeyEvent
@@ -238,17 +273,13 @@ export function Terminal({ agentId }: { agentId: number }) {
     // usual. See src/lib/terminal-keys.ts for why preventDefault is required.
     term.attachCustomKeyEventHandler((e) =>
       handleTerminalKeyEvent(e, (d) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ t: "i", d }));
-        }
+        send(d);
       }),
     );
 
     const resizeObserver = new ResizeObserver(() => {
-      fit.fit();
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ t: "r", cols: term.cols, rows: term.rows }));
-      }
+      fitTerminal();
+      sendResize();
     });
     resizeObserver.observe(ref.current);
 
@@ -266,7 +297,8 @@ export function Terminal({ agentId }: { agentId: number }) {
       moved = false;
     };
     const onTouchMove = (e: TouchEvent) => {
-      if (touchY === null || ws.readyState !== WebSocket.OPEN) return;
+      const ws = wsRef.current;
+      if (touchY === null || ws?.readyState !== WebSocket.OPEN) return;
       e.preventDefault(); // keep the page from rubber-banding
       if (Math.abs(e.touches[0].clientY - touchStartY) > 10) moved = true;
       const lineHeight = el.clientHeight / term.rows;
@@ -319,12 +351,14 @@ export function Terminal({ agentId }: { agentId: number }) {
     el.addEventListener("touchend", onTouchEnd, { passive: true });
 
     return () => {
+      disposed = true;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       el.removeEventListener("touchstart", onTouchStart);
       el.removeEventListener("touchmove", onTouchMove);
       el.removeEventListener("touchend", onTouchEnd);
       resizeObserver.disconnect();
       dataSub.dispose();
-      ws.close();
+      wsRef.current?.close();
       term.dispose();
       wsRef.current = null;
     };

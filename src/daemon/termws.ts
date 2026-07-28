@@ -9,6 +9,47 @@ function tmux(...args: string[]): Promise<void> {
   return runTmuxCommand(args).then(() => undefined);
 }
 
+function tmuxOutput(...args: string[]): Promise<string> {
+  return runTmuxCommand(args);
+}
+
+function viewerPrefix(agentId: number): string {
+  return `ccv-${agentId}-`;
+}
+
+async function killSession(name: string): Promise<void> {
+  await tmux("kill-session", "-t", name);
+}
+
+async function pruneAgentViewers(agentId: number): Promise<void> {
+  const prefix = viewerPrefix(agentId);
+  let out = "";
+  try {
+    out = await tmuxOutput("list-sessions", "-F", "#{session_name}");
+  } catch {
+    return;
+  }
+  await Promise.all(
+    out
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((name) => name.startsWith(prefix))
+      .map((name) => killSession(name).catch(() => {})),
+  );
+}
+
+function normalizedSize(size?: { cols: number; rows: number }): {
+  cols: number;
+  rows: number;
+} {
+  const cols = Number.isInteger(size?.cols) ? size!.cols : 120;
+  const rows = Number.isInteger(size?.rows) ? size!.rows : 32;
+  return {
+    cols: Math.min(Math.max(cols, 20), 300),
+    rows: Math.min(Math.max(rows, 5), 120),
+  };
+}
+
 /**
  * Bridge a browser xterm.js to an agent's tmux window.
  *
@@ -33,9 +74,15 @@ export async function attachTerminal(
   }
 
   const [session, windowId] = agent.tmux_target.split(":");
-  const viewer = `ccv-${agentId}-${crypto.randomBytes(3).toString("hex")}`;
+  const viewer = `${viewerPrefix(agentId)}${crypto.randomBytes(3).toString("hex")}`;
+  const initialSize = normalizedSize(size);
 
   try {
+    // Opening the same agent's terminal again must not accumulate old grouped
+    // tmux sessions. A browser tab can sleep or a websocket proxy can disappear
+    // without delivering a close event; pruning by agent keeps the latest drawer
+    // authoritative and bounds tmux/PTY handles.
+    await pruneAgentViewers(agentId);
     await tmux("new-session", "-d", "-t", session, "-s", viewer);
     // No tmux chrome in the browser: xterm.js renders only the pane.
     await tmux("set-option", "-t", viewer, "status", "off");
@@ -67,8 +114,8 @@ export async function attachTerminal(
     // daemon's own environment lacks LANG/LC_* (e.g. under launchd).
     term = pty.spawn("tmux", ["-u", "attach", "-t", viewer], {
       name: "xterm-256color",
-      cols: size?.cols ?? 120,
-      rows: size?.rows ?? 32,
+      cols: initialSize.cols,
+      rows: initialSize.rows,
       env: localeEnv(),
     });
   } catch {
@@ -80,22 +127,78 @@ export async function attachTerminal(
   }
 
   let closed = false;
-  const cleanup = () => {
+  let alive = true;
+  const heartbeat = setInterval(() => {
+    if (closed) return;
+    if (ws.readyState !== ws.OPEN || !alive) {
+      cleanup(true);
+      return;
+    }
+    alive = false;
+    try {
+      ws.ping();
+    } catch {
+      cleanup(true);
+    }
+  }, 15_000);
+
+  const cleanupGracefully = () => cleanup(false);
+
+  function cleanup(forceSocketClose: boolean): void {
     if (closed) return;
     closed = true;
+    clearInterval(heartbeat);
+    killSession(viewer).catch(() => {});
     try {
       term.kill();
     } catch {
       /* already gone */
     }
-    tmux("kill-session", "-t", viewer).catch(() => {});
-    if (ws.readyState === ws.OPEN) ws.close();
-  };
+    if (forceSocketClose) {
+      try {
+        ws.terminate();
+      } catch {
+        /* already gone */
+      }
+    } else if (ws.readyState === ws.OPEN) {
+      ws.close();
+    }
+  }
 
-  term.onData((data) => {
-    if (ws.readyState === ws.OPEN) ws.send(data);
+  function sendOutput(data: string): void {
+    if (ws.readyState !== ws.OPEN) return;
+    try {
+      ws.send(data, (err) => {
+        if (err) cleanup(true);
+      });
+    } catch {
+      cleanup(true);
+    }
+  }
+
+  function writeInput(data: string): void {
+    if (closed) return;
+    try {
+      term.write(data);
+    } catch {
+      cleanup(true);
+    }
+  }
+
+  function resizeTerminal(cols: number, rows: number): void {
+    if (closed) return;
+    try {
+      term.resize(cols, rows);
+    } catch {
+      cleanup(true);
+    }
+  }
+
+  term.onData(sendOutput);
+  term.onExit(cleanupGracefully);
+  ws.on("pong", () => {
+    alive = true;
   });
-  term.onExit(cleanup);
 
   ws.on("message", (raw) => {
     try {
@@ -106,14 +209,15 @@ export async function attachTerminal(
         rows?: number;
       };
       if (msg.t === "i" && typeof msg.d === "string") {
-        term.write(msg.d);
+        writeInput(msg.d);
       } else if (msg.t === "r" && msg.cols && msg.rows) {
-        term.resize(msg.cols, msg.rows);
+        const next = normalizedSize({ cols: msg.cols, rows: msg.rows });
+        resizeTerminal(next.cols, next.rows);
       }
     } catch {
       /* ignore malformed frames */
     }
   });
-  ws.on("close", cleanup);
-  ws.on("error", cleanup);
+  ws.on("close", cleanupGracefully);
+  ws.on("error", () => cleanup(true));
 }

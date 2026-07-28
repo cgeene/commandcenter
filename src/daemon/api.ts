@@ -84,6 +84,7 @@ import {
   type NotifyEventKey,
 } from "../notify-events.js";
 import { dismissAttention } from "../db/attention.js";
+import { BlockerValidationError } from "../lib/blockers.js";
 import {
   claimTask,
   childTasks,
@@ -1877,6 +1878,11 @@ export function buildApp(): Hono {
     }
     if (err instanceof WorkspaceValidationError) {
       return c.json({ error: err.message }, 400);
+    }
+    // Self-block, unknown blocker, or a cycle: the request conflicts with the
+    // current dependency graph, so it reads as a conflict rather than a 500.
+    if (err instanceof BlockerValidationError) {
+      return c.json({ error: err.message }, 409);
     }
     if (err instanceof PublicationValidationError) {
       return c.json({ error: err.message }, 409);

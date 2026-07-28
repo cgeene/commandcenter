@@ -11,6 +11,7 @@ import {
   type PublicationState,
 } from "../publication.js";
 import { resolveWorkerPublicationMode } from "./settings.js";
+import { BlockerValidationError, blockerChainReaches } from "../lib/blockers.js";
 
 export const WORKSPACE_KINDS = ["repo", "portfolio", "scratch"] as const;
 export type WorkspaceKind = (typeof WORKSPACE_KINDS)[number];
@@ -103,8 +104,40 @@ function parseReviewMode(value: unknown, fallback: ReviewMode = "full"): ReviewM
   return value as ReviewMode;
 }
 
+/**
+ * Reject a blocked_by assignment that would deadlock the ready queue.
+ *
+ * readyTasks() only releases a task once its blocker is 'done', so a task
+ * blocked on itself — or on a chain that leads back to itself — waits forever
+ * with nothing surfacing the reason. An unknown blocker id would otherwise fail
+ * at the FK constraint with an opaque SQLite message, so it is caught here too.
+ *
+ * `taskId` is undefined at creation time (the row has no id yet), where only
+ * the existence check applies: a brand-new task cannot be part of a cycle.
+ */
+export function assertBlockerAssignable(
+  blockerId: number,
+  taskId?: number,
+): void {
+  if (taskId !== undefined && blockerId === taskId) {
+    throw new BlockerValidationError(`task #${taskId} cannot be blocked by itself`);
+  }
+  if (!getTask(blockerId)) {
+    throw new BlockerValidationError(`blocker task #${blockerId} does not exist`);
+  }
+  if (
+    taskId !== undefined &&
+    blockerChainReaches(blockerId, taskId, (id) => getTask(id)?.blocked_by ?? null)
+  ) {
+    throw new BlockerValidationError(
+      `blocking task #${taskId} on #${blockerId} would create a dependency cycle`,
+    );
+  }
+}
+
 export function createTask(t: NewTask): Task {
   const db = getDb();
+  if (t.blocked_by != null) assertBlockerAssignable(t.blocked_by);
   const workerProvider = parseAgentProvider(t.worker_provider, "claude");
   const publicationMode =
     t.publication_mode ?? resolveWorkerPublicationMode();
@@ -414,6 +447,11 @@ export function updateTask(
   // at write time, so reject it (and any unknown value) up front.
   if (fields.review_mode !== undefined && !REVIEW_MODES.includes(fields.review_mode)) {
     throw new Error(`invalid review mode: ${String(fields.review_mode)}`);
+  }
+  // blocked_by: null clears the dependency; any other value must point at a
+  // real task that is not this one and whose own chain does not lead back here.
+  if (fields.blocked_by != null) {
+    assertBlockerAssignable(fields.blocked_by, id);
   }
   const sets = keys.map((k) => `${k} = @${k}`).join(", ");
   getDb()
