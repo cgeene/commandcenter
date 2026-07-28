@@ -574,7 +574,7 @@ Runtime-configurable — **not** environment variables. Edit with
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Master switch (the dashboard kill switch flips this) |
-| `max_concurrent` | `3` | Max live workers the scheduler maintains |
+| `max_concurrent` | `3` | Max workers on **active work**. Workers parked under a live reviewer are exempt — see [worker concurrency](docs/architecture.md#worker-concurrency) |
 | `daily_spawn_limit` | `20` | Autonomous spawns allowed per UTC day |
 | `stall_minutes` | `15` | Silence before a working agent is marked stalled |
 | `active_hours` | `null` | Only auto-spawn in this hour window (e.g. `22-6` wraps overnight) |

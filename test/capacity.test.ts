@@ -57,6 +57,24 @@ async function workerOn(status: "in_progress" | "review" | "done", state = "idle
   return { task, agent };
 }
 
+/** A live reviewer judging the task — what makes its worker cap-exempt. */
+async function reviewerOn(taskId: number) {
+  const { createAgent } = await import("../src/db/agents.js");
+  return createAgent({
+    kind: "reviewer",
+    state: "working",
+    task_id: taskId,
+    tmux_target: `cc:@r${taskId}`,
+  });
+}
+
+/** A live worker parked under a live reviewer: the exempt case. */
+async function parkedWorker(state = "idle") {
+  const w = await workerOn("review", state);
+  const reviewer = await reviewerOn(w.task.id);
+  return { ...w, reviewer };
+}
+
 function schedulerDeps(spawned: number[], now = new Date("2026-07-28T12:00:00Z")) {
   return {
     spawn: (id: number) => spawned.push(id),
@@ -66,10 +84,10 @@ function schedulerDeps(spawned: number[], now = new Date("2026-07-28T12:00:00Z")
 }
 
 describe("workerSlots", () => {
-  it("exempts a worker parked in review and counts one on active work", async () => {
+  it("exempts a worker parked under a live reviewer and counts one on active work", async () => {
     const { workerSlots } = await import("../src/daemon/capacity.js");
     const active = await workerOn("in_progress", "working");
-    const parked = await workerOn("review");
+    const parked = await parkedWorker();
 
     const slots = workerSlots();
     expect(slots.counted.map((a) => a.id)).toEqual([active.agent.id]);
@@ -81,11 +99,60 @@ describe("workerSlots", () => {
     // A missed Stop hook (still "working"), a stall flag, or a permission prompt
     // must not silently re-consume the slot the reviewer will release.
     for (const state of ["working", "stalled", "waiting_input"]) {
-      await workerOn("review", state);
+      await parkedWorker(state);
     }
     const slots = workerSlots();
     expect(slots.counted).toHaveLength(0);
     expect(slots.parked).toHaveLength(3);
+  });
+
+  it("counts a worker in review that no reviewer is judging", async () => {
+    const { workerSlots } = await import("../src/daemon/capacity.js");
+    // Review limbo: the task reached `review` but nothing is coming to release
+    // the worker (no PR to review, auto_review off, budget spent, ...). Exempting
+    // it would leak an unbounded, invisible live provider process.
+    const stuck = await workerOn("review");
+
+    const slots = workerSlots();
+    expect(slots.counted.map((a) => a.id)).toEqual([stuck.agent.id]);
+    expect(slots.parked).toHaveLength(0);
+  });
+
+  it("re-counts a parked worker when its reviewer dies without a verdict", async () => {
+    const { workerSlots } = await import("../src/daemon/capacity.js");
+    const { updateAgent } = await import("../src/db/agents.js");
+    const parked = await parkedWorker();
+    expect(workerSlots().parked).toHaveLength(1);
+
+    updateAgent(parked.reviewer.id, { state: "dead" });
+
+    const slots = workerSlots();
+    expect(slots.parked).toHaveLength(0);
+    expect(slots.counted.map((a) => a.id)).toEqual([parked.agent.id]);
+  });
+
+  it("counts a worker whose task is approved and awaiting merge", async () => {
+    const { workerSlots } = await import("../src/daemon/capacity.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    // The verdict landed: no rejection can arrive for this round, so the worker
+    // is a squatter for the watchdog's approved-awaiting-merge reap to retire —
+    // even while its (now finished) reviewer is still winding down.
+    const done = await parkedWorker();
+    updateTask(done.task.id, { review_verdict: "approve" });
+
+    const slots = workerSlots();
+    expect(slots.parked).toHaveLength(0);
+    expect(slots.counted.map((a) => a.id)).toEqual([done.agent.id]);
+  });
+
+  it("does not let one task's reviewer exempt another task's worker", async () => {
+    const { workerSlots } = await import("../src/daemon/capacity.js");
+    const reviewed = await parkedWorker();
+    const other = await workerOn("review");
+
+    const slots = workerSlots();
+    expect(slots.parked.map((a) => a.id)).toEqual([reviewed.agent.id]);
+    expect(slots.counted.map((a) => a.id)).toEqual([other.agent.id]);
   });
 
   it("still counts a squatter idling on a finished task and a worker with no task", async () => {
@@ -115,13 +182,13 @@ describe("workerSlots", () => {
 });
 
 describe("scheduler capacity with parked workers", () => {
-  it("spawns queued work while every live worker is parked in review", async () => {
+  it("spawns queued work while every live worker is parked under review", async () => {
     const { createTask } = await import("../src/db/tasks.js");
     const { setSchedulerConfig } = await import("../src/db/settings.js");
     const { countEventsToday } = await import("../src/db/events.js");
     const { tick } = await import("../src/daemon/scheduler.js");
     setSchedulerConfig({ enabled: true, max_concurrent: 1 });
-    await workerOn("review"); // parked: holds no slot
+    await parkedWorker(); // parked: holds no slot
     const waiting = createTask({ title: "waiting", prompt: "x", repo: "/r" });
 
     const spawned: number[] = [];
@@ -138,7 +205,7 @@ describe("scheduler capacity with parked workers", () => {
     const { tick } = await import("../src/daemon/scheduler.js");
     setSchedulerConfig({ enabled: true, max_concurrent: 1 });
     await workerOn("in_progress", "working"); // takes the only slot
-    await workerOn("review"); // parked, exempt
+    await parkedWorker(); // parked, exempt
     createTask({ title: "waiting", prompt: "x", repo: "/r" });
 
     const spawned: number[] = [];
@@ -159,7 +226,7 @@ describe("scheduler capacity with parked workers", () => {
     const { getDb } = await import("../src/db/db.js");
     const { deriveAttention } = await import("../src/daemon/attention.js");
     setSchedulerConfig({ enabled: true, max_concurrent: 1 });
-    await workerOn("review");
+    await parkedWorker();
     createTask({ title: "waiting", prompt: "x", repo: "/r" });
     // A stale blockage anchor from before the parked worker was exempt.
     logEvent("scheduler.capacity_blocked", { payload: { max_concurrent: 1 } });
@@ -172,6 +239,86 @@ describe("scheduler capacity with parked workers", () => {
   });
 });
 
+// A task can sit in `review` with nobody coming to land a verdict. Exempting
+// those workers would leak live provider processes with no bound and no signal,
+// so they fall back to the pre-existing behavior: counted, and therefore
+// bounded by the cap and named by the stall event and the Needs You panel.
+describe("review limbo (no reviewer is coming)", () => {
+  it("counts a repo task in review that auto-review skips for having no PR", async () => {
+    const { maybeAutoReview } = await import("../src/daemon/review.js");
+    const { listAgents } = await import("../src/db/agents.js");
+    const { workerSlots } = await import("../src/daemon/capacity.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    setSchedulerConfig({ enabled: true, auto_review: true, max_concurrent: 1 });
+    const stuck = await workerOn("review"); // repo task, pr_url still null
+
+    await maybeAutoReview(stuck.task.id);
+
+    expect(listAgents({ live: true }).some((a) => a.kind === "reviewer")).toBe(false);
+    const slots = workerSlots();
+    expect(slots.counted.map((a) => a.id)).toEqual([stuck.agent.id]);
+    expect(slots.parked).toHaveLength(0);
+  });
+
+  it("counts a worker in review when auto_review is switched off", async () => {
+    const { maybeAutoReview } = await import("../src/daemon/review.js");
+    const { listAgents } = await import("../src/db/agents.js");
+    const { workerSlots } = await import("../src/daemon/capacity.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    setSchedulerConfig({ enabled: true, auto_review: false, max_concurrent: 1 });
+    const stuck = await workerOn("review");
+    updateTask(stuck.task.id, { pr_url: "https://example.test/pr/1" });
+
+    await maybeAutoReview(stuck.task.id);
+
+    expect(listAgents({ live: true }).some((a) => a.kind === "reviewer")).toBe(false);
+    const slots = workerSlots();
+    expect(slots.counted.map((a) => a.id)).toEqual([stuck.agent.id]);
+    expect(slots.parked).toHaveLength(0);
+  });
+
+  it("blocks the queue on a limbo worker instead of spawning over it", async () => {
+    const { createTask } = await import("../src/db/tasks.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { tick } = await import("../src/daemon/scheduler.js");
+    setSchedulerConfig({ enabled: true, max_concurrent: 1 });
+    await workerOn("review"); // in review, but no reviewer judging it
+    createTask({ title: "waiting", prompt: "x", repo: "/r" });
+
+    const spawned: number[] = [];
+    tick(schedulerDeps(spawned));
+
+    expect(spawned).toEqual([]);
+    const blocked = listEvents(20).find((e) => e.kind === "scheduler.capacity_blocked");
+    const payload = JSON.parse(blocked!.payload!);
+    expect(payload.live_workers).toBe(1);
+    expect(payload.parked_workers).toBe(0);
+  });
+
+  it("names a limbo worker in the Needs You stall item", async () => {
+    const { createTask } = await import("../src/db/tasks.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { getDb } = await import("../src/db/db.js");
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    setSchedulerConfig({ enabled: true, max_concurrent: 1 });
+    const stuck = await workerOn("review");
+    createTask({ title: "waiting", prompt: "x", repo: "/r" });
+    logEvent("scheduler.capacity_blocked", { payload: { max_concurrent: 1 } });
+    getDb()
+      .prepare("UPDATE events SET ts = ? WHERE kind = 'scheduler.capacity_blocked'")
+      .run(new Date(Date.now() - 20 * 60_000).toISOString());
+
+    const stall = deriveAttention({ isPrOpen: () => true }).find(
+      (i) => i.kind === "scheduler_stalled",
+    );
+    expect(stall).toBeDefined();
+    expect(stall!.context).toContain(`a${stuck.agent.id}`);
+  });
+});
+
 describe("rejection re-entry into the cap", () => {
   it("logs the temporary over-cap when rework wakes a parked worker past the cap", async () => {
     const { handleVerdict } = await import("../src/daemon/review.js");
@@ -181,9 +328,9 @@ describe("rejection re-entry into the cap", () => {
     const { workerSlots } = await import("../src/daemon/capacity.js");
     setSchedulerConfig({ enabled: true, max_concurrent: 1 });
     await workerOn("in_progress", "working"); // already at the cap
-    const parked = await workerOn("review");
+    const parked = await parkedWorker();
 
-    await handleVerdict(parked.task.id, 99, "reject", "fix the empty-input case");
+    await handleVerdict(parked.task.id, parked.reviewer.id, "reject", "fix the empty-input case");
 
     // Rework is a continuation: it is never refused, so the worker keeps the task.
     const task = getTask(parked.task.id)!;
@@ -210,9 +357,14 @@ describe("rejection re-entry into the cap", () => {
     const { setSchedulerConfig } = await import("../src/db/settings.js");
     const { countEventsToday } = await import("../src/db/events.js");
     setSchedulerConfig({ enabled: true, max_concurrent: 3 });
-    const parked = await workerOn("review");
+    const parked = await parkedWorker();
 
-    await handleVerdict(parked.task.id, 99, "reject", "restore the deleted retry test");
+    await handleVerdict(
+      parked.task.id,
+      parked.reviewer.id,
+      "reject",
+      "restore the deleted retry test",
+    );
 
     expect(getTask(parked.task.id)!.status).toBe("in_progress");
     expect(countEventsToday("scheduler.worker_over_cap")).toBe(0);

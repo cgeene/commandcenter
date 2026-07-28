@@ -299,17 +299,30 @@ Counted:
 - workers on `claimed` / `in_progress` tasks, including a rework round after a
   rejection;
 - a worker with no task yet (a manual or mid-spawn agent);
+- a worker whose task is in `review` with nobody reviewing it — see below;
 - a worker idling on a finished or blocked task until the watchdog reaps it —
   a real squatter, so it stays visible to the cap rather than being forgiven.
 
-Exempt — **parked in review**: a worker whose task is in `review` has handed the
-work to the reviewer and owns no further state change until a verdict lands. It
-stays alive for exactly one reason: a rejection can then be delivered into its
-existing session, which is much cheaper than a respawn. Counting those idle
-workers took the fleet to zero throughput during review waves — every slot held
-by a parked worker while triaged tasks queued. The exemption ignores agent state,
-so a missed Stop hook or a permission prompt cannot silently re-consume a slot
-the reviewer is responsible for releasing.
+Exempt — **parked under review**: a worker is parked when a live reviewer agent
+is judging its task and no verdict has landed yet. It is idle by construction —
+it handed the work to the reviewer and owns no further state change — and stays
+alive for exactly one reason: a rejection can then be delivered into its existing
+session, which is much cheaper than a respawn. Counting those idle workers took
+the fleet to zero throughput during review waves, every slot held by a parked
+worker while triaged tasks queued. Within the parked case the exemption ignores
+agent state, so a missed Stop hook or a permission prompt cannot silently
+re-consume a slot the reviewer is responsible for releasing.
+
+The exemption is keyed on the **reviewer**, not on the `review` status, because a
+task can sit in `review` with nobody coming to release it: a repo task with no PR
+(auto-review skips it), `auto_review` off, the daily review budget spent, a
+submission with nothing reviewable, or a reviewer that died before submitting. A
+worker in that review limbo is exactly the squatter described above, so it counts
+— bounded by the cap and named by `scheduler.capacity_blocked` and the Needs You
+"scheduler stalled" item, instead of accumulating live provider processes with no
+limit and no signal. A worker whose task was already **approved** counts for the
+same reason: no rejection can arrive for that round, and the watchdog's
+approved-awaiting-merge reap retires it.
 
 When a rejection is delivered into a parked worker, its task returns to
 `in_progress` and the worker re-enters the count. Rework is a continuation of

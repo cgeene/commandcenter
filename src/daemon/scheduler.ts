@@ -255,10 +255,17 @@ function noteCapacityBlocked(
       workers,
     },
   });
+  // The count is the ACTIVE-WORK set: workers parked under a live reviewer are
+  // exempt, so they are reported separately rather than sending the human
+  // hunting for a slot none of them hold.
+  const parkedNote =
+    parked.length > 0
+      ? ` (+${parked.length} parked under review, not counted)`
+      : "";
   notifyEvent(
     "capacity_or_budget",
     "scheduler stalled — no free slots",
-    `${liveWorkers.length}/${cfg.max_concurrent} worker slots taken while tasks wait — check for idle workers holding slots`,
+    `${liveWorkers.length}/${cfg.max_concurrent} active-work slots taken while tasks wait${parkedNote} — check for workers idling on finished or already-reviewed work`,
     { tags: "construction" },
   );
 }
