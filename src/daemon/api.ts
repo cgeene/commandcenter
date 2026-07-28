@@ -87,6 +87,7 @@ import {
 } from "../notify-events.js";
 import { dismissAttention } from "../db/attention.js";
 import { BlockerValidationError } from "../lib/blockers.js";
+import { grantTaskPriority } from "../lib/task-priority.js";
 import {
   claimTask,
   childTasks,
@@ -421,6 +422,18 @@ export function buildApp(): Hono {
         return c.json({ error: "all-repositories children must be repository tasks" }, 400);
       }
     }
+    // Resolve the creating agent (if any) before the row is written: it decides
+    // both who the audit log credits and — for a worker — how much of the
+    // requested priority is granted. Unknown ids are ignored gracefully
+    // (treated as a human submission), as are humans on the dashboard/CLI.
+    const creator = body.agent_id !== undefined ? getAgent(body.agent_id) : undefined;
+    const filerTask =
+      creator?.task_id != null ? getTask(creator.task_id) : undefined;
+    const priorityGrant = grantTaskPriority({
+      creatorKind: creator?.kind ?? null,
+      requested: body.priority ?? parent?.priority,
+      filerTaskPriority: filerTask?.priority,
+    });
     const workerProvider =
       body.worker_provider ?? parent?.worker_provider ?? resolveWorkerProvider();
     const inheritedModel =
@@ -479,7 +492,7 @@ export function buildApp(): Hono {
         // clients and existing cloud workflows.
         dispatch_mode: explicitWorkspace ? "orchestrated" : "direct",
         parent_task_id: body.parent_task_id,
-        priority: body.priority ?? parent?.priority,
+        priority: priorityGrant.priority,
         worker_provider: workerProvider,
         model,
         reasoning_effort: reasoningEffort,
@@ -498,10 +511,11 @@ export function buildApp(): Hono {
       }
       throw error;
     }
-    // Resolve the creating agent (if any) so the audit log records who filed
-    // the task and so we can skip re-triaging a task main created itself.
-    // Unknown ids are ignored gracefully — treated as a human submission.
-    const creator = body.agent_id !== undefined ? getAgent(body.agent_id) : undefined;
+    // The creator (resolved above) is recorded so the audit log knows who filed
+    // the task and so delegateTaskToMain can skip re-triaging a task main
+    // created itself. A clamped worker request is recorded alongside it: the
+    // worker's own urgency signal is the input to the orchestrator's triage
+    // decision, so it must survive being overruled.
     logEvent("task.created", {
       taskId: task.id,
       agentId: creator?.id,
@@ -511,6 +525,12 @@ export function buildApp(): Hono {
         parent_task_id: task.parent_task_id,
         creator_agent_id: creator?.id ?? null,
         creator_kind: creator?.kind ?? null,
+        ...(priorityGrant.clamped
+          ? {
+              requested_priority: priorityGrant.requested,
+              granted_priority: task.priority,
+            }
+          : {}),
       },
     });
     // delegateTaskToMain self-guards main-created tasks (see orchestration.ts),
