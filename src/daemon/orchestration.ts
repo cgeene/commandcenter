@@ -1,10 +1,32 @@
 import { getAgent, listAgents, type Agent } from "../db/agents.js";
 import { latestTaskEvent, logEvent } from "../db/events.js";
-import { clearTriageQueueForTask } from "../db/notifications.js";
+import {
+  clearTriageQueueForTask,
+  listQueuedNotifications,
+} from "../db/notifications.js";
 import { getTask, type Task } from "../db/tasks.js";
-import { deliverToMainIfClear, queueDelivery } from "./notifqueue.js";
+import {
+  buildTriageMessage,
+  deliverToMainIfClear,
+  queueDelivery,
+} from "./notifqueue.js";
 import { dispatchableTasks } from "./serial.js";
 import { windowExists } from "./tmux.js";
+import {
+  pendingHumanWorkerResume,
+  taskCreatorKind,
+  triagePrompt,
+} from "./triageprompt.js";
+
+/**
+ * How long an UNACKED task waits before the catch-up path pings main about it
+ * again. The ack (task.triaged_at, stamped when the orchestrator reads the full
+ * record) is what normally stops re-delivery; this is the safety net for the
+ * case the ack cannot cover — a main that was handed the ping and then died,
+ * compacted, or simply never read the task. Without it, one delivered-but-
+ * unread ping would strand the task in the queue silently forever.
+ */
+export const TRIAGE_REDELIVER_AFTER_MS = 10 * 60_000;
 
 function availableMain(preferred?: Agent): Agent | undefined {
   const candidates = preferred ? [preferred] : listAgents({ live: true });
@@ -17,43 +39,35 @@ function availableMain(preferred?: Agent): Agent | undefined {
   );
 }
 
-/** Kind of the agent that created a task, from its task.created event
- *  (null when a human filed it via the dashboard/CLI). */
-function taskCreatorKind(taskId: number): Agent["kind"] | null {
-  const created = latestTaskEvent(taskId, ["task.created"]);
-  if (!created?.payload) return null;
-  try {
-    const payload = JSON.parse(created.payload) as { creator_kind?: unknown };
-    const kind = payload.creator_kind;
-    return kind === "main" || kind === "worker" || kind === "reviewer"
-      ? kind
-      : null;
-  } catch {
-    return null;
-  }
+/**
+ * Whether the task has been triaged and so must not be pinged again.
+ *
+ * A property of the TASK, not of any one orchestrator session: triaged_at is set
+ * by the orchestrator's own full read and cleared whenever the task changes in a
+ * way that needs fresh triage (see updateTask / clearTaskTriageAck). Every
+ * consumer of the ack — this module and notifqueue's staleness check — reads it
+ * exactly this way, so a queued ping can never be suppressed on one side and
+ * kept alive on the other.
+ *
+ * A task acked by an orchestrator that later dies stays quiet rather than
+ * re-surfacing on a timer; it remains visible (with triaged_at) in
+ * list_tasks(ready=true), which is where a fresh main is told to look for work it
+ * has not handled. Tasks that were never acked keep their periodic redelivery
+ * (see TRIAGE_REDELIVER_AFTER_MS).
+ */
+function triaged(task: Task): boolean {
+  return task.triaged_at !== null;
 }
 
-function pendingHumanWorkerResume(taskId: number): boolean {
-  const requested = latestTaskEvent(taskId, ["task.worker_resume_requested"]);
-  if (!requested) return false;
-  const spawned = latestTaskEvent(taskId, ["agent.spawned"]);
-  return !spawned || requested.id > spawned.id;
-}
-
-function taskPrompt(task: Task, creatorKind: Agent["kind"] | null): string {
-  if (pendingHumanWorkerResume(task.id)) {
-    return `[commandcenter] The human reopened approved task #${task.id}, but its managed worker launch failed and the task is queued (workspace_kind=${task.workspace_kind}). The prior approval is already invalidated and its result/review handoff is in the prompt. Call get_task(${task.id}), then spawn_worker(${task.id}); this retry will reuse the same-provider session when available. Do not create a duplicate task.`;
+/** Task-triage rows already persisted for this main, by task id. */
+function queuedTriageRows(mainId: number): Map<number, string> {
+  const rows = new Map<number, string>();
+  for (const row of listQueuedNotifications(mainId)) {
+    if (row.origin === "task_triage" && row.task_id != null) {
+      rows.set(row.task_id, row.message);
+    }
   }
-  const reopened = latestTaskEvent(task.id, ["task.archived_resumed"]);
-  const created = latestTaskEvent(task.id, ["task.created"]);
-  if (reopened && (!created || reopened.id > created.id)) {
-    return `[commandcenter] Archived task #${task.id} was reopened and is awaiting your triage (workspace_kind=${task.workspace_kind}). Call get_task(${task.id}), study the original task plus its Resume request section, then continue the SAME task. Do not create a duplicate task. For repo/scratch tasks, call spawn_worker(${task.id}); Command Center will resume the same provider session when its transcript still exists and otherwise start a fresh session with the preserved handoff. For portfolio tasks, re-evaluate its existing children and create only genuinely missing repository work.`;
-  }
-  const descriptor =
-    creatorKind === "worker"
-      ? `worker-filed follow-up task #${task.id}`
-      : `human-submitted task #${task.id}`;
-  return `[commandcenter] New ${descriptor} is awaiting your triage (workspace_kind=${task.workspace_kind}). Call get_task(${task.id}, verbose: true) — the compact default omits the prompt — study its full prompt, validate the scope and execution settings, then dispatch it. For portfolio tasks, never spawn the parent: mark it in_progress, use list_repositories, create per-repository child tasks with parent_task_id=${task.id}, preserve the parent's selected provider/model/reasoning effort unless you deliberately document an override, and spawn those isolated children. For scratch tasks, spawn the task directly and review its result/transcript rather than expecting a Git diff.`;
+  return rows;
 }
 
 /**
@@ -79,9 +93,88 @@ export type DelegateOutcome =
   | "delivered"
   | "queued"
   | "already_queued"
+  | "already_triaged"
   | "self_filed"
   | "no_main"
   | "not_triageable";
+
+/**
+ * Send one triage ping covering `tasks` — one message however many tasks it
+ * covers (buildTriageMessage sends a single task's prompt verbatim and collapses
+ * ordinary new-task pings into one compact list), so a queue that fills up while
+ * main is busy costs it one turn to read, not one per task.
+ *
+ * On a busy/mid-draft prompt each task is persisted as its own queued row: the
+ * flush re-validates and re-batches them individually, so a task dispatched in
+ * the meantime is dropped instead of delivered late.
+ *
+ * `retry` marks the periodic/idle catch-up, whose calls repeat on a timer rather
+ * than on something happening. That path must be silent once the work is already
+ * persisted (see below); event-driven callers always try, so a human's manual
+ * "notify main" is never answered with silence.
+ */
+async function deliverTriage(
+  main: Agent,
+  tasks: Task[],
+  opts: { retry?: boolean } = {},
+): Promise<DelegateOutcome> {
+  const items = tasks.map((task) => ({
+    task,
+    task_id: task.id,
+    message: triagePrompt(task, taskCreatorKind(task.id)),
+  }));
+  // What is already owed to this main, and therefore already recorded. A row
+  // whose stored message no longer matches (the task was reopened into a
+  // different flavor of ping) still needs refreshing.
+  const persisted = queuedTriageRows(main.id);
+  const unrecorded = items.filter((it) => persisted.get(it.task_id) !== it.message);
+  // The whole batch is already queued and unchanged: the flush owns it now (the
+  // same watchdog tick that calls us also flushes every idle main, and the Stop
+  // hook forces a flush), so trying again achieves nothing except noise. The
+  // watchdog runs every 10s, so without this a 12-task queue re-logged
+  // task.awaiting_main + delivery.persisted for all 12 tasks per tick and buried
+  // the very event feed this deduplication is meant to keep readable.
+  if (opts.retry && unrecorded.length === 0) return "already_queued";
+  const delivered = await deliverToMainIfClear(main, buildTriageMessage(items));
+  if (delivered !== "delivered") {
+    let created = false;
+    // Only tasks whose queue row does not already say this: repeating the events
+    // for a row that is unchanged records nothing new.
+    for (const it of unrecorded) {
+      logEvent("task.awaiting_main", {
+        taskId: it.task_id,
+        payload: { main_agent_id: main.id, reason: "main_prompt_busy" },
+      });
+      // Persist the ping instead of relying purely on re-derivation from task
+      // state. The state-derived retry (delegatePendingTaskToMain) is gated on
+      // an ack and a cooldown, and before this row existed there was no record
+      // that a delivery was owed at all, so a daemon restart erased a
+      // deliberate ping without a trace.
+      created =
+        queueDelivery({
+          mainId: main.id,
+          taskId: it.task_id,
+          message: it.message,
+          origin: "task_triage",
+          reason: "main_prompt_busy",
+        }) || created;
+    }
+    return created ? "queued" : "already_queued";
+  }
+  for (const it of items) {
+    // Delivered live — drop any earlier queued copy so the flush cannot repeat it.
+    clearTriageQueueForTask(it.task_id);
+    logEvent("task.delegated_to_main", {
+      taskId: it.task_id,
+      agentId: main.id,
+      payload: {
+        workspace_kind: it.task.workspace_kind,
+        batched: items.length > 1 ? items.length : undefined,
+      },
+    });
+  }
+  return "delivered";
+}
 
 /** Deliver a newly-created orchestrated task to Claude main, or persist the
  *  ping for the queue flush to deliver once the main's prompt is clear. */
@@ -93,6 +186,14 @@ export async function delegateTaskToMainDetailed(
   if (!task || task.dispatch_mode !== "orchestrated" || task.status !== "queued") {
     return "not_triageable";
   }
+  // Already triaged: the orchestrator has read this task and left it queued
+  // deliberately (sequenced behind other work), so pinging it again just burns a
+  // turn on re-reading state it already has. Every route lands here, which
+  // matters most for the PATCH route — editing a queued task's priority or
+  // blocker used to re-deliver it as if it were new. An edit that changes what
+  // triage judged, or an explicit re-flag, clears the ack (see updateTask /
+  // clearTaskTriageAck) and delivery resumes.
+  if (triaged(task)) return "already_triaged";
   // A task main filed itself must never trigger a triage ping back to main —
   // on ANY route (immediate POST, PATCH re-queue, the manual /delegate
   // endpoint, or the idle/SessionStart hooks and periodic scheduler that call
@@ -115,36 +216,7 @@ export async function delegateTaskToMainDetailed(
   // Never merge the triage prompt into the human's mid-typed draft or fire it
   // mid-turn: deliver only when the main is idle with a genuinely clear prompt
   // (the same gate every main-delivery path shares — see deliverToMainIfClear).
-  const message = taskPrompt(task, taskCreatorKind(task.id));
-  const delivered = await deliverToMainIfClear(main, message);
-  if (delivered !== "delivered") {
-    logEvent("task.awaiting_main", {
-      taskId,
-      payload: { main_agent_id: main.id, reason: "main_prompt_busy" },
-    });
-    // Persist the ping instead of relying purely on re-derivation from task
-    // state. The state-derived retry (delegatePendingTaskToMain) only ever
-    // delivers the OLDEST pending task, so a deliberate ping for a task further
-    // down the queue could wait behind everything in front of it — and before
-    // this row existed there was no record that a delivery was owed at all, so
-    // a daemon restart erased the request without a trace.
-    const created = queueDelivery({
-      mainId: main.id,
-      taskId: task.id,
-      message,
-      origin: "task_triage",
-      reason: "main_prompt_busy",
-    });
-    return created ? "queued" : "already_queued";
-  }
-  // Delivered live — drop any earlier queued copy so the flush cannot repeat it.
-  clearTriageQueueForTask(task.id);
-  logEvent("task.delegated_to_main", {
-    taskId,
-    agentId: main.id,
-    payload: { workspace_kind: task.workspace_kind },
-  });
-  return "delivered";
+  return deliverTriage(main, [task]);
 }
 
 /** Boolean form: true only when the triage prompt actually reached the main. */
@@ -155,21 +227,27 @@ export async function delegateTaskToMain(
   return (await delegateTaskToMainDetailed(taskId, preferredMain)) === "delivered";
 }
 
-/** On main startup/idle, re-deliver the oldest task that still needs triage. */
-export async function delegatePendingTaskToMain(main: Agent): Promise<boolean> {
-  if (!availableMain(main)) return false;
-  const pending = dispatchableTasks("orchestrated").filter((task) => {
-    // Skip main-created tasks: they need no triage, and leaving one in the
-    // pending set would park it at the queue head forever (delegatePending
-    // only delivers pending[0]), starving the tasks behind it. A failed
-    // human-requested worker resume is different: the task was reopened
-    // outside Main's current turn and still needs a managed spawn retry.
+/**
+ * Every ready task this main still owes triage on, queue order.
+ *
+ * The ack is the primary gate: a triaged task is never re-delivered, however it
+ * is left — including left queued on purpose, which is exactly the case that
+ * used to re-ping forever. Everything else is the "did this main ever get told"
+ * question the delegation events answer, plus a cooldown so a ping that was
+ * delivered but never acknowledged is eventually repeated rather than lost.
+ */
+export function pendingTriageTasks(main: Agent, nowMs: number = Date.now()): Task[] {
+  return dispatchableTasks("orchestrated").filter((task) => {
+    // Skip main-created tasks: they need no triage. A failed human-requested
+    // worker resume is different — the task was reopened outside Main's current
+    // turn and still needs a managed spawn retry.
     if (
       taskCreatorKind(task.id) === "main" &&
       !pendingHumanWorkerResume(task.id)
     ) {
       return false;
     }
+    if (triaged(task)) return false;
     const delegated = latestTaskEvent(task.id, ["task.delegated_to_main"]);
     const queued = latestTaskEvent(task.id, [
       "task.created",
@@ -177,15 +255,44 @@ export async function delegatePendingTaskToMain(main: Agent): Promise<boolean> {
       "task.worker_resume_requested",
       "task.reopened",
       "task.requeued",
+      // Losing a triage ack (edited, re-queued, or re-flagged by hand) is itself
+      // a reason to deliver again, whatever the delegation history says.
+      "task.triage_reflagged",
     ]);
-    return (
+    if (
       !delegated ||
       delegated.agent_id !== main.id ||
       Boolean(queued && queued.id > delegated.id)
-    );
+    ) {
+      return true;
+    }
+    // Delivered to THIS main, not re-queued since, and still not acked. The
+    // orchestrator may have died holding it or never read it, so nudge again —
+    // but on a cooldown, not on every idle tick.
+    const at = Date.parse(delegated.ts);
+    return Number.isFinite(at) && nowMs - at >= TRIAGE_REDELIVER_AFTER_MS;
   });
-  const task = pending[0];
-  return task ? delegateTaskToMain(task.id, main) : false;
+}
+
+/**
+ * On main startup/idle, and on every watchdog tick, deliver everything that
+ * still needs triage — as ONE message. This used to send pending[0] only, so a
+ * queue of N tasks cost N separate wake-ups (each one a full turn spent
+ * re-reading state) as the main went idle between them.
+ *
+ * pendingTriageTasks has already applied every guard the per-task route applies
+ * (ready, main-created, ack), so this goes straight to delivery. It is the timer-
+ * driven path, hence retry: once the pending set is fully persisted it stays
+ * quiet and lets the queue flush finish the job.
+ */
+export async function delegatePendingTaskToMain(
+  main: Agent,
+  opts: { nowMs?: number } = {},
+): Promise<boolean> {
+  if (!availableMain(main)) return false;
+  const pending = pendingTriageTasks(main, opts.nowMs);
+  if (pending.length === 0) return false;
+  return (await deliverTriage(main, pending, { retry: true })) === "delivered";
 }
 
 /** Periodic recovery for tasks that become ready after a blocker completes. */

@@ -88,7 +88,7 @@ button. Unknown keys fall back to the defaults below.
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Master switch for autonomous spawning. The dashboard kill switch flips this. |
-| `max_concurrent` | `3` | Max live workers the scheduler maintains. Manual spawns aren't counted against it but occupy slots. |
+| `max_concurrent` | `3` | Max workers on active work. Counts workers whose task is `claimed`/`in_progress` (including a rework round after a rejection), workers with no task yet, workers idling on a finished or blocked task, and workers whose task sits in `review` with no reviewer still working on it. Workers **parked under a running reviewer** are exempt, for up to 4 hours per review round — see [`architecture.md`](architecture.md#worker-concurrency). Manual spawns aren't counted against it but occupy slots. |
 | `daily_spawn_limit` | `20` | Autonomous spawns allowed per UTC day — a budget backstop. Manual spawns still work after the limit. |
 | `stall_minutes` | `15` | Minutes without any hook event before a working agent is marked stalled and pushed to your phone. |
 | `active_hours` | `null` | Only auto-spawn within this hour window (local time). `null` = always. `start > end` wraps overnight (e.g. `22-6`). |

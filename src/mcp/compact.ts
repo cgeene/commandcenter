@@ -41,6 +41,12 @@ export const COMPACT_TASK_FIELDS = [
   "pr_state",
   "pr_checks",
   "pr_is_draft",
+  // Whether this queued task has already been triaged. Small, and hiding it
+  // from the agent whose own ack it records is what makes an already-triaged
+  // queued task indistinguishable from a new one — a fresh or compacted
+  // orchestrator would have to verbose-read every queued task to tell them
+  // apart, and that read is itself the ack.
+  "triaged_at",
   "tokens_used",
   "result_summary",
   "created_at",
@@ -57,6 +63,9 @@ export const TASK_ROW_FIELDS = [
   "blocked_by",
   "pr_state",
   "review_verdict",
+  // list_tasks(ready=true) is how the orchestrator finds work it may have
+  // missed; without this it cannot see which of those it has already triaged.
+  "triaged_at",
   "updated_at",
 ] as const;
 

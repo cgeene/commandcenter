@@ -20,6 +20,7 @@ import {
   shapeTaskList,
   shapeTaskPayload,
 } from "./compact.js";
+import { taskReadPath } from "./triage.js";
 import { blockerEffect, blockerNote } from "../lib/blockers.js";
 
 const ROLE =
@@ -467,11 +468,18 @@ if (ROLE === "main") {
     "get_task",
     {
       description:
-        "Fetch one task by id. Compact by default: core fields plus a truncated result_summary, without the prompt or review notes. TRIAGE REQUIRES get_task(id, verbose: true) — that is the only way to read the task's full prompt. fields returns an exact subset.",
+        "Fetch one task by id. Compact by default: core fields plus a truncated result_summary, without the prompt or review notes. TRIAGE REQUIRES get_task(id, verbose: true) — that is the only way to read the task's full prompt, and it also acknowledges the task's triage ping so Command Center stops re-delivering it (an edit to its prompt/repo, or a re-queue, flags it for triage again). fields returns an exact subset.",
       inputSchema: { id: z.number().int(), verbose: verboseArg, fields: fieldsArg },
     },
+    // A full read carries ?triage_ack=1: this tool is main-role only, and
+    // reading the whole record IS the triage action — see taskReadPath.
     async ({ id, verbose, fields }) =>
-      asText(shapeTask(await call("GET", `/api/tasks/${id}`), { verbose, fields })),
+      asText(
+        shapeTask(await call("GET", taskReadPath(id, { verbose, fields })), {
+          verbose,
+          fields,
+        }),
+      ),
   );
 
   server.registerTool(

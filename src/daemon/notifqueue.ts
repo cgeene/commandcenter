@@ -16,6 +16,7 @@ import { notifyEvent } from "./notify.js";
 import { parsePane } from "./pane.js";
 import { resumeAgent } from "./resume.js";
 import { capturePane, windowExists } from "./tmux.js";
+import { batchableTriagePrompt } from "./triageprompt.js";
 
 const PANE_TAIL_LINES = 60;
 
@@ -441,6 +442,10 @@ function stalenessReason(
     const task = getTask(it.task_id);
     if (!task) return "task_gone";
     if (task.status !== "queued") return `task_${task.status}`;
+    // Acked while the ping sat in the queue: the orchestrator has read this
+    // task and left it queued on purpose, so delivering now would send it to
+    // re-triage what it already decided.
+    if (task.triaged_at) return "task_triaged";
     if (task.dispatch_mode !== "orchestrated") return "task_not_orchestrated";
     if (!readyTriageIds.has(task.id)) return "task_blocked";
     return null;
@@ -452,15 +457,36 @@ function stalenessReason(
   return null;
 }
 
-/** The batched triage half of a flush. A single row carries the full triage
- *  prompt that would have been delivered live, so it is sent verbatim; several
- *  collapse into one compact ping rather than concatenating whole prompts. */
+/**
+ * The batched triage half of a flush. A single row carries the full triage
+ * prompt that would have been delivered live, so it is sent verbatim; several
+ * ORDINARY ones collapse into one compact ping rather than concatenating whole
+ * prompts.
+ *
+ * A resume-flavored ping is never collapsed. Its prompt is the only thing that
+ * says "continue the SAME task, do not create a duplicate" (a reopened archived
+ * task) or "its managed worker launch failed — call spawn_worker" (a failed
+ * resume), and a generic list of ids cannot carry either. Batching those away
+ * would trade the N-messages problem for duplicate tasks, so they ride along in
+ * full after the compact list — see triageprompt.batchableTriagePrompt.
+ */
 export function buildTriageMessage(
   items: Pick<QueuedNotification, "task_id" | "message">[],
 ): string {
   if (items.length === 1) return items[0].message;
-  const ids = items.map((it) => `#${it.task_id}`).join(", ");
-  return `[commandcenter] ${items.length} tasks are awaiting your triage: ${ids}. Call get_task(<id>, verbose: true) on each — the compact default omits the prompt — study the full prompt, validate the scope and execution settings, then dispatch it. For portfolio tasks, never spawn the parent: mark it in_progress, create per-repository child tasks with parent_task_id set to the parent, preserve the parent's provider/model/reasoning effort unless you deliberately document an override, and spawn those isolated children.`;
+  const verbatim = items.filter((it) => !batchableTriagePrompt(it.task_id));
+  const collapsed = items.filter((it) => batchableTriagePrompt(it.task_id));
+  const parts: string[] = [];
+  if (collapsed.length === 1) {
+    parts.push(collapsed[0].message);
+  } else if (collapsed.length > 1) {
+    const ids = collapsed.map((it) => `#${it.task_id}`).join(", ");
+    parts.push(
+      `[commandcenter] ${collapsed.length} tasks are awaiting your triage: ${ids}. Call get_task(<id>, verbose: true) on each — the compact default omits the prompt — study the full prompt, validate the scope and execution settings, then dispatch it. For portfolio tasks, never spawn the parent: mark it in_progress, create per-repository child tasks with parent_task_id set to the parent, preserve the parent's provider/model/reasoning effort unless you deliberately document an override, and spawn those isolated children.`,
+    );
+  }
+  parts.push(...verbatim.map((it) => it.message));
+  return parts.join("\n\n");
 }
 
 export type FlushResult = "flushed" | "deferred" | "empty" | "not_live";
