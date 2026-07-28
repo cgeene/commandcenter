@@ -190,7 +190,14 @@ const TEMPLATES: Record<string, Template> = {
   "scheduler.capacity_blocked": (_e, p) => {
     const live = Number(p.live_workers) || 0;
     const max = Number(p.max_concurrent) || 0;
-    return `Scheduler stalled — ${live}/${max} worker slots taken while tasks wait`;
+    const parked = Number(p.parked_workers) || 0;
+    const suffix = parked > 0 ? ` (${parked} more parked in review, not counted)` : "";
+    return `Scheduler stalled — ${live}/${max} worker slots taken while tasks wait${suffix}`;
+  },
+  "scheduler.worker_over_cap": (e, p) => {
+    const counted = Number(p.counted_workers) || 0;
+    const max = Number(p.max_concurrent) || 0;
+    return `${counted}/${max} workers — over the cap while ${taskRef(e)} reworks a rejection`;
   },
   "scratch.pruned": (_e, p) =>
     `Removed ${str(p.count) || "expired"} expired scratch workspace${Number(p.count) === 1 ? "" : "s"}`,
