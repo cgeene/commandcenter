@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { listAgents } from "../db/agents.js";
 import { countTaskEvents, latestTaskEvent, logEvent } from "../db/events.js";
-import { latchNotify } from "../db/notifylatch.js";
+import { latchNotify, notifyLatched } from "../db/notifylatch.js";
 import {
   getIntegrationSettings,
   resolveWorktreesDir,
@@ -66,8 +66,9 @@ import {
  * pushing new work. It doesn't, because a conflict-free merge leaves the branch's
  * diff against the default branch byte-identical, so an existing approval still
  * covers the content — freshenTask therefore advances review_head_sha with the
- * local ref (and claims the approved-and-ready push latch) instead of letting the
- * sweep supersede the verdict and re-draft a PR the human was about to merge. A
+ * local ref (carrying the approved-and-ready push latch when, and only when, that
+ * push actually went out) instead of letting the sweep supersede the verdict and
+ * re-draft a PR the human was about to merge. A
  * task that has NOT been approved yet is freshened too; its pending review round
  * simply judges the merged tip, which is what it should be reading anyway.
  *
@@ -489,14 +490,25 @@ async function freshenTask(
       task.review_head_sha === tipSha;
     if (carriedApproval) {
       updateTask(task.id, { review_head_sha: mergeSha });
-      // The human was already told this PR is approved and mergeable; the push is
-      // latched per approved SHA, so claim the new one or the next sweep would
-      // re-announce the same PR just because a merge commit moved its HEAD.
-      latchNotify(
-        approvedReadyLatchKey(task.id, mergeSha),
-        "review_approved_ready",
-        task.id,
-      );
+      // The "approved & ready to merge" push is latched per approved SHA, so a
+      // carried approval has to carry its latch too — otherwise the next sweep
+      // re-announces the same PR just because a merge commit moved its HEAD.
+      //
+      // Carry it ONLY when it was genuinely held for the pre-merge SHA. That
+      // latch exists iff the human was actually told, and notify.ts claims it
+      // only after a successful dispatch precisely so an undelivered push (no
+      // ntfy URL configured yet, or a PR still stuck in draft because
+      // `gh pr ready` failed) is still owed and fires later. Claiming the new
+      // key unconditionally would swallow that owed push forever: the PR would
+      // sit mergeable and silent, since notifyApprovedReady's standing-state
+      // call is exactly what recovers a PR that only left draft after approval.
+      if (notifyLatched(approvedReadyLatchKey(task.id, tipSha))) {
+        latchNotify(
+          approvedReadyLatchKey(task.id, mergeSha),
+          "review_approved_ready",
+          task.id,
+        );
+      }
     }
     logEvent("pr.freshened", {
       taskId: task.id,

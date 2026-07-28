@@ -152,12 +152,18 @@ describe("freshenPass — clean merge", () => {
   it("pushes the merge commit, preserves the diff against main, and carries the approval", async () => {
     const { freshenPass } = await import("../src/daemon/freshen.js");
     const { getTask } = await import("../src/db/tasks.js");
+    const { notifyApprovedReady } = await import("../src/daemon/review.js");
     const { task, branch, tip } = await setupAgentTask({
       file: "feature.txt",
       contents: "feature\n",
       verifyCmd: "true",
       approved: true,
     });
+    // What approval time really does: the ready-to-merge push goes out for the
+    // approved SHA, claiming its latch. That is the precondition for carrying
+    // the latch forward below.
+    notifyApprovedReady(getTask(task.id)!);
+    expect(pushTitles()).toHaveLength(1);
     advanceMain("other.txt", "other\n");
 
     await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
@@ -188,11 +194,49 @@ describe("freshenPass — clean merge", () => {
       verified: true,
     });
 
-    // The human was already told this PR is mergeable; a carried approval must
-    // not re-announce it just because the HEAD moved.
+    // The human was already told this PR is mergeable, so the latch is carried
+    // onto the merge SHA and the standing-state sweep stays silent rather than
+    // re-announcing the same PR because its HEAD moved.
     const { notifyLatched } = await import("../src/db/notifylatch.js");
     const { approvedReadyLatchKey } = await import("../src/daemon/review.js");
     expect(notifyLatched(approvedReadyLatchKey(task.id, newTip))).toBe(true);
+    notifyApprovedReady(getTask(task.id)!);
+    expect(pushTitles()).toHaveLength(1); // still just the approval-time push
+  });
+
+  it("does not swallow the ready-to-merge push that was never delivered", async () => {
+    // The PR is approved but stuck as a draft (`gh pr ready` failed), so
+    // notifyApprovedReady dispatched NOTHING and no latch exists for the
+    // approved SHA. Freshening must not claim a latch on the merge SHA for a
+    // push the human never got — the sweep after a manual ready-flip is exactly
+    // what is supposed to deliver it.
+    const { freshenPass } = await import("../src/daemon/freshen.js");
+    const { notifyApprovedReady } = await import("../src/daemon/review.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { task, branch, tip } = await setupAgentTask({
+      file: "feature.txt",
+      contents: "feature\n",
+      approved: true,
+    });
+    updateTask(task.id, { pr_is_draft: 1 });
+    notifyApprovedReady(getTask(task.id)!); // no-op: a draft PR is not mergeable
+    expect(pushTitles()).toEqual([]);
+    advanceMain("other.txt", "other\n");
+
+    await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
+
+    const newTip = git(repoDir, "rev-parse", `origin/${branch}`);
+    expect(newTip).not.toBe(tip);
+    expect(getTask(task.id)!.review_head_sha).toBe(newTip); // approval carried
+
+    // The human flips the PR ready by hand; prsync records it and re-derives the
+    // standing state. The push must land — exactly once.
+    updateTask(task.id, { pr_is_draft: 0 });
+    notifyApprovedReady(getTask(task.id)!);
+    notifyApprovedReady(getTask(task.id)!);
+    expect(pushTitles()).toEqual([
+      `task #${task.id} reviewed & approved — PR ready to merge`,
+    ]);
   });
 
   it("leaves the carried approval alone when the review loop looks again", async () => {
