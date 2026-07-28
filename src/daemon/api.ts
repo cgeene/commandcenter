@@ -87,16 +87,19 @@ import { BlockerValidationError } from "../lib/blockers.js";
 import {
   claimTask,
   childTasks,
+  clearTaskTriageAck,
   createTask,
   DISPATCH_MODES,
   getTask,
   listTasks,
+  markTaskTriaged,
   readyTasks,
   REVIEW_MODES,
   updateTask,
   WORKSPACE_KINDS,
   type Task,
 } from "../db/tasks.js";
+import { clearTriageQueueForTask } from "../db/notifications.js";
 import { handleHookEvent, resetAutoNudgeCount, type HookPayload } from "./hooks.js";
 import {
   confirmHumanPublication,
@@ -520,7 +523,27 @@ export function buildApp(): Hono {
 
   app.get("/api/tasks/:id", (c) => {
     const task = getTask(Number(c.req.param("id")));
-    return task ? c.json(task) : c.json({ error: "not found" }, 404);
+    if (!task) return c.json({ error: "not found" }, 404);
+    // triage_ack=1 says "this read IS the triage action" — the cc MCP server
+    // sets it when the orchestrator reads a task's FULL record, which is the
+    // only way to see the prompt triage needs. Acking stops the platform
+    // re-delivering a task the orchestrator has already read (markTaskTriaged
+    // no-ops on anything that is not a queued orchestrated task, so a plain
+    // dashboard or worker read can never ack). Nothing else about the response
+    // changes, so this stays a GET.
+    if (c.req.query("triage_ack") === "1") {
+      const acked = markTaskTriaged(task.id);
+      if (acked) {
+        // A ping still sitting in the delivery queue for this task is moot now.
+        const dropped = clearTriageQueueForTask(task.id);
+        logEvent("task.triage_acked", {
+          taskId: task.id,
+          payload: { dropped_queued: dropped },
+        });
+        return c.json(acked);
+      }
+    }
+    return c.json(task);
   });
 
   app.get("/api/tasks/:id/session", (c) => {
@@ -782,6 +805,16 @@ export function buildApp(): Hono {
     if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
       return c.json({ error: "task blockers are not done" }, 409);
     }
+    // Hitting this route deliberately IS the re-flag: the human (or the
+    // dashboard's "notify main" action) is asking for this task to be put in
+    // front of the orchestrator again, so drop any prior triage ack that would
+    // otherwise suppress the send.
+    if (clearTaskTriageAck(id)) {
+      logEvent("task.triage_reflagged", {
+        taskId: id,
+        payload: { reason: "manual delegate" },
+      });
+    }
     // Report what actually happened rather than collapsing every non-delivery
     // into one failure. A busy/mid-draft composer defers the send and the click
     // is persisted for the queue flush (202, not an error); the reasons a ping
@@ -815,6 +848,18 @@ export function buildApp(): Hono {
         {
           error:
             "no live Claude main agent to deliver to — spawn a main agent, or spawn this task's worker directly",
+        },
+        409,
+      );
+    }
+    // Unreachable from this route (the re-flag above clears the ack first), but
+    // named so any other caller gets the real reason instead of "not awaiting
+    // triage" — the task IS awaiting dispatch, it has just already been read.
+    if (outcome === "already_triaged") {
+      return c.json(
+        {
+          error:
+            "Claude main has already triaged this task and left it queued — dispatch it from main, or edit the task to flag it for fresh triage",
         },
         409,
       );
