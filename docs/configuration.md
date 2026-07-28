@@ -109,3 +109,27 @@ example `mcp__some_server__get_*` or `Bash(some-cli status*)`.
 **Never** put a state-changing pattern here. Anything that could mutate state
 should fall through to a normal permission prompt instead. If in doubt, leave it
 out.
+
+## PR integration config
+
+The `integration` settings group controls how the platform keeps open agent PRs
+mergeable while the default branch advances (see the dispatch/integration section
+of [`architecture.md`](architecture.md)). It is stored in the SQLite `settings`
+table and patched via `PATCH /api/settings/integration`, e.g.
+
+```sh
+curl -s -X PATCH http://127.0.0.1:$CC_PORT/api/settings/integration \
+  -H 'content-type: application/json' \
+  -d '{"strict_serial_repos":["/Users/me/projects/personal/commandcenter"]}'
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `auto_freshen` | `true` | Re-merge the repo's default branch into open agent PRs that have fallen behind it, re-running the task's `verify_cmd` before pushing. |
+| `freshen_max_attempts` | `3` | Freshen attempts one task may accumulate before the platform stops and pushes `integration_halted` instead of burning more tokens. |
+| `freshen_per_pass_limit` | `2` | Merges per PR-sync pass. A burst of merges queues: the rest log `pr.freshen_deferred` and are picked up on the next pass. |
+| `strict_serial_repos` | `[]` | Absolute repo paths where only ONE task may be active at a time (active = `claimed`/`in_progress`/`review`, or holding an open agent PR). Opt-in; the default is parallel work sequenced by `blocked_by` at triage. |
+| `merge_nudge_minutes` | `120` | Minutes an approved, mergeable PR may sit unmerged while other tasks in the same repo are queued/active before the human is nudged once. `null` disables the nudge. |
+
+Merging is never automated at any setting — the nudge is the only merge-related
+action the platform takes.

@@ -74,6 +74,8 @@ describe("notification defaults", () => {
       [
         "daemon_stale_build",
         "escalation",
+        "integration_halted",
+        "merge_latency",
         "pr_state_mismatch",
         "quota_spend_limit",
         "quota_threshold",

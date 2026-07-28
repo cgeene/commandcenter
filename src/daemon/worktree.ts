@@ -20,10 +20,28 @@ const FETCH_TIMEOUT_MS = 10_000;
  * this headless daemon; the timeout is a second backstop against a wedged
  * connection. Throws on any failure — callers decide the fallback.
  */
-function fetchQuiet(repo: string, ...refs: string[]): void {
+export function fetchQuiet(repo: string, ...refs: string[]): void {
   execFileSync("git", ["-C", repo, "fetch", "--quiet", "origin", ...refs], {
     encoding: "utf8",
     timeout: FETCH_TIMEOUT_MS,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+  });
+}
+
+const PUSH_TIMEOUT_MS = 60_000;
+
+/**
+ * Push to origin from `repo`. Same protections as fetchQuiet, and for the same
+ * reason: `git()` is execFileSync, so a network call without a timeout and
+ * without GIT_TERMINAL_PROMPT=0 could block the whole daemon event loop forever
+ * on a wedged connection or a credential prompt. Throws on any failure —
+ * deliberately never `--force`, so a non-fast-forward is an error, not a
+ * rewrite.
+ */
+export function pushQuiet(repo: string, ...args: string[]): void {
+  execFileSync("git", ["-C", repo, "push", "--quiet", "origin", ...args], {
+    encoding: "utf8",
+    timeout: PUSH_TIMEOUT_MS,
     env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
   });
 }
@@ -52,6 +70,39 @@ function detectDefaultBranch(repo: string): string | undefined {
 }
 
 /**
+ * Outcome of resolving the repo's default branch against origin. On success
+ * `branch` is the plain branch NAME ("main"), never `origin/main`, and
+ * `refs/remotes/origin/<branch>` has just been refreshed from the remote.
+ */
+export type OriginDefaultBranch =
+  | { ok: true; branch: string }
+  | { ok: false; reason: "no-origin-remote" | "fetch-failed"; tried: string[] };
+
+/**
+ * Fetch the repo's default branch from origin and report its name. The local
+ * `origin/HEAD` guess is tried first, then the conventional names, because a
+ * clone made without `set-head` has no recorded default. Never throws: callers
+ * decide what a failure (no remote, offline, auth) means for them.
+ */
+export function fetchOriginDefaultBranch(repo: string): OriginDefaultBranch {
+  if (!hasOriginRemote(repo)) {
+    return { ok: false, reason: "no-origin-remote", tried: [] };
+  }
+  const candidates = [detectDefaultBranch(repo), "main", "master"].filter(
+    (b, i, arr): b is string => Boolean(b) && arr.indexOf(b) === i,
+  );
+  for (const branch of candidates) {
+    try {
+      fetchQuiet(repo, branch);
+      return { ok: true, branch };
+    } catch {
+      // try the next candidate name
+    }
+  }
+  return { ok: false, reason: "fetch-failed", tried: candidates };
+}
+
+/**
  * Fetch the repo's default branch from origin and return `origin/<branch>`
  * as a worktree start-point, so new task branches begin from the real
  * upstream tip instead of whatever the shared main checkout's HEAD happens
@@ -60,28 +111,14 @@ function detectDefaultBranch(repo: string): string | undefined {
  * can fall back to local HEAD instead of failing the spawn.
  */
 function resolveOriginStartPoint(repo: string, taskId: number): string | undefined {
-  if (!hasOriginRemote(repo)) {
-    logEvent("worktree.fallback_local_head", {
-      taskId,
-      payload: { reason: "no-origin-remote" },
-    });
-    return undefined;
-  }
-
-  const candidates = [detectDefaultBranch(repo), "main", "master"].filter(
-    (b, i, arr): b is string => Boolean(b) && arr.indexOf(b) === i,
-  );
-  for (const branch of candidates) {
-    try {
-      fetchQuiet(repo, branch);
-      return `origin/${branch}`;
-    } catch {
-      // try the next candidate name
-    }
-  }
+  const resolved = fetchOriginDefaultBranch(repo);
+  if (resolved.ok) return `origin/${resolved.branch}`;
   logEvent("worktree.fallback_local_head", {
     taskId,
-    payload: { reason: "fetch-failed", tried: candidates },
+    payload:
+      resolved.reason === "no-origin-remote"
+        ? { reason: resolved.reason }
+        : { reason: resolved.reason, tried: resolved.tried },
   });
   return undefined;
 }

@@ -235,6 +235,52 @@ the setting never changes tasks already created.
    local branch pruned). Closed without merge → `blocked`. New comments or a
    CHANGES_REQUESTED verdict → piped into the live worker (or baked into a
    respawn prompt), task back to `in_progress`.
+9. **Integration** — the same pass keeps still-open agent PRs mergeable while the
+   default branch moves under them (below).
+
+## Dispatch overlap and PR integration
+
+Two tasks in one repository can run at the same time: each worker has its own
+worktree and never sees the other's files. What is *not* isolated is the
+**integration window** — once two agent PRs are open together, whichever merges
+first leaves every other open branch missing those commits, and the PR that was
+"approved and ready" an hour ago now conflicts.
+
+The platform handles that in three layers (`src/daemon/freshen.ts`,
+`src/lib/integration.ts`, `src/daemon/serial.ts`):
+
+1. **Auto-freshen (on by default).** On every PR-sync pass, each open agent PR
+   whose branch no longer contains the repo's default branch is re-merged in a
+   throwaway detached worktree:
+   - clean merge and the task's `verify_cmd` passes → the merge commit is pushed
+     to the same branch (`pr.freshened`), updating the PR in place. A
+     conflict-free merge leaves the branch's diff against the default branch
+     unchanged, so an existing approval is carried forward (`review_head_sha`
+     advances) rather than being superseded — a mechanical merge never re-drafts
+     a PR the human was about to merge or spends another review round.
+   - conflict (`pr.freshen_conflict`) or a merged tree that fails verification
+     (`pr.freshen_verify_failed`) → **nothing is pushed**; the task is requeued
+     and its worker respawned with a standardized brief appended to the prompt:
+     the work is already complete, merge (never rebase) the default branch, keep
+     both sides' intent, re-verify, push the same branch.
+   - guard rails: only `agent/task-N[-resume-N]` branches belonging to that exact
+     task are touched, never a force-push, never a task with a live
+     worker/reviewer, at most `freshen_per_pass_limit` merges per pass (the rest
+     log `pr.freshen_deferred` and wait for the next pass), and after
+     `freshen_max_attempts` attempts without the PR merging the task is halted
+     with a push to the human (`pr.freshen_halted`).
+2. **Overlap-aware dispatch stays a triage judgment.** There is no repo-wide lock
+   by default: the orchestrator sequences tasks whose file footprints overlap with
+   `blocked_by`. For repositories that want the blunt guarantee instead, listing
+   the repo path in `integration.strict_serial_repos` allows only one active task
+   at a time (active = `claimed`/`in_progress`/`review`, or still holding an open
+   agent PR). It gates both the ready queue and `spawnWorker`, and is empty by
+   default.
+3. **Merge-latency nudge.** Merging is *always* the human's call and is never
+   automated. When an approved, mergeable PR has waited longer than
+   `merge_nudge_minutes` while other tasks in the same repo are queued or running,
+   the human gets one push per approval (`pr.merge_nudge`) — the conflict window
+   is merge latency, so the cheapest fix is merging sooner.
 
 ## The adversarial review loop
 

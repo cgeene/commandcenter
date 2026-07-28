@@ -1,8 +1,9 @@
 import { getAgent, listAgents, type Agent } from "../db/agents.js";
 import { latestTaskEvent, logEvent } from "../db/events.js";
 import { clearTriageQueueForTask } from "../db/notifications.js";
-import { getTask, readyTasks, type Task } from "../db/tasks.js";
+import { getTask, type Task } from "../db/tasks.js";
 import { deliverToMainIfClear, queueDelivery } from "./notifqueue.js";
+import { dispatchableTasks } from "./serial.js";
 import { windowExists } from "./tmux.js";
 
 function availableMain(preferred?: Agent): Agent | undefined {
@@ -71,7 +72,8 @@ function taskPrompt(task: Task, creatorKind: Agent["kind"] | null): string {
  * - "no_main": there is no live main window to deliver to — the only outcome
  *   that a new main agent would fix.
  * - "not_triageable": the task is not awaiting triage at all (wrong
- *   dispatch_mode/status, or its blockers are not done).
+ *   dispatch_mode/status, its blockers are not done, or its repo is configured
+ *   strict-serial and another task is holding it).
  */
 export type DelegateOutcome =
   | "delivered"
@@ -102,7 +104,7 @@ export async function delegateTaskToMainDetailed(
   ) {
     return "self_filed";
   }
-  if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
+  if (!dispatchableTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
     return "not_triageable";
   }
   const main = availableMain(preferredMain);
@@ -156,7 +158,7 @@ export async function delegateTaskToMain(
 /** On main startup/idle, re-deliver the oldest task that still needs triage. */
 export async function delegatePendingTaskToMain(main: Agent): Promise<boolean> {
   if (!availableMain(main)) return false;
-  const pending = readyTasks("orchestrated").filter((task) => {
+  const pending = dispatchableTasks("orchestrated").filter((task) => {
     // Skip main-created tasks: they need no triage, and leaving one in the
     // pending set would park it at the queue head forever (delegatePending
     // only delivers pending[0]), starving the tasks behind it. A failed
@@ -193,5 +195,5 @@ export async function delegatePendingTaskToLiveMain(): Promise<boolean> {
 }
 
 export function pendingOrchestratedTasks(): Task[] {
-  return readyTasks("orchestrated");
+  return dispatchableTasks("orchestrated");
 }

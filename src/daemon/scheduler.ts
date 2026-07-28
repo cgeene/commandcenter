@@ -9,13 +9,7 @@ import {
   logEvent,
 } from "../db/events.js";
 import { getSchedulerConfig, type SchedulerConfig } from "../db/settings.js";
-import {
-  createTask,
-  getTask,
-  listTasks,
-  readyTasks,
-  updateTask,
-} from "../db/tasks.js";
+import { createTask, getTask, listTasks, updateTask } from "../db/tasks.js";
 import { flushMainQueue } from "./notifqueue.js";
 import { notifyEvent } from "./notify.js";
 import { parsePane, type PendingPermission } from "./pane.js";
@@ -30,6 +24,7 @@ import { versionInfo } from "./version.js";
 import { WAIT_HOOK_EVENTS } from "./waiting.js";
 import { pruneScratchWorkspaces } from "./workspaces.js";
 import { delegatePendingTaskToLiveMain } from "./orchestration.js";
+import { dispatchableTasks } from "./serial.js";
 
 /** Task statuses that mean the worker has nothing left to do — safe to reap. */
 const TERMINAL_STATUSES = ["done", "cancelled", "failed"];
@@ -162,7 +157,7 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
   // Human/UI tasks are main-orchestrated; only explicit compatibility/cron
   // tasks retain the historical direct scheduler path, so capacity accounting
   // and spawning both operate on the direct-dispatch queue.
-  const ready = readyTasks("direct");
+  const ready = dispatchableTasks("direct");
   const liveWorkers = listAgents({ live: true }).filter(
     (a) => a.kind === "worker",
   );

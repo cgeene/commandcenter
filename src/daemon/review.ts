@@ -27,6 +27,17 @@ export function reviewMaxCycles(): number {
   return getSchedulerConfig().review_max_cycles;
 }
 
+/** The de-dup key for the approved-and-ready push: one push per approved SHA.
+ *  Exported because a mechanical freshen merge CARRIES an approval onto a new
+ *  SHA (src/daemon/freshen.ts) and must claim the new key rather than let the
+ *  next sweep re-announce work the human was already told about. */
+export function approvedReadyLatchKey(
+  taskId: number,
+  approvedSha: string | null,
+): string {
+  return `task:${taskId}:approved_ready:${approvedSha ?? "nosha"}`;
+}
+
 /**
  * The one push that means "Caleb, act now".
  *
@@ -53,7 +64,7 @@ export function notifyApprovedReady(task: Task): void {
     task.open_pr !== 0 && Boolean(task.pr_url) && task.pr_is_draft === 0;
   if (!awaitingHuman && !prReady) return;
   // review_head_sha is the SHA (or snapshot tree) the approval covers.
-  const once = `task:${task.id}:approved_ready:${task.review_head_sha ?? "nosha"}`;
+  const once = approvedReadyLatchKey(task.id, task.review_head_sha);
   if (awaitingHuman) {
     notifyEvent(
       "review_approved_ready",
