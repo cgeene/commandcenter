@@ -29,10 +29,14 @@ import {
   setBrowserAlerts,
 } from "../../src/lib/app-attention";
 import { Terminal } from "./Terminal";
+import { resetsIn } from "../../src/lib/usage";
+import { daysInWindow, paceTarget, projectedCycleSpend } from "../../src/lib/pricing";
 import type {
   Agent,
   AppSettings,
   AttentionItem,
+  UsageMeter,
+  UsagePayload,
   CronJob,
   Doc,
   DocWithContent,
@@ -196,6 +200,7 @@ export function App() {
   const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTabState] = useState<TabId>(tabFromHash);
+  const { usage, refresh: refreshUsage, refreshing: refreshingUsage } = useUsage();
   const keyboardStyle = useKeyboardAwareStyle();
 
   const setTab = (t: TabId) => {
@@ -509,11 +514,22 @@ export function App() {
               agents={agents}
               events={events}
               attention={attention}
+              usage={usage}
+              onRefreshUsage={refreshUsage}
+              refreshingUsage={refreshingUsage}
               onSelect={(t) => openTask(t.id)}
             />
           )}
 
-          {tab === "tokens" && <TokensView tasks={tasks} onSelect={(t) => openTask(t.id)} />}
+          {tab === "tokens" && (
+            <TokensView
+              tasks={tasks}
+              usage={usage}
+              onRefreshUsage={refreshUsage}
+              refreshingUsage={refreshingUsage}
+              onSelect={(t) => openTask(t.id)}
+            />
+          )}
 
           {tab === "prs" && (
             <PrsView tasks={tasks} meta={jiraMeta} onSelect={(t) => openTask(t.id)} />
@@ -1155,6 +1171,269 @@ function dayKey(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
+function fmtUsd(n: number): string {
+  if (n >= 1000) return `$${Math.round(n).toLocaleString()}`;
+  if (n >= 10) return `$${n.toFixed(0)}`;
+  return `$${n.toFixed(2)}`;
+}
+
+/**
+ * Spend data for the whole dashboard. Polled slowly on its own timer rather
+ * than folded into the 2.5s task refresh: the live figure only moves hourly,
+ * and the org page it mirrors is nobody's idea of a hot path.
+ */
+function useUsage(): {
+  usage: UsagePayload | null;
+  refresh: () => Promise<void>;
+  refreshing: boolean;
+} {
+  const [usage, setUsage] = useState<UsagePayload | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  useEffect(() => {
+    const load = () =>
+      api<UsagePayload>("GET", "/api/usage")
+        .then(setUsage)
+        .catch(() => {}); // spend is never load-bearing — a failure just leaves the last figure
+    load();
+    const id = setInterval(load, 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Forces an upstream fetch rather than re-reading the hourly cache — what
+  // the operator wants right after a big run finishes.
+  const refresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      setUsage(await api<UsagePayload>("POST", "/api/usage/refresh", {}));
+    } catch {
+      /* keep whatever we had */
+    } finally {
+      setRefreshing(false);
+    }
+  }, []);
+
+  return { usage, refresh, refreshing };
+}
+
+/** Percent → the same red/yellow/green banding the rest of the board uses. */
+function meterTone(percent: number | null): string {
+  if (percent === null) return "";
+  if (percent >= 90) return "bad";
+  if (percent >= 70) return "warn";
+  return "ok";
+}
+
+function MeterBar({ meter, now }: { meter: UsageMeter; now: Date }) {
+  const pct = meter.percent ?? 0;
+  const resets = resetsIn(meter.resets_at, now);
+  return (
+    <div className="bar-row">
+      <div className="bar-label">
+        <span>{meter.label}</span>
+        <b>{meter.percent === null ? "—" : `${Math.round(meter.percent)}%`}</b>
+      </div>
+      <div className="bar-track">
+        <span
+          className={`bar-fill quota ${meterTone(meter.percent)}`}
+          style={{ width: `${Math.min(100, pct)}%` }}
+        />
+      </div>
+      {resets && <span className="meter-reset muted">resets in {resets}</span>}
+    </div>
+  );
+}
+
+/**
+ * The headline "how much of my quota is left" widget, shared by the Tokens tab
+ * and the mission-control spend panel.
+ *
+ * Source precedence is the whole point of this component. The live feed is the
+ * only number that matches the claude.ai usage page, because it also counts
+ * work done outside commandcenter (interactive Claude Code sessions, the
+ * orchestrator itself). The local estimate can never reconcile with it, so it
+ * is shown as a clearly-labelled fallback rather than blended in.
+ */
+function SpendHeadline({
+  usage,
+  onRefresh,
+  refreshing,
+  compact = false,
+}: {
+  usage: UsagePayload | null;
+  onRefresh: () => void;
+  refreshing: boolean;
+  compact?: boolean;
+}) {
+  const now = new Date();
+  if (!usage) return <span className="empty-panel muted">Loading usage…</span>;
+
+  const live = usage.live.usage;
+  const headline = live?.headline ?? null;
+  const meters = live?.meters ?? [];
+  const spend = live?.spend ?? null;
+
+  if (headline) {
+    const shown = compact ? meters.slice(0, 2) : meters;
+    return (
+      <div className="spend-headline">
+        <div className="spend-top">
+          <b className={meterTone(headline.percent)}>
+            {headline.percent === null ? "—" : `${Math.round(headline.percent)}%`}
+          </b>
+          <span className="muted">of {headline.label}</span>
+          <span className="chip approved" title="Live from Claude — the same figure as the usage page, including usage outside commandcenter">
+            org usage data
+          </span>
+          <button className="linkish" onClick={onRefresh} disabled={refreshing}>
+            {refreshing ? "refreshing…" : "refresh"}
+          </button>
+        </div>
+        <div className="bar-list">
+          {shown.map((m) => (
+            <MeterBar key={m.key} meter={m} now={now} />
+          ))}
+        </div>
+        {spend?.limit_reached && (
+          <p className="spend-note bad">
+            Extra-usage spend limit reached
+            {spend.limit_usd !== null && ` (${fmtUsd(spend.used_usd)} of ${fmtUsd(spend.limit_usd)})`}
+            .
+          </p>
+        )}
+        {spend && !spend.limit_reached && spend.limit_usd !== null && (
+          <p className="spend-note muted">
+            Extra usage: {fmtUsd(spend.used_usd)} of {fmtUsd(spend.limit_usd)}
+          </p>
+        )}
+        <p className="spend-note muted">
+          Checked {usage.live.checked_at ? usage.live.checked_at.slice(11, 16) : "—"} UTC
+          {usage.live.error && ` · last refresh failed: ${usage.live.error}`}
+        </p>
+      </div>
+    );
+  }
+
+  // No live feed — fall back to the local estimate against the configured
+  // budget, and say plainly that it is neither live nor billing data.
+  return (
+    <LocalSpendHeadline
+      usage={usage}
+      onRefresh={onRefresh}
+      refreshing={refreshing}
+      compact={compact}
+    />
+  );
+}
+
+function LocalSpendHeadline({
+  usage,
+  onRefresh,
+  refreshing,
+  compact,
+}: {
+  usage: UsagePayload;
+  onRefresh: () => void;
+  refreshing: boolean;
+  compact: boolean;
+}) {
+  const orgTotal = usage.org.total_usd;
+  const spent = orgTotal ?? usage.local.cycle.cost_usd;
+  const quota = usage.quota.monthly_quota_usd;
+  const pct = quota ? Math.min(100, (spent / quota) * 100) : null;
+  const label = orgTotal !== null ? "org billing data" : "local estimate";
+
+  return (
+    <div className="spend-headline">
+      <div className="spend-top">
+        <b className={meterTone(pct)}>{fmtUsd(spent)}</b>
+        <span className="muted">{quota ? `of ${fmtUsd(quota)} this cycle` : "this cycle"}</span>
+        <span
+          className={`chip ${orgTotal !== null ? "approved" : ""}`}
+          title={
+            orgTotal !== null
+              ? "Anthropic Admin API cost report (Console/Platform API spend)"
+              : "Estimated from local session transcripts — not billing data, and it only counts work this daemon ran"
+          }
+        >
+          {label}
+        </span>
+        <button className="linkish" onClick={onRefresh} disabled={refreshing}>
+          {refreshing ? "refreshing…" : "refresh"}
+        </button>
+      </div>
+      {quota !== null && (
+        <div className="bar-track">
+          <span
+            className={`bar-fill quota ${meterTone(pct)}`}
+            style={{ width: `${pct ?? 0}%` }}
+          />
+        </div>
+      )}
+      {!compact && (
+        <p className="spend-note muted">
+          {usage.live.error
+            ? `Live Claude usage unavailable (${usage.live.error}) — showing the local estimate instead.`
+            : "Live Claude usage unavailable — showing the local estimate instead."}
+          {quota === null && " Set a monthly quota in Settings to draw a budget line."}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Daily burn bars for the current cycle with a linear pace line. Local
+ * estimate only — the live feed reports windows, not a per-day series, so this
+ * is the breakdown the org page can't give you.
+ */
+function BurnChart({ usage }: { usage: UsagePayload }) {
+  const { cycle } = usage.local;
+  const quota = usage.quota.monthly_quota_usd;
+  const maxDay = Math.max(0.01, ...cycle.days.map((d) => d.cost_usd));
+  // The pace line sits at the per-day spend that would exactly exhaust the
+  // quota over the cycle — bars above it are days that outran the budget.
+  const perDayPace = quota ? quota / cycle.days_total : null;
+  const scaleMax = Math.max(maxDay, perDayPace ?? 0);
+  const today = dayKey(new Date());
+
+  return (
+    <div className="burn-chart-wrap">
+      <div className="burn-chart" aria-label="Estimated daily spend this cycle">
+        {perDayPace !== null && (
+          <span
+            className="pace-line"
+            style={{ bottom: `${(perDayPace / scaleMax) * 100}%` }}
+            title={`Pace to stay within budget: ${fmtUsd(perDayPace)}/day`}
+          />
+        )}
+        {cycle.days.map((d) => (
+          <div
+            key={d.day}
+            className={`burn-day${d.day === today ? " today" : ""}`}
+            title={`${d.day}: ${fmtUsd(d.cost_usd)} estimated · ${fmtTokens(d.tokens)} tokens`}
+          >
+            <span
+              className="burn-bar"
+              style={{ height: `${Math.max(2, (d.cost_usd / scaleMax) * 100)}%` }}
+            />
+          </div>
+        ))}
+      </div>
+      <div className="chart-legend">
+        <span>
+          {cycle.start} → {cycle.end}
+        </span>
+        {perDayPace !== null && (
+          <span>
+            <i className="legend-dot pace" /> pace {fmtUsd(perDayPace)}/day
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function shortDayLabel(key: string): string {
   const [, month, day] = key.split("-");
   return `${month}/${day}`;
@@ -1165,12 +1444,18 @@ function DashboardView({
   agents,
   events,
   attention,
+  usage,
+  onRefreshUsage,
+  refreshingUsage,
   onSelect,
 }: {
   tasks: Task[];
   agents: Agent[];
   events: Event[];
   attention: AttentionItem[];
+  usage: UsagePayload | null;
+  onRefreshUsage: () => void;
+  refreshingUsage: boolean;
   onSelect: (t: Task) => void;
 }) {
   const statusOrder = ["queued", "in_progress", "review", "blocked", "done", "failed"];
@@ -1330,25 +1615,32 @@ function DashboardView({
           <div className="panel-head">
             <div>
               <span className="eyebrow">Spend</span>
-              <h2>Token burn</h2>
+              <h2>Quota this cycle</h2>
             </div>
           </div>
-          {tokenRows.length > 0 ? (
-            <div className="bar-list">
-              {tokenRows.map((row) => (
-                <div key={row.label} className="bar-row">
-                  <div className="bar-label">
-                    <span>{row.label}</span>
-                    <b>{fmtTokens(row.tokens)}</b>
+          <SpendHeadline
+            usage={usage}
+            onRefresh={onRefreshUsage}
+            refreshing={refreshingUsage}
+            compact
+          />
+          {tokenRows.length > 0 && (
+            <>
+              <div className="panel-subhead muted">All-time tokens by model</div>
+              <div className="bar-list">
+                {tokenRows.map((row) => (
+                  <div key={row.label} className="bar-row">
+                    <div className="bar-label">
+                      <span>{row.label}</span>
+                      <b>{fmtTokens(row.tokens)}</b>
+                    </div>
+                    <div className="bar-track">
+                      <span className="bar-fill tokens" style={{ width: `${(row.tokens / maxTokens) * 100}%` }} />
+                    </div>
                   </div>
-                  <div className="bar-track">
-                    <span className="bar-fill tokens" style={{ width: `${(row.tokens / maxTokens) * 100}%` }} />
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <span className="empty-panel muted">No token usage recorded yet</span>
+                ))}
+              </div>
+            </>
           )}
         </section>
 
@@ -2109,6 +2401,99 @@ function WorkspaceSection({
   );
 }
 
+/**
+ * Budget line for the LOCAL estimate. Deliberately narrow in scope: when the
+ * live Claude usage feed is reachable it brings its own limits and this is
+ * ignored, so the section says so rather than implying it drives the headline.
+ */
+function QuotaSection({
+  settings,
+  onSaved,
+  onError,
+}: {
+  settings: AppSettings;
+  onSaved: () => void;
+  onError: (m: string) => void;
+}) {
+  const { stored, admin_key_set } = settings.quota;
+  const [quota, setQuota] = useState(
+    stored.monthly_quota_usd === null ? "" : String(stored.monthly_quota_usd),
+  );
+  const [resetDay, setResetDay] = useState(String(stored.cycle_reset_day));
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    setSaving(true);
+    onError("");
+    try {
+      const trimmed = quota.trim();
+      const parsed = trimmed === "" ? null : Number(trimmed);
+      if (parsed !== null && (!Number.isFinite(parsed) || parsed <= 0)) {
+        throw new Error("Monthly quota must be a positive number of dollars, or blank.");
+      }
+      await api("PATCH", "/api/settings/quota", {
+        monthly_quota_usd: parsed,
+        cycle_reset_day: Number(resetDay),
+      });
+      onSaved();
+    } catch (e) {
+      onError(errMsg(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>Spend &amp; quota</h2>
+      <p className="muted">
+        Draws a budget line against the <b>local estimate</b> on the Tokens tab. When live
+        Claude usage is available it carries its own limits and takes over the headline —
+        these settings don&rsquo;t change it.
+      </p>
+      <SettingRow
+        label="Monthly quota (USD)"
+        when="immediate"
+        hint="Blank shows cycle burn with no budget line."
+      >
+        <input
+          type="number"
+          min="1"
+          step="1"
+          placeholder="e.g. 500"
+          value={quota}
+          onChange={(e) => setQuota(e.target.value)}
+        />
+      </SettingRow>
+      <SettingRow
+        label="Cycle reset day"
+        when="immediate"
+        hint="Day of month the budget resets. 1-28, so every month has it."
+      >
+        <select value={resetDay} onChange={(e) => setResetDay(e.target.value)}>
+          {Array.from({ length: 28 }, (_, i) => String(i + 1)).map((d) => (
+            <option key={d} value={d}>
+              {d}
+            </option>
+          ))}
+        </select>
+      </SettingRow>
+      <SettingRow
+        label="Org billing data"
+        when="immediate"
+        hint="Set CC_ANTHROPIC_ADMIN_KEY in the daemon env to pull real dollars from the Anthropic Admin API cost report. Note it reports Console/Platform API spend, which is a different surface from a Claude Code subscription seat."
+      >
+        <span className={`chip ${admin_key_set ? "approved" : ""}`}>
+          {admin_key_set ? "Admin key set" : "Admin key unset"}
+        </span>
+      </SettingRow>
+      <button onClick={save} disabled={saving}>
+        {saving ? "Saving…" : "Save"}
+      </button>
+    </section>
+  );
+}
+
 function NotificationsSection({
   settings,
   onSaved,
@@ -2657,6 +3042,12 @@ function SettingsView() {
             onSaved={load}
             onError={setError}
           />
+          <QuotaSection
+            key={`q${JSON.stringify(settings.quota.stored)}`}
+            settings={settings}
+            onSaved={load}
+            onError={setError}
+          />
           <JiraSection
             key={`j${JSON.stringify(settings.jira.stored)}`}
             settings={settings}
@@ -3065,53 +3456,134 @@ function fmtTokens(n: number): string {
 
 function TokensView({
   tasks,
+  usage,
+  onRefreshUsage,
+  refreshingUsage,
   onSelect,
 }: {
   tasks: Task[];
+  usage: UsagePayload | null;
+  onRefreshUsage: () => void;
+  refreshingUsage: boolean;
   onSelect: (t: Task) => void;
 }) {
+  // Cycle-to-date is the default: an all-time counter can't answer "how much
+  // of this month's quota is left", which is the question this tab exists for.
+  const [view, setView] = useState<"cycle" | "all">("cycle");
   const tracked = tasks.filter((t) => (t.tokens_used ?? 0) > 0);
   const total = tracked.reduce((s, t) => s + (t.tokens_used ?? 0), 0);
-  const today = new Date().toISOString().slice(0, 10);
-  const todayTotal = tracked
-    .filter((t) => t.updated_at.slice(0, 10) === today)
-    .reduce((s, t) => s + (t.tokens_used ?? 0), 0);
-
-  const byModel = new Map<string, number>();
-  for (const t of tracked) {
-    const key = t.model ?? "default";
-    byModel.set(key, (byModel.get(key) ?? 0) + (t.tokens_used ?? 0));
-  }
   const rows = [...tracked].sort(
     (a, b) => (b.tokens_used ?? 0) - (a.tokens_used ?? 0),
   );
 
+  const window = usage ? (view === "cycle" ? usage.local.cycle : usage.local.all_time) : null;
+  const projected =
+    usage && view === "cycle"
+      ? projectedCycleSpend(usage.local.cycle.cost_usd, usage.local.cycle)
+      : null;
+
   return (
     <main>
       <div className="tokens-view">
-        <div className="stat-cards">
-          <div className="stat-card">
-            <b>{fmtTokens(total)}</b>
-            <span className="muted">Total tokens</span>
+        <section className="dashboard-panel">
+          <div className="panel-head">
+            <div>
+              <span className="eyebrow">Quota</span>
+              <h2>Usage this cycle</h2>
+            </div>
           </div>
-          <div className="stat-card">
-            <b>{fmtTokens(todayTotal)}</b>
-            <span className="muted">Tasks touched today</span>
-          </div>
-          <div className="stat-card">
-            <b>{tracked.length}</b>
-            <span className="muted">Tasks tracked</span>
-          </div>
-          {[...byModel.entries()]
-            .sort((a, b) => b[1] - a[1])
-            .map(([model, n]) => (
-              <div className="stat-card" key={model}>
-                <b>{fmtTokens(n)}</b>
-                <span className="muted">{model}</span>
-              </div>
-            ))}
+          <SpendHeadline
+            usage={usage}
+            onRefresh={onRefreshUsage}
+            refreshing={refreshingUsage}
+          />
+        </section>
+
+        <div className="view-toggle">
+          <button
+            className={view === "cycle" ? "sched-on" : ""}
+            onClick={() => setView("cycle")}
+          >
+            This cycle
+          </button>
+          <button className={view === "all" ? "sched-on" : ""} onClick={() => setView("all")}>
+            All time
+          </button>
         </div>
 
+        {usage && window && (
+          <>
+            <div className="stat-cards">
+              <div className="stat-card">
+                <b>{fmtUsd(window.cost_usd)}</b>
+                <span className="muted">
+                  Estimated {view === "cycle" ? "this cycle" : "all time"}
+                </span>
+              </div>
+              <div className="stat-card">
+                <b>{fmtTokens(window.tokens)}</b>
+                <span className="muted">Tokens</span>
+              </div>
+              {view === "cycle" && projected !== null && (
+                <div className="stat-card">
+                  <b>{fmtUsd(projected)}</b>
+                  <span className="muted">Projected at this pace</span>
+                </div>
+              )}
+              {view === "cycle" && (
+                <div className="stat-card">
+                  <b>
+                    {usage.local.cycle.days_elapsed}/{usage.local.cycle.days_total}
+                  </b>
+                  <span className="muted">Days into cycle</span>
+                </div>
+              )}
+            </div>
+
+            {view === "cycle" && <BurnChart usage={usage} />}
+
+            {window.by_model.length > 0 && (
+              <table className="token-table">
+                <thead>
+                  <tr>
+                    <th>Model</th>
+                    <th className="num">Tokens</th>
+                    <th className="num">Estimated</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {window.by_model.map((m) => (
+                    <tr key={m.model}>
+                      <td>{m.model}</td>
+                      <td className="num">{fmtTokens(m.tokens)}</td>
+                      <td className="num">
+                        {m.priced ? (
+                          fmtUsd(m.cost_usd)
+                        ) : (
+                          <span className="muted" title="No price on file for this model — its tokens are counted but not costed">
+                            not priced
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+
+            <p className="muted token-note">
+              Per-day and per-model figures are a <b>local estimate</b> from session
+              transcripts priced against a static rate table — not billing data. They cover
+              only work this daemon ran, so they will read lower than the org figure above,
+              which also counts interactive Claude Code sessions.
+              {usage.local.tracked_since
+                ? ` Daily tracking starts ${usage.local.tracked_since}.`
+                : " No daily burn recorded yet — tracking starts at the next agent Stop."}
+            </p>
+          </>
+        )}
+
+        <div className="panel-subhead muted">Lifetime tokens per task</div>
         {rows.length > 0 ? (
           <table className="token-table">
             <thead>
