@@ -23,6 +23,12 @@ import { parseFrontmatter } from "../../src/lib/frontmatter";
 import { softenLineBreaks } from "../../src/lib/markdown";
 import { jiraChip } from "../../src/lib/jira";
 import {
+  canNotifyMain,
+  canSpawnWorker,
+  delegateOutcomeNote,
+  type NoteTone,
+} from "../../src/lib/taskactions";
+import {
   syncAppBadge,
   newlyArrivedIds,
   browserAlertsEnabled,
@@ -3935,8 +3941,12 @@ function TaskPanel({
   const [publicationPrUrl, setPublicationPrUrl] = useState(task.pr_url ?? "");
   // "Notify Claude Main" does not always reach the main agent right away — a
   // busy or mid-draft composer defers the send and the ping is queued instead.
-  // Say so, rather than letting a silent success imply instant delivery.
-  const [delegateNote, setDelegateNote] = useState<string | null>(null);
+  // Say so, rather than letting a silent success imply instant delivery. (A
+  // genuinely undeliverable ping 409s and surfaces in the global error banner.)
+  const [delegateNote, setDelegateNote] = useState<{
+    tone: NoteTone;
+    message: string;
+  } | null>(null);
   return (
     <div className="drawer">
       <div className="drawer-head">
@@ -4048,19 +4058,7 @@ function TaskPanel({
             </div>
           )}
         <div className="actions">
-          {["queued", "claimed"].includes(task.status) &&
-            task.dispatch_mode === "direct" &&
-            task.workspace_kind !== "portfolio" && (
-            <button
-              className="primary"
-              onClick={() =>
-                onAction(() => api("POST", "/api/agents", { task_id: task.id }))
-              }
-            >
-              ▶ Spawn Worker
-            </button>
-          )}
-          {task.status === "queued" && task.dispatch_mode === "orchestrated" && (
+          {canNotifyMain(task) && (
             <button
               className="primary"
               onClick={() => {
@@ -4071,11 +4069,28 @@ function TaskPanel({
                     `/api/tasks/${task.id}/delegate`,
                     {},
                   );
-                  setDelegateNote(delegateNoteFor(res.status));
+                  setDelegateNote(delegateOutcomeNote(res.status));
                 });
               }}
             >
               Notify Claude Main
+            </button>
+          )}
+          {canSpawnWorker(task) && (
+            <button
+              // Secondary next to "Notify Claude Main": on an orchestrated task
+              // this bypasses main's triage and starts the worker now.
+              className={canNotifyMain(task) ? undefined : "primary"}
+              title={
+                canNotifyMain(task)
+                  ? "Spawn the worker now, without waiting for Claude main's triage"
+                  : undefined
+              }
+              onClick={() =>
+                onAction(() => api("POST", "/api/agents", { task_id: task.id }))
+              }
+            >
+              ▶ Spawn Worker
             </button>
           )}
           {task.agent_id && (
@@ -4159,22 +4174,14 @@ function TaskPanel({
             </button>
           )}
         </div>
-        {delegateNote && <div className="muted">{delegateNote}</div>}
+        {delegateNote && (
+          <div className={`banner banner-${delegateNote.tone}`}>
+            {delegateNote.message}
+          </div>
+        )}
       </div>
     </div>
   );
-}
-
-/** Human-readable outcome of POST /api/tasks/:id/delegate. */
-function delegateNoteFor(status: string | undefined): string {
-  switch (status) {
-    case "queued":
-      return "Claude Main's prompt is busy — the triage ping is queued and will be delivered as soon as its composer is clear.";
-    case "already_queued":
-      return "A triage ping for this task is already queued for Claude Main; it will be delivered as soon as its composer is clear.";
-    default:
-      return "Sent to Claude Main.";
-  }
 }
 
 function CronsDrawer({ onClose }: { onClose: () => void }) {

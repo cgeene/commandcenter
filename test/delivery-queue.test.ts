@@ -326,7 +326,7 @@ describe("staleness — a queued delivery is re-validated before it is sent late
 });
 
 describe("POST /api/tasks/:id/delegate response shape", () => {
-  it("reports queued rather than implying instant delivery", async () => {
+  it("202s a queued ping rather than implying instant delivery — or failure", async () => {
     const { task } = await setup("working");
     panes.set(MAIN, HUMAN_DRAFT);
     const { buildApp } = await import("../src/daemon/api.js");
@@ -334,11 +334,26 @@ describe("POST /api/tasks/:id/delegate response shape", () => {
     const res = await buildApp().request(`/api/tasks/${task.id}/delegate`, {
       method: "POST",
     });
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, status: "queued" });
+    expect(res.status).toBe(202);
+    const body = (await res.json()) as { status: string; detail: string };
+    expect(body.status).toBe("queued");
+    expect(body.detail).toContain("queued");
   });
 
-  it("reports delivered when the main's prompt was clear", async () => {
+  it("202s a repeat click whose ping is already queued", async () => {
+    const { task } = await setup("working");
+    panes.set(MAIN, HUMAN_DRAFT);
+    const { buildApp } = await import("../src/daemon/api.js");
+
+    await buildApp().request(`/api/tasks/${task.id}/delegate`, { method: "POST" });
+    const res = await buildApp().request(`/api/tasks/${task.id}/delegate`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(202);
+    expect(await res.json()).toMatchObject({ status: "already_queued" });
+  });
+
+  it("200s with delivered when the main's prompt was clear", async () => {
     const { task } = await setup("idle");
     panes.set(MAIN, CLEAR_PROMPT);
     const { buildApp } = await import("../src/daemon/api.js");
@@ -347,7 +362,7 @@ describe("POST /api/tasks/:id/delegate response shape", () => {
       method: "POST",
     });
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, status: "delivered" });
+    expect(await res.json()).toEqual({ status: "delivered" });
   });
 
   it("still 409s when there is no main agent to deliver to", async () => {
@@ -363,5 +378,9 @@ describe("POST /api/tasks/:id/delegate response shape", () => {
       method: "POST",
     });
     expect(res.status).toBe(409);
+    // The error must point at the fix (spawn a main), not just state a failure.
+    expect((await res.json()) as { error: string }).toMatchObject({
+      error: expect.stringContaining("spawn a main agent"),
+    });
   });
 });
