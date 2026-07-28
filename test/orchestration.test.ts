@@ -86,7 +86,7 @@ describe("main-first task delegation", () => {
       dispatch_mode: "orchestrated",
       open_pr: false,
     });
-    createTask({
+    const child = createTask({
       title: "child",
       prompt: "x",
       repo: "/repo",
@@ -99,14 +99,28 @@ describe("main-first task delegation", () => {
     const secondMain = createAgent({ kind: "main", state: "idle", tmux_target: "cc:@2" });
     sendText.mockClear();
 
+    // A new main inherits everything still awaiting triage, as ONE message —
+    // the outstanding parent AND the child that was never spawned.
     expect(await delegatePendingTaskToMain(secondMain)).toBe(true);
     expect(sendText).toHaveBeenCalledTimes(1);
     expect(String(sendText.mock.calls[0]?.[1])).toContain(`#${parent.id}`);
+    expect(String(sendText.mock.calls[0]?.[1])).toContain(`#${child.id}`);
 
+    // Both are now in front of this main, so working through the parent does not
+    // earn a second ping about the child it was already told about...
     const { updateTask } = await import("../src/db/tasks.js");
     updateTask(parent.id, { status: "in_progress" });
     sendText.mockClear();
-    expect(await delegatePendingTaskToMain(secondMain)).toBe(true);
+    expect(await delegatePendingTaskToMain(secondMain)).toBe(false);
+    expect(sendText).not.toHaveBeenCalled();
+
+    // ...unless it is never acknowledged, in which case it resurfaces later.
+    const { TRIAGE_REDELIVER_AFTER_MS } = await import("../src/daemon/orchestration.js");
+    expect(
+      await delegatePendingTaskToMain(secondMain, {
+        nowMs: Date.now() + TRIAGE_REDELIVER_AFTER_MS + 1_000,
+      }),
+    ).toBe(true);
     expect(sendText).toHaveBeenCalledTimes(1);
     expect(String(sendText.mock.calls[0]?.[1])).toContain("workspace_kind=repo");
   });

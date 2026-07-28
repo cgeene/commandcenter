@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   pr_checks      TEXT,
   pr_is_draft    INTEGER,
   human_approved_at TEXT,
+  triaged_at     TEXT,
   pr_synced_at   TEXT,
   pr_sync_fails  INTEGER NOT NULL DEFAULT 0,
   jira_key       TEXT,
@@ -344,6 +345,13 @@ function migrate(db: Database.Database): void {
   // trigger (see prsync.applyPrState).
   if (!cols.includes("human_approved_at")) {
     db.exec("ALTER TABLE tasks ADD COLUMN human_approved_at TEXT");
+  }
+  // triaged_at: when the orchestrator last acknowledged a queued orchestrated
+  // task by reading its full record (get_task verbose — the defined triage
+  // action). NULL means "still needs triage", which is what the delivery path
+  // keys re-pings on; see markTaskTriaged and orchestration.ts.
+  if (!cols.includes("triaged_at")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN triaged_at TEXT");
   }
   // JIRA integration columns — mirror the pr_* quartet. jira_key is the
   // first-class link (NULL = no ticket yet); jira_state/jira_status_category

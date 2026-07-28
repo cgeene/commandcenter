@@ -1,6 +1,7 @@
 import { dismissedKeys } from "../db/attention.js";
 import { listAgents } from "../db/agents.js";
 import { liveUsageEnabled } from "../config.js";
+import { workerSlots } from "./capacity.js";
 import {
   countEventsToday,
   earliestEventTsAfter,
@@ -298,7 +299,10 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   if (cfg.enabled) {
     const ready = readyTasks();
     if (ready.length > 0) {
-      const liveWorkers = agents.filter((a) => a.kind === "worker");
+      // Same accounting as the scheduler's auto-spawn pass: workers parked
+      // under a running reviewer are exempt, so they are never named as the
+      // blockage — but they are reported, so the count adds up for the human.
+      const { counted: liveWorkers, parked } = workerSlots({ agents, tasks });
 
       // capacity: all slots taken. Anchor to the FIRST capacity_blocked event
       // of the current episode (since the last successful spawn) so the age is
@@ -308,11 +312,15 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
         const anchor = earliestEventTsAfter("scheduler.capacity_blocked", since);
         if (anchor && nowMs - Date.parse(anchor) > SCHEDULER_STALL_MS) {
           const who = liveWorkers.map((w) => `a${w.id}`).join(", ");
+          const parkedNote =
+            parked.length > 0
+              ? `; ${parked.length} more ${parked.length === 1 ? "worker is" : "workers are"} parked under review and not counted`
+              : "";
           push({
             id: `scheduler_stalled:capacity:${anchor}`,
             kind: "scheduler_stalled",
-            title: `Scheduler stalled — ${liveWorkers.length} idle workers holding slots`,
-            context: `${ready.length} task${ready.length === 1 ? "" : "s"} ready but all ${cfg.max_concurrent} worker slots are taken (${who}); kill idle workers or raise max_concurrent`,
+            title: `Scheduler stalled — ${liveWorkers.length} worker${liveWorkers.length === 1 ? "" : "s"} holding active-work slots`,
+            context: `${ready.length} task${ready.length === 1 ? "" : "s"} ready but all ${cfg.max_concurrent} active-work slots are taken (${who})${parkedNote}; kill workers that are done or raise max_concurrent`,
             severity: "yellow",
             urgent: false,
             task_id: null,

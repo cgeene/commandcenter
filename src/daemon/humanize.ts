@@ -62,7 +62,13 @@ const TEMPLATES: Record<string, Template> = {
     `Auto-completed ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
   "task.recovered": (e) => `Recovered ${taskRef(e)} after a false window-loss signal`,
   "task.awaiting_main": (e) => `${taskRef(e)} is waiting for Claude main to triage it`,
-  "task.delegated_to_main": (e) => `Sent ${taskRef(e)} to Claude main for triage`,
+  "task.delegated_to_main": (e, p) =>
+    `Sent ${taskRef(e)} to Claude main for triage${
+      Number(p.batched) > 1 ? ` (batched with ${Number(p.batched) - 1} more)` : ""
+    }`,
+  "task.triage_acked": (e) => `Claude main read ${taskRef(e)} — triage acknowledged`,
+  "task.triage_reflagged": (e, p) =>
+    `${taskRef(e)} flagged for triage again${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
   "task.delegation_failed": () => `Main-agent task delivery will be retried`,
 
   // --- review ---
@@ -184,7 +190,14 @@ const TEMPLATES: Record<string, Template> = {
   "scheduler.capacity_blocked": (_e, p) => {
     const live = Number(p.live_workers) || 0;
     const max = Number(p.max_concurrent) || 0;
-    return `Scheduler stalled — ${live}/${max} worker slots taken while tasks wait`;
+    const parked = Number(p.parked_workers) || 0;
+    const suffix = parked > 0 ? ` (${parked} more parked in review, not counted)` : "";
+    return `Scheduler stalled — ${live}/${max} worker slots taken while tasks wait${suffix}`;
+  },
+  "scheduler.worker_over_cap": (e, p) => {
+    const counted = Number(p.counted_workers) || 0;
+    const max = Number(p.max_concurrent) || 0;
+    return `${counted}/${max} workers — over the cap while ${taskRef(e)} reworks a rejection`;
   },
   "scratch.pruned": (_e, p) =>
     `Removed ${str(p.count) || "expired"} expired scratch workspace${Number(p.count) === 1 ? "" : "s"}`,

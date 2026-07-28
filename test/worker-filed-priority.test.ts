@@ -175,6 +175,28 @@ describe("worker-filed task priority", () => {
     expect(sendText.mock.calls[0][1]).toContain("queued at 3");
   });
 
+  it("keeps the request visible when the triage ping is batched", async () => {
+    // Ordinary new-task pings collapse into one compact list of ids, which can
+    // say nothing about priority — so a clamped task must ride along in full.
+    const { agent } = await workingWorker(2);
+    const clamped = (await fileTask({ priority: 1, agent_id: agent.id })).task;
+    const plain = (await fileTask({ title: "somebody else's task" })).task;
+    const alsoPlain = (await fileTask({ title: "a third task" })).task;
+    const { delegatePendingTaskToMain } = await import("../src/daemon/orchestration.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const main = createAgent({ kind: "main", state: "idle", tmux_target: "cc:@1" });
+    expect(await delegatePendingTaskToMain(main)).toBe(true);
+    expect(sendText).toHaveBeenCalledTimes(1);
+    const message = sendText.mock.calls[0][1] as string;
+    // The two ordinary tasks collapsed; the clamped one kept its own prompt.
+    expect(message).toContain("2 tasks are awaiting your triage");
+    expect(message).toContain(`#${plain.id}`);
+    expect(message).toContain(`#${alsoPlain.id}`);
+    expect(message).toContain(`worker-filed follow-up task #${clamped.id}`);
+    expect(message).toContain("asked for priority 1");
+    expect(message).toContain("queued at 3");
+  });
+
   it("says nothing about priority when the worker's request stood", async () => {
     const { agent } = await workingWorker(2);
     const { task } = await fileTask({ agent_id: agent.id });

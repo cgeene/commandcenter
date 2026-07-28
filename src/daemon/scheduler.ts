@@ -16,6 +16,7 @@ import {
   readyTasks,
   updateTask,
 } from "../db/tasks.js";
+import { workerSlots } from "./capacity.js";
 import { flushMainQueue } from "./notifqueue.js";
 import { notifyEvent } from "./notify.js";
 import { parsePane, type PendingPermission } from "./pane.js";
@@ -163,15 +164,15 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
   // tasks retain the historical direct scheduler path, so capacity accounting
   // and spawning both operate on the direct-dispatch queue.
   const ready = readyTasks("direct");
-  const liveWorkers = listAgents({ live: true }).filter(
-    (a) => a.kind === "worker",
-  );
+  // Workers parked under a running reviewer hold no slot (see capacity.ts) —
+  // during a review wave they would otherwise pin the fleet at zero throughput.
+  const { counted: liveWorkers, parked } = workerSlots();
   let capacity = cfg.max_concurrent - liveWorkers.length;
   if (capacity <= 0) {
     // Ready work but no free slots: without this the scheduler no-ops silently
     // (the exact bug that let finished workers squat every slot). Surface it,
     // throttled so it's a once-an-hour heads-up, not a per-tick alarm.
-    if (ready.length > 0) noteCapacityBlocked(cfg, liveWorkers, now);
+    if (ready.length > 0) noteCapacityBlocked(cfg, liveWorkers, parked, now);
     return;
   }
 
@@ -233,6 +234,7 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
 function noteCapacityBlocked(
   cfg: SchedulerConfig,
   liveWorkers: Agent[],
+  parked: Agent[],
   now: Date,
 ): void {
   const last = latestEventTs("scheduler.capacity_blocked");
@@ -244,12 +246,26 @@ function noteCapacityBlocked(
     return { agent_id: w.id, task_id: w.task_id, task_status: task?.status ?? null };
   });
   logEvent("scheduler.capacity_blocked", {
-    payload: { max_concurrent: cfg.max_concurrent, live_workers: liveWorkers.length, workers },
+    payload: {
+      max_concurrent: cfg.max_concurrent,
+      live_workers: liveWorkers.length,
+      // Exempt parked workers are reported so "all slots taken" can never be
+      // misread as "these idle review workers are the blockage".
+      parked_workers: parked.length,
+      workers,
+    },
   });
+  // The count is the ACTIVE-WORK set: workers parked under a live reviewer are
+  // exempt, so they are reported separately rather than sending the human
+  // hunting for a slot none of them hold.
+  const parkedNote =
+    parked.length > 0
+      ? ` (+${parked.length} parked under review, not counted)`
+      : "";
   notifyEvent(
     "capacity_or_budget",
     "scheduler stalled — no free slots",
-    `${liveWorkers.length}/${cfg.max_concurrent} worker slots taken while tasks wait — check for idle workers holding slots`,
+    `${liveWorkers.length}/${cfg.max_concurrent} active-work slots taken while tasks wait${parkedNote} — check for workers idling on finished or already-reviewed work`,
     { tags: "construction" },
   );
 }
