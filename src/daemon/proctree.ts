@@ -1,0 +1,272 @@
+import { execFileSync } from "node:child_process";
+
+/**
+ * Process-tree teardown for reaped agent panes.
+ *
+ * `tmux kill-window` kills the pane's shell and hangs up its pty. That is not
+ * enough: anything the agent backgrounded into its own process group — a load
+ * generator, a watcher, a dev server, a `detached` child of the provider
+ * process — keeps running, is reparented to pid 1, and is then invisible to
+ * Command Center forever. A reviewer once leaked fourteen busy-loops this way
+ * and held the machine at load 100+ for hours.
+ *
+ * So before the window goes away we take a `ps` snapshot, work out everything
+ * that belongs to the pane, and signal the whole set.
+ */
+
+export interface ProcRow {
+  pid: number;
+  ppid: number;
+  pgid: number;
+  /** Controlling terminal as `ps` names it ("ttys012"), or "" when there is none. */
+  tty: string;
+  /** Seconds since the process started, from `ps etime`. */
+  elapsedSec: number;
+}
+
+/** `ps` spellings for "no controlling terminal" (macOS uses ??, Linux ?). */
+const NO_TTY = new Set(["??", "?", "-", ""]);
+
+/** Grace between SIGTERM and SIGKILL. Overridable so tests don't sleep. */
+function graceMs(): number {
+  const raw = Number(process.env.CC_REAP_GRACE_MS);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 3000;
+}
+
+/**
+ * Elapsed time as `ps` prints it: `MM:SS`, `HH:MM:SS`, or `DD-HH:MM:SS`.
+ * Unparseable input yields Infinity — for the age guard that means "too old to
+ * be ours", which is the safe direction.
+ */
+export function parseElapsed(text: string): number {
+  const [days, clock] = text.includes("-")
+    ? [Number(text.slice(0, text.indexOf("-"))), text.slice(text.indexOf("-") + 1)]
+    : [0, text];
+  const parts = clock.split(":").map(Number);
+  if (!Number.isFinite(days) || parts.length < 2 || parts.length > 3) return Infinity;
+  if (parts.some((n) => !Number.isFinite(n))) return Infinity;
+  const [h, m, s] = parts.length === 3 ? parts : [0, parts[0], parts[1]];
+  return days * 86400 + h * 3600 + m * 60 + s;
+}
+
+/** Normalize a tmux `#{pane_tty}` ("/dev/ttys012") to the `ps` spelling. */
+export function normalizeTty(tty: string): string {
+  const name = tty.trim().replace(/^\/dev\//, "");
+  return NO_TTY.has(name) ? "" : name;
+}
+
+export function parseProcessTable(text: string): ProcRow[] {
+  const rows: ProcRow[] = [];
+  for (const line of text.split("\n")) {
+    const fields = line.trim().split(/\s+/);
+    if (fields.length !== 5) continue; // header, blank, or a shape we don't know
+    const [pid, ppid, pgid, tty, etime] = fields;
+    const row: ProcRow = {
+      pid: Number(pid),
+      ppid: Number(ppid),
+      pgid: Number(pgid),
+      tty: normalizeTty(tty),
+      elapsedSec: parseElapsed(etime),
+    };
+    if (!Number.isInteger(row.pid) || !Number.isInteger(row.ppid)) continue;
+    if (!Number.isInteger(row.pgid)) continue;
+    rows.push(row);
+  }
+  return rows;
+}
+
+export function snapshotProcesses(): ProcRow[] {
+  try {
+    return parseProcessTable(
+      execFileSync("ps", ["-Ao", "pid=,ppid=,pgid=,tty=,etime="], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        maxBuffer: 16 * 1024 * 1024,
+      }),
+    );
+  } catch {
+    // No snapshot means no kill list. Falling back to "kill nothing extra" is
+    // the only safe failure mode; the window teardown still happens.
+    return [];
+  }
+}
+
+/**
+ * The daemon itself and every process it descends from. These must never end
+ * up in a kill list, however the tree walk reaches them.
+ */
+export function selfAncestry(procs: ProcRow[], startPid = process.pid): Set<number> {
+  const byPid = new Map(procs.map((p) => [p.pid, p]));
+  const out = new Set<number>();
+  let cur: number | undefined = startPid;
+  while (cur !== undefined && cur > 1 && !out.has(cur)) {
+    out.add(cur);
+    cur = byPid.get(cur)?.ppid;
+  }
+  return out;
+}
+
+/**
+ * Everything reachable from `seeds` that belongs to the same pane.
+ *
+ * Two expansions, applied to fixpoint:
+ *   - children, transitively — catches a child that called setsid() and so has
+ *     its own process group and no tty, as long as its parent is still alive
+ *     (which it is, because we snapshot before killing the window);
+ *   - process-group siblings — a pgid is system-wide unique to its leader, so
+ *     if one member is ours the whole group is ours. This catches a job the
+ *     interactive shell put in its own group, and it keeps working after the
+ *     members are reparented to pid 1.
+ *
+ * `protectedPids` is subtracted at every step, and any process group that a
+ * protected process belongs to is never expanded — so the walk can't hop from
+ * the pane into the daemon's own group.
+ */
+export function collectProcessTree(
+  seeds: readonly ProcRow[],
+  procs: readonly ProcRow[],
+  protectedPids: ReadonlySet<number>,
+): ProcRow[] {
+  const byPid = new Map(procs.map((p) => [p.pid, p]));
+  const children = new Map<number, ProcRow[]>();
+  const byPgid = new Map<number, ProcRow[]>();
+  for (const p of procs) {
+    const siblings = children.get(p.ppid);
+    if (siblings) siblings.push(p);
+    else children.set(p.ppid, [p]);
+    const group = byPgid.get(p.pgid);
+    if (group) group.push(p);
+    else byPgid.set(p.pgid, [p]);
+  }
+
+  const protectedPgids = new Set<number>();
+  for (const pid of protectedPids) {
+    const row = byPid.get(pid);
+    if (row) protectedPgids.add(row.pgid);
+  }
+
+  const selected = new Map<number, ProcRow>();
+  const queue: ProcRow[] = [];
+  const add = (p: ProcRow | undefined): void => {
+    if (!p || p.pid <= 1) return;
+    if (protectedPids.has(p.pid) || selected.has(p.pid)) return;
+    selected.set(p.pid, p);
+    queue.push(p);
+  };
+
+  for (const seed of seeds) add(byPid.get(seed.pid) ?? seed);
+  while (queue.length > 0) {
+    const cur = queue.pop()!;
+    for (const child of children.get(cur.pid) ?? []) add(child);
+    if (!protectedPgids.has(cur.pgid)) {
+      for (const sibling of byPgid.get(cur.pgid) ?? []) add(sibling);
+    }
+  }
+  return [...selected.values()];
+}
+
+function signal(pid: number, sig: NodeJS.Signals): void {
+  try {
+    process.kill(pid, sig);
+  } catch {
+    // Already gone, or not ours to signal. Either way there is nothing to do.
+  }
+}
+
+/**
+ * SIGKILL whatever is still standing after the grace period. A pid is only
+ * killed if it is still present AND still in the process group we recorded —
+ * cheap insurance against signalling an unrelated process that happened to
+ * reuse the pid.
+ */
+export function escalateSurvivors(tree: readonly ProcRow[]): number[] {
+  if (tree.length === 0) return [];
+  const fresh = new Map(snapshotProcesses().map((p) => [p.pid, p]));
+  const killed: number[] = [];
+  for (const p of tree) {
+    const current = fresh.get(p.pid);
+    if (!current || current.pgid !== p.pgid) continue;
+    signal(p.pid, "SIGKILL");
+    killed.push(p.pid);
+  }
+  return killed;
+}
+
+function scheduleEscalation(tree: readonly ProcRow[]): void {
+  if (tree.length === 0) return;
+  const timer = setTimeout(() => escalateSurvivors(tree), graceMs());
+  // Never hold the daemon (or a test run) open waiting on the escalation.
+  timer.unref?.();
+}
+
+export interface PaneProcess {
+  /** The pane's shell pid (tmux `#{pane_pid}`). */
+  pid: number;
+  /** The pane's tty in `ps` spelling, or "" when unknown. */
+  tty: string;
+}
+
+/**
+ * SIGTERM everything belonging to a live pane, and schedule a SIGKILL sweep of
+ * whatever ignores it. Call this while the pane is still alive — the parent
+ * links it walks disappear the moment the pane shell exits.
+ *
+ * Returns the pids that were signalled.
+ */
+export function terminatePaneTree(pane: PaneProcess): number[] {
+  const procs = snapshotProcesses();
+  const paneRow = procs.find((p) => p.pid === pane.pid);
+  if (!paneRow) return [];
+
+  const protectedPids = selfAncestry(procs);
+  // The tmux server is the pane's parent, not its child, so the walk never
+  // reaches it — but it is catastrophic to kill, so say so explicitly.
+  protectedPids.add(paneRow.ppid);
+
+  const seeds = [paneRow];
+  if (pane.tty) {
+    // Strays already reparented to pid 1 keep the pane's controlling terminal,
+    // which is exclusive to this pane. The pgid expansion above cannot find
+    // them (their parent chain is gone), the tty can.
+    for (const p of procs) if (p.tty === pane.tty) seeds.push(p);
+  }
+
+  const tree = collectProcessTree(seeds, procs, protectedPids);
+  for (const p of tree) signal(p.pid, "SIGTERM");
+  scheduleEscalation(tree);
+  return tree.map((p) => p.pid);
+}
+
+/**
+ * Last-resort cleanup for a pane whose window has already vanished (a crashed
+ * window, or a watchdog reap that arrives after the fact). The parent chain and
+ * the tty are both gone by then; the pane's process group id is the only handle
+ * left, and it survives reparenting.
+ *
+ * `panePid` doubles as that pgid because tmux makes each pane shell a session
+ * and group leader. Pids do get reused, so a candidate is only accepted if it
+ * started no earlier than the pane did — `paneAgeSec` is how long ago the agent
+ * was spawned.
+ */
+export function sweepVanishedPaneGroup(panePid: number, paneAgeSec: number): number[] {
+  if (!Number.isInteger(panePid) || panePid <= 1) return [];
+  const procs = snapshotProcesses();
+  const paneRow = procs.find((p) => p.pid === panePid);
+  // The pane shell is alive: the window did not actually vanish (or the pid was
+  // reused by something outside this group). Leave it to the live-pane path.
+  if (paneRow && paneRow.pgid === panePid) return [];
+
+  const protectedPids = selfAncestry(procs);
+  // Allow a minute of slack: spawned_at is recorded slightly before the pane
+  // starts, and etime has second granularity.
+  const maxAgeSec = paneAgeSec + 60;
+  const seeds = procs.filter(
+    (p) => p.pgid === panePid && !protectedPids.has(p.pid) && p.elapsedSec <= maxAgeSec,
+  );
+  if (seeds.length === 0) return [];
+
+  const tree = collectProcessTree(seeds, procs, protectedPids);
+  for (const p of tree) signal(p.pid, "SIGTERM");
+  scheduleEscalation(tree);
+  return tree.map((p) => p.pid);
+}

@@ -66,6 +66,18 @@ to it. A tmux window must be missing in two consecutive successful health
 snapshots before an agent is reaped, and an unreliable tmux observation causes
 no agent/task mutation.
 
+Reaping an agent kills the pane's whole process tree, not just its tmux window
+(`src/daemon/proctree.ts`). `tmux kill-window` only takes down the pane shell,
+so anything an agent backgrounded into its own process group — a load
+generator, a watcher, a dev server — would otherwise survive, be reparented to
+pid 1, and keep burning CPU invisibly. Before the window is torn down the
+daemon snapshots `ps`, collects the pane's descendants and process-group
+members (the daemon's own ancestry and the tmux server are excluded), sends
+`SIGTERM`, and `SIGKILL`s anything still standing a few seconds later. Each
+agent's pane pid is recorded so a reap that arrives after the window has
+already gone can still sweep leftovers by process group; that sweep ignores
+processes older than the agent, so a reused pid cannot be hit.
+
 Codex scratch tasks are pre-trusted only at the exact server-created task
 directory. The scratch parent and general temporary directories are never
 trusted. Repository trust remains a human decision.

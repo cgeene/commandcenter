@@ -7,13 +7,14 @@ const newWindow = vi.fn(
   (_name: string, _cwd: string, _command: string) => "cc:@7",
 );
 const windowExists = vi.fn(() => false);
-const killWindow = vi.fn();
+const killWindow = vi.fn((_target: string) => [] as number[]);
 
 vi.mock("../src/daemon/tmux.js", () => ({
   newWindow: (name: string, cwd: string, command: string) =>
     newWindow(name, cwd, command),
   windowExists: (target: string) => windowExists(target),
   killWindow: (target: string) => killWindow(target),
+  paneProcess: () => null,
 }));
 
 let tmpDir: string;

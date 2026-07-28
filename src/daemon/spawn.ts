@@ -52,7 +52,8 @@ import {
 } from "./permissions.js";
 import { resolveReviewDelta } from "./reviewstate.js";
 import { findProviderTranscript } from "./transcript.js";
-import { killWindow, newWindow, windowExists } from "./tmux.js";
+import { killWindow, newWindow, paneProcess, windowExists } from "./tmux.js";
+import { sweepVanishedPaneGroup } from "./proctree.js";
 import {
   createReviewWorktree,
   createSnapshotReviewWorktree,
@@ -110,6 +111,7 @@ function buildWorkerPrompt(task: Task, branch: string | null): string {
       : "Scope: work ONLY inside this worktree. If you discover the task's real work belongs in a DIFFERENT repo, do not edit that repo — call report_blocked naming the correct repo path so the task can be re-dispatched there with proper isolation.",
     "Your task counts as complete only once you set result_summary. Stopping without it flags the task as incomplete, not done.",
     "Do NOT run multi-agent self-review workflows (e.g. the code-review skill's dynamic workflow) on your own diff — the platform runs an independent adversarial review on every PR/result, so self-review duplicates it at significant token cost. Your verification commands (typecheck/tests/build) are your quality gate.",
+    "Anything you start in the background (`&`, `nohup`, a dev server, a watcher, a synthetic load generator) must be stopped before you finish — cleanup you leave for after you stop will not run. Prefer your harness's managed background-process facility over a bare `&`.",
   ];
   if (task.review_cycles > 0 && task.review_notes) {
     lines.push(
@@ -310,6 +312,18 @@ export const _buildWorkerDenyForTest = buildWorkerDeny;
 export const _buildWorkerAskForTest = buildWorkerAsk;
 export const _buildReviewerAllowForTest = buildReviewerAllow;
 export const _buildReviewerDenyForTest = buildReviewerDeny;
+
+/**
+ * Record the agent's window together with the pid of the shell tmux started in
+ * it. Both are needed at reap time: the target to kill the window, the pid to
+ * chase down anything the agent backgrounded if the window is already gone.
+ */
+function attachPane(agentId: number, target: string): void {
+  updateAgent(agentId, {
+    tmux_target: target,
+    pane_pid: paneProcess(target)?.pid ?? null,
+  });
+}
 
 function buildClaudeCmd(opts: {
   model?: string;
@@ -583,7 +597,7 @@ export function spawnWorker(
     // SessionStart is the readiness handshake. Leaving the agent in spawning
     // lets the watchdog detect missing/untrusted hooks instead of pretending a
     // worker is healthy merely because its tmux window exists.
-    updateAgent(agent.id, { tmux_target: target });
+    attachPane(agent.id, target);
     updateTask(taskId, {
       status: "in_progress",
       agent_id: agent.id,
@@ -867,7 +881,7 @@ export function spawnReviewer(
   // SessionStart is the readiness handshake, just as it is for workers.
   // Keeping the reviewer in spawning lets the watchdog surface a provider
   // trust prompt instead of claiming the reviewer is already healthy.
-  updateAgent(agent.id, { tmux_target: target });
+  attachPane(agent.id, target);
   logEvent("reviewer.spawned", {
     agentId: agent.id,
     taskId,
@@ -918,7 +932,7 @@ export function spawnMain(model?: string): Agent {
   );
   // Do not report the orchestrator as working until its SessionStart hook
   // arrives. The provider may first require a one-time workspace-trust choice.
-  updateAgent(agent.id, { tmux_target: target });
+  attachPane(agent.id, target);
   logEvent("agent.spawned", {
     agentId: agent.id,
     payload: { target, model: resolvedModel, kind: "main" },
@@ -1024,9 +1038,19 @@ export function killAgent(
   // DB row marked dead. "kill" must still stop that split-brain process.
   if (agent.state === "dead" && !liveWindow) return agent;
 
-  if (agent.tmux_target && liveWindow) {
-    killWindow(agent.tmux_target);
-  }
+  // Kill the pane's whole process tree, not just its window: an agent that
+  // backgrounded a load generator, watcher or dev server would otherwise leave
+  // it running forever, orphaned to pid 1 and invisible to Command Center.
+  const killedPids = agent.tmux_target && liveWindow
+    ? killWindow(agent.tmux_target)
+    : agent.pane_pid
+      // Window already gone (crash, or a watchdog reap after the fact) — the
+      // pane's process group is the only handle on its leftovers.
+      ? sweepVanishedPaneGroup(
+          agent.pane_pid,
+          Math.max(0, (Date.now() - Date.parse(agent.spawned_at)) / 1000),
+        )
+      : [];
   updateAgent(agentId, { state: "dead" });
 
   const task = agent.task_id ? getTask(agent.task_id) : undefined;
@@ -1036,7 +1060,7 @@ export function killAgent(
     logEvent("agent.killed", {
       agentId,
       taskId: agent.task_id ?? undefined,
-      payload: { ...opts, split_brain: true },
+      payload: { ...opts, split_brain: true, killed_pids: killedPids.length },
     });
     return getAgent(agentId)!;
   }
@@ -1067,7 +1091,7 @@ export function killAgent(
   logEvent("agent.killed", {
     agentId,
     taskId: agent.task_id ?? undefined,
-    payload: opts,
+    payload: { ...opts, killed_pids: killedPids.length },
   });
   return getAgent(agentId)!;
 }

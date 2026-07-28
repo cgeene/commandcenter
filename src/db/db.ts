@@ -93,6 +93,10 @@ CREATE TABLE IF NOT EXISTS agents (
   state         TEXT NOT NULL DEFAULT 'spawning',
   task_id       INTEGER REFERENCES tasks(id),
   tmux_target   TEXT,
+  -- pid of the shell tmux started in the pane. Kept so a reap that arrives
+  -- after the window has already gone can still find (and kill) processes the
+  -- agent left behind in the pane's process group.
+  pane_pid      INTEGER,
   session_id    TEXT,
   transcript_path TEXT,
   runtime_config_path TEXT,
@@ -377,6 +381,9 @@ function migrate(db: Database.Database): void {
   }
   if (!agentCols.includes("reasoning_effort")) {
     db.exec("ALTER TABLE agents ADD COLUMN reasoning_effort TEXT");
+  }
+  if (!agentCols.includes("pane_pid")) {
+    db.exec("ALTER TABLE agents ADD COLUMN pane_pid INTEGER");
   }
   const cronCols = (db.prepare("PRAGMA table_info(crons)").all() as { name: string }[]).map(
     (c) => c.name,

@@ -14,7 +14,8 @@ const createWorktree = vi.fn(() => ({
 vi.mock("../src/daemon/tmux.js", () => ({
   newWindow: (...args: unknown[]) => newWindow(...args),
   windowExists: () => false,
-  killWindow: vi.fn(),
+  killWindow: vi.fn(() => []),
+  paneProcess: () => null,
 }));
 
 vi.mock("../src/daemon/worktree.js", () => ({
