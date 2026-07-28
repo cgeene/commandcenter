@@ -20,6 +20,7 @@ import {
   shapeTaskList,
   shapeTaskPayload,
 } from "./compact.js";
+import { blockerEffect, blockerNote } from "../lib/blockers.js";
 
 const ROLE =
   process.env.CC_ROLE === "main" || process.env.CC_ROLE === "reviewer"
@@ -56,6 +57,40 @@ const REVIEW_MODE_SCHEMA = z
   .describe(
     "how hard the adversarial reviewer works (default 'full'). 'light' = a diff-scoped read with no independent re-verification: use ONLY for documentation, threshold, and runbook changes, UI-only changes confined to web/src, and test-only changes. 'full' stays MANDATORY for daemon logic, policy/permissions, migrations, and prod-mutating work, however small. When in doubt, leave it 'full'.",
   );
+
+/** Task sequencing. One blocker per task — the column is a single FK, so a new
+ *  value replaces the old one rather than adding to it. */
+const BLOCKED_BY_SCHEMA = z
+  .number()
+  .int()
+  .positive()
+  .describe(
+    "id of the task that must finish first; this task is held out of the ready queue until that task is done. One blocker per task — setting it replaces any existing one.",
+  );
+
+/**
+ * Blocker advisory appended to a mutation echo: the orchestrator should not
+ * have to make a second call to learn whether the dependency it just recorded
+ * is already satisfied (blocker done → ready now) or permanently stuck
+ * (blocker cancelled/failed → never becomes done).
+ */
+async function blockerStatusNote(blockerId: number) {
+  try {
+    const blocker = await call<{ id: number; status: string }>(
+      "GET",
+      `/api/tasks/${blockerId}`,
+    );
+    return {
+      id: blockerId,
+      status: blocker.status,
+      effect: blockerEffect(blocker.status),
+      note: blockerNote(blockerId, blocker.status),
+    };
+  } catch {
+    // Advisory only — never fail an update that already landed.
+    return undefined;
+  }
+}
 
 // Read tools default to a compact projection; these opt back into more.
 const verboseArg = z
@@ -105,7 +140,7 @@ server.registerTool(
         .describe("Codex reasoning effort; defaults to high"),
       worker_provider: z.enum(["claude", "codex"]).optional(),
       priority: z.number().int().min(0).max(4).optional(),
-      blocked_by: z.number().int().optional(),
+      blocked_by: BLOCKED_BY_SCHEMA.optional(),
       verify_cmd: z.string().optional(),
       open_pr: z
         .boolean()
@@ -443,7 +478,7 @@ if (ROLE === "main") {
     "update_task",
     {
       description:
-        "Update a task (status, priority, worker provider, model, reasoning effort, review mode, prompt, result_summary...). Returns the compact task record plus whichever fields you changed — the values you just sent are otherwise not echoed back; use get_task(id, verbose: true) if you need to re-read the whole thing.",
+        "Update a task (status, priority, worker provider, model, reasoning effort, review mode, blocked_by, prompt, result_summary...). Use blocked_by to persist a sequencing constraint you worked out (two tasks touching the same files must not run at once) so it survives this session; blocked_by: null clears it. Returns the compact task record plus whichever fields you changed — the values you just sent are otherwise not echoed back; use get_task(id, verbose: true) if you need to re-read the whole thing.",
       inputSchema: {
         id: z.number().int(),
         status: z
@@ -462,6 +497,11 @@ if (ROLE === "main") {
           .optional()
           .describe("new allow-listed Git root; kill the prior worker first"),
         prompt: z.string().optional(),
+        blocked_by: BLOCKED_BY_SCHEMA.nullable()
+          .optional()
+          .describe(
+            "id of the task that must finish first, or null to clear the dependency. Rejected if it points at this task or would close a cycle (both would deadlock the ready queue). A blocker that is already done is accepted and reported as already-satisfied.",
+          ),
         verify_cmd: z.string().optional(),
         result_summary: z.string().optional(),
         open_pr: z
@@ -478,13 +518,15 @@ if (ROLE === "main") {
     // that the update landed — the same mechanism confirm_human_publication
     // uses for the publication columns. echoedFields keeps the bulk (the
     // prompt the caller just sent) out of the echo.
-    async ({ id, ...fields }) =>
-      asText(
-        compactTask(
-          await call("PATCH", `/api/tasks/${id}`, fields),
-          echoedFields(Object.keys(fields)),
-        ),
-      ),
+    async ({ id, ...fields }) => {
+      const updated = compactTask(
+        await call("PATCH", `/api/tasks/${id}`, fields),
+        echoedFields(Object.keys(fields)),
+      );
+      if (fields.blocked_by == null) return asText(updated);
+      const blocker = await blockerStatusNote(fields.blocked_by);
+      return asText(blocker ? { ...(updated as object), blocker } : updated);
+    },
   );
 
   server.registerTool(
