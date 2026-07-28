@@ -8,8 +8,10 @@ import {
   latestAgentEventTs,
   latestEventTs,
   latestTaskEvent,
+  logEvent,
 } from "../db/events.js";
 import { JIRA_SYNC_FAIL_THRESHOLD } from "../lib/jira.js";
+import { normalizePrState } from "../lib/prstate.js";
 import { quotaConditions, quotaIsCritical } from "../lib/quotaalert.js";
 import { resetsIn } from "../lib/usage.js";
 import {
@@ -20,7 +22,6 @@ import {
 } from "../db/settings.js";
 import { listTasks, readyTasks } from "../db/tasks.js";
 import { reviewMaxCycles } from "./review.js";
-import { prStates } from "./prcache.js";
 import { WAIT_HOOK_EVENTS } from "./waiting.js";
 
 /**
@@ -80,14 +81,15 @@ function excerpt(s: string | null | undefined, n = 200): string {
 
 export interface DeriveDeps {
   now?: Date;
-  /** OPEN/unknown -> true, MERGED/CLOSED -> false. */
+  /** Confirmed-open -> true. Merged, closed AND unknown -> false (see
+   *  computeAttention: unknown fails closed). */
   isPrOpen: (url: string) => boolean;
 }
 
 /**
- * Pure derivation over current DB state. `isPrOpen` is injected because the
- * only external dependency (a `gh` PR-state lookup) must be cached/awaited by
- * the caller before this synchronous pass runs.
+ * Pure derivation over current DB state. `isPrOpen` is injected so the PR
+ * lifecycle policy (which states count as actionable, and what to do about an
+ * unresolved one) lives in exactly one place — see computeAttention.
  */
 export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   const now = deps.now ?? new Date();
@@ -426,24 +428,62 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   return items;
 }
 
+/** Latch so a PR stuck without a resolvable state logs once per episode rather
+ *  than once per poll — the dashboard hits /api/attention every couple of
+ *  seconds. Re-arms as soon as a known state lands for that task. */
+const unknownPrStates = new Set<string>();
+
 /**
- * Build the queue for the API: resolve the (cached) open/closed state of every
- * approved task's PR, then run the pure derivation.
+ * Build the queue for the API. A PR's lifecycle comes exclusively from the
+ * tasks.pr_state column that prsync refreshes every two minutes — one source of
+ * truth, free to read, and durable across daemon restarts.
+ *
+ * This makes NO `gh` calls, by design. The panel used to resolve states itself
+ * through an in-memory cache, which cost it both ways: a cold start fanned one
+ * `gh pr view` out per approved PR at once, and an unresolved state counted as
+ * "still open", so a machine-wide `gh` outage right after a restart surfaced
+ * every merged PR in history as a merge reminder (~91 items, 2026-07-28).
+ * Reading a persisted column is burst-free and restart-proof. Two minutes of
+ * staleness is immaterial for a panel a human reads.
+ *
+ * An unknown state — never synced, or a value normalizePrState doesn't
+ * recognize — FAILS CLOSED: the merge item is withheld and the situation logged.
+ * Prsync fills the column in on its next pass, so a genuine merge reminder is at
+ * most one poll cycle late; ghost items, by contrast, cost the panel its
+ * credibility.
  */
 export async function computeAttention(now = new Date()): Promise<AttentionItem[]> {
-  const prUrls = listTasks()
-    .filter(
-      (t) =>
-        t.review_verdict === "approve" &&
-        t.pr_url &&
-        t.open_pr !== 0 &&
-        (t.status === "review" || t.status === "done"),
-    )
-    .map((t) => t.pr_url!);
-  const states = await prStates(prUrls, now.getTime());
-  const isPrOpen = (url: string) => {
-    const s = states.get(url);
-    return s !== "MERGED" && s !== "CLOSED"; // unknown/OPEN -> still actionable
-  };
-  return deriveAttention({ now, isPrOpen });
+  const open = new Map<string, boolean>();
+  for (const t of listTasks()) {
+    if (t.review_verdict !== "approve") continue;
+    if (!t.pr_url || t.open_pr === 0) continue;
+    if (t.status !== "review" && t.status !== "done") continue;
+    const state = normalizePrState(t.pr_state);
+    const key = `${t.id}:${t.pr_url}`;
+    if (state === null) {
+      if (!unknownPrStates.has(key)) {
+        unknownPrStates.add(key);
+        logEvent("attention.pr_state_unknown", {
+          taskId: t.id,
+          payload: {
+            pr_url: t.pr_url,
+            pr_state: t.pr_state,
+            pr_synced_at: t.pr_synced_at,
+            pr_sync_fails: t.pr_sync_fails,
+          },
+        });
+      }
+    } else {
+      unknownPrStates.delete(key);
+    }
+    // Two tasks could in principle carry the same pr_url; a confirmed OPEN wins
+    // over an unresolved one.
+    open.set(t.pr_url, open.get(t.pr_url) === true || state === "open");
+  }
+  return deriveAttention({ now, isPrOpen: (url) => open.get(url) === true });
+}
+
+/** Test helper — the latch is module state, so a fresh DB needs a fresh latch. */
+export function _resetPrStateLatch(): void {
+  unknownPrStates.clear();
 }

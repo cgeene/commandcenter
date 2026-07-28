@@ -255,6 +255,80 @@ describe("main-first task delegation", () => {
     expect(kinds).not.toContain("task.awaiting_main");
   });
 
+  it("does notify main when a human-requested worker resume failed to launch", async () => {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { delegateTaskToMain } = await import(
+      "../src/daemon/orchestration.js"
+    );
+    const main = createAgent({
+      kind: "main",
+      state: "idle",
+      tmux_target: "cc:@main",
+    });
+    const task = createTask({
+      title: "main-created child",
+      prompt: "continue it",
+      repo: "/repo",
+      dispatch_mode: "orchestrated",
+    });
+    logEvent("task.created", {
+      taskId: task.id,
+      agentId: main.id,
+      payload: { creator_kind: "main" },
+    });
+    logEvent("task.worker_resume_requested", {
+      taskId: task.id,
+      payload: { approval_invalidated: true },
+    });
+
+    expect(await delegateTaskToMain(task.id, main)).toBe(true);
+    expect(String(sendText.mock.calls[0]?.[1])).toContain(
+      "managed worker launch failed",
+    );
+    expect(String(sendText.mock.calls[0]?.[1])).toContain(
+      `spawn_worker(${task.id})`,
+    );
+  });
+
+  it("retries a failed human worker resume for a main-created task when main becomes idle", async () => {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { delegatePendingTaskToMain } = await import(
+      "../src/daemon/orchestration.js"
+    );
+    const main = createAgent({
+      kind: "main",
+      state: "idle",
+      tmux_target: "cc:@main",
+    });
+    const task = createTask({
+      title: "main-created child",
+      prompt: "continue it",
+      repo: "/repo",
+      dispatch_mode: "orchestrated",
+    });
+    logEvent("task.created", {
+      taskId: task.id,
+      agentId: main.id,
+      payload: { creator_kind: "main" },
+    });
+    logEvent("task.worker_resume_requested", {
+      taskId: task.id,
+      payload: { approval_invalidated: true },
+    });
+
+    expect(await delegatePendingTaskToMain(main)).toBe(true);
+    expect(String(sendText.mock.calls[0]?.[1])).toContain(
+      "managed worker launch failed",
+    );
+    expect(String(sendText.mock.calls[0]?.[1])).toContain(
+      `spawn_worker(${task.id})`,
+    );
+  });
+
   it("never pings main via the idle-hook retry for a task main filed itself", async () => {
     const { createAgent } = await import("../src/db/agents.js");
     const { createTask } = await import("../src/db/tasks.js");

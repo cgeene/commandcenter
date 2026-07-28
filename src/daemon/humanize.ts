@@ -46,6 +46,14 @@ const TEMPLATES: Record<string, Template> = {
     `${taskRef(e)} blocked${p.reason ? `: ${clip(p.reason, 80)}` : ""}`,
   "task.failed": (e) => `${taskRef(e)} failed`,
   "task.cancelled": (e) => `${taskRef(e)} cancelled`,
+  "task.archived_resumed": (e, p) =>
+    `Resumed archived ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
+  "task.worker_resume_requested": (e) =>
+    `Reopened ${taskRef(e)} for more work; prior approval invalidated`,
+  "task.worker_resumed": (e, p) =>
+    `Resumed ${worker(e)} on ${taskRef(e)} (${str(p.session_mode) || "provider session"})`,
+  "task.worker_resume_failed": (e) =>
+    `Reopened ${taskRef(e)}, but its worker launch failed; queued for retry`,
   "task.reopened": (e, p) =>
     `Reopened ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
   "task.requeued": (e, p) =>
@@ -211,6 +219,8 @@ const TEMPLATES: Record<string, Template> = {
   // --- misc ---
   "main.escalated": (_e, p) => `Main agent escalated: ${clip(p.title, 80)}`,
   "attention.dismissed": () => `Dismissed a "needs you" item`,
+  "attention.pr_state_unknown": (e) =>
+    `Withheld the merge reminder for ${taskRef(e)} — its PR state is unresolved until PR sync catches up`,
   "scheduler.config": () => `Scheduler settings changed`,
   "watchdog.tmux_unavailable": () => `tmux health observation unavailable — no agents changed`,
   "watchdog.tmux_recovered": () => `tmux health observation recovered`,

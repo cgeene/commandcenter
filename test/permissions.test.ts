@@ -124,11 +124,9 @@ describe("spawn.ts allow-list builders", () => {
     for (const entry of READ_ONLY_PROFILE) expect(allow).toContain(entry);
   });
 
-  it("reviewer settings allow the whole Bash tool so verify/build never stalls", async () => {
+  it("reviewer settings allow Bash for independent tests and builds", async () => {
     const { _buildReviewerAllowForTest } = await import("../src/daemon/spawn.js");
     const { createTask } = await import("../src/db/tasks.js");
-    // Any verify_cmd (even a compound one) runs under the blanket Bash allow —
-    // no need to allow-list the exact command string.
     const task = createTask({
       title: "t",
       prompt: "x",
@@ -137,9 +135,10 @@ describe("spawn.ts allow-list builders", () => {
     });
     const allow = _buildReviewerAllowForTest(task);
     expect(allow).toContain("Bash");
+    expect(allow).toContain("Bash(git diff*)");
   });
 
-  it("reviewer edits and Git publishing are denied", async () => {
+  it("reviewer edits, Git publishing, and host tmux control are denied", async () => {
     const { _buildReviewerDenyForTest } = await import("../src/daemon/spawn.js");
     const deny = _buildReviewerDenyForTest();
     expect(deny).toEqual(
@@ -151,6 +150,9 @@ describe("spawn.ts allow-list builders", () => {
         "Bash(git push*)",
         "Bash(sudo *)",
         "Bash(gh pr merge*)",
+        "Bash(tmux kill-*)",
+        "Bash(*tmux * kill-*)",
+        "Bash(*pkill *tmux*)",
       ]),
     );
   });
@@ -197,7 +199,8 @@ describe("spawn.ts allow-list builders", () => {
     });
     const repo = createTask({ title: "implement", prompt: "x", repo: "/r" });
 
-    // Every worker (Git or scratch) blocks sudo / rm -rf / gh pr merge / repo delete.
+    // Every worker (Git or scratch) blocks sudo / rm -rf / PR merge /
+    // repo deletion / Command Center terminal control.
     for (const deny of [_buildWorkerDenyForTest(scratch), _buildWorkerDenyForTest(repo)]) {
       expect(deny).toEqual(
         expect.arrayContaining([
@@ -205,6 +208,9 @@ describe("spawn.ts allow-list builders", () => {
           "Bash(rm -rf /*)",
           "Bash(gh pr merge*)",
           "Bash(gh repo delete*)",
+          "Bash(tmux kill-*)",
+          "Bash(*tmux * send-keys*)",
+          "Bash(killall *tmux*)",
         ]),
       );
     }

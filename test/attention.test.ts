@@ -16,8 +16,6 @@ afterEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
-  const { _clearPrCache } = await import("../src/daemon/prcache.js");
-  _clearPrCache();
 });
 
 const allOpen = () => true;
@@ -741,43 +739,5 @@ describe("deriveAttention — quota", () => {
     const second = deriveAttention({ isPrOpen: allOpen }).find((i) => i.kind === "quota");
     expect(second).toBeTruthy();
     expect(second!.id).not.toBe(first.id);
-  });
-});
-
-describe("prcache", () => {
-  it("returns a fresh cached value without shelling out", async () => {
-    const { prState, _seedPrCache } = await import("../src/daemon/prcache.js");
-    const url = "https://github.com/nylas/repo/pull/1";
-    const now = 1_000_000;
-    _seedPrCache(url, "MERGED", now);
-    expect(await prState(url, now + 60_000)).toBe("MERGED"); // within 5m TTL
-  });
-
-  it("keeps the stale value when a refresh fails", async () => {
-    const { prState, _seedPrCache } = await import("../src/daemon/prcache.js");
-    // an unresolvable PR forces the gh call to fail on the stale-entry path
-    const url = "https://github.com/nylas-does-not-exist-xyz/nope/pull/999999";
-    const now = 2_000_000;
-    _seedPrCache(url, "OPEN", now);
-    // 6 minutes later the entry is stale; gh fails -> previous value retained
-    expect(await prState(url, now + 6 * 60_000)).toBe("OPEN");
-  });
-
-  it("treats a non-PR url as unknown", async () => {
-    const { prState } = await import("../src/daemon/prcache.js");
-    expect(await prState("https://example.com/not/a/pr")).toBe("unknown");
-  });
-
-  it("prStates resolves many urls into one map", async () => {
-    const { prStates, _seedPrCache } = await import("../src/daemon/prcache.js");
-    const now = 3_000_000;
-    _seedPrCache("https://github.com/a/b/pull/1", "OPEN", now);
-    _seedPrCache("https://github.com/a/b/pull/2", "CLOSED", now);
-    const map = await prStates(
-      ["https://github.com/a/b/pull/1", "https://github.com/a/b/pull/2"],
-      now + 1000,
-    );
-    expect(map.get("https://github.com/a/b/pull/1")).toBe("OPEN");
-    expect(map.get("https://github.com/a/b/pull/2")).toBe("CLOSED");
   });
 });

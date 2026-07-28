@@ -18,6 +18,7 @@ agp <group> <command> [options]
 | `task update <id>` | Update fields: `-s/--status`, `-P/--priority`, `--provider <claude\|codex>`, `-m/--model`, `-e/--effort`, `--result <summary>`. Provider changes are rejected while the task has a live agent. |
 | `task claim <id>` | Atomically claim a queued task. |
 | `task cancel <id>` | Close a task from any state (kills its live worker/reviewer). `--rm-worktree` also removes the worktree (uncommitted work is lost). Approved unpublished Human-publishes work is retained; destructive cleanup requires `--rm-worktree --discard-unpublished`. Reports any tasks left dangling by `blocked_by`. |
+| `task resume <id>` | Reopen a done/cancelled task in place. `-p/--prompt` or `-f/--prompt-file` supplies changed requirements. Preserves a resumable same-provider session and safely falls back to a fresh session with the archived handoff. |
 | `task diff <id>` | Show the diff on the task's branch. `--stat` for stat + commits only. |
 
 ## `agp review <taskId>`
@@ -40,7 +41,7 @@ is Claude, or the `CC_REVIEWER_PROVIDER` / `CC_REVIEWER_VARIETY` policy), and
 | `agent kill <id>` | Kill an agent's tmux window. `--requeue` puts its task back in the queue; `--rm-worktree` removes the worktree. |
 | `agent peek <id>` | Print the agent's visible terminal output. `-n/--lines <n>` (default 50). |
 | `agent send <id> <text…>` | Send a message into an agent's interactive session. |
-| `agent session <id>` | Show provider, session ID, transcript path (when available), working directory, and a copyable provider-specific resume command. |
+| `agent session <id>` | Show provider, session ID, transcript path (when available), working directory, and a copyable detached resume command. Codex commands include Command Center's isolated `CODEX_HOME`; plain `codex resume <id>` searches the wrong session store. |
 
 ## `agp attach <agentId>`
 

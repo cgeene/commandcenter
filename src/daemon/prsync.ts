@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { listAgents } from "../db/agents.js";
 import { logEvent } from "../db/events.js";
+import { normalizePrState } from "../lib/prstate.js";
 import {
   getTask,
   tasksNeedingPrReconcile,
@@ -252,7 +253,7 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
         /* leave it for manual cleanup */
       }
     }
-    if (task.branch && /^agent\/task-\d+$/.test(task.branch)) {
+    if (task.branch && /^agent\/task-\d+(?:-resume-\d+)?$/.test(task.branch)) {
       try {
         git(task.repo, "branch", "-D", task.branch);
       } catch {
@@ -378,7 +379,7 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
     // Worker is parked on a permission prompt — injected text would answer
     // the menu, not reach the conversation. The wait is already being
     // escalated; retry on a later pass once it's unblocked.
-    if (outcome === "waiting_input") return;
+    if (outcome === "waiting_input" || outcome === "delivery_failed") return;
     if (outcome === "sent") {
       updateTask(taskId, {
         status: "in_progress",
@@ -393,7 +394,8 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
       logEvent("task.reopened", { taskId, payload: { reason: "pr feedback" } });
       return;
     }
-    // not_live: fall through to requeue
+    // not_live: fall through to requeue. A bounded delivery failure above
+    // deliberately leaves the live worker and task association untouched.
   }
 
   // notes flow into the respawn prompt, same as a reviewer rejection. Append
@@ -428,7 +430,10 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
  */
 export function recordSyncSuccess(taskId: number, pr: PrState): void {
   const fields: Partial<Task> = {
-    pr_state: pr.state.toLowerCase(),
+    // Through the same normalizer every reader uses, so writer and reader can
+    // never disagree on casing. A state we don't recognize stores as NULL,
+    // which keeps the task in the sync candidate set to be retried.
+    pr_state: normalizePrState(pr.state),
     pr_checks: pr.checks ?? null,
     pr_synced_at: new Date().toISOString(),
     pr_sync_fails: 0,

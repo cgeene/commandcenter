@@ -446,6 +446,38 @@ describe("verify bypass fix", () => {
   });
 });
 
+describe("lean-comment policy in worker prompts", () => {
+  it("is standing instruction for repo and scratch workers alike", async () => {
+    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const repoTask = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const scratchTask = createTask({
+      title: "t",
+      prompt: "x",
+      repo: "/scratch/task-ABC123",
+      workspace_kind: "scratch",
+      open_pr: false,
+    });
+    for (const prompt of [
+      _buildWorkerPromptForTest(repoTask, "agent/task-1"),
+      _buildWorkerPromptForTest(scratchTask, null),
+    ]) {
+      expect(prompt).toContain("something the code cannot show");
+      expect(prompt).toContain("Never write narrative what-this-does comments");
+      expect(prompt).toContain("provenance belongs in the commit message");
+    }
+  });
+
+  it("asks a PR task for a tight body ending in human decisions", async () => {
+    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    expect(_buildWorkerPromptForTest(task, "agent/task-1")).toContain(
+      "any decision that needs human attention",
+    );
+  });
+});
+
 describe("open_pr prompt wiring", () => {
   it("worker prompt tells a branch-only task not to open a PR", async () => {
     const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
@@ -533,6 +565,21 @@ describe("open_pr prompt wiring", () => {
     const prompt = buildReviewerPrompt(task);
     expect(prompt).toContain("BRANCH-ONLY");
     expect(prompt).toContain("A missing PR is NOT a defect");
+  });
+
+  it("reviewer and worker prompts forbid direct host tmux control", async () => {
+    const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
+    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "safe terminal", prompt: "x", repo: "/r" });
+
+    const reviewer = buildReviewerPrompt(task);
+    expect(reviewer).toContain("run relevant tests, builds, typechecks");
+    expect(reviewer).toContain("do not invoke tmux kill/respawn/send-keys");
+
+    const worker = _buildWorkerPromptForTest(task, "agent/task-1");
+    expect(worker).toContain("Never control Command Center's terminal infrastructure");
+    expect(worker).toContain("do not invoke tmux kill/respawn/send-keys");
   });
 
   it("reviewer prompt states a PR is expected for normal tasks", async () => {

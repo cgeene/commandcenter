@@ -20,6 +20,7 @@ import type { Task } from "../db/tasks.js";
 import { gitToplevel } from "../daemon/worktree.js";
 import { writeCodexConfig } from "../daemon/genconfig.js";
 import { countRepositoriesUnder } from "../daemon/workspaces.js";
+import { killAgent, spawnMain } from "../daemon/spawn.js";
 import { classifyGhStatus } from "./doctor.js";
 import { api } from "./client.js";
 
@@ -185,6 +186,31 @@ task
         `warning: task #${d.id} ("${d.title}") is blocked_by #${r.task.id} and will never become ready — re-point or cancel it`,
       );
     }
+  });
+
+task
+  .command("resume <id>")
+  .description("reopen an archived task in place and send it to Claude main")
+  .option("-p, --prompt <instructions>", "changed or additional requirements")
+  .option("-f, --prompt-file <file>", "read resume instructions from a file")
+  .action(async (id: string, opts) => {
+    if (opts.prompt && opts.promptFile) {
+      throw new Error("use either --prompt or --prompt-file, not both");
+    }
+    const instructions = opts.promptFile
+      ? fs.readFileSync(opts.promptFile, "utf8")
+      : opts.prompt;
+    const result = await api<{
+      task: Task;
+      session_mode: "same_provider_session" | "fresh_session";
+    }>("POST", `/api/tasks/${id}/resume`, { instructions });
+    console.log(
+      `task #${result.task.id} reopened and ${
+        result.task.dispatch_mode === "orchestrated"
+          ? "queued for Claude main"
+          : "queued for the scheduler"
+      } (${result.session_mode.replaceAll("_", " ")})`,
+    );
   });
 
 task
@@ -933,7 +959,7 @@ program
 
     const list = spawnSync(
       "tmux",
-      ["list-windows", "-t", tmuxSession(), "-F", "#{window_name}\t#{session_name}:#{window_id}"],
+      ["list-windows", "-a", "-F", "#{window_name}\t#{session_name}:#{window_id}"],
       { encoding: "utf8" },
     );
     const row = (list.stdout ?? "")
@@ -957,8 +983,11 @@ program
         if (opts.main) {
           const agents = await api<Agent[]>("GET", "/api/agents?live=true");
           const main = agents.find((a) => a.kind === "main");
-          if (main) await api("POST", `/api/agents/${main.id}/kill`, {});
-          const a = await api<Agent>("POST", "/api/main", {});
+          // The public kill endpoint intentionally refuses Main. Upgrade is a
+          // local CLI lifecycle operation, so use the same daemon primitives
+          // directly and retain the current model while replacing the process.
+          if (main) killAgent(main.id);
+          const a = spawnMain(main?.model ?? undefined);
           console.log(`main agent a${a.id} respawned in ${a.tmux_target}`);
         }
         return;
