@@ -94,12 +94,11 @@ async function mainWentIdle(mainId: number): Promise<void> {
   panes.set(MAIN, CLEAR_PROMPT);
 }
 
-/** What the orchestrator's `get_task(id, verbose: true)` does over HTTP.
- *  `agentId` is the reading main, as the cc MCP server passes it. */
-async function readFullTask(id: number, agentId?: number): Promise<Response> {
+/** What the orchestrator's `get_task(id, verbose: true)` does over HTTP. */
+async function readFullTask(id: number): Promise<Response> {
   const { buildApp } = await import("../src/daemon/api.js");
   const { taskReadPath } = await import("../src/mcp/triage.js");
-  return buildApp().request(taskReadPath(id, { verbose: true, agentId }));
+  return buildApp().request(taskReadPath(id, { verbose: true }));
 }
 
 /** How many events of `kind` exist, across all tasks. */
@@ -141,7 +140,7 @@ describe("triage ack — reading a task stops it being re-delivered", () => {
     // Nothing may ping it again: not the immediate route, not the idle catch-up,
     // and not the unacked-task cooldown that the ack overrides.
     sendText.mockClear();
-    expect(await delegateTaskToMainDetailed(task.id)).toBe("skipped");
+    expect(await delegateTaskToMainDetailed(task.id)).toBe("already_triaged");
     expect(await delegatePendingTaskToMain(main)).toBe(false);
     expect(
       await delegatePendingTaskToMain(main, {
@@ -286,7 +285,7 @@ describe("triage ack — what brings a task back", () => {
       method: "POST",
     });
     expect(res.status).toBe(200);
-    expect((await res.json()) as { status: string }).toEqual({ ok: true, status: "delivered" });
+    expect((await res.json()) as { status: string }).toMatchObject({ status: "delivered" });
     expect(sendText).toHaveBeenCalledOnce();
     const { listEvents } = await import("../src/db/events.js");
     expect(listEvents(30).map((e) => e.kind)).toContain("task.triage_reflagged");
@@ -463,32 +462,136 @@ describe("triage ack — safety net for a task that is never acked", () => {
     expect(messages()[0]).toContain(`get_task(${task.id}`);
   });
 
-  it("surfaces a task the DEAD main acked to its replacement", async () => {
+  it("keeps a triaged task quiet for a replacement main, and discoverable", async () => {
+    // The ack is a property of the TASK, not of one orchestrator session: a
+    // triaged task stays quiet even after the main that read it dies, rather
+    // than resurfacing on a timer forever. What replaces the ping is visibility
+    // — list_tasks(ready=true) still returns the task, carrying triaged_at, so a
+    // fresh orchestrator can see both that it is queued and that it was already
+    // triaged, and pick it up deliberately.
     const { main, tasks } = await setup();
     const [task] = tasks;
-    const { delegatePendingTaskToMain } = await import("../src/daemon/orchestration.js");
+    const { delegatePendingTaskToMain, pendingTriageTasks, TRIAGE_REDELIVER_AFTER_MS } =
+      await import("../src/daemon/orchestration.js");
     expect(await delegatePendingTaskToMain(main)).toBe(true);
+    await readFullTask(task.id);
 
-    // That main read the task and left it queued, then died. The ack was one
-    // orchestrator session saying "I have this one" — a replacement has never
-    // seen it, so it must not inherit the silence.
-    await readFullTask(task.id, main.id);
     const { createAgent, updateAgent } = await import("../src/db/agents.js");
     updateAgent(main.id, { state: "dead" });
     const replacement = createAgent({ kind: "main", state: "idle", tmux_target: MAIN });
     sendText.mockClear();
 
-    const { pendingTriageTasks } = await import("../src/daemon/orchestration.js");
-    expect(pendingTriageTasks(main).map((t) => t.id)).toEqual([]);
-    expect(pendingTriageTasks(replacement).map((t) => t.id)).toEqual([task.id]);
-    expect(await delegatePendingTaskToMain(replacement)).toBe(true);
-    expect(messages()[0]).toContain(`get_task(${task.id}`);
-
-    // The replacement's own ack then silences it for the replacement too.
-    await readFullTask(task.id, replacement.id);
-    sendText.mockClear();
-    expect(await delegatePendingTaskToMain(replacement)).toBe(false);
+    // Quiet for both mains, and quiet for good — well past the unacked cooldown,
+    // which is what would otherwise turn "no ack from this main" into a 10-minute
+    // re-ping loop that no amount of reading could stop.
+    for (const agent of [main, replacement]) {
+      expect(pendingTriageTasks(agent).map((t) => t.id)).toEqual([]);
+      expect(await delegatePendingTaskToMain(agent)).toBe(false);
+      expect(
+        await delegatePendingTaskToMain(agent, {
+          nowMs: Date.now() + TRIAGE_REDELIVER_AFTER_MS * 2,
+        }),
+      ).toBe(false);
+    }
     expect(sendText).not.toHaveBeenCalled();
+
+    // Still on the ready queue the replacement is told to check, with the triage
+    // state visible on the row it gets back.
+    const { readyTasks } = await import("../src/db/tasks.js");
+    const ready = readyTasks("orchestrated");
+    expect(ready.map((t) => t.id)).toContain(task.id);
+    expect(ready.find((t) => t.id === task.id)!.triaged_at).not.toBeNull();
+    const { TASK_ROW_FIELDS } = await import("../src/mcp/compact.js");
+    expect(TASK_ROW_FIELDS).toContain("triaged_at");
+  });
+
+  it("does not churn the delivery queue for a triaged task after its main dies", async () => {
+    // The failure this pins: if the delivery path and the queue's staleness
+    // check disagree about whether a task is acked, every tick persists a ping
+    // that the next flush expires — a permanent ~10s storm of
+    // task.awaiting_main / delivery.persisted / delivery.expired, and a ping the
+    // main never actually receives. Both sides read the same flag, so a triaged
+    // task produces no rows and no events at all.
+    const { main, tasks } = await setup();
+    const [task] = tasks;
+    const { delegatePendingTaskToMain } = await import("../src/daemon/orchestration.js");
+    expect(await delegatePendingTaskToMain(main)).toBe(true);
+    await readFullTask(task.id);
+
+    const { createAgent, updateAgent } = await import("../src/db/agents.js");
+    updateAgent(main.id, { state: "dead" });
+    // The replacement is mid-turn with the human typing — the state that makes
+    // the live send defer and the ping get persisted instead.
+    const replacement = createAgent({ kind: "main", state: "working", tmux_target: MAIN });
+    panes.set(MAIN, HUMAN_DRAFT);
+    sendText.mockClear();
+
+    const before = {
+      awaiting: await countEvents("task.awaiting_main"),
+      persisted: await countEvents("delivery.persisted"),
+      expired: await countEvents("delivery.expired"),
+    };
+    const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
+    const { countQueuedNotifications } = await import("../src/db/notifications.js");
+    for (let tick = 0; tick < 5; tick++) {
+      expect(await delegatePendingTaskToMain(replacement)).toBe(false);
+      expect(await flushMainQueue(replacement.id, { force: true })).toBe("empty");
+      expect(countQueuedNotifications(replacement.id)).toBe(0);
+    }
+    expect(await countEvents("task.awaiting_main")).toBe(before.awaiting);
+    expect(await countEvents("delivery.persisted")).toBe(before.persisted);
+    expect(await countEvents("delivery.expired")).toBe(before.expired);
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it("cannot be scoped to one agent — an attributed ack still silences every main", async () => {
+    // Regression repro for the agent-scoped ack this replaced. The request is
+    // sent exactly as that version's MCP layer sent it, with the reading agent
+    // attached; nothing reads that now, and that is the point. When suppression
+    // was per agent, a second main could never ack (the stamp was taken once and
+    // never re-attributed), so it was re-pinged every cooldown forever — and on
+    // the deferred path the delivery side and the queue's staleness check
+    // disagreed, persisting a ping that the next flush immediately expired, over
+    // and over.
+    const { main, tasks } = await setup();
+    const [task] = tasks;
+    const { buildApp } = await import("../src/daemon/api.js");
+    const { delegatePendingTaskToMain, TRIAGE_REDELIVER_AFTER_MS } = await import(
+      "../src/daemon/orchestration.js"
+    );
+    expect(await delegatePendingTaskToMain(main)).toBe(true);
+    const acked = await buildApp().request(
+      `/api/tasks/${task.id}?triage_ack=1&agent_id=${main.id}`,
+    );
+    expect(acked.status).toBe(200);
+
+    const { createAgent, updateAgent } = await import("../src/db/agents.js");
+    updateAgent(main.id, { state: "dead" });
+    const replacement = createAgent({ kind: "main", state: "working", tmux_target: MAIN });
+    panes.set(MAIN, HUMAN_DRAFT);
+    sendText.mockClear();
+    const before = {
+      awaiting: await countEvents("task.awaiting_main"),
+      expired: await countEvents("delivery.expired"),
+    };
+
+    const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
+    const { countQueuedNotifications } = await import("../src/db/notifications.js");
+    for (let tick = 0; tick < 4; tick++) {
+      expect(
+        await delegatePendingTaskToMain(replacement, {
+          nowMs: Date.now() + TRIAGE_REDELIVER_AFTER_MS * 2,
+        }),
+      ).toBe(false);
+      expect(await flushMainQueue(replacement.id, { force: true })).toBe("empty");
+    }
+    expect(countQueuedNotifications(replacement.id)).toBe(0);
+    expect(await countEvents("task.awaiting_main")).toBe(before.awaiting);
+    expect(await countEvents("delivery.expired")).toBe(before.expired);
+    expect(sendText).not.toHaveBeenCalled();
+    // Nothing about who read it is recorded, so nothing can branch on it.
+    const { latestTaskEvent } = await import("../src/db/events.js");
+    expect(latestTaskEvent(task.id, ["task.triage_acked"])?.agent_id).toBeNull();
   });
 
   it("still surfaces an unacked task to a NEW main after the old one died", async () => {

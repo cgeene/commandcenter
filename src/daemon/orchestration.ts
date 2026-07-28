@@ -39,21 +39,23 @@ function availableMain(preferred?: Agent): Agent | undefined {
 }
 
 /**
- * Whether `main` has already acknowledged this task and so must not be pinged
- * about it again.
+ * Whether the task has been triaged and so must not be pinged again.
  *
- * Scoped to the agent that acked: an ack is one orchestrator session saying "I
- * have this one", not a permanent property of the task. A replacement main (the
- * previous one died, or was restarted) has never seen the task, so it still
- * needs to be told — otherwise a task acked and deliberately left queued would
- * become invisible the moment its orchestrator went away. An ack with no
- * recorded agent falls back to suppressing, which is the conservative side for
- * the storm this guard exists to stop.
+ * A property of the TASK, not of any one orchestrator session: triaged_at is set
+ * by the orchestrator's own full read and cleared whenever the task changes in a
+ * way that needs fresh triage (see updateTask / clearTaskTriageAck). Every
+ * consumer of the ack — this module and notifqueue's staleness check — reads it
+ * exactly this way, so a queued ping can never be suppressed on one side and
+ * kept alive on the other.
+ *
+ * A task acked by an orchestrator that later dies stays quiet rather than
+ * re-surfacing on a timer; it remains visible (with triaged_at) in
+ * list_tasks(ready=true), which is where a fresh main is told to look for work it
+ * has not handled. Tasks that were never acked keep their periodic redelivery
+ * (see TRIAGE_REDELIVER_AFTER_MS).
  */
-function ackedBy(task: Task, main: Agent): boolean {
-  if (!task.triaged_at) return false;
-  const ack = latestTaskEvent(task.id, ["task.triage_acked"]);
-  return !ack || ack.agent_id === null || ack.agent_id === main.id;
+function triaged(task: Task): boolean {
+  return task.triaged_at !== null;
 }
 
 /** Task-triage rows already persisted for this main, by task id. */
@@ -70,12 +72,29 @@ function queuedTriageRows(mainId: number): Map<number, string> {
 /**
  * What became of a triage delegation attempt.
  *
- * "queued" is the distinction that matters to the human: the ping was accepted
- * and persisted, but the main's composer was busy so it will arrive later. It
- * used to be indistinguishable from "skipped", which is how a "Notify Claude
- * Main" click could look like a plain failure — or, worse, like nothing at all.
+ * Every non-delivery used to collapse into one "skipped", which is how a
+ * "Notify Claude Main" click could look like a plain failure — or, worse, like
+ * nothing at all. Each reason a ping did not land now has its own name, because
+ * they call for opposite reactions from the human:
+ *
+ * - "queued": accepted and persisted; the main's composer was busy so it
+ *   arrives on the next flush. Nothing to do.
+ * - "self_filed": main filed this task itself, so it is never pinged about it
+ *   (it already knows and dispatches directly) — unless a human worker resume
+ *   is owed on it. A live main is irrelevant here.
+ * - "no_main": there is no live main window to deliver to — the only outcome
+ *   that a new main agent would fix.
+ * - "not_triageable": the task is not awaiting triage at all (wrong
+ *   dispatch_mode/status, or its blockers are not done).
  */
-export type DelegateOutcome = "delivered" | "queued" | "already_queued" | "skipped";
+export type DelegateOutcome =
+  | "delivered"
+  | "queued"
+  | "already_queued"
+  | "already_triaged"
+  | "self_filed"
+  | "no_main"
+  | "not_triageable";
 
 /**
  * Send one triage ping covering `tasks` — one message however many tasks it
@@ -163,8 +182,16 @@ export async function delegateTaskToMainDetailed(
 ): Promise<DelegateOutcome> {
   const task = getTask(taskId);
   if (!task || task.dispatch_mode !== "orchestrated" || task.status !== "queued") {
-    return "skipped";
+    return "not_triageable";
   }
+  // Already triaged: the orchestrator has read this task and left it queued
+  // deliberately (sequenced behind other work), so pinging it again just burns a
+  // turn on re-reading state it already has. Every route lands here, which
+  // matters most for the PATCH route — editing a queued task's priority or
+  // blocker used to re-deliver it as if it were new. An edit that changes what
+  // triage judged, or an explicit re-flag, clears the ack (see updateTask /
+  // clearTaskTriageAck) and delivery resumes.
+  if (triaged(task)) return "already_triaged";
   // A task main filed itself must never trigger a triage ping back to main —
   // on ANY route (immediate POST, PATCH re-queue, the manual /delegate
   // endpoint, or the idle/SessionStart hooks and periodic scheduler that call
@@ -174,23 +201,16 @@ export async function delegateTaskToMainDetailed(
     taskCreatorKind(task.id) === "main" &&
     !pendingHumanWorkerResume(task.id)
   ) {
-    return "skipped";
+    return "self_filed";
   }
   if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
-    return "skipped";
+    return "not_triageable";
   }
   const main = availableMain(preferredMain);
   if (!main) {
     logEvent("task.awaiting_main", { taskId });
-    return "skipped";
+    return "no_main";
   }
-  // This main has read the task already and left it queued deliberately
-  // (sequenced behind other work), so pinging it again just burns a turn on
-  // re-reading state it already has. Every route lands here, which matters most
-  // for the PATCH route — editing a queued task's priority or blocker used to
-  // re-deliver it as if it were new. An edit that changes what triage judged, or
-  // an explicit re-flag, clears the ack (see updateTask / clearTaskTriageAck).
-  if (ackedBy(task, main)) return "skipped";
   // Never merge the triage prompt into the human's mid-typed draft or fire it
   // mid-turn: deliver only when the main is idle with a genuinely clear prompt
   // (the same gate every main-delivery path shares — see deliverToMainIfClear).
@@ -208,12 +228,11 @@ export async function delegateTaskToMain(
 /**
  * Every ready task this main still owes triage on, queue order.
  *
- * The ack is the primary gate: a task THIS main has read is never re-delivered
- * to it, however it is left — including left queued on purpose, which is exactly
- * the case that used to re-ping forever. Everything else is the "did this main
- * ever get told" question the delegation events answer, plus a cooldown so a
- * ping that was delivered but never acted on is eventually repeated rather than
- * lost.
+ * The ack is the primary gate: a triaged task is never re-delivered, however it
+ * is left — including left queued on purpose, which is exactly the case that
+ * used to re-ping forever. Everything else is the "did this main ever get told"
+ * question the delegation events answer, plus a cooldown so a ping that was
+ * delivered but never acknowledged is eventually repeated rather than lost.
  */
 export function pendingTriageTasks(main: Agent, nowMs: number = Date.now()): Task[] {
   return readyTasks("orchestrated").filter((task) => {
@@ -226,7 +245,7 @@ export function pendingTriageTasks(main: Agent, nowMs: number = Date.now()): Tas
     ) {
       return false;
     }
-    if (ackedBy(task, main)) return false;
+    if (triaged(task)) return false;
     const delegated = latestTaskEvent(task.id, ["task.delegated_to_main"]);
     const queued = latestTaskEvent(task.id, [
       "task.created",

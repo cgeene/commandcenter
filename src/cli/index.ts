@@ -17,6 +17,7 @@ import { buildDreamPrompt } from "../prompts/dreamer.js";
 import type { Agent } from "../db/agents.js";
 import type { Event } from "../db/events.js";
 import type { Task } from "../db/tasks.js";
+import { blockerNote, parseBlockedByFlag } from "../lib/blockers.js";
 import { gitToplevel } from "../daemon/worktree.js";
 import { writeCodexConfig } from "../daemon/genconfig.js";
 import { countRepositoriesUnder } from "../daemon/workspaces.js";
@@ -139,17 +140,34 @@ task
   .option("-m, --model <model>")
   .option("-e, --effort <effort>", "Codex reasoning effort")
   .option("--provider <provider>", "worker provider (claude|codex)")
+  .option(
+    "-b, --blocked-by <taskId|none>",
+    "task that must be done first ('none' clears the dependency)",
+  )
   .option("--result <summary>")
   .action(async (id: string, opts) => {
+    // Parsed (and rejected) before the request is built: an unparseable id
+    // would otherwise reach the API as null and clear the dependency.
+    const blockedBy =
+      opts.blockedBy === undefined
+        ? undefined
+        : parseBlockedByFlag(String(opts.blockedBy));
     const t = await api<Task>("PATCH", `/api/tasks/${id}`, {
       status: opts.status,
       priority: opts.priority !== undefined ? Number(opts.priority) : undefined,
       model: opts.model,
       reasoning_effort: opts.effort,
       worker_provider: opts.provider,
+      ...(blockedBy === undefined ? {} : { blocked_by: blockedBy }),
       result_summary: opts.result,
     });
     console.log(`task #${t.id}: ${t.status}`);
+    if (blockedBy === null) {
+      console.log(`task #${t.id} is no longer blocked by another task`);
+    } else if (blockedBy !== undefined && t.blocked_by != null) {
+      const blocker = await api<Task>("GET", `/api/tasks/${t.blocked_by}`);
+      console.log(blockerNote(blocker.id, blocker.status));
+    }
   });
 
 task

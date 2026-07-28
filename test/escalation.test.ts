@@ -1,13 +1,18 @@
-import { beforeEach, afterEach, describe, expect, it } from "vitest";
+import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 let tmpDir: string;
+let fetchMock: ReturnType<typeof vi.fn>;
+const realFetch = globalThis.fetch;
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-escalate-"));
   process.env.CC_DATA_DIR = tmpDir;
+  delete process.env.CC_NTFY_URL;
+  fetchMock = vi.fn(async () => new Response("ok"));
+  globalThis.fetch = fetchMock as unknown as typeof fetch;
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
 });
@@ -15,6 +20,8 @@ beforeEach(async () => {
 afterEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
+  globalThis.fetch = realFetch;
+  delete process.env.CC_NTFY_URL;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -72,6 +79,30 @@ describe("watchdog escalation", () => {
     const escalations = listEvents(20).filter((e) => e.kind === "waiting.escalated");
     expect(escalations.length).toBe(1);
     expect(escalations[0].agent_id).toBe(worker.id);
+  });
+
+  it("latches the ntfy push for the same wait episode", async () => {
+    process.env.CC_NTFY_URL = "https://ntfy.test/cc";
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { getDb } = await import("../src/db/db.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const worker = createAgent({ kind: "worker", state: "waiting_input" });
+    logEvent("hook.notification", { agentId: worker.id });
+    await backdateLatest("hook.notification", 10);
+
+    watchdog(noopDeps);
+    // Simulate the weaker event-row guard being lost or raced. The persisted
+    // ntfy latch must still stop a duplicate phone push for this wait episode.
+    getDb().prepare("DELETE FROM events WHERE kind = 'waiting.escalated'").run();
+    watchdog(noopDeps);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const pushed = listEvents(20).filter((e) => e.kind === "notify.pushed");
+    expect(pushed.length).toBe(1);
+    expect(JSON.parse(pushed[0].payload ?? "{}").once).toMatch(
+      new RegExp(`^waiting:${worker.id}:`),
+    );
   });
 
   it("does not page before the deadline", async () => {

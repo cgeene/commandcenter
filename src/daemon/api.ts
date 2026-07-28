@@ -83,6 +83,7 @@ import {
   type NotifyEventKey,
 } from "../notify-events.js";
 import { dismissAttention } from "../db/attention.js";
+import { BlockerValidationError } from "../lib/blockers.js";
 import {
   claimTask,
   childTasks,
@@ -535,14 +536,8 @@ export function buildApp(): Hono {
       if (acked) {
         // A ping still sitting in the delivery queue for this task is moot now.
         const dropped = clearTriageQueueForTask(task.id);
-        // Attributed to the reading agent: the ack suppresses re-delivery to
-        // THAT orchestrator session only, so a replacement main is still told
-        // about the task (orchestration.ackedBy).
-        const reader = Number(c.req.query("agent_id"));
         logEvent("task.triage_acked", {
           taskId: task.id,
-          agentId:
-            Number.isSafeInteger(reader) && reader > 0 ? reader : undefined,
           payload: { dropped_queued: dropped },
         });
         return c.json(acked);
@@ -820,14 +815,56 @@ export function buildApp(): Hono {
         payload: { reason: "manual delegate" },
       });
     }
-    // Report what actually happened rather than collapsing "held for later" into
-    // a plain failure: a busy/mid-draft composer defers the send, and the click
-    // is persisted for the queue flush instead of being delivered now.
+    // Report what actually happened rather than collapsing every non-delivery
+    // into one failure. A busy/mid-draft composer defers the send and the click
+    // is persisted for the queue flush (202, not an error); the reasons a ping
+    // will never land are distinct and get distinct messages, because only one
+    // of them is fixed by spawning a main agent.
     const outcome = await delegateTaskToMainDetailed(id);
-    if (outcome === "skipped") {
-      return c.json({ error: "main agent is unavailable" }, 409);
+    if (outcome === "delivered") return c.json({ status: "delivered" });
+    if (outcome === "queued" || outcome === "already_queued") {
+      return c.json(
+        {
+          status: outcome,
+          detail:
+            outcome === "already_queued"
+              ? "main agent busy — a delivery for this task is already queued and will flush automatically"
+              : "main agent busy — delivery queued and will flush automatically",
+        },
+        202,
+      );
     }
-    return c.json({ ok: true, status: outcome });
+    if (outcome === "self_filed") {
+      return c.json(
+        {
+          error:
+            "Claude main filed this task itself and already knows about it — it is never pinged for its own tasks; dispatch it from main, or spawn this task's worker directly",
+        },
+        409,
+      );
+    }
+    if (outcome === "no_main") {
+      return c.json(
+        {
+          error:
+            "no live Claude main agent to deliver to — spawn a main agent, or spawn this task's worker directly",
+        },
+        409,
+      );
+    }
+    // Unreachable from this route (the re-flag above clears the ack first), but
+    // named so any other caller gets the real reason instead of "not awaiting
+    // triage" — the task IS awaiting dispatch, it has just already been read.
+    if (outcome === "already_triaged") {
+      return c.json(
+        {
+          error:
+            "Claude main has already triaged this task and left it queued — dispatch it from main, or edit the task to flag it for fresh triage",
+        },
+        409,
+      );
+    }
+    return c.json({ error: "task is not awaiting main-agent triage" }, 409);
   });
 
   app.get("/api/tasks/:id/diff", (c) => {
@@ -937,6 +974,15 @@ export function buildApp(): Hono {
     const body = spawnSchema.parse(await c.req.json());
     const task = getTask(body.task_id);
     if (!task) return c.json({ error: "not found" }, 404);
+    // A human spawning a worker outranks the orchestrator, so dispatch_mode is
+    // deliberately not checked here — orchestrated tasks are spawnable too.
+    // Portfolio parents never are; spawnWorker also refuses, but say so plainly.
+    if (task.workspace_kind === "portfolio") {
+      return c.json(
+        { error: "portfolio tasks are split into per-repository children, not spawned" },
+        409,
+      );
+    }
     const provider = body.provider ?? task.worker_provider;
     if (provider === "claude" && body.reasoning_effort !== undefined) {
       return c.json({ error: "reasoning effort is only supported for Codex workers" }, 400);
@@ -1874,6 +1920,11 @@ export function buildApp(): Hono {
     }
     if (err instanceof WorkspaceValidationError) {
       return c.json({ error: err.message }, 400);
+    }
+    // Self-block, unknown blocker, or a cycle: the request conflicts with the
+    // current dependency graph, so it reads as a conflict rather than a 500.
+    if (err instanceof BlockerValidationError) {
+      return c.json({ error: err.message }, 409);
     }
     if (err instanceof PublicationValidationError) {
       return c.json({ error: err.message }, 409);

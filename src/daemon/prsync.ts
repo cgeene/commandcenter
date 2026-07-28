@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { listAgents } from "../db/agents.js";
 import { logEvent } from "../db/events.js";
+import { normalizePrState } from "../lib/prstate.js";
 import {
   getTask,
   tasksNeedingPrReconcile,
@@ -429,7 +430,10 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
  */
 export function recordSyncSuccess(taskId: number, pr: PrState): void {
   const fields: Partial<Task> = {
-    pr_state: pr.state.toLowerCase(),
+    // Through the same normalizer every reader uses, so writer and reader can
+    // never disagree on casing. A state we don't recognize stores as NULL,
+    // which keeps the task in the sync candidate set to be retried.
+    pr_state: normalizePrState(pr.state),
     pr_checks: pr.checks ?? null,
     pr_synced_at: new Date().toISOString(),
     pr_sync_fails: 0,

@@ -176,6 +176,18 @@ describe("reviewer prompt — full vs light", () => {
     expect(prompt).not.toContain("You are an adversarial code reviewer");
   });
 
+  it("tells both modes that comment style is not a finding", async () => {
+    const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const base = { title: "t", prompt: "x", repo: tmpDir };
+    for (const mode of ["full", "light"] as const) {
+      const task = createTask({ ...base, review_mode: mode });
+      const prompt = buildReviewerPrompt({ ...task, branch: "agent/t" });
+      expect(prompt).toContain("is NOT a finding unless a comment is factually wrong or stale");
+      expect(prompt).toContain("never rejection grounds or listed action items");
+    }
+  });
+
   it("keeps the verdict contract identical in both modes", async () => {
     const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
     const { createTask } = await import("../src/db/tasks.js");
