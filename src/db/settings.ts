@@ -21,6 +21,12 @@ import {
   type QuotaAlertLatch,
 } from "../lib/quotaalert.js";
 import type { LiveUsageState } from "../lib/usage.js";
+import {
+  isNotifyEventKey,
+  NOTIFY_EVENT_DEFAULTS,
+  NOTIFY_EVENT_KEYS,
+  type NotifyEventKey,
+} from "../notify-events.js";
 
 export interface SchedulerConfig {
   /** Master switch — the dashboard kill switch flips this. */
@@ -188,21 +194,49 @@ export interface NotificationSettings {
   ntfy_url: string | null;
   /** ntfy bearer token (overrides CC_NTFY_TOKEN). Secret — never serialized out. */
   ntfy_token: string | null;
+  /** Per-event push toggles. Sparse on purpose: only explicit overrides are
+   *  stored, so an event absent here follows NOTIFY_EVENT_DEFAULTS and a later
+   *  change to the built-in default applies without a settings migration. */
+  events: Partial<Record<NotifyEventKey, boolean>>;
 }
 
 export const NOTIFICATION_SETTINGS_DEFAULTS: NotificationSettings = {
   ntfy_url: null,
   ntfy_token: null,
+  events: {},
 };
 
 export function getNotificationSettings(): NotificationSettings {
-  return readGroup("notifications", NOTIFICATION_SETTINGS_DEFAULTS);
+  const group = readGroup("notifications", NOTIFICATION_SETTINGS_DEFAULTS);
+  // Drop anything that isn't a live event key / boolean: the catalog can lose
+  // an event between releases, and a stale stored key must not resurface.
+  const events: Partial<Record<NotifyEventKey, boolean>> = {};
+  for (const [key, value] of Object.entries(group.events ?? {})) {
+    if (isNotifyEventKey(key) && typeof value === "boolean") events[key] = value;
+  }
+  return { ...group, events };
 }
 
+/**
+ * Patch the notification group. `events` is the one field merged KEY-WISE
+ * rather than replaced wholesale: the UI and the API both send only the
+ * toggles they touched, and an explicit `null` for a key clears that override
+ * (back to the built-in default) instead of pinning it to false.
+ */
 export function setNotificationSettings(
-  patch: Partial<NotificationSettings>,
+  patch: Partial<Omit<NotificationSettings, "events">> & {
+    events?: Partial<Record<NotifyEventKey, boolean | null>>;
+  },
 ): NotificationSettings {
-  const merged = { ...getNotificationSettings(), ...patch };
+  const current = getNotificationSettings();
+  const { events: eventPatch, ...rest } = patch;
+  const events = { ...current.events };
+  for (const [key, value] of Object.entries(eventPatch ?? {})) {
+    if (!isNotifyEventKey(key)) continue;
+    if (value === null || value === undefined) delete events[key];
+    else events[key] = value;
+  }
+  const merged: NotificationSettings = { ...current, ...rest, events };
   setSetting("notifications", JSON.stringify(merged));
   return merged;
 }
@@ -418,4 +452,22 @@ export function resolveNtfyUrl(): string | undefined {
 export function resolveNtfyToken(): string | undefined {
   const stored = getNotificationSettings().ntfy_token?.trim();
   return stored || ntfyToken();
+}
+
+/** Does this event push? DB override > built-in default. Read at notify time,
+ *  so flipping a toggle in Settings applies to the very next event. */
+export function resolveNotifyEventEnabled(event: NotifyEventKey): boolean {
+  const stored = getNotificationSettings().events[event];
+  return typeof stored === "boolean" ? stored : NOTIFY_EVENT_DEFAULTS[event];
+}
+
+/** Every event's effective on/off — what the Settings UI renders. */
+export function resolveNotifyEvents(): Record<NotifyEventKey, boolean> {
+  const stored = getNotificationSettings().events;
+  return Object.fromEntries(
+    NOTIFY_EVENT_KEYS.map((k) => [
+      k,
+      typeof stored[k] === "boolean" ? stored[k] : NOTIFY_EVENT_DEFAULTS[k],
+    ]),
+  ) as Record<NotifyEventKey, boolean>;
 }

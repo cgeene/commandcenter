@@ -240,6 +240,60 @@ describe("staleness — a queued delivery is re-validated before it is sent late
     });
   });
 
+  /**
+   * Layer separation. The queue owns DURABILITY of orchestrator-bound messages;
+   * whether Caleb's phone buzzes is decided at the trigger layer (notifyEvent,
+   * with its own toggles and once-per-situation latches). So the whole
+   * queue→defer→expire lifecycle must be push-silent: a delivery that sat in
+   * SQLite across a restart and then went stale is not news to a human, and the
+   * watchdog page for a genuinely stuck worker is derived independently from the
+   * worker's own waiting_input state, not from this queue.
+   */
+  it("never pushes: queueing, deferring, and expiring are delivery-layer only", async () => {
+    const priorUrl = process.env.CC_NTFY_URL;
+    process.env.CC_NTFY_URL = "https://ntfy.test/cc";
+    const realFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async () => new Response("ok"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      const { main } = await setup("working");
+      const { createAgent, updateAgent } = await import("../src/db/agents.js");
+      const worker = createAgent({
+        kind: "worker",
+        state: "waiting_input",
+        tmux_target: "cc:@w1",
+      });
+      const { queueDelivery, flushMainQueue } = await import(
+        "../src/daemon/notifqueue.js"
+      );
+      queueDelivery({
+        mainId: main.id,
+        workerId: worker.id,
+        message: "which region?",
+        origin: "worker_waiting",
+        reason: "main_working",
+      });
+
+      // Deferred once (the human is mid-draft), then expired on the next flush.
+      panes.set(MAIN, HUMAN_DRAFT);
+      await flushMainQueue(main.id, { force: true });
+      updateAgent(worker.id, { state: "working" });
+      panes.set(MAIN, CLEAR_PROMPT);
+      expect(await flushMainQueue(main.id, { force: true })).toBe("empty");
+
+      const { listEvents } = await import("../src/db/events.js");
+      const kinds = listEvents(40).map((e) => e.kind);
+      expect(kinds).toContain("delivery.expired");
+      // The lifecycle is fully recorded in the feed, and nothing was pushed.
+      expect(kinds).not.toContain("notify.pushed");
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = realFetch;
+      if (priorUrl === undefined) delete process.env.CC_NTFY_URL;
+      else process.env.CC_NTFY_URL = priorUrl;
+    }
+  });
+
   it("sends triage and worker-wait pings as one message when both are queued", async () => {
     const { main, task } = await setup("working");
     panes.set(MAIN, HUMAN_DRAFT);

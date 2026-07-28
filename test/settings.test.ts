@@ -71,6 +71,76 @@ describe("settings store round-trip", () => {
   });
 });
 
+describe("per-event notification toggles", () => {
+  it("defaults to the catalog, overrides per event, and clears with null", async () => {
+    const settings = await import("../src/db/settings.js");
+    const { NOTIFY_EVENT_DEFAULTS } = await import("../src/notify-events.js");
+
+    // Unset → no stored overrides, everything follows the built-in default.
+    expect(settings.getNotificationSettings().events).toEqual({});
+    expect(settings.resolveNotifyEvents()).toEqual(NOTIFY_EVENT_DEFAULTS);
+    expect(settings.resolveNotifyEventEnabled("review_approved_ready")).toBe(true);
+    expect(settings.resolveNotifyEventEnabled("task_review_entered")).toBe(false);
+
+    settings.setNotificationSettings({ events: { task_review_entered: true } });
+    expect(settings.resolveNotifyEventEnabled("task_review_entered")).toBe(true);
+
+    // A second patch merges key-wise instead of replacing the whole map...
+    settings.setNotificationSettings({ events: { escalation: false } });
+    expect(settings.resolveNotifyEventEnabled("task_review_entered")).toBe(true);
+    expect(settings.resolveNotifyEventEnabled("escalation")).toBe(false);
+    // ...and does not disturb the sibling fields in the group.
+    settings.setNotificationSettings({ ntfy_url: "https://ntfy.sh/x" });
+    expect(settings.getNotificationSettings().ntfy_url).toBe("https://ntfy.sh/x");
+    expect(settings.resolveNotifyEventEnabled("escalation")).toBe(false);
+
+    // null clears the override back to the built-in default.
+    settings.setNotificationSettings({ events: { escalation: null } });
+    expect(settings.getNotificationSettings().events).not.toHaveProperty("escalation");
+    expect(settings.resolveNotifyEventEnabled("escalation")).toBe(true);
+  });
+
+  it("ignores a stored key that is no longer in the catalog", async () => {
+    const settings = await import("../src/db/settings.js");
+    settings.setNotificationSettings({
+      // Simulate a settings blob written by an older release.
+      events: { retired_event: true } as never,
+    });
+    expect(settings.getNotificationSettings().events).toEqual({});
+  });
+
+  it("round-trips through the API and rejects an unknown event key", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const app = buildApp();
+
+    const ok = await app.request("/api/settings/notifications", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ events: { task_completed: true, escalation: null } }),
+    });
+    expect(ok.status).toBe(200);
+
+    const get = await (await app.request("/api/settings")).json();
+    expect(get.notifications.stored.events).toEqual({ task_completed: true });
+    expect(get.notifications.effective.events.task_completed).toBe(true);
+    expect(get.notifications.effective.events.escalation).toBe(true);
+    expect(get.notifications.effective.events.task_review_entered).toBe(false);
+    // The catalog ships with the settings so the UI can render + label it.
+    expect(
+      get.notify_event_choices.find(
+        (e: { key: string }) => e.key === "review_approved_ready",
+      ),
+    ).toMatchObject({ category: "action", default_enabled: true });
+
+    const bad = await app.request("/api/settings/notifications", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ events: { not_an_event: true } }),
+    });
+    expect(bad.status).toBe(400);
+  });
+});
+
 describe("env-fallback precedence (setting > env > default)", () => {
   it("resolveMainModel prefers DB, then env, then the fable default", async () => {
     const settings = await import("../src/db/settings.js");

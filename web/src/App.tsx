@@ -2610,7 +2610,7 @@ function QuotaSection({
       <SettingRow
         label="Quota alert threshold (%)"
         when="immediate"
-        hint="Pushes a notification (and raises a Needs You item) once the live feed's busiest meter reaches this share of its window — once per crossing, not once per hourly poll. Blank turns off the utilization alert; hitting the org spend cap still alerts either way. Needs live Claude usage enabled."
+        hint="Pushes a notification (and raises a Needs You item) once the live feed's busiest meter reaches this share of its window — once per crossing, not once per hourly poll. Blank turns off the utilization alert; hitting the org spend cap still alerts either way. Needs live Claude usage enabled. The push itself can be silenced under Notifications → What gets pushed, which leaves the Needs You item in place."
       >
         <input
           type="number"
@@ -2661,6 +2661,13 @@ function NotificationsSection({
   const [tokenInput, setTokenInput] = useState("");
   const [clearToken, setClearToken] = useState(false);
   const [saving, setSaving] = useState(false);
+  // Per-event push toggles, edited as the fully-resolved on/off map. On save we
+  // diff against the built-in defaults and store only genuine overrides, so an
+  // untouched event keeps following the default if we ever change it.
+  const eventSpecs = settings.notify_event_choices ?? [];
+  const [events, setEvents] = useState<Record<string, boolean>>(
+    () => ({ ...effective.events }),
+  );
 
   // Browser (in-app) alerts: a desktop notification + dock bounce for a new
   // "Needs You" item. Two independent gates — the browser permission (one-way:
@@ -2730,8 +2737,15 @@ function NotificationsSection({
     setSaving(true);
     onError("");
     try {
+      const eventPatch: Record<string, boolean | null> = {};
+      for (const spec of eventSpecs) {
+        const on = events[spec.key] ?? spec.default_enabled;
+        // null clears the override; only a genuine deviation is stored.
+        eventPatch[spec.key] = on === spec.default_enabled ? null : on;
+      }
       const body: Record<string, unknown> = {
         ntfy_url: url.trim() || null,
+        events: eventPatch,
       };
       // Only touch the token when the operator explicitly set or cleared it —
       // omitting it leaves the stored secret untouched.
@@ -2821,6 +2835,48 @@ function NotificationsSection({
           )}
         </div>
       </SettingRow>
+      <h3>What gets pushed</h3>
+      <p className="muted">
+        A push should mean “do something now”. The defaults are the smallest set
+        that meets that bar; everything else stays in the activity feed. Turn any
+        of it back on here.
+      </p>
+      {(settings.notify_category_choices ?? []).map((cat) => {
+        const specs = eventSpecs.filter((s) => s.category === cat.key);
+        if (specs.length === 0) return null;
+        return (
+          <div className="setting-row" key={cat.key}>
+            <div className="setting-head">
+              <span className="setting-label">{cat.label}</span>
+            </div>
+            <span className="setting-hint muted">{cat.blurb}</span>
+            {specs.map((spec) => {
+              const on = events[spec.key] ?? spec.default_enabled;
+              return (
+                <div key={spec.key}>
+                  <label className="setting-check">
+                    <input
+                      type="checkbox"
+                      checked={on}
+                      onChange={(e) =>
+                        setEvents((prev) => ({
+                          ...prev,
+                          [spec.key]: e.target.checked,
+                        }))
+                      }
+                    />
+                    {spec.label}
+                    {on !== spec.default_enabled && (
+                      <span className="chip">overridden</span>
+                    )}
+                  </label>
+                  <span className="setting-hint muted">{spec.description}</span>
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
       <div className="settings-actions">
         <button className="primary" disabled={saving} onClick={save}>
           {saving ? "Saving…" : "Save Notifications"}

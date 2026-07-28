@@ -17,7 +17,7 @@ import {
   updateTask,
 } from "../db/tasks.js";
 import { flushMainQueue } from "./notifqueue.js";
-import { notify } from "./notify.js";
+import { notifyEvent } from "./notify.js";
 import { parsePane, type PendingPermission } from "./pane.js";
 import { killAgent, paneAgeSeconds, spawnWorker } from "./spawn.js";
 import { sweepVanishedPaneGroup, type PaneSweepResult } from "./proctree.js";
@@ -186,9 +186,10 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
       const day = now.toISOString().slice(0, 10);
       if (budgetNotifiedDay !== day) {
         budgetNotifiedDay = day;
-        notify(
+        notifyEvent(
+          "capacity_or_budget",
           "scheduler budget reached",
-          `${cfg.daily_spawn_limit} autonomous spawns today — pausing until tomorrow (manual spawns still work)`,
+          `${cfg.daily_spawn_limit} autonomous spawns today — pausing until tomorrow. Manual spawns still work; nothing is lost.`,
           { priority: "high", tags: "moneybag" },
         );
         logEvent("scheduler.budget_reached");
@@ -211,10 +212,17 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
         status: "blocked",
         result_summary: `scheduler spawn failed: ${msg}`,
       });
-      notify(`task #${task.id} blocked`, `spawn failed: ${msg}`, {
-        priority: "high",
-        tags: "rotating_light",
-      });
+      notifyEvent(
+        "task_blocked",
+        `task #${task.id} blocked — could not start`,
+        `${task.title}\nThe scheduler failed to spawn a worker: ${msg}\nIt will not retry on its own — fix the cause and requeue it.`,
+        {
+          priority: "high",
+          tags: "rotating_light",
+          taskId: task.id,
+          once: `task:${task.id}:blocked:spawn_failed`,
+        },
+      );
     }
   }
 }
@@ -238,7 +246,8 @@ function noteCapacityBlocked(
   logEvent("scheduler.capacity_blocked", {
     payload: { max_concurrent: cfg.max_concurrent, live_workers: liveWorkers.length, workers },
   });
-  notify(
+  notifyEvent(
+    "capacity_or_budget",
     "scheduler stalled — no free slots",
     `${liveWorkers.length}/${cfg.max_concurrent} worker slots taken while tasks wait — check for idle workers holding slots`,
     { tags: "construction" },
@@ -274,12 +283,18 @@ function announceStartupPermission(
     taskId: agent.task_id ?? undefined,
     payload: { provider: agent.provider, kind: agent.kind, trust },
   });
-  notify(
-    `${agent.kind === "main" ? "main agent" : `a${agent.id}`} needs ${trust ? "trust review" : "startup approval"}`,
+  notifyEvent(
+    "escalation",
+    `${agent.kind === "main" ? "main agent" : `a${agent.id}`} needs ${trust ? "your trust decision" : "your startup approval"}`,
     trust
-      ? `${agent.provider} is asking for a one-time workspace/repository trust decision. Review it in Command Center; trust is intentionally never delegated to another model.`
-      : `${agent.provider} is waiting for approval before its lifecycle hooks are ready. Review it in Command Center.`,
-    { priority: "high", tags: "warning" },
+      ? `${agent.provider} is asking for a one-time workspace/repository trust decision. Answer it in Command Center; trust is intentionally never delegated to another model.`
+      : `${agent.provider} is waiting for approval before its lifecycle hooks are ready. Answer it in Command Center — it cannot start until you do.`,
+    {
+      priority: "high",
+      tags: "warning",
+      agentId: agent.id,
+      taskId: agent.task_id,
+    },
   );
 }
 
@@ -430,18 +445,26 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
         if (vanishes <= 1) {
           updateTask(task.id, { status: "queued", agent_id: null });
           logEvent("task.requeued", { taskId: task.id });
-          notify(
+          notifyEvent(
+            "worker_stalled",
             `task #${task.id} requeued`,
-            `${task.title} — its worker vanished; will retry once`,
-            { tags: "recycle" },
+            `${task.title} — its worker vanished; the scheduler will retry it once. Nothing needed from you yet.`,
+            { tags: "recycle", taskId: task.id, agentId: agent.id },
           );
         } else {
           updateTask(task.id, { status: "failed" });
           logEvent("task.failed", { taskId: task.id });
-          notify(
-            `task #${task.id} failed`,
-            `${task.title} — worker vanished twice, giving up`,
-            { priority: "high", tags: "x" },
+          notifyEvent(
+            "task_failed",
+            `task #${task.id} failed — giving up`,
+            `${task.title}\nIts worker vanished twice, so the scheduler stopped retrying. It will not run again until you requeue it.`,
+            {
+              priority: "high",
+              tags: "x",
+              taskId: task.id,
+              agentId: agent.id,
+              once: `task:${task.id}:failed:worker_vanished`,
+            },
           );
         }
       }
@@ -467,10 +490,16 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
         taskId: agent.task_id ?? undefined,
         payload: { provider: agent.provider },
       });
-      notify(
+      notifyEvent(
+        "worker_stalled",
         `a${agent.id} did not initialize`,
         `${agent.provider} SessionStart was not received; inspect its terminal and provider hook setup`,
-        { priority: "high", tags: "warning" },
+        {
+          priority: "high",
+          tags: "warning",
+          agentId: agent.id,
+          taskId: agent.task_id,
+        },
       );
       continue;
     }
@@ -545,10 +574,16 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
             agentId: agent.id,
             taskId: agent.task_id ?? undefined,
           });
-          notify(
-            `a${agent.id}${agent.task_id ? ` (task #${agent.task_id})` : ""} still needs input`,
-            `waiting ${cfg.escalate_minutes}m+ and the main agent didn't resolve it — peek or attach`,
-            { priority: "high", tags: "warning" },
+          notifyEvent(
+            "escalation",
+            `a${agent.id}${agent.task_id ? ` (task #${agent.task_id})` : ""} needs your input`,
+            `It has been waiting ${cfg.escalate_minutes}m+ and the orchestrator did not resolve it, so it is now yours — peek or attach to unblock it.`,
+            {
+              priority: "high",
+              tags: "warning",
+              agentId: agent.id,
+              taskId: agent.task_id,
+            },
           );
         }
       }
@@ -570,10 +605,16 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
         if (task && ["in_progress", "review"].includes(task.status)) {
           updateAgent(agent.id, { state: "stalled" });
           logEvent("agent.stalled", { agentId: agent.id, taskId: task.id });
-          notify(
+          notifyEvent(
+            "worker_stalled",
             `${agent.kind} a${agent.id} stalled on task #${task.id}`,
             `${task.title} — no activity for ${cfg.stall_minutes}m; peek or kill`,
-            { priority: "high", tags: "hourglass" },
+            {
+              priority: "high",
+              tags: "hourglass",
+              agentId: agent.id,
+              taskId: task.id,
+            },
           );
         }
       }
@@ -590,17 +631,19 @@ function warnIfStale(): void {
   if (!v.stale || v.dist_mtime === staleWarnedFor) return;
   staleWarnedFor = v.dist_mtime;
   logEvent("daemon.stale", { payload: v });
-  notify(
+  notifyEvent(
+    "daemon_stale_build",
     "agentd is running STALE code",
-    `dist/ was rebuilt at ${v.dist_mtime} but the daemon started ${v.started_at} — run: agp upgrade`,
-    { priority: "high", tags: "warning" },
+    `dist/ was rebuilt at ${v.dist_mtime} but the daemon started ${v.started_at}. Every change since then is silently not running — run: agp upgrade`,
+    { priority: "high", tags: "warning", once: `daemon:stale:${v.dist_mtime}` },
   );
 }
 
 function sendWindowReport(): void {
   const tasks = listTasks();
   const count = (s: string) => tasks.filter((t) => t.status === s).length;
-  notify(
+  notifyEvent(
+    "window_report",
     "scheduler window closed — report",
     `done ${count("done")} · review ${count("review")} · blocked ${count("blocked")} · failed ${count("failed")} · queued ${count("queued")}`,
     { tags: "sunrise" },

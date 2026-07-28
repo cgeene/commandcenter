@@ -50,6 +50,7 @@ import {
   jiraEnabledRepos,
   resolveMainModel,
   resolveMainWorkspaceDir,
+  resolveNotifyEvents,
   resolveNtfyToken,
   resolveNtfyUrl,
   resolveReviewerProviderPin,
@@ -75,6 +76,12 @@ import {
 } from "../db/tokens.js";
 import { cycleWindow, daysInWindow } from "../lib/pricing.js";
 import { getLiveUsage, refreshLiveUsage } from "./usagelive.js";
+import {
+  isNotifyEventKey,
+  NOTIFY_CATEGORIES,
+  NOTIFY_EVENT_LIST,
+  type NotifyEventKey,
+} from "../notify-events.js";
 import { dismissAttention } from "../db/attention.js";
 import {
   claimTask,
@@ -888,8 +895,15 @@ export function buildApp(): Hono {
       agentId: body.agent_id,
       payload: { title: body.title },
     });
-    const { notify } = await import("./notify.js");
-    notify(body.title, body.message, { priority: "high", tags: "sos" });
+    const { notifyEvent } = await import("./notify.js");
+    // Deliberately un-latched: the orchestrator escalates on purpose, and a
+    // repeat escalation about the same task is a new decision to make.
+    notifyEvent("escalation", body.title, body.message, {
+      priority: "high",
+      tags: "sos",
+      taskId: body.task_id,
+      agentId: body.agent_id,
+    });
     return c.json({ ok: true });
   });
 
@@ -1291,6 +1305,23 @@ export function buildApp(): Hono {
         const trimmed = v.trim();
         return trimmed.length === 0 ? null : trimmed;
       }),
+    // Per-event push toggles. Sparse: only the keys sent are touched, and an
+    // explicit null clears that override back to the built-in default.
+    events: z
+      .record(z.string(), z.boolean().nullable())
+      .optional()
+      .superRefine((v, ctx) => {
+        if (v == null) return;
+        for (const key of Object.keys(v)) {
+          if (!isNotifyEventKey(key)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `unknown notification event: ${key}`,
+              path: [key],
+            });
+          }
+        }
+      }),
   });
 
   // JIRA behavior config (§6). SECRETS STAY OUT: the token, email, and base URL
@@ -1411,9 +1442,12 @@ export function buildApp(): Hono {
       },
       notifications: {
         // Secret token is never serialized — only its presence.
-        stored: { ntfy_url: notifications.ntfy_url },
+        stored: { ntfy_url: notifications.ntfy_url, events: notifications.events },
         ntfy_token_set: Boolean(resolveNtfyToken()),
-        effective: { ntfy_url: resolveNtfyUrl() ?? null },
+        effective: {
+          ntfy_url: resolveNtfyUrl() ?? null,
+          events: resolveNotifyEvents(),
+        },
       },
       jira: {
         // Behavior config only — never a secret. The token is env-only and its
@@ -1437,6 +1471,8 @@ export function buildApp(): Hono {
       },
       model_choices: CLAUDE_MODEL_SLUGS,
       provider_choices: AGENT_PROVIDERS,
+      notify_event_choices: NOTIFY_EVENT_LIST,
+      notify_category_choices: NOTIFY_CATEGORIES,
     });
   });
 
@@ -1463,7 +1499,13 @@ export function buildApp(): Hono {
 
   app.patch("/api/settings/notifications", async (c) => {
     const patch = notificationSettingsPatchSchema.parse(await c.req.json());
-    setNotificationSettings(patch);
+    // Keys are validated against the catalog above, so the widening cast is safe.
+    setNotificationSettings({
+      ...patch,
+      events: patch.events as
+        | Partial<Record<NotifyEventKey, boolean | null>>
+        | undefined,
+    });
     // Never echo the token (or its replacement) back — return presence only,
     // mirroring GET so the client can update its masked field state.
     const notifications = getNotificationSettings();
@@ -1474,14 +1516,18 @@ export function buildApp(): Hono {
         patch: {
           ntfy_url: patch.ntfy_url ?? null,
           ntfy_token_changed: patch.ntfy_token !== undefined,
+          events: patch.events ?? null,
         },
       },
     });
     return c.json({
       notifications: {
-        stored: { ntfy_url: notifications.ntfy_url },
+        stored: { ntfy_url: notifications.ntfy_url, events: notifications.events },
         ntfy_token_set: Boolean(resolveNtfyToken()),
-        effective: { ntfy_url: resolveNtfyUrl() ?? null },
+        effective: {
+          ntfy_url: resolveNtfyUrl() ?? null,
+          events: resolveNotifyEvents(),
+        },
       },
     });
   });

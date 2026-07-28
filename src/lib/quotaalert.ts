@@ -186,7 +186,10 @@ export function quotaConditions(
   };
 }
 
-/** A page to send. The daemon turns these into notify() + an event row. */
+/** A page to send. The daemon turns these into an event row plus a
+ *  notifyEvent() push, keyed on {@link QuotaAlert.kind} — which is also the
+ *  notification-catalog event key (src/notify-events.ts), so each kind carries
+ *  its own Settings toggle. */
 export interface QuotaAlert {
   kind: "quota_threshold" | "quota_spend_limit";
   event: string;
