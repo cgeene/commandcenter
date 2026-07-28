@@ -73,10 +73,26 @@ generator, a watcher, a dev server — would otherwise survive, be reparented to
 pid 1, and keep burning CPU invisibly. Before the window is torn down the
 daemon snapshots `ps`, collects the pane's descendants and process-group
 members (the daemon's own ancestry and the tmux server are excluded), sends
-`SIGTERM`, and `SIGKILL`s anything still standing a few seconds later. Each
-agent's pane pid is recorded so a reap that arrives after the window has
-already gone can still sweep leftovers by process group; that sweep ignores
-processes older than the agent, so a reused pid cannot be hit.
+`SIGTERM`, and `SIGKILL`s anything still standing a few seconds later
+(`CC_REAP_GRACE_MS`; a daemon shutdown inside that window flushes the pending
+`SIGKILL`s rather than stranding them).
+
+Each agent's pane pid is recorded at spawn as a fallback handle. It is used
+whenever the live-pane teardown finds nothing — the window vanished, or
+`remain-on-exit` is holding a pane corpse whose reported pid is stale — and the
+watchdog's vanish branch uses it too, since that branch requeues the task
+rather than calling the kill path. The recorded pid is cleared once swept, so a
+later kill neither re-sweeps nor skips an agent that was never swept. The sweep
+ignores processes older than the agent, so a reused pid cannot be hit.
+
+That fallback reaches leftovers still in the pane's process group — in practice
+the ones that ignore `SIGHUP`, since the pty hangup kills the rest of the group
+when the pane dies. It cannot reach a leftover that called `setsid()`: it has
+left both the process group and the session, and once its parent is gone
+nothing on the system still links it to the pane (macOS will not let `ps` read
+another process's environment, so an inherited marker is not an option either).
+Those are only reachable while the pane is alive, which is why every deliberate
+reap tears the tree down before the window goes.
 
 Codex scratch tasks are pre-trusted only at the exact server-created task
 directory. The scratch parent and general temporary directories are never

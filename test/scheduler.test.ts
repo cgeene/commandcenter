@@ -195,6 +195,69 @@ describe("watchdog", () => {
     expect(getTask(task.id)?.status).toBe("failed"); // second vanish -> give up
   });
 
+  it("sweeps the pane's process group when it confirms a vanished window", async () => {
+    // This branch never calls killAgent — the task is requeued, not cancelled —
+    // so if it does not sweep here, the agent's orphaned background processes
+    // are unreachable forever: the row goes state=dead, drops out of
+    // listAgents({live:true}), and a later kill hits killAgent's early return.
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent, updateAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const agent = createAgent({
+      kind: "worker",
+      state: "working",
+      task_id: task.id,
+      tmux_target: "cc:@9",
+    });
+    updateAgent(agent.id, { pane_pid: 4242 });
+    updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+
+    const swept: Array<[number, number]> = [];
+    const missing = {
+      spawn: () => {},
+      windowIds: () => [],
+      now: () => new Date(),
+      sweepPaneGroup: (panePid: number, ageSec: number) => {
+        swept.push([panePid, ageSec]);
+        return [7001, 7002];
+      },
+    };
+    watchdog(missing); // first pass only records the missing window
+    expect(swept).toEqual([]);
+    watchdog(missing); // second pass confirms the vanish
+
+    expect(swept.length).toBe(1);
+    expect(swept[0][0]).toBe(4242);
+    expect(swept[0][1]).toBeGreaterThanOrEqual(0);
+    const vanished = listEvents(20).find((e) => e.kind === "agent.vanished");
+    expect(JSON.parse(vanished!.payload!).swept_pids).toEqual([7001, 7002]);
+    // Marked swept, so a later kill does not sweep the same group twice.
+    expect(getAgent(agent.id)?.pane_pid).toBeNull();
+  });
+
+  it("does not sweep a vanished agent that never recorded a pane pid", async () => {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    createAgent({ kind: "worker", state: "working", tmux_target: "cc:@9" });
+
+    const swept: number[] = [];
+    const missing = {
+      spawn: () => {},
+      windowIds: () => [],
+      now: () => new Date(),
+      sweepPaneGroup: (panePid: number) => {
+        swept.push(panePid);
+        return [];
+      },
+    };
+    watchdog(missing);
+    watchdog(missing);
+    expect(swept).toEqual([]);
+  });
+
   it("never mutates agents when tmux cannot be observed reliably", async () => {
     const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
     const { createAgent, getAgent } = await import("../src/db/agents.js");

@@ -1025,6 +1025,37 @@ export function cancelTask(
   };
 }
 
+/** How long ago the agent was spawned — the pid-reuse guard for a pane sweep. */
+export function paneAgeSeconds(agent: Agent, nowMs = Date.now()): number {
+  const age = (nowMs - Date.parse(agent.spawned_at)) / 1000;
+  return Number.isFinite(age) ? Math.max(0, age) : 0;
+}
+
+/**
+ * Stop everything the agent's pane was running, and give up the recorded pane
+ * pid once we have — a cleared pane_pid is what marks the pane as swept, so a
+ * later kill of an already-dead agent knows there is nothing left to chase.
+ */
+function reapPaneProcesses(agent: Agent, liveWindow: boolean): number[] {
+  const killed: number[] = [];
+  if (agent.tmux_target && liveWindow) {
+    // Kills the pane's whole process tree, not just its window: an agent that
+    // backgrounded a load generator, watcher or dev server would otherwise
+    // leave it running, orphaned to pid 1 and invisible to Command Center.
+    killed.push(...killWindow(agent.tmux_target));
+  }
+  // An empty result means no live pane was found behind the window — either it
+  // is gone, or `remain-on-exit` is holding a corpse whose reported pid is
+  // stale and possibly reused, so paneProcess rightly refused it. Either way
+  // the pane pid recorded at spawn is now the only trustworthy handle on
+  // whatever the agent left running.
+  if (killed.length === 0 && agent.pane_pid) {
+    killed.push(...sweepVanishedPaneGroup(agent.pane_pid, paneAgeSeconds(agent)));
+  }
+  if (agent.pane_pid !== null) updateAgent(agent.id, { pane_pid: null });
+  return killed;
+}
+
 export function killAgent(
   agentId: number,
   opts?: { requeue?: boolean; rmWorktree?: boolean },
@@ -1035,22 +1066,15 @@ export function killAgent(
     agent.tmux_target && windowExists(agent.tmux_target),
   );
   // A false watchdog observation can leave a live provider process behind a
-  // DB row marked dead. "kill" must still stop that split-brain process.
-  if (agent.state === "dead" && !liveWindow) return agent;
+  // DB row marked dead. "kill" must still stop that split-brain process — and
+  // so must it for an agent the watchdog marked dead while its pane was never
+  // swept (pane_pid is cleared once it has been), or its leftovers would be
+  // unreachable forever.
+  if (agent.state === "dead" && !liveWindow && agent.pane_pid === null) {
+    return agent;
+  }
 
-  // Kill the pane's whole process tree, not just its window: an agent that
-  // backgrounded a load generator, watcher or dev server would otherwise leave
-  // it running forever, orphaned to pid 1 and invisible to Command Center.
-  const killedPids = agent.tmux_target && liveWindow
-    ? killWindow(agent.tmux_target)
-    : agent.pane_pid
-      // Window already gone (crash, or a watchdog reap after the fact) — the
-      // pane's process group is the only handle on its leftovers.
-      ? sweepVanishedPaneGroup(
-          agent.pane_pid,
-          Math.max(0, (Date.now() - Date.parse(agent.spawned_at)) / 1000),
-        )
-      : [];
+  const killedPids = reapPaneProcesses(agent, liveWindow);
   updateAgent(agentId, { state: "dead" });
 
   const task = agent.task_id ? getTask(agent.task_id) : undefined;
@@ -1060,7 +1084,7 @@ export function killAgent(
     logEvent("agent.killed", {
       agentId,
       taskId: agent.task_id ?? undefined,
-      payload: { ...opts, split_brain: true, killed_pids: killedPids.length },
+      payload: { ...opts, split_brain: true, killed_pids: killedPids },
     });
     return getAgent(agentId)!;
   }
@@ -1091,7 +1115,7 @@ export function killAgent(
   logEvent("agent.killed", {
     agentId,
     taskId: agent.task_id ?? undefined,
-    payload: { ...opts, killed_pids: killedPids.length },
+    payload: { ...opts, killed_pids: killedPids },
   });
   return getAgent(agentId)!;
 }

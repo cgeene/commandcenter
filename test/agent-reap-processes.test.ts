@@ -61,7 +61,60 @@ describe("killAgent process teardown", () => {
     expect(killWindow).toHaveBeenCalledWith("cc:@4");
     expect(sweepVanishedPaneGroup).not.toHaveBeenCalled();
     const killedEvent = listEvents(50).find((e) => e.kind === "agent.killed");
-    expect(JSON.parse(killedEvent!.payload!).killed_pids).toBe(2);
+    // The pid list, not a count — a count is not chaseable in a postmortem.
+    expect(JSON.parse(killedEvent!.payload!).killed_pids).toEqual([4001, 4002]);
+  });
+
+  it("falls back to the pane group when the window survives but its pane is dead", async () => {
+    // remain-on-exit keeps the window (windowExists true), but the pane process
+    // already exited, so killWindow finds nothing to signal. The recorded
+    // pane_pid must still be used — otherwise a crashed agent's leftovers get
+    // no cleanup at all.
+    const { killAgent } = await import("../src/daemon/spawn.js");
+    const { createAgent, updateAgent, getAgent } = await import("../src/db/agents.js");
+    const worker = createAgent({
+      kind: "worker",
+      state: "working",
+      tmux_target: "cc:@4",
+    });
+    updateAgent(worker.id, { pane_pid: 9182 });
+    killWindow.mockReturnValueOnce([]); // dead pane behind a live window
+
+    killAgent(worker.id);
+
+    expect(killWindow).toHaveBeenCalledWith("cc:@4");
+    expect(sweepVanishedPaneGroup).toHaveBeenCalledTimes(1);
+    expect(sweepVanishedPaneGroup.mock.calls[0][0]).toBe(9182);
+    expect(getAgent(worker.id)?.pane_pid).toBeNull();
+  });
+
+  it("still sweeps an agent the watchdog already marked dead without sweeping it", async () => {
+    // killAgent early-returns for a dead row with no live window. That must not
+    // apply while pane_pid is still set: it means nothing ever tore the pane
+    // down, and this is the last chance to.
+    const { killAgent } = await import("../src/daemon/spawn.js");
+    const { createAgent, updateAgent } = await import("../src/db/agents.js");
+    const worker = createAgent({ kind: "worker", state: "working", tmux_target: "cc:@4" });
+    updateAgent(worker.id, { state: "dead", pane_pid: 9182 });
+    windowExists.mockReturnValue(false);
+
+    killAgent(worker.id);
+
+    expect(sweepVanishedPaneGroup).toHaveBeenCalledTimes(1);
+    expect(sweepVanishedPaneGroup.mock.calls[0][0]).toBe(9182);
+  });
+
+  it("early-returns for a dead agent whose pane was already swept", async () => {
+    const { killAgent } = await import("../src/daemon/spawn.js");
+    const { createAgent, updateAgent } = await import("../src/db/agents.js");
+    const worker = createAgent({ kind: "worker", state: "working", tmux_target: "cc:@4" });
+    updateAgent(worker.id, { state: "dead", pane_pid: null });
+    windowExists.mockReturnValue(false);
+
+    killAgent(worker.id);
+
+    expect(sweepVanishedPaneGroup).not.toHaveBeenCalled();
+    expect(killWindow).not.toHaveBeenCalled();
   });
 
   it("falls back to the recorded pane process group when the window is gone", async () => {

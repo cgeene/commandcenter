@@ -192,11 +192,55 @@ export function escalateSurvivors(tree: readonly ProcRow[]): number[] {
   return killed;
 }
 
+/**
+ * Escalations still waiting out their grace period. Held so a daemon shutdown
+ * inside the grace window doesn't strand a SIGTERM-ignoring child forever —
+ * the very outcome this module exists to prevent.
+ */
+const pendingEscalations = new Map<NodeJS.Timeout, readonly ProcRow[]>();
+let shutdownHooked = false;
+
+/** SIGKILL every pending escalation now, instead of waiting out its timer. */
+export function flushPendingEscalations(): number[] {
+  const killed: number[] = [];
+  for (const [timer, tree] of pendingEscalations) {
+    clearTimeout(timer);
+    killed.push(...escalateSurvivors(tree));
+  }
+  pendingEscalations.clear();
+  return killed;
+}
+
+/**
+ * Flush on the way out. The signal handlers are installed only while something
+ * is pending and re-raise the signal afterwards, so the daemon's default
+ * termination behavior is unchanged.
+ */
+function hookShutdownFlush(): void {
+  if (shutdownHooked) return;
+  shutdownHooked = true;
+  process.on("exit", () => {
+    flushPendingEscalations();
+  });
+  for (const sig of ["SIGTERM", "SIGINT"] as const) {
+    process.on(sig, () => {
+      flushPendingEscalations();
+      process.removeAllListeners(sig);
+      process.kill(process.pid, sig);
+    });
+  }
+}
+
 function scheduleEscalation(tree: readonly ProcRow[]): void {
   if (tree.length === 0) return;
-  const timer = setTimeout(() => escalateSurvivors(tree), graceMs());
+  hookShutdownFlush();
+  const timer = setTimeout(() => {
+    pendingEscalations.delete(timer);
+    escalateSurvivors(tree);
+  }, graceMs());
   // Never hold the daemon (or a test run) open waiting on the escalation.
   timer.unref?.();
+  pendingEscalations.set(timer, tree);
 }
 
 export interface PaneProcess {
@@ -238,15 +282,28 @@ export function terminatePaneTree(pane: PaneProcess): number[] {
 }
 
 /**
- * Last-resort cleanup for a pane whose window has already vanished (a crashed
- * window, or a watchdog reap that arrives after the fact). The parent chain and
- * the tty are both gone by then; the pane's process group id is the only handle
- * left, and it survives reparenting.
+ * Last-resort cleanup for a pane whose process is already gone — a crashed
+ * window, a pane corpse behind `remain-on-exit`, or a watchdog reap that
+ * arrives after the fact. The parent chain and the tty are both unusable by
+ * then; the pane's process group id is the only handle left, and it does
+ * survive reparenting to pid 1.
  *
  * `panePid` doubles as that pgid because tmux makes each pane shell a session
- * and group leader. Pids do get reused, so a candidate is only accepted if it
+ * and group leader. Pids get reused, so a candidate is only accepted if it
  * started no earlier than the pane did — `paneAgeSec` is how long ago the agent
  * was spawned.
+ *
+ * Reach, measured rather than assumed:
+ *  - a leftover still in the pane's process group IS found. In practice that
+ *    means one that ignores SIGHUP (`nohup`, or a handler), because the pty
+ *    hangup already kills the rest of the group when the pane dies.
+ *  - a leftover that called setsid() (a `detached` child, and anything under
+ *    it) is NOT found: it left both the process group and the session, and
+ *    once its parent is gone nothing on the system still links it to the pane.
+ *    macOS offers no way back — `ps -E` will not read another process's
+ *    environment, so an inherited marker cannot be matched either. Those are
+ *    only reachable while the pane is alive, via terminatePaneTree, which is
+ *    why every deliberate reap tears the tree down before the window goes.
  */
 export function sweepVanishedPaneGroup(panePid: number, paneAgeSec: number): number[] {
   if (!Number.isInteger(panePid) || panePid <= 1) return [];

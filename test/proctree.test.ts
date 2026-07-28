@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   collectProcessTree,
   escalateSurvivors,
+  flushPendingEscalations,
   normalizeTty,
   parseElapsed,
   parseProcessTable,
@@ -221,6 +222,36 @@ describe("terminatePaneTree (real processes)", () => {
 
   it("does nothing when the pane pid is not a live process", () => {
     expect(terminatePaneTree({ pid: 2_147_483_646, tty: "" })).toEqual([]);
+  });
+
+  it("flushes a pending escalation instead of stranding it on shutdown", async () => {
+    // If the daemon exits inside the grace window, a SIGTERM-ignoring child
+    // would never get its SIGKILL — the exact leak this module prevents.
+    const pane = spawn(
+      process.execPath,
+      [
+        "-e",
+        `require('node:child_process').spawn(process.execPath,['-e','process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});setTimeout(()=>{},600000)`,
+      ],
+      { stdio: "ignore" },
+    );
+    pane.unref();
+    await new Promise((r) => setTimeout(r, 900));
+
+    // A long grace so the timer cannot fire on its own during the test.
+    process.env.CC_REAP_GRACE_MS = "600000";
+    try {
+      const killed = terminatePaneTree({ pid: pane.pid!, tty: "" });
+      expect(killed.length).toBeGreaterThan(1);
+      await new Promise((r) => setTimeout(r, 400));
+      expect(killed.some(alive)).toBe(true); // the SIGTERM-ignoring child
+
+      flushPendingEscalations();
+      expect(await waitForExit(killed)).toEqual([]);
+    } finally {
+      delete process.env.CC_REAP_GRACE_MS;
+      flushPendingEscalations();
+    }
   });
 });
 

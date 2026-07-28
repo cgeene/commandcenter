@@ -69,19 +69,34 @@ function descendants(root: number): number[] {
 const LEAKY = `require('node:child_process').spawn('/bin/sh',['-c','(while :; do sleep 1; done) & sleep 600'],{detached:true,stdio:'ignore'});setTimeout(()=>{},600000)`;
 const leakyCommand = `${process.execPath} -e ${JSON.stringify(LEAKY)}`;
 
+// A pane that leaves a job which ignores SIGHUP. Unlike the detached shape
+// above, this one stays in the pane's process group — so it is still reachable
+// after the pane's own process is gone, which is what the pane_pid fallback is
+// for. (A same-group job that does NOT ignore SIGHUP dies with the pty, so this
+// is the shape that actually survives a crashed agent.)
+const NOHUP_LEAK = `/bin/sh -c 'nohup sleep 594 >/dev/null 2>&1 & exec sleep 595'`;
+
+let dataDir: string;
+
 describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree", () => {
   beforeAll(() => {
     fs.mkdirSync(TMPDIR, { recursive: true });
     process.env.TMUX_TMPDIR = TMPDIR;
     process.env.CC_TMUX_SESSION = SESSION;
     delete process.env.TMUX; // don't let a surrounding tmux hijack the target
+    dataDir = fs.mkdtempSync("/tmp/cc-kw-db-");
+    process.env.CC_DATA_DIR = dataDir;
   });
 
-  afterAll(() => {
+  afterAll(async () => {
+    const { closeDb } = await import("../src/db/db.js");
+    closeDb();
     spawnSync("tmux", ["kill-server"], { stdio: "ignore" });
     fs.rmSync(TMPDIR, { recursive: true, force: true });
+    fs.rmSync(dataDir, { recursive: true, force: true });
     delete process.env.CC_TMUX_SESSION;
     delete process.env.TMUX_TMPDIR;
+    delete process.env.CC_DATA_DIR;
   });
 
   it("reproduces the leak: a bare kill-window strands the background children", async () => {
@@ -147,7 +162,9 @@ describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree",
 
   it("reports no pane process for a pane whose command already exited", async () => {
     // A window held open by remain-on-exit keeps reporting the exited pid, and
-    // that pid may since have been reused. It must never be acted on.
+    // that pid may since have been reused. killWindow must never act on it —
+    // cleanup for this case goes through the DB-recorded pane_pid instead (see
+    // the killAgent test below).
     const { newWindow, paneProcess, killWindow } = await import("../src/daemon/tmux.js");
     const target = newWindow("deadpane", "/tmp", "sleep 600");
     await new Promise((r) => setTimeout(r, 500));
@@ -158,5 +175,42 @@ describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree",
 
     expect(paneProcess(target)).toBeNull();
     expect(killWindow(target)).toEqual([]);
+  });
+
+  it("killAgent still kills leftovers when the pane died behind a surviving window", async () => {
+    // The crash case: the agent's process is gone, remain-on-exit keeps the
+    // window (so windowExists is true), and killWindow can do nothing because
+    // the reported pane pid is stale. The pane_pid recorded at spawn is the
+    // only handle left, and the reap must use it.
+    const { newWindow, paneProcess, windowExists } = await import("../src/daemon/tmux.js");
+    const { createAgent, updateAgent, getAgent } = await import("../src/db/agents.js");
+    const { killAgent } = await import("../src/daemon/spawn.js");
+
+    const target = newWindow("crashed", "/tmp", NOHUP_LEAK);
+    await new Promise((r) => setTimeout(r, 1200));
+    const pane = paneProcess(target)!;
+    expect(pane).not.toBeNull();
+
+    const leftovers = snapshotProcesses()
+      .filter((p) => p.pgid === pane.pid && p.pid !== pane.pid)
+      .map((p) => p.pid);
+    expect(leftovers.length).toBeGreaterThan(0);
+
+    const agent = createAgent({ kind: "worker", state: "working", tmux_target: target });
+    updateAgent(agent.id, { pane_pid: pane.pid });
+
+    // Crash the agent's own process; its nohup'd job keeps running.
+    process.kill(pane.pid, "SIGKILL");
+    await waitForExit([pane.pid]);
+    await new Promise((r) => setTimeout(r, 400));
+    expect(windowExists(target)).toBe(true); // remain-on-exit corpse
+    expect(paneProcess(target)).toBeNull();
+    expect(leftovers.filter(alive).length).toBeGreaterThan(0);
+
+    killAgent(agent.id);
+
+    expect(await waitForExit(leftovers)).toEqual([]);
+    // pane_pid is cleared once swept, so a repeat kill has nothing to chase.
+    expect(getAgent(agent.id)?.pane_pid).toBeNull();
   });
 });
