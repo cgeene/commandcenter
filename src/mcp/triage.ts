@@ -13,8 +13,15 @@
  */
 export function taskReadPath(
   id: number,
-  opts: { verbose?: boolean; fields?: string[] } = {},
+  opts: { verbose?: boolean; fields?: string[]; agentId?: number } = {},
 ): string {
   const fullRead = opts.verbose === true && !(opts.fields && opts.fields.length > 0);
-  return `/api/tasks/${id}${fullRead ? "?triage_ack=1" : ""}`;
+  if (!fullRead) return `/api/tasks/${id}`;
+  // Who acked. An ack is one orchestrator session saying "I have this one", so a
+  // replacement main still gets told about the task (see orchestration.ackedBy).
+  const agent =
+    Number.isSafeInteger(opts.agentId) && (opts.agentId as number) > 0
+      ? `&agent_id=${opts.agentId}`
+      : "";
+  return `/api/tasks/${id}?triage_ack=1${agent}`;
 }

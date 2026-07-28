@@ -81,6 +81,7 @@ function fullTask(over: Partial<FakeTask> = {}): FakeTask {
     pr_checks: "pass",
     pr_is_draft: 1,
     human_approved_at: null,
+    triaged_at: null,
     pr_synced_at: "2026-07-27T10:00:00.000Z",
     pr_sync_fails: 0,
     jira_key: "EN-1234",
@@ -316,6 +317,20 @@ describe("main-role tools", () => {
     expect(out.prompt).toHaveLength(3000);
     expect(out.result_summary).toHaveLength(1200);
     expect(out.review_notes).toHaveLength(2500);
+  });
+
+  it("get_task acks the triage ping on a full read only, attributed to this main", async () => {
+    // Reading the whole record IS the triage action, so it doubles as the ack
+    // that stops the platform re-delivering the task — and the ack belongs to
+    // this orchestrator session, so a replacement main is still told about it.
+    await callTool("get_task", { id: 42, verbose: true });
+    expect(fetchCalls.at(-1)?.path).toBe("/api/tasks/42?triage_ack=1&agent_id=7");
+
+    // A compact read or a projection is a lookup, not triage.
+    await callTool("get_task", { id: 42 });
+    expect(fetchCalls.at(-1)?.path).toBe("/api/tasks/42");
+    await callTool("get_task", { id: 42, verbose: true, fields: ["status"] });
+    expect(fetchCalls.at(-1)?.path).toBe("/api/tasks/42");
   });
 
   it("get_task fields projects exactly", async () => {

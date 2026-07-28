@@ -94,11 +94,18 @@ async function mainWentIdle(mainId: number): Promise<void> {
   panes.set(MAIN, CLEAR_PROMPT);
 }
 
-/** What the orchestrator's `get_task(id, verbose: true)` does over HTTP. */
-async function readFullTask(id: number): Promise<Response> {
+/** What the orchestrator's `get_task(id, verbose: true)` does over HTTP.
+ *  `agentId` is the reading main, as the cc MCP server passes it. */
+async function readFullTask(id: number, agentId?: number): Promise<Response> {
   const { buildApp } = await import("../src/daemon/api.js");
   const { taskReadPath } = await import("../src/mcp/triage.js");
-  return buildApp().request(taskReadPath(id, { verbose: true }));
+  return buildApp().request(taskReadPath(id, { verbose: true, agentId }));
+}
+
+/** How many events of `kind` exist, across all tasks. */
+async function countEvents(kind: string): Promise<number> {
+  const { listEvents } = await import("../src/db/events.js");
+  return listEvents(500).filter((e) => e.kind === kind).length;
 }
 
 const messages = () => sendText.mock.calls.map((call) => String(call[1]));
@@ -320,6 +327,85 @@ describe("triage delivery batching", () => {
     expect(message).not.toContain(`#${tasks[1].id}`);
   });
 
+  it("records a deferred batch ONCE, however many times the watchdog retries", async () => {
+    // The watchdog calls this every ~10s. While main is mid-turn or mid-draft
+    // every one of those calls used to re-log task.awaiting_main AND
+    // delivery.persisted for EVERY task in the batch — the same event storm this
+    // whole change exists to stop, multiplied by the queue depth, flooding the
+    // 30-event feed the human and the orchestrator audit from.
+    const { main, tasks } = await setup(3);
+    panes.set(MAIN, HUMAN_DRAFT);
+    const { delegatePendingTaskToMain } = await import("../src/daemon/orchestration.js");
+
+    expect(await delegatePendingTaskToMain(main)).toBe(false);
+    expect(await countEvents("task.awaiting_main")).toBe(tasks.length);
+    expect(await countEvents("delivery.persisted")).toBe(tasks.length);
+
+    // Four more ticks over an unchanged pending set: nothing new to record.
+    for (let tick = 0; tick < 4; tick++) {
+      expect(await delegatePendingTaskToMain(main)).toBe(false);
+    }
+    expect(await countEvents("task.awaiting_main")).toBe(tasks.length);
+    expect(await countEvents("delivery.persisted")).toBe(tasks.length);
+    const { countQueuedNotifications } = await import("../src/db/notifications.js");
+    expect(countQueuedNotifications(main.id)).toBe(tasks.length);
+    expect(sendText).not.toHaveBeenCalled();
+
+    // A genuinely new task still gets recorded — the quiet is about repetition,
+    // not about dropping work.
+    const { createTask } = await import("../src/db/tasks.js");
+    const late = createTask({
+      title: "arrived later",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+      open_pr: false,
+    });
+    expect(await delegatePendingTaskToMain(main)).toBe(false);
+    expect(await countEvents("task.awaiting_main")).toBe(tasks.length + 1);
+    expect(countQueuedNotifications(main.id)).toBe(tasks.length + 1);
+    const { latestTaskEvent } = await import("../src/db/events.js");
+    expect(latestTaskEvent(late.id, ["task.awaiting_main"])).toBeDefined();
+  });
+
+  it("keeps a reopened task's do-not-duplicate directive inside a batch", async () => {
+    const { main, tasks } = await setup(2);
+    // tasks[0] is a reopened archived task: its ping carries instructions no
+    // generic "N tasks awaiting triage" line can express, and losing them is how
+    // the orchestrator ends up filing a duplicate task.
+    const { logEvent } = await import("../src/db/events.js");
+    logEvent("task.archived_resumed", { taskId: tasks[0].id });
+    const { delegatePendingTaskToMain } = await import("../src/daemon/orchestration.js");
+
+    expect(await delegatePendingTaskToMain(main)).toBe(true);
+    expect(sendText).toHaveBeenCalledOnce();
+    const message = messages()[0];
+    expect(message).toContain(`Archived task #${tasks[0].id} was reopened`);
+    expect(message).toContain("Do not create a duplicate task");
+    expect(message).toContain("continue the SAME task");
+    // ...and the ordinary task still rides along in the same single message.
+    expect(message).toContain(`#${tasks[1].id}`);
+  });
+
+  it("keeps the directive when the batch arrives via the deferred-queue flush", async () => {
+    const { main, tasks } = await setup(2);
+    const { logEvent } = await import("../src/db/events.js");
+    logEvent("task.worker_resume_requested", { taskId: tasks[0].id });
+    panes.set(MAIN, HUMAN_DRAFT);
+    const { delegatePendingTaskToMain } = await import("../src/daemon/orchestration.js");
+    expect(await delegatePendingTaskToMain(main)).toBe(false);
+
+    panes.set(MAIN, CLEAR_PROMPT);
+    const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
+    expect(await flushMainQueue(main.id, { force: true })).toBe("flushed");
+    expect(sendText).toHaveBeenCalledOnce();
+    const message = messages()[0];
+    expect(message).toContain("managed worker launch failed");
+    expect(message).toContain(`spawn_worker(${tasks[0].id})`);
+    expect(message).toContain("Do not create a duplicate task");
+    expect(message).toContain(`#${tasks[1].id}`);
+  });
+
   it("queues each batched task separately when the composer is busy", async () => {
     const { main, tasks } = await setup(2);
     panes.set(MAIN, HUMAN_DRAFT);
@@ -375,6 +461,34 @@ describe("triage ack — safety net for a task that is never acked", () => {
     ).toBe(true);
     expect(sendText).toHaveBeenCalledOnce();
     expect(messages()[0]).toContain(`get_task(${task.id}`);
+  });
+
+  it("surfaces a task the DEAD main acked to its replacement", async () => {
+    const { main, tasks } = await setup();
+    const [task] = tasks;
+    const { delegatePendingTaskToMain } = await import("../src/daemon/orchestration.js");
+    expect(await delegatePendingTaskToMain(main)).toBe(true);
+
+    // That main read the task and left it queued, then died. The ack was one
+    // orchestrator session saying "I have this one" — a replacement has never
+    // seen it, so it must not inherit the silence.
+    await readFullTask(task.id, main.id);
+    const { createAgent, updateAgent } = await import("../src/db/agents.js");
+    updateAgent(main.id, { state: "dead" });
+    const replacement = createAgent({ kind: "main", state: "idle", tmux_target: MAIN });
+    sendText.mockClear();
+
+    const { pendingTriageTasks } = await import("../src/daemon/orchestration.js");
+    expect(pendingTriageTasks(main).map((t) => t.id)).toEqual([]);
+    expect(pendingTriageTasks(replacement).map((t) => t.id)).toEqual([task.id]);
+    expect(await delegatePendingTaskToMain(replacement)).toBe(true);
+    expect(messages()[0]).toContain(`get_task(${task.id}`);
+
+    // The replacement's own ack then silences it for the replacement too.
+    await readFullTask(task.id, replacement.id);
+    sendText.mockClear();
+    expect(await delegatePendingTaskToMain(replacement)).toBe(false);
+    expect(sendText).not.toHaveBeenCalled();
   });
 
   it("still surfaces an unacked task to a NEW main after the old one died", async () => {

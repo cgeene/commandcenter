@@ -535,8 +535,14 @@ export function buildApp(): Hono {
       if (acked) {
         // A ping still sitting in the delivery queue for this task is moot now.
         const dropped = clearTriageQueueForTask(task.id);
+        // Attributed to the reading agent: the ack suppresses re-delivery to
+        // THAT orchestrator session only, so a replacement main is still told
+        // about the task (orchestration.ackedBy).
+        const reader = Number(c.req.query("agent_id"));
         logEvent("task.triage_acked", {
           taskId: task.id,
+          agentId:
+            Number.isSafeInteger(reader) && reader > 0 ? reader : undefined,
           payload: { dropped_queued: dropped },
         });
         return c.json(acked);

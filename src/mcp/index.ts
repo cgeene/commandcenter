@@ -440,10 +440,19 @@ if (ROLE === "main") {
     // reading the whole record IS the triage action — see taskReadPath.
     async ({ id, verbose, fields }) =>
       asText(
-        shapeTask(await call("GET", taskReadPath(id, { verbose, fields })), {
-          verbose,
-          fields,
-        }),
+        shapeTask(
+          await call(
+            "GET",
+            taskReadPath(id, {
+              verbose,
+              fields,
+              agentId: process.env.CC_AGENT_ID
+                ? Number(process.env.CC_AGENT_ID)
+                : undefined,
+            }),
+          ),
+          { verbose, fields },
+        ),
       ),
   );
 
