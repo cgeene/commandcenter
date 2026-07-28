@@ -209,6 +209,24 @@ describe("PATCH /api/tasks/:id blocked_by", () => {
     ).toBeNull();
   });
 
+  it("accepts an already-done blocker and leaves the task ready", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const a = createTask({ title: "a", prompt: "x", repo: "/r" });
+    const b = createTask({ title: "b", prompt: "x", repo: "/r" });
+    updateTask(a.id, { status: "done" });
+
+    const res = await patch(b.id, { blocked_by: a.id });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { blocked_by: number | null }).blocked_by).toBe(a.id);
+
+    // already-satisfied: recording the dependency must not park the task
+    const ready = (await (await buildApp().request("/api/tasks?ready=true")).json()) as {
+      id: number;
+    }[];
+    expect(ready.map((t) => t.id)).toEqual([b.id]);
+  });
+
   it("rejects a self-block with 409", async () => {
     const { createTask, getTask } = await import("../src/db/tasks.js");
     const t = createTask({ title: "t", prompt: "x", repo: "/r" });
