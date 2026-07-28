@@ -583,6 +583,7 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
               tags: "warning",
               agentId: agent.id,
               taskId: agent.task_id,
+              once: `waiting:${agent.id}:${waitStart}`,
             },
           );
         }
