@@ -62,7 +62,13 @@ const TEMPLATES: Record<string, Template> = {
     `Auto-completed ${taskRef(e)}${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
   "task.recovered": (e) => `Recovered ${taskRef(e)} after a false window-loss signal`,
   "task.awaiting_main": (e) => `${taskRef(e)} is waiting for Claude main to triage it`,
-  "task.delegated_to_main": (e) => `Sent ${taskRef(e)} to Claude main for triage`,
+  "task.delegated_to_main": (e, p) =>
+    `Sent ${taskRef(e)} to Claude main for triage${
+      Number(p.batched) > 1 ? ` (batched with ${Number(p.batched) - 1} more)` : ""
+    }`,
+  "task.triage_acked": (e) => `Claude main read ${taskRef(e)} — triage acknowledged`,
+  "task.triage_reflagged": (e, p) =>
+    `${taskRef(e)} flagged for triage again${p.reason ? ` (${clip(p.reason, 60)})` : ""}`,
   "task.delegation_failed": () => `Main-agent task delivery will be retried`,
 
   // --- review ---

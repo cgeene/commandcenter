@@ -1,4 +1,5 @@
 import { getDb, type TaskStatus, TASK_STATUSES } from "./db.js";
+import { logEvent } from "./events.js";
 import { parseAgentProvider, type AgentProvider } from "../providers.js";
 import {
   reasoningEffortForProvider,
@@ -55,6 +56,7 @@ export interface Task {
   pr_checks: string | null; // CI rollup: pass | fail | pending | none
   pr_is_draft: number | null; // 1 draft (internal review pending), 0 ready, NULL unknown
   human_approved_at: string | null; // latest human GitHub approval (signal only, not a re-queue trigger)
+  triaged_at: string | null; // orchestrator acked the triage ping by reading the full record; NULL = still needs triage
   pr_synced_at: string | null; // last successful prsync
   pr_sync_fails: number; // consecutive prsync failures; escalates at 3
   jira_key: string | null; // JIRA issue key, e.g. "EN-1234"; NULL = no ticket yet
@@ -322,6 +324,38 @@ export function claimTask(id: number, agentId?: number): Task | undefined {
   return info.changes === 1 ? getTask(id) : undefined;
 }
 
+/**
+ * Record that the orchestrator has triaged a queued task, so the triage
+ * delivery path stops re-pinging it about a task it has already read.
+ *
+ * Conditional in SQL rather than in the caller: only a queued, orchestrated
+ * task is awaiting triage at all, and only the FIRST ack matters (a later
+ * re-read must not push the stamp forward and hide an edit made in between).
+ * Returns the stamped task, or undefined when nothing was stamped.
+ */
+export function markTaskTriaged(id: number): Task | undefined {
+  const info = getDb()
+    .prepare(
+      `UPDATE tasks
+          SET triaged_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = @id AND status = 'queued' AND dispatch_mode = 'orchestrated'
+          AND triaged_at IS NULL`,
+    )
+    .run({ id });
+  return info.changes === 1 ? getTask(id) : undefined;
+}
+
+/** Drop a task's triage ack so it is delivered for triage again. Used for an
+ *  explicit re-flag (the manual "notify main" route); ordinary re-queues and
+ *  prompt/repo edits are handled inside updateTask. */
+export function clearTaskTriageAck(id: number): boolean {
+  return (
+    getDb()
+      .prepare("UPDATE tasks SET triaged_at = NULL WHERE id = ? AND triaged_at IS NOT NULL")
+      .run(id).changes === 1
+  );
+}
+
 const UPDATABLE = new Set([
   "title",
   "prompt",
@@ -415,12 +449,39 @@ export function updateTask(
   if (fields.review_mode !== undefined && !REVIEW_MODES.includes(fields.review_mode)) {
     throw new Error(`invalid review mode: ${String(fields.review_mode)}`);
   }
+  // A task that re-enters the queue, or whose prompt/repo changed, is no longer
+  // the task the orchestrator triaged: drop the ack here — the single choke
+  // point every re-queue path (review rejection, PR feedback, archived resume,
+  // the stale-agent sweep) already writes through — so it gets delivered for
+  // triage again. Cosmetic edits (priority, review_mode, …) keep the ack.
+  const invalidatesTriage =
+    fields.status === "queued" ||
+    fields.prompt !== undefined ||
+    fields.repo !== undefined;
+  const priorAck = invalidatesTriage ? getTask(id)?.triaged_at : undefined;
   const sets = keys.map((k) => `${k} = @${k}`).join(", ");
   getDb()
     .prepare(
-      `UPDATE tasks SET ${sets}, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      `UPDATE tasks SET ${sets}${invalidatesTriage ? ", triaged_at = NULL" : ""},
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
        WHERE id = @id`,
     )
     .run({ id, ...fields });
+  // Losing an ack is a delivery-relevant event, not just a column going NULL:
+  // the triage delivery path reads it as "this task needs triage again" and the
+  // dashboard feed shows the human why the orchestrator was pinged twice.
+  if (priorAck) {
+    logEvent("task.triage_reflagged", {
+      taskId: id,
+      payload: {
+        reason:
+          fields.prompt !== undefined
+            ? "prompt edited"
+            : fields.repo !== undefined
+              ? "repository changed"
+              : "back in the queue",
+      },
+    });
+  }
   return getTask(id);
 }

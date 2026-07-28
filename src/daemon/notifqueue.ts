@@ -441,6 +441,10 @@ function stalenessReason(
     const task = getTask(it.task_id);
     if (!task) return "task_gone";
     if (task.status !== "queued") return `task_${task.status}`;
+    // Acked while the ping sat in the queue: the orchestrator has read this
+    // task and left it queued on purpose, so delivering now would send it to
+    // re-triage what it already decided.
+    if (task.triaged_at) return "task_triaged";
     if (task.dispatch_mode !== "orchestrated") return "task_not_orchestrated";
     if (!readyTriageIds.has(task.id)) return "task_blocked";
     return null;
