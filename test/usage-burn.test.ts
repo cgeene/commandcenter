@@ -399,18 +399,42 @@ describe("per-model transcript sums", () => {
 describe("quota settings", () => {
   it("round-trips and merges partial patches", async () => {
     const { getQuotaSettings, setQuotaSettings } = await import("../src/db/settings.js");
-    expect(getQuotaSettings()).toEqual({ monthly_quota_usd: null, cycle_reset_day: 1 });
+    expect(getQuotaSettings()).toEqual({
+      monthly_quota_usd: null,
+      cycle_reset_day: 1,
+      alert_threshold_percent: 80,
+    });
 
     setQuotaSettings({ monthly_quota_usd: 250, cycle_reset_day: 15 });
-    expect(getQuotaSettings()).toEqual({ monthly_quota_usd: 250, cycle_reset_day: 15 });
+    expect(getQuotaSettings()).toEqual({
+      monthly_quota_usd: 250,
+      cycle_reset_day: 15,
+      alert_threshold_percent: 80,
+    });
 
-    // A patch touching one field leaves the other alone.
+    // A patch touching one field leaves the others alone.
     setQuotaSettings({ monthly_quota_usd: 400 });
-    expect(getQuotaSettings()).toEqual({ monthly_quota_usd: 400, cycle_reset_day: 15 });
+    expect(getQuotaSettings()).toEqual({
+      monthly_quota_usd: 400,
+      cycle_reset_day: 15,
+      alert_threshold_percent: 80,
+    });
 
     // Clearing the quota drops the budget line but keeps the cycle.
     setQuotaSettings({ monthly_quota_usd: null });
-    expect(getQuotaSettings()).toEqual({ monthly_quota_usd: null, cycle_reset_day: 15 });
+    expect(getQuotaSettings()).toEqual({
+      monthly_quota_usd: null,
+      cycle_reset_day: 15,
+      alert_threshold_percent: 80,
+    });
+
+    // The alert threshold is independently clearable (null = alerting off).
+    setQuotaSettings({ alert_threshold_percent: null });
+    expect(getQuotaSettings()).toEqual({
+      monthly_quota_usd: null,
+      cycle_reset_day: 15,
+      alert_threshold_percent: null,
+    });
   });
 });
 

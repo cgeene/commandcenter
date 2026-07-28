@@ -167,7 +167,8 @@ export type AttentionKind =
   | "stale_waiting"
   | "scheduler_stalled"
   | "orchestration"
-  | "jira_sync";
+  | "jira_sync"
+  | "quota";
 
 export interface JiraMeta {
   base_url: string;
@@ -355,7 +356,11 @@ export interface AppSettings {
     effective: { ntfy_url: string | null };
   };
   quota: {
-    stored: { monthly_quota_usd: number | null; cycle_reset_day: number };
+    stored: {
+      monthly_quota_usd: number | null;
+      cycle_reset_day: number;
+      alert_threshold_percent: number | null;
+    };
     /** Derived from CC_ANTHROPIC_ADMIN_KEY — the key itself never crosses. */
     admin_key_set: boolean;
     /** Whether the daemon was opted into reading Claude Code's stored OAuth

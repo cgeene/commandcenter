@@ -15,6 +15,11 @@ import {
   type PublicationMode,
 } from "../publication.js";
 import { DEFAULT_CYCLE_RESET_DAY } from "../lib/pricing.js";
+import {
+  EMPTY_QUOTA_ALERT_LATCH,
+  QUOTA_ALERT_THRESHOLD_DEFAULT,
+  type QuotaAlertLatch,
+} from "../lib/quotaalert.js";
 import type { LiveUsageState } from "../lib/usage.js";
 
 export interface SchedulerConfig {
@@ -274,11 +279,16 @@ export interface QuotaSettings {
   /** Day of month the budget resets (1-28; a stored larger value is pinned to
    *  the month's last day so February still works). */
   cycle_reset_day: number;
+  /** Page the operator once the LIVE feed's headline meter reaches this
+   *  percentage of its window. null disables the alert. Unlike the two fields
+   *  above, this one is about the live feed, not the local estimate. */
+  alert_threshold_percent: number | null;
 }
 
 export const QUOTA_SETTINGS_DEFAULTS: QuotaSettings = {
   monthly_quota_usd: null,
   cycle_reset_day: DEFAULT_CYCLE_RESET_DAY,
+  alert_threshold_percent: QUOTA_ALERT_THRESHOLD_DEFAULT,
 };
 
 export function getQuotaSettings(): QuotaSettings {
@@ -307,6 +317,19 @@ export function getLiveUsageCache(): LiveUsageState {
 
 export function setLiveUsageCache(state: LiveUsageState): void {
   setSetting("usage_live", JSON.stringify(state));
+}
+
+/**
+ * Escalate-once state for the quota alert (daemon/quotaalert.ts). Persisted
+ * rather than held in memory so a daemon restart doesn't re-page the operator
+ * for a crossing they were already told about.
+ */
+export function getQuotaAlertLatch(): QuotaAlertLatch {
+  return readGroup("quota_alert", EMPTY_QUOTA_ALERT_LATCH);
+}
+
+export function setQuotaAlertLatch(latch: QuotaAlertLatch): void {
+  setSetting("quota_alert", JSON.stringify(latch));
 }
 
 /** Anthropic Admin API cost-report roll-up (org billing dollars). */

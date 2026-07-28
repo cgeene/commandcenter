@@ -2510,9 +2510,15 @@ function WorkspaceSection({
 }
 
 /**
- * Budget line for the LOCAL estimate. Deliberately narrow in scope: when the
- * live Claude usage feed is reachable it brings its own limits and this is
- * ignored, so the section says so rather than implying it drives the headline.
+ * Two settings that both concern spend but read from opposite sources, which is
+ * why the copy works so hard to separate them:
+ *
+ *  - monthly quota + cycle reset day draw a budget line against the LOCAL
+ *    estimate. When the live Claude feed is reachable it brings its own limits
+ *    and these are ignored, so the section says so rather than implying they
+ *    drive the headline.
+ *  - the alert threshold is the other direction entirely: it watches the LIVE
+ *    feed's headline meter and is what pages the operator.
  */
 function QuotaSection({
   settings,
@@ -2528,6 +2534,9 @@ function QuotaSection({
     stored.monthly_quota_usd === null ? "" : String(stored.monthly_quota_usd),
   );
   const [resetDay, setResetDay] = useState(String(stored.cycle_reset_day));
+  const [alertPct, setAlertPct] = useState(
+    stored.alert_threshold_percent === null ? "" : String(stored.alert_threshold_percent),
+  );
   const [saving, setSaving] = useState(false);
 
   const save = async () => {
@@ -2539,9 +2548,15 @@ function QuotaSection({
       if (parsed !== null && (!Number.isFinite(parsed) || parsed <= 0)) {
         throw new Error("Monthly quota must be a positive number of dollars, or blank.");
       }
+      const pctRaw = alertPct.trim();
+      const pct = pctRaw === "" ? null : Number(pctRaw);
+      if (pct !== null && (!Number.isInteger(pct) || pct < 1 || pct > 100)) {
+        throw new Error("Alert threshold must be a whole number from 1 to 100, or blank.");
+      }
       await api("PATCH", "/api/settings/quota", {
         monthly_quota_usd: parsed,
         cycle_reset_day: Number(resetDay),
+        alert_threshold_percent: pct,
       });
       onSaved();
     } catch (e) {
@@ -2555,9 +2570,10 @@ function QuotaSection({
     <section className="settings-section">
       <h2>Spend &amp; quota</h2>
       <p className="muted">
-        Draws a budget line against the <b>local estimate</b> on the Tokens tab. When live
-        Claude usage is available it carries its own limits and takes over the headline —
-        these settings don&rsquo;t change it.
+        The monthly quota draws a budget line against the <b>local estimate</b> on the
+        Tokens tab. When live Claude usage is available it carries its own limits and takes
+        over the headline — the budget line doesn&rsquo;t change it. The alert threshold is
+        the other way round: it watches the <b>live feed</b>.
       </p>
       <SettingRow
         label="Monthly quota (USD)"
@@ -2585,6 +2601,21 @@ function QuotaSection({
             </option>
           ))}
         </select>
+      </SettingRow>
+      <SettingRow
+        label="Quota alert threshold (%)"
+        when="immediate"
+        hint="Pushes a notification (and raises a Needs You item) once the live feed's busiest meter reaches this share of its window — once per crossing, not once per hourly poll. Blank turns off the utilization alert; hitting the org spend cap still alerts either way. Needs live Claude usage enabled."
+      >
+        <input
+          type="number"
+          min="1"
+          max="100"
+          step="5"
+          placeholder="off"
+          value={alertPct}
+          onChange={(e) => setAlertPct(e.target.value)}
+        />
       </SettingRow>
       <SettingRow
         label="Live Claude usage"
@@ -3322,6 +3353,7 @@ const KIND_ICON: Record<AttentionItem["kind"], string> = {
   scheduler_stalled: "🚦",
   orchestration: "◈",
   jira_sync: "🎫",
+  quota: "📊",
 };
 
 function OperationsSnapshot({
