@@ -5,11 +5,12 @@ import {
   countTaskEvents,
   latestAgentEvent,
   latestAgentEventTs,
+  latestTaskEvent,
   latestTaskEventId,
   logEvent,
 } from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
-import { getTask, updateTask, type Task } from "../db/tasks.js";
+import { getTask, listTasks, updateTask, type Task } from "../db/tasks.js";
 import {
   delegateToMain as delegateWorkerWaitToMain,
   deliverToMainIfClear,
@@ -140,6 +141,31 @@ const backgroundParkSince = new Map<number, number>();
 /** Test-only: this map outlives the per-test in-memory db (see above). */
 export function __clearBackgroundParkForTests(): void {
   backgroundParkSince.clear();
+}
+
+/** Terminal markers of a verify run started by transitionOnStop. */
+const VERIFY_DONE_EVENTS = ["verify.passed", "verify.failed"] as const;
+
+/** Beyond this a `verify.started` with no outcome is not a run in progress —
+ *  it is the residue of a daemon that died mid-verify. Without the bound, one
+ *  such event would mask the task from the stall sweep permanently. */
+const VERIFY_STALE_MS = VERIFY_TIMEOUT_MS + 2 * 60_000;
+
+/**
+ * Is a verify_cmd run currently executing for this task?
+ *
+ * runVerify blocks the Stop-hook handler for as long as the command takes
+ * (minutes for a real test suite), and the task stays `in_progress` that whole
+ * time. Callers use this to tell "the transition is on its way" apart from
+ * "nothing is going to move this task", which from the outside look identical.
+ */
+export function verifyInFlight(taskId: number, nowMs = Date.now()): boolean {
+  const latest = latestTaskEvent(taskId, [
+    "verify.started",
+    ...VERIFY_DONE_EVENTS,
+  ]);
+  if (latest?.kind !== "verify.started") return false;
+  return nowMs - Date.parse(latest.ts) < VERIFY_STALE_MS;
 }
 
 interface StallCheck {
@@ -510,18 +536,28 @@ export async function handleHookEvent(
       // verdict and then idles would be silenced here — losing the very
       // re-escalation path (idle → waiting_input → watchdog page) the task says
       // reviewers must keep. Reviewers fall through to the normal wait path.
-      if (agent.kind === "worker" && isIdlePrompt) {
+      if (agent.kind === "worker" && isIdlePrompt && stopFiredForLatestTurn(agentId)) {
         const task = agent.task_id ? getTask(agent.task_id) : undefined;
-        if (
-          task &&
-          IDLE_SUPPRESS_STATUSES.includes(task.status) &&
-          stopFiredForLatestTurn(agentId)
-        ) {
+        if (task && IDLE_SUPPRESS_STATUSES.includes(task.status)) {
           updateAgent(agentId, { state: "idle" });
           logEvent("waiting.suppressed_in_review", {
             agentId,
             taskId: task.id,
             payload: { task_status: task.status },
+          });
+          break;
+        }
+        // Its own Stop hook is still inside runVerify. Claude re-emits
+        // idle_prompt ~60s after a turn ends, but a real test suite runs for
+        // minutes, so this fires on nearly every verified task — and reported
+        // as a wait it is indistinguishable from a worker asking a question,
+        // which is what made finished rework rounds look permanently stalled.
+        // The transition lands when the command exits; nobody is needed here.
+        if (task && task.status === "in_progress" && verifyInFlight(task.id)) {
+          updateAgent(agentId, { state: "idle" });
+          logEvent("waiting.suppressed_verifying", {
+            agentId,
+            taskId: task.id,
           });
           break;
         }
@@ -857,6 +893,12 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     if (pass && (!resumed || pass > resumed)) return;
   }
 
+  // Logged BEFORE the await: the task sits in `in_progress` for however long
+  // the command takes, and this is the only record that the transition is
+  // already under way. verifyInFlight() and the stall sweep both key on it, so
+  // it must exist before anything can observe the gap.
+  logEvent("verify.started", { taskId: task.id, agentId: agent.id });
+
   const result = await runVerify(task.verify_cmd, task.worktree);
 
   // Verification can take minutes — if the task was cancelled (or otherwise
@@ -924,6 +966,84 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
         once: `task:${task.id}:blocked:verify:${priorFails + 1}`,
       },
     );
+  }
+}
+
+/** Grace after a worker's Stop before the sweep will call its task stalled.
+ *  Comfortably longer than the Stop handler's own pre-verify work, so the
+ *  sweep can never race the transition it exists to rescue. */
+const TRANSITION_STALL_GRACE_MS = 60_000;
+
+/** Events that mean SOMETHING has moved this task since its worker stopped —
+ *  a verify run, a status change, or a message delivered into its session.
+ *  `task.transition_stalled` is in the list on purpose: it makes the sweep
+ *  fire at most once per Stop. */
+export const TRANSITION_PROGRESS_EVENTS = [
+  "verify.started",
+  ...VERIFY_DONE_EVENTS,
+  "task.status",
+  "task.review",
+  "task.blocked",
+  "task.reopened",
+  "task.requeued",
+  "task.autocompleted",
+  "task.transition_stalled",
+  "agent.sent",
+];
+
+/**
+ * Rescue a task nothing can advance: its worker ended a turn with a
+ * result_summary, yet the task is still `in_progress` with no verify running
+ * and no other event since that Stop. The Stop hook is the only thing that
+ * promotes a finished worker to `review`, and it runs inside a single HTTP
+ * handler — a daemon restart, a thrown handler, or a lost hook delivery in
+ * that window leaves the work finished and the task permanently parked, with
+ * nothing but a generic "waiting for input" ping to show for it.
+ *
+ * Be loud first (event + Needs You item), then re-drive the same transition
+ * the Stop hook would have. Re-driving re-runs verify_cmd, which is correct:
+ * nothing has verified this result yet.
+ */
+export async function stalledTransitionSweep(
+  opts: { nowMs?: number } = {},
+): Promise<void> {
+  const nowMs = opts.nowMs ?? Date.now();
+  for (const task of listTasks("in_progress")) {
+    if (!task.result_summary || !task.agent_id) continue;
+    const agent = getAgent(task.agent_id);
+    if (!agent || !stopFiredForLatestTurn(agent.id)) continue;
+    const stop = latestAgentEvent(agent.id, ["hook.stop"]);
+    if (!stop || nowMs - Date.parse(stop.ts) < TRANSITION_STALL_GRACE_MS) continue;
+    if (verifyInFlight(task.id, nowMs)) continue;
+    const acted = latestTaskEventId(task.id, TRANSITION_PROGRESS_EVENTS);
+    if (acted !== undefined && acted > stop.id) continue;
+
+    logEvent("task.transition_stalled", {
+      taskId: task.id,
+      agentId: agent.id,
+      payload: { stopped_at: stop.ts, has_verify_cmd: Boolean(task.verify_cmd) },
+    });
+    notifyEvent(
+      "worker_stalled",
+      `task #${task.id} finished but never entered review`,
+      `${task.title}\na${agent.id} stopped with a result at ${stop.ts} and the task is still in_progress with nothing running. Re-driving the transition now — if it stays in_progress, promote it by hand.`,
+      {
+        priority: "high",
+        tags: "warning",
+        taskId: task.id,
+        agentId: agent.id,
+        once: `task:${task.id}:transition_stalled:${stop.id}`,
+      },
+    );
+    try {
+      await transitionOnStop(task, agent);
+    } catch (err) {
+      logEvent("task.transition_retry_failed", {
+        taskId: task.id,
+        agentId: agent.id,
+        payload: { error: err instanceof Error ? err.message : String(err) },
+      });
+    }
   }
 }
 

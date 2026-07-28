@@ -11,6 +11,7 @@ import {
   latestTaskEvent,
   logEvent,
 } from "../db/events.js";
+import { TRANSITION_PROGRESS_EVENTS } from "./hooks.js";
 import { JIRA_SYNC_FAIL_THRESHOLD } from "../lib/jira.js";
 import { normalizePrState } from "../lib/prstate.js";
 import { quotaConditions, quotaIsCritical } from "../lib/quotaalert.js";
@@ -37,6 +38,7 @@ export type AttentionKind =
   | "merge_pr"
   | "merge_and_apply"
   | "decision"
+  | "stalled_transition"
   | "escalation"
   | "stale_waiting"
   | "scheduler_stalled"
@@ -208,6 +210,58 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
       agent_id: t.agent_id,
       pr_url: t.pr_url,
       created_at: t.updated_at,
+    });
+  }
+
+  // --- stalled_transition: the lifecycle itself is stuck. Two shapes, both of
+  //     which used to surface only as a generic idle ping: a worker that
+  //     finished with a result the platform never promoted out of in_progress,
+  //     and a reviewer holding a verdict the task's status refuses. Both are
+  //     anchored to the event that recorded the stall, and both clear as soon
+  //     as anything moves the task — see TRANSITION_PROGRESS_EVENTS. ---------
+  //
+  //     Both are gated on a task status first: this runs on every /api/attention
+  //     poll, and an unfiltered per-task event lookup would be two queries per
+  //     task per poll.
+  for (const t of tasks) {
+    if (t.status !== "in_progress" && t.status !== "blocked") continue;
+    if (t.status === "in_progress" && t.result_summary) {
+      const marker = latestTaskEvent(t.id, TRANSITION_PROGRESS_EVENTS);
+      if (marker?.kind === "task.transition_stalled") {
+        push({
+          id: `stalled_transition:${t.id}:${marker.id}`,
+          kind: "stalled_transition",
+          title: `Stuck after finishing — #${t.id} ${t.title}`,
+          context: `The worker wrote a result but the task never left in_progress. ${excerpt(t.result_summary, 140)}`,
+          severity: "orange",
+          urgent: false,
+          task_id: t.id,
+          agent_id: t.agent_id,
+          pr_url: t.pr_url,
+          created_at: marker.ts,
+        });
+        continue;
+      }
+    }
+    const held = latestTaskEvent(t.id, [
+      "review.verdict_unsubmittable",
+      "review.approved",
+      "review.rejected",
+      "review.verdict_accepted_while_blocked",
+      "task.status",
+    ]);
+    if (held?.kind !== "review.verdict_unsubmittable") continue;
+    push({
+      id: `stalled_transition:verdict:${t.id}:${held.id}`,
+      kind: "stalled_transition",
+      title: `Reviewer verdict blocked — #${t.id} ${t.title}`,
+      context: `A reviewer finished but could not record its verdict: the task is ${t.status}, not review. Move it back to review and have the reviewer re-submit.`,
+      severity: "orange",
+      urgent: false,
+      task_id: t.id,
+      agent_id: held.agent_id,
+      pr_url: t.pr_url,
+      created_at: held.ts,
     });
   }
 

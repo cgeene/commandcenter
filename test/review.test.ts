@@ -171,6 +171,101 @@ describe("handleVerdict", () => {
     );
   });
 
+  // --- a verdict reached while the task was auto-blocked underneath it ------
+  // The reviewer spends minutes on a round; the cycle cap or a repeatedly
+  // failing verify_cmd can block the task in that window. Discarding a
+  // completed review because of it wastes the whole round.
+
+  /** A blocked task with the reviewer that is still judging it alive. */
+  async function setupBlockedWithLiveReviewer(
+    fields: Parameters<typeof setupReviewTask>[0] = {},
+  ) {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    const { task, worker } = await setupReviewTask(fields);
+    const reviewer = createAgent({
+      kind: "reviewer",
+      state: "working",
+      task_id: task.id,
+    });
+    updateTask(task.id, { status: "blocked" });
+    return { task, worker, reviewer };
+  }
+
+  it("a live reviewer's approve is accepted while the task sits blocked", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, reviewer } = await setupBlockedWithLiveReviewer({
+      review_cycles: 2,
+    });
+    await handleVerdict(task.id, reviewer.id, "approve", "verified end to end");
+    const t = getTask(task.id)!;
+    expect(t.review_verdict).toBe("approve");
+    expect(t.review_notes).toContain("verified end to end");
+    // status re-derived from the verdict: back to review for the merge gate
+    expect(t.status).toBe("review");
+    const kinds = listEvents(20).map((e) => e.kind);
+    expect(kinds).toContain("review.approved");
+    expect(kinds).toContain("review.verdict_accepted_while_blocked");
+  });
+
+  it("an approve accepted while blocked completes a doc-only task", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { task, reviewer } = await setupBlockedWithLiveReviewer({
+      open_pr: false,
+    });
+    await handleVerdict(task.id, reviewer.id, "approve", "doc is accurate");
+    expect(getTask(task.id)?.status).toBe("done");
+  });
+
+  it("a reject accepted while blocked is recorded but leaves the block standing", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    setSchedulerConfig({ review_max_cycles: 6 }); // below the cap on purpose
+    const { task, reviewer } = await setupBlockedWithLiveReviewer({
+      review_cycles: 1,
+    });
+    await handleVerdict(task.id, reviewer.id, "reject", "the fix is incomplete");
+    const t = getTask(task.id)!;
+    // NOT resurrected into in_progress/queued — whatever blocked it still holds
+    expect(t.status).toBe("blocked");
+    expect(t.review_verdict).toBe("reject");
+    expect(t.review_notes).toContain("incomplete");
+    expect(t.review_cycles).toBe(2);
+  });
+
+  it("a dead reviewer's verdict on a blocked task is still refused, loudly", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { updateAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, reviewer } = await setupBlockedWithLiveReviewer();
+    updateAgent(reviewer.id, { state: "dead" });
+    await expect(
+      handleVerdict(task.id, reviewer.id, "approve", "n"),
+    ).rejects.toThrow(/blocked/);
+    expect(listEvents(20).map((e) => e.kind)).toContain(
+      "review.verdict_unsubmittable",
+    );
+  });
+
+  it("a refused verdict names the real status instead of failing opaquely", async () => {
+    const { handleVerdict, ReviewStateError } = await import(
+      "../src/daemon/review.js"
+    );
+    const { updateTask } = await import("../src/db/tasks.js");
+    const { task } = await setupReviewTask();
+    updateTask(task.id, { status: "cancelled" });
+    const err = await handleVerdict(task.id, 99, "approve", "n").catch((e) => e);
+    expect(err).toBeInstanceOf(ReviewStateError);
+    expect(err.taskStatus).toBe("cancelled");
+    expect(err.expectedStatus).toBe("review");
+    expect(err.message).toMatch(/cancelled/);
+    expect(err.message).toMatch(/review/);
+  });
+
   it("rejected notes land in the respawned worker's prompt", async () => {
     const { handleVerdict } = await import("../src/daemon/review.js");
     const { getTask } = await import("../src/db/tasks.js");

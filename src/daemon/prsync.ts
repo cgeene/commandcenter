@@ -10,6 +10,7 @@ import {
   type Task,
 } from "../db/tasks.js";
 import { integrationPass } from "./freshen.js";
+import { stalledTransitionSweep } from "./hooks.js";
 import { notifyEvent } from "./notify.js";
 import { notifyApprovedReady, reviewLoopSweep, reviewMaxCycles } from "./review.js";
 import { resumeAgent } from "./resume.js";
@@ -537,6 +538,11 @@ export async function prSyncPass(): Promise<void> {
   // and its carried-over approval are already consistent when the sweep looks at
   // them. Never throws — see integrationPass.
   await integrationPass();
+
+  // Runs BEFORE the review sweep: it is what puts a stranded finished worker's
+  // task into `review` in the first place, so the sweep below can pick it up in
+  // the same pass instead of a poll interval later.
+  await stalledTransitionSweep();
 
   // Safety net for the auto-review loop: catch a stale approval (post-approval
   // push with no clean worker Stop) or any review-status task the Stop-hook

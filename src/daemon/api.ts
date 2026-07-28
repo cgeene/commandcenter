@@ -108,6 +108,7 @@ import {
   confirmHumanPublication,
   handleVerdict,
   PublicationValidationError,
+  ReviewStateError,
   taskDiff,
 } from "./review.js";
 import { clearReviewSnapshot } from "./reviewsnapshot.js";
@@ -2007,6 +2008,18 @@ export function buildApp(): Hono {
     }
     if (err instanceof WorkerSpawnValidationError) {
       return c.json({ error: err.message }, 409);
+    }
+    // A reviewer reads this straight out of submit_review, so it must name the
+    // conflict it has to act on rather than a generic failure.
+    if (err instanceof ReviewStateError) {
+      return c.json(
+        {
+          error: err.message,
+          task_status: err.taskStatus,
+          expected_status: err.expectedStatus,
+        },
+        err.taskStatus === null ? 404 : 409,
+      );
     }
     // Do not expose stack traces, local paths, command output, or provider
     // details through the browser/API boundary.
