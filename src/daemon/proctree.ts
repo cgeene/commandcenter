@@ -29,7 +29,11 @@ const NO_TTY = new Set(["??", "?", "-", ""]);
 
 /** Grace between SIGTERM and SIGKILL. Overridable so tests don't sleep. */
 function graceMs(): number {
-  const raw = Number(process.env.CC_REAP_GRACE_MS);
+  // A blank or whitespace-only value is "unset", not "zero grace" — Number("")
+  // is 0, which would turn SIGTERM into an immediate SIGKILL.
+  const configured = process.env.CC_REAP_GRACE_MS?.trim();
+  if (!configured) return 3000;
+  const raw = Number(configured);
   return Number.isFinite(raw) && raw >= 0 ? raw : 3000;
 }
 
@@ -223,11 +227,14 @@ function hookShutdownFlush(): void {
     flushPendingEscalations();
   });
   for (const sig of ["SIGTERM", "SIGINT"] as const) {
-    process.on(sig, () => {
+    // Remove only this handler before re-raising — removeAllListeners would
+    // silently disable anyone else's shutdown handler (including vitest's).
+    const handler = (): void => {
       flushPendingEscalations();
-      process.removeAllListeners(sig);
+      process.off(sig, handler);
       process.kill(process.pid, sig);
-    });
+    };
+    process.on(sig, handler);
   }
 }
 
@@ -305,25 +312,70 @@ export function terminatePaneTree(pane: PaneProcess): number[] {
  *    only reachable while the pane is alive, via terminatePaneTree, which is
  *    why every deliberate reap tears the tree down before the window goes.
  */
-export function sweepVanishedPaneGroup(panePid: number, paneAgeSec: number): number[] {
-  if (!Number.isInteger(panePid) || panePid <= 1) return [];
-  const procs = snapshotProcesses();
-  const paneRow = procs.find((p) => p.pid === panePid);
-  // The pane shell is alive: the window did not actually vanish (or the pid was
-  // reused by something outside this group). Leave it to the live-pane path.
-  if (paneRow && paneRow.pgid === panePid) return [];
-
-  const protectedPids = selfAncestry(procs);
-  // Allow a minute of slack: spawned_at is recorded slightly before the pane
-  // starts, and etime has second granularity.
+/**
+ * Members of `panePid`'s process group that plausibly belong to that pane.
+ *
+ * Pids are reused, so a pid that once identified a pane can later name an
+ * unrelated process group. The age check is what separates the two: nothing in
+ * the pane's group can have started before the pane itself, so a group that
+ * predates the agent is somebody else's and is left alone. A minute of slack
+ * covers the gap between `spawned_at` and the pane actually starting, plus
+ * `etime`'s one-second granularity.
+ */
+export function vanishedPaneSeeds(
+  panePid: number,
+  paneAgeSec: number,
+  procs: readonly ProcRow[],
+  protectedPids: ReadonlySet<number>,
+): ProcRow[] {
   const maxAgeSec = paneAgeSec + 60;
-  const seeds = procs.filter(
+  return procs.filter(
     (p) => p.pgid === panePid && !protectedPids.has(p.pid) && p.elapsedSec <= maxAgeSec,
   );
-  if (seeds.length === 0) return [];
+}
+
+export type PaneSweepOutcome =
+  /** Found leftovers and signalled them. */
+  | "swept"
+  /** Looked properly and there was nothing left to kill. */
+  | "clean"
+  /** Could not look, or the pane is demonstrably still alive. Nothing was
+   *  done and the caller must KEEP the recorded pane pid — it is still the
+   *  only handle on this pane. */
+  | "declined";
+
+export interface PaneSweepResult {
+  outcome: PaneSweepOutcome;
+  /** pids signalled; empty unless `outcome` is "swept". */
+  killed: number[];
+}
+
+export function sweepVanishedPaneGroup(
+  panePid: number,
+  paneAgeSec: number,
+): PaneSweepResult {
+  // Not a usable handle in the first place — nothing to do and nothing to keep.
+  if (!Number.isInteger(panePid) || panePid <= 1) {
+    return { outcome: "clean", killed: [] };
+  }
+  const procs = snapshotProcesses();
+  // No snapshot means no observation. Saying "clean" here would throw away the
+  // handle on the strength of a failed `ps`.
+  if (procs.length === 0) return { outcome: "declined", killed: [] };
+
+  const paneRow = procs.find((p) => p.pid === panePid);
+  // The pane shell is alive and still leads its group: the pane did not vanish
+  // at all (a false vanish, or a reap racing a live pane). Leave it to the
+  // live-pane path, and leave the recorded pid in place — clearing it here
+  // would disarm the sweep for this agent's real death later on.
+  if (paneRow && paneRow.pgid === panePid) return { outcome: "declined", killed: [] };
+
+  const protectedPids = selfAncestry(procs);
+  const seeds = vanishedPaneSeeds(panePid, paneAgeSec, procs, protectedPids);
+  if (seeds.length === 0) return { outcome: "clean", killed: [] };
 
   const tree = collectProcessTree(seeds, procs, protectedPids);
   for (const p of tree) signal(p.pid, "SIGTERM");
   scheduleEscalation(tree);
-  return tree.map((p) => p.pid);
+  return { outcome: "swept", killed: tree.map((p) => p.pid) };
 }

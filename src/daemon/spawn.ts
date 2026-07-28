@@ -1038,6 +1038,7 @@ export function paneAgeSeconds(agent: Agent, nowMs = Date.now()): number {
  */
 function reapPaneProcesses(agent: Agent, liveWindow: boolean): number[] {
   const killed: number[] = [];
+  let paneHandled = true;
   if (agent.tmux_target && liveWindow) {
     // Kills the pane's whole process tree, not just its window: an agent that
     // backgrounded a load generator, watcher or dev server would otherwise
@@ -1050,9 +1051,15 @@ function reapPaneProcesses(agent: Agent, liveWindow: boolean): number[] {
   // the pane pid recorded at spawn is now the only trustworthy handle on
   // whatever the agent left running.
   if (killed.length === 0 && agent.pane_pid) {
-    killed.push(...sweepVanishedPaneGroup(agent.pane_pid, paneAgeSeconds(agent)));
+    const sweep = sweepVanishedPaneGroup(agent.pane_pid, paneAgeSeconds(agent));
+    killed.push(...sweep.killed);
+    paneHandled = sweep.outcome !== "declined";
   }
-  if (agent.pane_pid !== null) updateAgent(agent.id, { pane_pid: null });
+  // Only give up the handle once it has actually been acted on. A declined
+  // sweep looked at a live pane (or could not look at all) and did nothing.
+  if (agent.pane_pid !== null && paneHandled) {
+    updateAgent(agent.id, { pane_pid: null });
+  }
   return killed;
 }
 

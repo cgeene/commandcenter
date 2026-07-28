@@ -10,6 +10,7 @@ import {
   selfAncestry,
   snapshotProcesses,
   sweepVanishedPaneGroup,
+  vanishedPaneSeeds,
   terminatePaneTree,
   type ProcRow,
 } from "../src/daemon/proctree.js";
@@ -274,39 +275,13 @@ describe("sweepVanishedPaneGroup (real processes)", () => {
     const orphans = snapshotProcesses().filter((p) => p.pgid === pgid);
     expect(orphans.length).toBeGreaterThan(0);
 
-    const killed = sweepVanishedPaneGroup(pgid, 3600);
-    expect(killed.length).toBeGreaterThan(0);
-    expect(await waitForExit(killed)).toEqual([]);
+    const sweep = sweepVanishedPaneGroup(pgid, 3600);
+    expect(sweep.outcome).toBe("swept");
+    expect(sweep.killed.length).toBeGreaterThan(0);
+    expect(await waitForExit(sweep.killed)).toEqual([]);
   });
 
-  it("ignores a process group older than the agent that supposedly owns it", async () => {
-    const leader = spawn("/bin/sh", ["-c", "(while :; do sleep 1; done) & sleep 600"], {
-      detached: true,
-      stdio: "ignore",
-    });
-    leader.unref();
-    await new Promise((r) => setTimeout(r, 700));
-    const pgid = leader.pid!;
-    process.kill(pgid, "SIGKILL");
-    await new Promise((r) => setTimeout(r, 300));
-
-    // paneAgeSec 0 (+60s slack) still admits these; a negative age never can,
-    // which is the pid-reuse guard doing its job.
-    expect(sweepVanishedPaneGroup(pgid, -3600)).toEqual([]);
-    const spared = snapshotProcesses().filter((p) => p.pgid === pgid);
-    expect(spared.length).toBeGreaterThan(0);
-
-    for (const p of spared) {
-      try {
-        process.kill(p.pid, "SIGKILL");
-      } catch {
-        // already gone
-      }
-    }
-    expect(await waitForExit(spared.map((p) => p.pid))).toEqual([]);
-  });
-
-  it("declines to sweep a group whose leader is still alive", async () => {
+  it("declines to sweep a group whose leader is still alive, and keeps the handle", async () => {
     const leader = spawn("/bin/sh", ["-c", "sleep 600"], {
       detached: true,
       stdio: "ignore",
@@ -314,15 +289,61 @@ describe("sweepVanishedPaneGroup (real processes)", () => {
     leader.unref();
     await new Promise((r) => setTimeout(r, 400));
 
-    expect(sweepVanishedPaneGroup(leader.pid!, 3600)).toEqual([]);
+    // "declined", not "clean": callers must keep pane_pid on this path, or a
+    // false vanish would disarm the sweep for the agent's real death.
+    expect(sweepVanishedPaneGroup(leader.pid!, 3600)).toEqual({
+      outcome: "declined",
+      killed: [],
+    });
     expect(alive(leader.pid!)).toBe(true);
 
     process.kill(leader.pid!, "SIGKILL");
   });
 
   it("rejects nonsense pids", () => {
-    expect(sweepVanishedPaneGroup(1, 3600)).toEqual([]);
-    expect(sweepVanishedPaneGroup(0, 3600)).toEqual([]);
-    expect(sweepVanishedPaneGroup(-5, 3600)).toEqual([]);
+    for (const pid of [1, 0, -5]) {
+      expect(sweepVanishedPaneGroup(pid, 3600)).toEqual({
+        outcome: "clean",
+        killed: [],
+      });
+    }
+  });
+});
+
+describe("vanishedPaneSeeds (pid-reuse age guard)", () => {
+  // The case the guard exists for: pid 500 was an agent's pane long ago, the
+  // agent is gone, and pid 500 has since been reused as the leader of somebody
+  // else's process group. That group is older than the agent that is asking, so
+  // none of it may be touched.
+  const olderGroup = [
+    row(500, 1, 500, "", 7200),
+    row(501, 500, 500, "", 7100),
+  ];
+
+  it("selects nothing when the group predates the agent", () => {
+    expect(vanishedPaneSeeds(500, 30, olderGroup, new Set())).toEqual([]);
+  });
+
+  it("selects the group when it is younger than the agent", () => {
+    // Same pids, but started after the agent did — genuinely this pane's.
+    const ours = [row(500, 1, 500, "", 20), row(501, 500, 500, "", 15)];
+    expect(vanishedPaneSeeds(500, 30, ours, new Set()).map((p) => p.pid)).toEqual([
+      500, 501,
+    ]);
+  });
+
+  it("admits a member up to the clock-skew slack but not beyond it", () => {
+    const agentAgeSec = 30;
+    const justInside = [row(500, 1, 500, "", agentAgeSec + 60)];
+    const justOutside = [row(500, 1, 500, "", agentAgeSec + 61)];
+    expect(vanishedPaneSeeds(500, agentAgeSec, justInside, new Set())).toHaveLength(1);
+    expect(vanishedPaneSeeds(500, agentAgeSec, justOutside, new Set())).toEqual([]);
+  });
+
+  it("never selects a protected pid", () => {
+    const ours = [row(500, 1, 500, "", 10), row(501, 500, 500, "", 10)];
+    expect(
+      vanishedPaneSeeds(500, 30, ours, new Set([501])).map((p) => p.pid),
+    ).toEqual([500]);
   });
 });

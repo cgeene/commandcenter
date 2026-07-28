@@ -20,7 +20,7 @@ import { flushMainQueue } from "./notifqueue.js";
 import { notify } from "./notify.js";
 import { parsePane, type PendingPermission } from "./pane.js";
 import { killAgent, paneAgeSeconds, spawnWorker } from "./spawn.js";
-import { sweepVanishedPaneGroup } from "./proctree.js";
+import { sweepVanishedPaneGroup, type PaneSweepResult } from "./proctree.js";
 import {
   capturePane,
   listLiveWindowIds,
@@ -44,7 +44,7 @@ export interface SchedulerDeps {
   now: () => Date;
   pendingPermission?: (agent: Agent) => PendingPermission | null;
   /** Kill what a vanished agent left running in its pane's process group. */
-  sweepPaneGroup?: (panePid: number, ageSec: number) => number[];
+  sweepPaneGroup?: (panePid: number, ageSec: number) => PaneSweepResult;
 }
 
 const defaultDeps: SchedulerDeps = {
@@ -398,15 +398,27 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
       // branch never calls killAgent (the task is requeued, not cancelled), so
       // the sweep has to happen here or nowhere. Clearing pane_pid marks the
       // pane swept; leaving it set would let a later kill sweep it twice.
-      const swept =
+      const sweep =
         agent.pane_pid !== null
           ? sweepPaneGroup(agent.pane_pid, paneAgeSeconds(agent, nowMs))
-          : [];
-      updateAgent(agent.id, { state: "dead", pane_pid: null });
+          : null;
+      // A declined sweep means the pane is demonstrably still alive — this is a
+      // false vanish, which recoverFalseVanishes may well undo on a later pass.
+      // Keep pane_pid: recovery restores only `state`, so clearing it here
+      // would leave a live agent with no handle and permanently disarm the
+      // sweep for its eventual real death.
+      const paneHandled = sweep !== null && sweep.outcome !== "declined";
+      updateAgent(agent.id, {
+        state: "dead",
+        ...(paneHandled ? { pane_pid: null } : {}),
+      });
       logEvent("agent.vanished", {
         agentId: agent.id,
         taskId: agent.task_id ?? undefined,
-        payload: swept.length > 0 ? { swept_pids: swept } : undefined,
+        payload:
+          sweep && sweep.killed.length > 0
+            ? { swept_pids: sweep.killed }
+            : undefined,
       });
       const task = agent.task_id ? getTask(agent.task_id) : undefined;
       if (task && ["in_progress", "claimed"].includes(task.status)) {

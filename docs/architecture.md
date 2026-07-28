@@ -81,9 +81,16 @@ Each agent's pane pid is recorded at spawn as a fallback handle. It is used
 whenever the live-pane teardown finds nothing — the window vanished, or
 `remain-on-exit` is holding a pane corpse whose reported pid is stale — and the
 watchdog's vanish branch uses it too, since that branch requeues the task
-rather than calling the kill path. The recorded pid is cleared once swept, so a
-later kill neither re-sweeps nor skips an agent that was never swept. The sweep
-ignores processes older than the agent, so a reused pid cannot be hit.
+rather than calling the kill path.
+
+The recorded pid is released only once the sweep has actually acted on the
+pane, so a later kill neither re-sweeps nor skips an agent that was never
+swept. The sweep reports back whether it *declined* — the pane's process group
+leader is still alive (a false vanish, which the watchdog may later recover),
+or `ps` could not be read at all — and on that path the handle is kept. Dropping
+it there would leave a live agent with no handle at all, because recovery
+restores only the agent's state. The sweep also ignores processes older than
+the agent, so a reused pid cannot be hit.
 
 That fallback reaches leftovers still in the pane's process group — in practice
 the ones that ignore `SIGHUP`, since the pty hangup kills the rest of the group

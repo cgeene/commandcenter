@@ -20,7 +20,10 @@ vi.mock("../src/daemon/tmux.js", () => ({
   sendEnter: () => {},
 }));
 
-const sweepVanishedPaneGroup = vi.fn((_pgid: number, _ageSec: number) => [5001]);
+const sweepVanishedPaneGroup = vi.fn((_pgid: number, _ageSec: number) => ({
+  outcome: "swept" as const,
+  killed: [5001],
+}));
 vi.mock("../src/daemon/proctree.js", () => ({
   sweepVanishedPaneGroup: (pgid: number, ageSec: number) =>
     sweepVanishedPaneGroup(pgid, ageSec),
@@ -35,6 +38,7 @@ beforeEach(async () => {
   windowExists.mockClear();
   windowExists.mockReturnValue(true);
   sweepVanishedPaneGroup.mockClear();
+  sweepVanishedPaneGroup.mockReturnValue({ outcome: "swept", killed: [5001] });
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
 });
@@ -102,6 +106,43 @@ describe("killAgent process teardown", () => {
 
     expect(sweepVanishedPaneGroup).toHaveBeenCalledTimes(1);
     expect(sweepVanishedPaneGroup.mock.calls[0][0]).toBe(9182);
+  });
+
+  it("keeps the pane pid when the sweep declines (the pane is still alive)", async () => {
+    // Mirrors the watchdog's false-vanish case at the kill path: nothing was
+    // swept, so the handle must survive for the agent's eventual real death.
+    const { killAgent } = await import("../src/daemon/spawn.js");
+    const { createAgent, updateAgent, getAgent } = await import("../src/db/agents.js");
+    const worker = createAgent({
+      kind: "worker",
+      state: "working",
+      tmux_target: "cc:@4",
+    });
+    updateAgent(worker.id, { pane_pid: 9182 });
+    windowExists.mockReturnValue(false);
+    sweepVanishedPaneGroup.mockReturnValue({ outcome: "declined", killed: [] });
+
+    killAgent(worker.id);
+
+    expect(sweepVanishedPaneGroup).toHaveBeenCalledTimes(1);
+    expect(getAgent(worker.id)?.pane_pid).toBe(9182);
+  });
+
+  it("releases the pane pid when the sweep looked and found nothing", async () => {
+    const { killAgent } = await import("../src/daemon/spawn.js");
+    const { createAgent, updateAgent, getAgent } = await import("../src/db/agents.js");
+    const worker = createAgent({
+      kind: "worker",
+      state: "working",
+      tmux_target: "cc:@4",
+    });
+    updateAgent(worker.id, { pane_pid: 9182 });
+    windowExists.mockReturnValue(false);
+    sweepVanishedPaneGroup.mockReturnValue({ outcome: "clean", killed: [] });
+
+    killAgent(worker.id);
+
+    expect(getAgent(worker.id)?.pane_pid).toBeNull();
   });
 
   it("early-returns for a dead agent whose pane was already swept", async () => {
