@@ -850,6 +850,59 @@ dd { font-family: var(--font-mono); word-break: break-all; }
   flex: 1; padding: var(--panel-pad);
   display: flex; flex-direction: column; gap: var(--space-7);
 }
+
+/* --- spend / quota --------------------------------------------------- *
+ * The headline widget is shared by the Tokens tab and the dashboard's
+ * spend panel, so it styles itself and inherits the surrounding panel's
+ * background rather than setting one. */
+.spend-headline { display: flex; flex-direction: column; gap: var(--space-5); }
+.spend-top {
+  display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--space-3);
+}
+.spend-top b { font-size: 28px; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.spend-top b.ok { color: var(--green); }
+.spend-top b.warn { color: var(--yellow); }
+.spend-top b.bad { color: var(--red); }
+.spend-note { font-size: var(--font-size-small); margin: 0; }
+.spend-note.bad { color: var(--red); }
+.meter-reset { font-size: var(--font-size-small); }
+.bar-fill.quota { background: var(--blue); }
+.bar-fill.quota.ok { background: var(--green); }
+.bar-fill.quota.warn { background: var(--yellow); }
+.bar-fill.quota.bad { background: var(--red); }
+.panel-subhead {
+  font-size: var(--font-size-small); text-transform: uppercase;
+  letter-spacing: 0.06em; margin-top: var(--space-5);
+}
+.view-toggle { display: flex; gap: var(--space-3); }
+.linkish {
+  background: none; border: none; color: var(--muted-strong);
+  text-decoration: underline; cursor: pointer; padding: 0; font: inherit;
+  font-size: var(--font-size-small);
+}
+.linkish:disabled { cursor: default; opacity: 0.6; text-decoration: none; }
+
+/* Daily burn bars. position:relative anchors the absolute pace line, which
+   is positioned from the bottom so it lines up with the bars' baseline. */
+.burn-chart-wrap { display: flex; flex-direction: column; gap: var(--space-3); }
+.burn-chart {
+  position: relative; display: flex; align-items: flex-end;
+  gap: 2px; height: 120px; padding-top: var(--space-3);
+}
+.burn-day { flex: 1; height: 100%; display: flex; align-items: flex-end; }
+.burn-bar {
+  width: 100%; border-radius: 2px 2px 0 0;
+  background: linear-gradient(180deg, var(--accent), var(--blue));
+}
+.burn-day.today .burn-bar { background: var(--yellow); }
+.pace-line {
+  position: absolute; left: 0; right: 0; height: 0;
+  border-top: 1px dashed var(--border-strong); pointer-events: none;
+}
+.legend-dot.pace { background: var(--border-strong); }
+/* Travels with the burn chart so it can't be read as billing data, including
+   on the mission-control panel that leads with a live "org usage data" chip. */
+.estimate-tag { color: var(--muted); font-style: italic; }
 .stat-cards { display: flex; flex-wrap: wrap; gap: var(--space-5); }
 .stat-card {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent), var(--panel);

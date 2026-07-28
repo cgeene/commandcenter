@@ -216,8 +216,45 @@ CREATE TABLE IF NOT EXISTS queued_notifications (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- Per-day token burn, the time dimension tasks.tokens_used lacks (that column
+-- is a lifetime per-task total, overwritten in place, so it can never answer
+-- "how much did we spend this billing cycle"). Written at the worker Stop hook
+-- from the DELTA since that session's last sample, bucketed by the UTC day the
+-- sample landed on. Rows are append-only in effect: a second sample on the same
+-- day adds to the same row, a sample after midnight opens a new one.
+-- cache_creation is the TOTAL of both cache-write TTLs; cache_creation_1h is
+-- the 1-hour-TTL subset, which bills at 2x input instead of 1.25x.
+CREATE TABLE IF NOT EXISTS token_daily (
+  day               TEXT NOT NULL,
+  agent_kind        TEXT NOT NULL,
+  model             TEXT NOT NULL,
+  input_tokens      INTEGER NOT NULL DEFAULT 0,
+  output_tokens     INTEGER NOT NULL DEFAULT 0,
+  cache_read        INTEGER NOT NULL DEFAULT 0,
+  cache_creation    INTEGER NOT NULL DEFAULT 0,
+  cache_creation_1h INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, agent_kind, model)
+);
+
+-- High-water mark of what token_daily has already absorbed, per (session,
+-- model). Transcripts hold cumulative session totals, so the delta we owe the
+-- day bucket is (transcript total - watermark). Keyed by session so a fresh
+-- session starts from zero and a resumed one doesn't double-count its history.
+CREATE TABLE IF NOT EXISTS token_samples (
+  session_id        TEXT NOT NULL,
+  model             TEXT NOT NULL,
+  input_tokens      INTEGER NOT NULL DEFAULT 0,
+  output_tokens     INTEGER NOT NULL DEFAULT 0,
+  cache_read        INTEGER NOT NULL DEFAULT 0,
+  cache_creation    INTEGER NOT NULL DEFAULT 0,
+  cache_creation_1h INTEGER NOT NULL DEFAULT 0,
+  sampled_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (session_id, model)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
+CREATE INDEX IF NOT EXISTS idx_token_daily_day ON token_daily(day);
 `;
 
 /** Additive migrations for columns that postdate the original CREATE TABLE. */
@@ -355,6 +392,17 @@ function migrate(db: Database.Database): void {
   }
   if (!cronCols.includes("auto_review")) {
     db.exec("ALTER TABLE crons ADD COLUMN auto_review INTEGER NOT NULL DEFAULT 1");
+  }
+  // cache_creation_1h postdates the original burn tables: a database created
+  // between the two needs the column added rather than silently costing every
+  // 1-hour cache write at the cheaper 5-minute rate.
+  for (const table of ["token_daily", "token_samples"]) {
+    const cols = (db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(
+      (c) => c.name,
+    );
+    if (cols.length > 0 && !cols.includes("cache_creation_1h")) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN cache_creation_1h INTEGER NOT NULL DEFAULT 0`);
+    }
   }
   const memCols = (db.prepare("PRAGMA table_info(memories)").all() as { name: string }[]).map(
     (c) => c.name,
