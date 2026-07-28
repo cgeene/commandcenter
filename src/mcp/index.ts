@@ -54,7 +54,7 @@ const REVIEW_MODE_SCHEMA = z
   .enum(["full", "light"])
   .optional()
   .describe(
-    "how hard the adversarial reviewer works (default 'full'). 'light' = a diff-scoped read with no independent re-verification: use ONLY for documentation, threshold, and runbook changes. NEVER for prod-mutating work or code-logic changes, however small. When in doubt, leave it 'full'.",
+    "how hard the adversarial reviewer works (default 'full'). 'light' = a diff-scoped read with no independent re-verification: use ONLY for documentation, threshold, and runbook changes, UI-only changes confined to web/src, and test-only changes. 'full' stays MANDATORY for daemon logic, policy/permissions, migrations, and prod-mutating work, however small. When in doubt, leave it 'full'.",
   );
 
 // Read tools default to a compact projection; these opt back into more.
