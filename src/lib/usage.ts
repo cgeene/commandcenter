@@ -225,6 +225,32 @@ export function pickHeadline(meters: UsageMeter[]): UsageMeter | null {
   });
 }
 
+/** The parts of the cached org cost report the UI needs to judge usability. */
+export interface OrgCostSnapshot {
+  total_usd: number | null;
+  cycle_start: string | null;
+  fetched_at: string | null;
+}
+
+/**
+ * Org billing dollars, but only if they describe the cycle being displayed.
+ *
+ * The cache is deliberately sticky: a failed poll keeps the previous figures
+ * so a transient 401 or network blip doesn't blank the number, and removing
+ * the admin key stops the poller without clearing what it last saw. The cost
+ * of that stickiness is that a July cache outlives July. Showing July's
+ * dollars against August's quota under an "org billing" label would be worse
+ * than falling back to the local estimate — so the window has to match.
+ */
+export function orgCycleSpend(
+  org: OrgCostSnapshot,
+  cycleStart: string,
+): { usd: number; fetched_at: string | null } | null {
+  if (org.total_usd === null) return null;
+  if (!org.cycle_start || org.cycle_start !== cycleStart) return null;
+  return { usd: org.total_usd, fetched_at: org.fetched_at };
+}
+
 /** "resets in 2h 40m" / "resets in 3d". Empty string when unknown or past. */
 export function resetsIn(resetsAt: string | null, now: Date): string {
   if (!resetsAt) return "";

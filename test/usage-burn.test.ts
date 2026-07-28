@@ -231,6 +231,22 @@ describe("delta bucketing", () => {
     expect(row.cache_creation_1h).toBeLessThanOrEqual(row.cache_creation);
   });
 
+  it("prunes watermarks for long-dead sessions but keeps live ones", async () => {
+    const { recordTokenSample, pruneTokenSamples } = await import("../src/db/tokens.js");
+    const { getDb } = await import("../src/db/db.js");
+    recordTokenSample("old", "worker", new Map([["claude-opus-5", counts(10, 1)]]));
+    recordTokenSample("new", "worker", new Map([["claude-opus-5", counts(10, 1)]]));
+    getDb()
+      .prepare("UPDATE token_samples SET sampled_at = '2020-01-01T00:00:00.000Z' WHERE session_id = 'old'")
+      .run();
+
+    expect(pruneTokenSamples()).toBe(1);
+    const left = getDb().prepare("SELECT session_id FROM token_samples").all() as {
+      session_id: string;
+    }[];
+    expect(left.map((r) => r.session_id)).toEqual(["new"]);
+  });
+
   it("records nothing for an empty sample", async () => {
     const { recordTokenSample, allBuckets } = await import("../src/db/tokens.js");
     recordTokenSample("s1", "worker", new Map());
@@ -399,6 +415,12 @@ describe("quota settings", () => {
 });
 
 describe("live usage poller", () => {
+  // Opt-in is off by default now, so the tests that exercise the poller must
+  // enable it explicitly (the opt-in tests below clear it again).
+  beforeEach(() => {
+    process.env.CC_LIVE_USAGE = "1";
+  });
+
   const OK_PAYLOAD = {
     limits: [
       { kind: "session", percent: 57, resets_at: "2026-07-28T02:40:00Z" },
@@ -495,8 +517,10 @@ describe("live usage poller", () => {
     mod._setCredentialReader(null);
   });
 
-  it("stays inert when disabled by env", async () => {
-    process.env.CC_LIVE_USAGE = "0";
+  it("never touches the credential unless explicitly opted in", async () => {
+    // Reading Claude Code's stored OAuth token is opt-in: with CC_LIVE_USAGE
+    // unset the daemon must not go near the keychain, at boot or over HTTP.
+    delete process.env.CC_LIVE_USAGE;
     const mod = await import("../src/daemon/usagelive.js");
     mod._resetLiveUsageState();
     let called = false;
@@ -506,8 +530,35 @@ describe("live usage poller", () => {
     });
     const state = await mod.refreshLiveUsage();
     expect(called).toBe(false);
-    expect(state.error).toMatch(/disabled/i);
+    expect(state.error).toMatch(/CC_LIVE_USAGE/);
     mod._setCredentialReader(null);
+  });
+
+  it("stays off for an explicit opt-out and any non-affirmative value", async () => {
+    const mod = await import("../src/daemon/usagelive.js");
+    const { liveUsageEnabled } = await import("../src/config.js");
+    for (const v of ["0", "false", "no", "", "maybe"]) {
+      process.env.CC_LIVE_USAGE = v;
+      expect(liveUsageEnabled(), v).toBe(false);
+    }
+    process.env.CC_LIVE_USAGE = "0";
+    mod._resetLiveUsageState();
+    let called = false;
+    mod._setCredentialReader(() => {
+      called = true;
+      return undefined;
+    });
+    await mod.refreshLiveUsage();
+    expect(called).toBe(false);
+    mod._setCredentialReader(null);
+  });
+
+  it("arms only for an affirmative opt-in value", async () => {
+    const { liveUsageEnabled } = await import("../src/config.js");
+    for (const v of ["1", "true", "yes", "TRUE"]) {
+      process.env.CC_LIVE_USAGE = v;
+      expect(liveUsageEnabled(), v).toBe(true);
+    }
   });
 });
 

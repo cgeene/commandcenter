@@ -162,10 +162,19 @@ export function anthropicAdminKey(): string | undefined {
   return process.env.CC_ANTHROPIC_ADMIN_KEY?.trim() || undefined;
 }
 
-/** Kill switch for the live Claude-usage poller, which reads the OAuth token
- *  Claude Code already keeps on this machine. Set CC_LIVE_USAGE=0 to opt out. */
+/**
+ * Opt-in switch for the live Claude-usage poller.
+ *
+ * OFF unless CC_LIVE_USAGE=1. That poller reads the OAuth access token Claude
+ * Code stores on this machine (macOS keychain / ~/.claude/.credentials.json)
+ * and sends it to an undocumented endpoint. Reading a credential the daemon
+ * has never previously touched is the operator's decision to make, not a
+ * default — so it is gated exactly like CC_ANTHROPIC_ADMIN_KEY gates the org
+ * cost report: absent env, the subsystem never arms and costs nothing.
+ */
 export function liveUsageEnabled(): boolean {
-  return (process.env.CC_LIVE_USAGE?.trim() ?? "1") !== "0";
+  const raw = process.env.CC_LIVE_USAGE?.trim().toLowerCase() ?? "";
+  return raw === "1" || raw === "true" || raw === "yes";
 }
 
 /** Directory holding Claude Code's own state, including the Linux/WSL

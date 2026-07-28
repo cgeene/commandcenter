@@ -12,6 +12,7 @@ import {
 } from "../src/lib/pricing.js";
 import {
   normalizeOauthUsage,
+  orgCycleSpend,
   pickHeadline,
   resetsIn,
   type UsageMeter,
@@ -328,6 +329,48 @@ describe("live usage normalizer", () => {
       expect(u.meters).toEqual([]);
       expect(u.headline).toBeNull();
     }
+  });
+});
+
+describe("org cost cache usability", () => {
+  const fresh = {
+    total_usd: 123.45,
+    cycle_start: "2026-08-01",
+    fetched_at: "2026-08-05T10:00:00Z",
+  };
+
+  it("uses the org figure when it describes the cycle on screen", () => {
+    expect(orgCycleSpend(fresh, "2026-08-01")).toEqual({
+      usd: 123.45,
+      fetched_at: "2026-08-05T10:00:00Z",
+    });
+  });
+
+  it("refuses a cache built for a previous cycle", () => {
+    // The realistic failure: July's cache is kept through an August poll
+    // failure (401 after a key rotation, or the admin key being removed, both
+    // of which leave the previous figures in place). Showing July's dollars
+    // against August's quota under an "org billing" label would silently
+    // override the correct local estimate.
+    const stale = { ...fresh, cycle_start: "2026-07-01" };
+    expect(orgCycleSpend(stale, "2026-08-01")).toBeNull();
+  });
+
+  it("refuses a cache with no recorded window", () => {
+    expect(orgCycleSpend({ ...fresh, cycle_start: null }, "2026-08-01")).toBeNull();
+  });
+
+  it("reports nothing when the report never succeeded", () => {
+    expect(orgCycleSpend({ total_usd: null, cycle_start: null, fetched_at: null }, "2026-08-01"))
+      .toBeNull();
+  });
+
+  it("keeps a genuine zero-spend cycle rather than treating it as missing", () => {
+    expect(orgCycleSpend({ ...fresh, total_usd: 0 }, "2026-08-01")?.usd).toBe(0);
+  });
+
+  it("carries fetched_at through so the UI can show freshness", () => {
+    expect(orgCycleSpend(fresh, "2026-08-01")?.fetched_at).toBe("2026-08-05T10:00:00Z");
   });
 });
 

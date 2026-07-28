@@ -358,6 +358,9 @@ export interface AppSettings {
     stored: { monthly_quota_usd: number | null; cycle_reset_day: number };
     /** Derived from CC_ANTHROPIC_ADMIN_KEY — the key itself never crosses. */
     admin_key_set: boolean;
+    /** Whether the daemon was opted into reading Claude Code's stored OAuth
+     *  credential (CC_LIVE_USAGE=1). Off unless explicitly enabled. */
+    live_usage_enabled: boolean;
   };
   jira: {
     stored: JiraConfig;

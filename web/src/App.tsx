@@ -29,7 +29,7 @@ import {
   setBrowserAlerts,
 } from "../../src/lib/app-attention";
 import { Terminal } from "./Terminal";
-import { resetsIn } from "../../src/lib/usage";
+import { orgCycleSpend as orgCycleSpendFor, resetsIn } from "../../src/lib/usage";
 import { projectedCycleSpend } from "../../src/lib/pricing";
 import type {
   Agent,
@@ -1225,19 +1225,61 @@ function useUsage(): {
  * invisible on the machines that matter. Percent meters and a dollar budget
  * answer different questions and are shown together.
  */
+/**
+ * Org billing dollars for the CURRENT cycle, or null.
+ *
+ * The org cache is only usable when it was built for the cycle we're showing.
+ * It is deliberately kept across failures (a 401 after a key rotation, a
+ * network blip, the admin key being removed) so a transient error doesn't blank
+ * the figure — but that same stickiness means a cache from July survives into
+ * August. Presenting July's dollars against August's quota, labelled "org
+ * billing", would be worse than falling back to the estimate. So: window must
+ * match, or we don't use it.
+ */
+function orgCycleSpend(usage: UsagePayload): { usd: number; fetched_at: string | null } | null {
+  return orgCycleSpendFor(usage.org, usage.local.cycle.start);
+}
+
+/** "as of Jul 20" — freshness for a figure that only refreshes hourly and can
+ *  sit unchanged through an outage. */
+function asOf(fetchedAt: string | null): string {
+  if (!fetchedAt) return "";
+  const t = Date.parse(fetchedAt);
+  if (!Number.isFinite(t)) return "";
+  return new Date(t).toISOString().slice(0, 10);
+}
+
+/**
+ * Points at Settings when no budget is configured.
+ *
+ * Rendered on every path, including the live-feed branch and the compact
+ * mission-control panel. The live meters report plan windows as percentages
+ * and say nothing about dollars, so without this a quota is simply an
+ * undiscoverable feature on exactly the machines where the live feed works.
+ */
+function QuotaHint({ usage }: { usage: UsagePayload }) {
+  if (usage.quota.monthly_quota_usd !== null) return null;
+  return (
+    <p className="spend-note muted">
+      No monthly quota set — add one in Settings to draw a budget line against cycle burn.
+    </p>
+  );
+}
+
 function QuotaBudgetBar({ usage }: { usage: UsagePayload }) {
   const quota = usage.quota.monthly_quota_usd;
   if (quota === null) return null;
-  const orgTotal = usage.org.total_usd;
-  const spent = orgTotal ?? usage.local.cycle.cost_usd;
+  const org = orgCycleSpend(usage);
+  const spent = org?.usd ?? usage.local.cycle.cost_usd;
   const pct = Math.min(100, (spent / quota) * 100);
+  const stamp = org ? asOf(org.fetched_at) : "";
   return (
     <div className="bar-row">
       <div className="bar-label">
         <span>
           Budget{" "}
           <span className="muted">
-            ({orgTotal !== null ? "org billing" : "local estimate"})
+            ({org ? `org billing${stamp ? `, as of ${stamp}` : ""}` : "local estimate"})
           </span>
         </span>
         <b>
@@ -1330,6 +1372,7 @@ function SpendHeadline({
           ))}
           <QuotaBudgetBar usage={usage} />
         </div>
+        <QuotaHint usage={usage} />
         {spend?.limit_reached && (
           <p className="spend-note bad">
             Extra-usage spend limit reached
@@ -1373,11 +1416,11 @@ function LocalSpendHeadline({
   refreshing: boolean;
   compact: boolean;
 }) {
-  const orgTotal = usage.org.total_usd;
-  const spent = orgTotal ?? usage.local.cycle.cost_usd;
+  const org = orgCycleSpend(usage);
+  const spent = org?.usd ?? usage.local.cycle.cost_usd;
   const quota = usage.quota.monthly_quota_usd;
   const pct = quota ? Math.min(100, (spent / quota) * 100) : null;
-  const label = orgTotal !== null ? "org billing data" : "local estimate";
+  const stamp = org ? asOf(org.fetched_at) : "";
 
   return (
     <div className="spend-headline">
@@ -1385,14 +1428,14 @@ function LocalSpendHeadline({
         <b className={meterTone(pct)}>{fmtUsd(spent)}</b>
         <span className="muted">{quota ? `of ${fmtUsd(quota)} this cycle` : "this cycle"}</span>
         <span
-          className={`chip ${orgTotal !== null ? "approved" : ""}`}
+          className={`chip ${org ? "approved" : ""}`}
           title={
-            orgTotal !== null
+            org
               ? "Anthropic Admin API cost report (Console/Platform API spend)"
               : "Estimated from local session transcripts — not billing data, and it only counts work this daemon ran"
           }
         >
-          {label}
+          {org ? `org billing data${stamp ? ` · as of ${stamp}` : ""}` : "local estimate — not billing data"}
         </span>
         <button className="linkish" onClick={onRefresh} disabled={refreshing}>
           {refreshing ? "refreshing…" : "refresh"}
@@ -1406,12 +1449,13 @@ function LocalSpendHeadline({
           />
         </div>
       )}
+      {/* Always shown when unset — a hidden hint is the same as no feature. */}
+      <QuotaHint usage={usage} />
       {!compact && (
         <p className="spend-note muted">
           {usage.live.error
             ? `Live Claude usage unavailable (${usage.live.error}) — showing the local estimate instead.`
             : "Live Claude usage unavailable — showing the local estimate instead."}
-          {quota === null && " Set a monthly quota in Settings to draw a budget line."}
         </p>
       )}
     </div>
@@ -1465,6 +1509,11 @@ function BurnChart({ usage }: { usage: UsagePayload }) {
             <i className="legend-dot pace" /> pace {fmtUsd(perDayPace)}/day
           </span>
         )}
+        {/* The chart sits under an "org usage data" chip on mission control.
+            Without this it reads as billing data; it is neither billing nor
+            live, so the label travels with the chart rather than living in a
+            paragraph only the Tokens tab renders. */}
+        <span className="estimate-tag">local estimate — not billing data</span>
       </div>
     </div>
   );
@@ -2474,7 +2523,7 @@ function QuotaSection({
   onSaved: () => void;
   onError: (m: string) => void;
 }) {
-  const { stored, admin_key_set } = settings.quota;
+  const { stored, admin_key_set, live_usage_enabled } = settings.quota;
   const [quota, setQuota] = useState(
     stored.monthly_quota_usd === null ? "" : String(stored.monthly_quota_usd),
   );
@@ -2536,6 +2585,15 @@ function QuotaSection({
             </option>
           ))}
         </select>
+      </SettingRow>
+      <SettingRow
+        label="Live Claude usage"
+        when="immediate"
+        hint="Off unless CC_LIVE_USAGE=1 is set in the daemon env. When on, the daemon reads the OAuth token Claude Code already stores on this machine (read-only, never refreshed) and shows the same quota figures as the claude.ai usage page — including usage from outside commandcenter."
+      >
+        <span className={`chip ${live_usage_enabled ? "approved" : ""}`}>
+          {live_usage_enabled ? "Enabled" : "Disabled"}
+        </span>
       </SettingRow>
       <SettingRow
         label="Org billing data"
@@ -3535,7 +3593,8 @@ function TokensView({
     (a, b) => (b.tokens_used ?? 0) - (a.tokens_used ?? 0),
   );
 
-  const window = usage ? (view === "cycle" ? usage.local.cycle : usage.local.all_time) : null;
+  // Not `window` — that shadows the DOM global inside this component.
+  const activeWindow = usage ? (view === "cycle" ? usage.local.cycle : usage.local.all_time) : null;
   const projected =
     usage && view === "cycle"
       ? projectedCycleSpend(usage.local.cycle.cost_usd, usage.local.cycle)
@@ -3570,17 +3629,17 @@ function TokensView({
           </button>
         </div>
 
-        {usage && window && (
+        {usage && activeWindow && (
           <>
             <div className="stat-cards">
               <div className="stat-card">
-                <b>{fmtUsd(window.cost_usd)}</b>
+                <b>{fmtUsd(activeWindow.cost_usd)}</b>
                 <span className="muted">
                   Estimated {view === "cycle" ? "this cycle" : "all time"}
                 </span>
               </div>
               <div className="stat-card">
-                <b>{fmtTokens(window.tokens)}</b>
+                <b>{fmtTokens(activeWindow.tokens)}</b>
                 <span className="muted">Tokens</span>
               </div>
               {view === "cycle" && projected !== null && (
@@ -3601,7 +3660,7 @@ function TokensView({
 
             {view === "cycle" && <BurnChart usage={usage} />}
 
-            {window.by_model.length > 0 && (
+            {activeWindow.by_model.length > 0 && (
               <table className="token-table">
                 <thead>
                   <tr>
@@ -3611,7 +3670,7 @@ function TokensView({
                   </tr>
                 </thead>
                 <tbody>
-                  {window.by_model.map((m) => (
+                  {activeWindow.by_model.map((m) => (
                     <tr key={m.model}>
                       <td>{m.model}</td>
                       <td className="num">{fmtTokens(m.tokens)}</td>

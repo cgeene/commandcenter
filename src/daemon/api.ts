@@ -13,6 +13,7 @@ import {
   jiraBaseUrl,
   jiraEmail,
   jiraToken,
+  liveUsageEnabled,
 } from "../config.js";
 import { TASK_STATUSES, type TaskStatus } from "../db/db.js";
 import { getAgent, listAgents } from "../db/agents.js";
@@ -1423,6 +1424,9 @@ export function buildApp(): Hono {
         // Presence only — the admin key itself never crosses the boundary,
         // mirroring how jira.token_set is derived from CC_JIRA_TOKEN.
         admin_key_set: Boolean(anthropicAdminKey()),
+        // Whether the operator opted the daemon into reading Claude Code's
+        // stored OAuth credential (CC_LIVE_USAGE=1). Off by default.
+        live_usage_enabled: liveUsageEnabled(),
       },
       model_choices: CLAUDE_MODEL_SLUGS,
       provider_choices: AGENT_PROVIDERS,

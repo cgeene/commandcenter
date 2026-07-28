@@ -180,7 +180,9 @@ function noteFailure(reason: string): LiveUsageState {
  * with a null `usage` as "show the local estimate instead".
  */
 export async function refreshLiveUsage(): Promise<LiveUsageState> {
-  if (!liveUsageEnabled()) return noteFailure("disabled by CC_LIVE_USAGE=0");
+  // Gate the manual-refresh route too, not just the poller — otherwise an
+  // opt-out install could still be made to read the credential over HTTP.
+  if (!liveUsageEnabled()) return noteFailure("live usage not enabled (set CC_LIVE_USAGE=1)");
 
   const cred = await readCredential();
   if (!cred) return noteFailure("no Claude Code credentials found on this machine");
@@ -220,7 +222,9 @@ export function getLiveUsage(): LiveUsageState {
 
 export function startLiveUsageSync(): void {
   if (!liveUsageEnabled()) {
-    console.log("live usage disabled: CC_LIVE_USAGE=0");
+    // Opt-in only: without CC_LIVE_USAGE=1 the daemon never reads the stored
+    // OAuth credential, and the dashboard falls back to the local estimate.
+    console.log("live usage disabled: set CC_LIVE_USAGE=1 to enable");
     return;
   }
   // Startup fetch, then hourly — mirrors startPrSync / startJiraSync.

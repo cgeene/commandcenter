@@ -144,6 +144,25 @@ export function recordTokenSample(
       );
     }
   })();
+
+  pruneTokenSamples(now);
+}
+
+/**
+ * Watermarks for sessions that have been silent for this long are dropped.
+ *
+ * They exist only to compute the next delta, so an abandoned session's row is
+ * dead weight and the table would otherwise grow forever. The window is
+ * deliberately generous: pruning a session that later resumes would re-record
+ * its whole cumulative total as a fresh delta, so this must be far longer than
+ * any plausible gap between two Stop hooks on the same session.
+ */
+const SAMPLE_RETENTION_DAYS = 90;
+
+/** Drop watermarks for long-dead sessions. Cheap enough to run per sample. */
+export function pruneTokenSamples(now = new Date()): number {
+  const cutoff = new Date(now.getTime() - SAMPLE_RETENTION_DAYS * 86_400_000).toISOString();
+  return getDb().prepare("DELETE FROM token_samples WHERE sampled_at < ?").run(cutoff).changes;
 }
 
 /** Raw buckets in [start, end) — end exclusive, both YYYY-MM-DD. */
