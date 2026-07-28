@@ -58,12 +58,28 @@ function taskPrompt(task: Task, creatorKind: Agent["kind"] | null): string {
 /**
  * What became of a triage delegation attempt.
  *
- * "queued" is the distinction that matters to the human: the ping was accepted
- * and persisted, but the main's composer was busy so it will arrive later. It
- * used to be indistinguishable from "skipped", which is how a "Notify Claude
- * Main" click could look like a plain failure — or, worse, like nothing at all.
+ * Every non-delivery used to collapse into one "skipped", which is how a
+ * "Notify Claude Main" click could look like a plain failure — or, worse, like
+ * nothing at all. Each reason a ping did not land now has its own name, because
+ * they call for opposite reactions from the human:
+ *
+ * - "queued": accepted and persisted; the main's composer was busy so it
+ *   arrives on the next flush. Nothing to do.
+ * - "self_filed": main filed this task itself, so it is never pinged about it
+ *   (it already knows and dispatches directly) — unless a human worker resume
+ *   is owed on it. A live main is irrelevant here.
+ * - "no_main": there is no live main window to deliver to — the only outcome
+ *   that a new main agent would fix.
+ * - "not_triageable": the task is not awaiting triage at all (wrong
+ *   dispatch_mode/status, or its blockers are not done).
  */
-export type DelegateOutcome = "delivered" | "queued" | "already_queued" | "skipped";
+export type DelegateOutcome =
+  | "delivered"
+  | "queued"
+  | "already_queued"
+  | "self_filed"
+  | "no_main"
+  | "not_triageable";
 
 /** Deliver a newly-created orchestrated task to Claude main, or persist the
  *  ping for the queue flush to deliver once the main's prompt is clear. */
@@ -73,7 +89,7 @@ export async function delegateTaskToMainDetailed(
 ): Promise<DelegateOutcome> {
   const task = getTask(taskId);
   if (!task || task.dispatch_mode !== "orchestrated" || task.status !== "queued") {
-    return "skipped";
+    return "not_triageable";
   }
   // A task main filed itself must never trigger a triage ping back to main —
   // on ANY route (immediate POST, PATCH re-queue, the manual /delegate
@@ -84,15 +100,15 @@ export async function delegateTaskToMainDetailed(
     taskCreatorKind(task.id) === "main" &&
     !pendingHumanWorkerResume(task.id)
   ) {
-    return "skipped";
+    return "self_filed";
   }
   if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
-    return "skipped";
+    return "not_triageable";
   }
   const main = availableMain(preferredMain);
   if (!main) {
     logEvent("task.awaiting_main", { taskId });
-    return "skipped";
+    return "no_main";
   }
   // Never merge the triage prompt into the human's mid-typed draft or fire it
   // mid-turn: deliver only when the main is idle with a genuinely clear prompt

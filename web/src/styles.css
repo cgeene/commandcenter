@@ -1121,6 +1121,14 @@ dd { font-family: var(--font-mono); word-break: break-all; }
   color: var(--yellow); border-color: rgba(243, 185, 95, 0.5);
   background: rgba(243, 185, 95, 0.08);
 }
+.banner-ok {
+  color: var(--green); border-color: rgba(104, 217, 130, 0.5);
+  background: rgba(104, 217, 130, 0.08);
+}
+.banner-info {
+  color: var(--accent); border-color: rgba(69, 214, 200, 0.5);
+  background: rgba(69, 214, 200, 0.08);
+}
 .jira-endpoint { margin-right: auto; font-size: var(--font-size-meta); }
 
 /* JIRA per-repo configuration. */
