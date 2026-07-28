@@ -918,6 +918,11 @@ function signalTitle(kind: string, payload: Record<string, unknown>): string {
     "agent.auto_nudged": "Agent nudged",
     "waiting.escalated": "Waiting escalated",
     "waiting.delegated": "Question delegated",
+    "delivery.persisted": "Delivery queued",
+    "delivery.deferred": "Delivery deferred",
+    "delivery.resumed_on_boot": "Delivery queue resumed",
+    "delivery.delivered": "Delivery sent",
+    "delivery.expired": "Delivery expired",
     "scheduler.capacity_blocked": "Scheduler at capacity",
     "scheduler.spawned": "Scheduler spawned",
     "scheduler.spawn_error": "Scheduler failed",
@@ -3872,6 +3877,10 @@ function TaskPanel({
   onTranscript: (sessionId: string, provider: "claude" | "codex") => Promise<void>;
 }) {
   const [publicationPrUrl, setPublicationPrUrl] = useState(task.pr_url ?? "");
+  // "Notify Claude Main" does not always reach the main agent right away — a
+  // busy or mid-draft composer defers the send and the ping is queued instead.
+  // Say so, rather than letting a silent success imply instant delivery.
+  const [delegateNote, setDelegateNote] = useState<string | null>(null);
   return (
     <div className="drawer">
       <div className="drawer-head">
@@ -3998,9 +4007,17 @@ function TaskPanel({
           {task.status === "queued" && task.dispatch_mode === "orchestrated" && (
             <button
               className="primary"
-              onClick={() =>
-                onAction(() => api("POST", `/api/tasks/${task.id}/delegate`, {}))
-              }
+              onClick={() => {
+                setDelegateNote(null);
+                void onAction(async () => {
+                  const res = await api<{ status?: string }>(
+                    "POST",
+                    `/api/tasks/${task.id}/delegate`,
+                    {},
+                  );
+                  setDelegateNote(delegateNoteFor(res.status));
+                });
+              }}
             >
               Notify Claude Main
             </button>
@@ -4086,9 +4103,22 @@ function TaskPanel({
             </button>
           )}
         </div>
+        {delegateNote && <div className="muted">{delegateNote}</div>}
       </div>
     </div>
   );
+}
+
+/** Human-readable outcome of POST /api/tasks/:id/delegate. */
+function delegateNoteFor(status: string | undefined): string {
+  switch (status) {
+    case "queued":
+      return "Claude Main's prompt is busy — the triage ping is queued and will be delivered as soon as its composer is clear.";
+    case "already_queued":
+      return "A triage ping for this task is already queued for Claude Main; it will be delivered as soon as its composer is clear.";
+    default:
+      return "Sent to Claude Main.";
+  }
 }
 
 function CronsDrawer({ onClose }: { onClose: () => void }) {

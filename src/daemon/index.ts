@@ -14,6 +14,7 @@ import { migrateDocsToFrontmatter } from "../db/docs.js";
 import { buildApp } from "./api.js";
 import { startCostSync } from "./costsync.js";
 import { startJiraSync } from "./jirasync.js";
+import { resumePendingDeliveries } from "./notifqueue.js";
 import { startLiveUsageSync } from "./usagelive.js";
 import { startPrSync } from "./prsync.js";
 import { startScheduler } from "./scheduler.js";
@@ -33,6 +34,16 @@ try {
   }
 } catch (err) {
   console.error("doc frontmatter migration failed (continuing):", err);
+}
+// Re-adopt deliveries a previous daemon process had queued for the main agent
+// but never sent, so a restart mid-defer does not silently swallow them.
+try {
+  const resumed = resumePendingDeliveries();
+  if (resumed > 0) {
+    console.log(`resumed ${resumed} pending main-agent delivery/deliveries from the queue`);
+  }
+} catch (err) {
+  console.error("could not resume pending deliveries (continuing):", err);
 }
 initVersion(); // snapshot dist/ mtime for stale-daemon detection
 
