@@ -8,7 +8,11 @@ import { execFileSync } from "node:child_process";
 // point of freshening is what git actually does to a branch, and a stubbed git
 // would prove nothing about conflicts or the preserved diff. Same timeout
 // reasoning as test/worktree.test.ts — these are slow under parallel load.
-vi.setConfig({ testTimeout: 30_000 });
+// hookTimeout matters as much as testTimeout here (and is what the full suite
+// tripped over first): beforeEach builds a bare remote plus a seeded clone, and
+// that synchronous git work has been measured past vitest's 10s hook default
+// when the whole suite is running in parallel.
+vi.setConfig({ testTimeout: 30_000, hookTimeout: 30_000 });
 
 vi.mock("../src/daemon/tmux.js", () => ({
   windowExists: () => true,

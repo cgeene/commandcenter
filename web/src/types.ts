@@ -380,6 +380,19 @@ export interface AppSettings {
      *  credential (CC_LIVE_USAGE=1). Off unless explicitly enabled. */
     live_usage_enabled: boolean;
   };
+  /** PR-integration behavior. No `effective` twin: every field is read
+   *  directly, with no env-var fallback layer behind it. */
+  integration: {
+    stored: {
+      auto_freshen: boolean;
+      freshen_max_attempts: number;
+      freshen_per_pass_limit: number;
+      /** Absolute repo paths allowed only one active task at a time. Opt-in. */
+      strict_serial_repos: string[];
+      /** null = the merge-latency nudge is off. */
+      merge_nudge_minutes: number | null;
+    };
+  };
   jira: {
     stored: JiraConfig;
     // Derived from CC_JIRA_TOKEN presence — the token value NEVER crosses the

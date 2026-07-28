@@ -114,8 +114,11 @@ out.
 
 The `integration` settings group controls how the platform keeps open agent PRs
 mergeable while the default branch advances (see the dispatch/integration section
-of [`architecture.md`](architecture.md)). It is stored in the SQLite `settings`
-table and patched via `PATCH /api/settings/integration`, e.g.
+of [`architecture.md`](architecture.md)). Edit it in the dashboard's **Settings →
+PR integration** panel, where `strict_serial_repos` is a toggle per repository
+from the server-validated catalog (a hand-typed path that doesn't match
+`tasks.repo` would read as "on" while serializing nothing). It is stored in the
+SQLite `settings` table, so it can also be patched directly:
 
 ```sh
 curl -s -X PATCH http://127.0.0.1:$CC_PORT/api/settings/integration \
