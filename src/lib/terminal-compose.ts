@@ -43,12 +43,16 @@ export function setComposeBarEnabled(store: Pick<Storage, "setItem">, on: boolea
 
 /**
  * Whether this looks like a touch device, i.e. one whose keyboard is virtual.
- * A coarse primary pointer is the reliable signal; `maxTouchPoints` is the
- * fallback for browsers that don't implement the pointer media query. Both are
- * passed in rather than read here so this stays testable outside a browser.
+ *
+ * A coarse PRIMARY pointer is the signal, and when the browser answers that
+ * question its answer is final — a touchscreen laptop driven by a mouse reports
+ * a fine pointer and must be treated as a desktop, even though it has touch
+ * points. `maxTouchPoints` is consulted only when the media query is
+ * unavailable, which is what `coarsePointer: null` means. Both are passed in
+ * rather than read here so this stays testable outside a browser.
  */
-export function isTouchLike(coarsePointer: boolean, maxTouchPoints: number): boolean {
-  return coarsePointer || maxTouchPoints > 0;
+export function isTouchLike(coarsePointer: boolean | null, maxTouchPoints: number): boolean {
+  return coarsePointer === null ? maxTouchPoints > 0 : coarsePointer;
 }
 
 /**
@@ -67,9 +71,11 @@ export function sanitizeComposeText(text: string): string {
 }
 
 /**
- * The exact bytes to write to the pty for a composed message, or null when
- * there is nothing worth sending (empty or whitespace-only buffer — a bare
- * Enter is the key bar's job, not the compose bar's).
+ * The exact bytes to write to the pty for a composed message, or null when the
+ * buffer is empty — a bare Enter is the key bar's job, not the compose bar's.
+ * Whitespace IS sendable: the key bar has no space key, so the compose bar is
+ * the only way to type one, and swallowing it would lose text the operator
+ * explicitly sent.
  *
  * Embedded newlines become ESC+CR (meta-return), the same sequence Shift+Enter
  * injects, so a multi-line message lands as multiple lines in a Claude Code
@@ -78,6 +84,6 @@ export function sanitizeComposeText(text: string): string {
  */
 export function composePayload(text: string, submit: boolean): string | null {
   const cleaned = sanitizeComposeText(text);
-  if (cleaned.trim() === "") return null;
+  if (cleaned === "") return null;
   return cleaned.split("\n").join(SHIFT_ENTER_NEWLINE) + (submit ? "\r" : "");
 }

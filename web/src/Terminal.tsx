@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
@@ -25,12 +25,13 @@ const BAR_KEYS: { label: string; seq: string }[] = [
 const COMPOSE_MAX_HEIGHT_PX = 84;
 
 /** True when the browser reports a virtual keyboard (phone/tablet), which is
- *  the only place the compose bar shows up unless it's been toggled on. */
+ *  the only place the compose bar shows up unless it's been toggled on.
+ *  A browser that doesn't know the pointer feature serializes the query as
+ *  "not all" — that, and only that, falls back to counting touch points. */
 function touchDevice(): boolean {
-  return isTouchLike(
-    window.matchMedia?.("(pointer: coarse)").matches ?? false,
-    navigator.maxTouchPoints ?? 0,
-  );
+  const query = window.matchMedia?.("(pointer: coarse)");
+  const supported = !!query && query.media !== "not all";
+  return isTouchLike(supported ? query.matches : null, navigator.maxTouchPoints ?? 0);
 }
 
 /** A line that looks like a numbered menu option, e.g. "❯ 1. Yes" or "  2. No". */
@@ -55,18 +56,45 @@ function ComposeBar({ send }: { send: (data: string) => void }) {
   const [submitOnSend, setSubmitOnSend] = useState(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  // Grow with the content up to ~3 lines, then scroll. Runs after every text
-  // change, including the reset to "" on send.
-  useLayoutEffect(() => {
+  // Grow with the content up to ~3 lines, then scroll. scrollHeight is the
+  // CONTENT height, but box-sizing is border-box app-wide, so the border has to
+  // be added back — otherwise even a single line sits 2px short and scrolls
+  // from the first character.
+  const autosize = useCallback(() => {
     const el = inputRef.current;
     if (!el) return;
     el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, COMPOSE_MAX_HEIGHT_PX)}px`;
-  }, [text]);
+    const border = el.offsetHeight - el.clientHeight; // measured while unset
+    el.style.height = `${Math.min(el.scrollHeight + border, COMPOSE_MAX_HEIGHT_PX)}px`;
+  }, []);
+
+  useLayoutEffect(autosize, [text, autosize]);
+
+  // A width change reflows wrapped text to a different number of lines, so the
+  // height has to be recomputed on rotation and whenever the drawer resizes
+  // (which it does when the virtual keyboard opens). Only width is acted on:
+  // reacting to our own height writes would loop.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    // Seeded from the observer's own first delivery (which costs one harmless
+    // re-measure) so it's compared against the same box every time — clientWidth
+    // would include padding that contentRect.width doesn't.
+    let lastWidth = -1;
+    const ro = new ResizeObserver((entries) => {
+      const width = entries[0].contentRect.width;
+      if (width === lastWidth) return;
+      lastWidth = width;
+      autosize();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [autosize]);
 
   const flush = (submit: boolean) => {
     const payload = composePayload(text, submit);
-    if (payload !== null) send(payload);
+    if (payload === null) return; // empty buffer: nothing to send, nothing to clear
+    send(payload);
     setText("");
     inputRef.current?.focus(); // keep the virtual keyboard up for the next line
   };
@@ -286,18 +314,22 @@ export function Terminal({ agentId }: { agentId: number }) {
           aria-pressed={compose}
           title={compose ? "Hide compose bar" : "Show compose bar"}
           onMouseDown={(e) => e.preventDefault()}
-          onClick={() =>
-            setCompose((on) => {
-              setComposeBarEnabled(localStorage, !on);
-              return !on;
-            })
-          }
+          onClick={() => {
+            const next = !compose;
+            setComposeBarEnabled(localStorage, next);
+            setCompose(next);
+          }}
         >
           abc
         </button>
       </div>
       <div className="terminal" ref={ref} />
-      {compose && <ComposeBar send={send} />}
+      {/* The key is load-bearing. Switching to another agent's terminal keeps
+          this component mounted at the same tree position (openPanel swaps
+          agentId in place, deliberately, so the effect above tears the old
+          websocket down) — without a key React would reuse the ComposeBar and
+          an unsent draft for agent A would be sent into agent B's pty. */}
+      {compose && <ComposeBar key={agentId} send={send} />}
     </div>
   );
 }

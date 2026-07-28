@@ -44,8 +44,15 @@ describe("isTouchLike", () => {
     expect(isTouchLike(true, 0)).toBe(true);
   });
 
-  it("falls back to touch points when the pointer query is unavailable", () => {
-    expect(isTouchLike(false, 5)).toBe(true);
+  it("trusts a reported fine pointer over the touch-point count", () => {
+    // A touchscreen laptop driven by a mouse: it has touch points, but its
+    // primary pointer is fine, so it's a desktop and gets no compose bar.
+    expect(isTouchLike(false, 10)).toBe(false);
+  });
+
+  it("falls back to touch points only when the pointer query is unavailable", () => {
+    expect(isTouchLike(null, 5)).toBe(true);
+    expect(isTouchLike(null, 0)).toBe(false);
   });
 
   it("is false for a plain mouse-driven desktop", () => {
@@ -93,9 +100,13 @@ describe("composePayload", () => {
     expect(SHIFT_ENTER_NEWLINE).not.toBe("\r");
   });
 
-  it("returns null for an empty or whitespace-only buffer", () => {
+  it("returns null for an empty buffer", () => {
     expect(composePayload("", true)).toBeNull();
-    expect(composePayload("   \n\n", true)).toBeNull();
+    expect(composePayload("\n\n", true)).toBeNull();
+  });
+
+  it("still sends a whitespace-only buffer — the key bar has no space key", () => {
+    expect(composePayload("  ", true)).toBe("  \r");
   });
 
   it("emits exactly one trailing CR even when the buffer ends in newlines", () => {
