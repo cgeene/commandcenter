@@ -468,6 +468,27 @@ describe("lean-comment policy in worker prompts", () => {
     }
   });
 
+  it("makes the claims-vs-state self-check standing for repo and scratch workers", async () => {
+    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const repoTask = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const scratchTask = createTask({
+      title: "t",
+      prompt: "x",
+      repo: "/scratch/task-DEF456",
+      workspace_kind: "scratch",
+      open_pr: false,
+    });
+    for (const prompt of [
+      _buildWorkerPromptForTest(repoTask, "agent/task-1"),
+      _buildWorkerPromptForTest(scratchTask, null),
+    ]) {
+      expect(prompt).toContain("re-read every factual statement");
+      expect(prompt).toContain('"verified/provisioned/live/deployed" claim');
+      expect(prompt).toContain("an earlier draft, an intention, or another branch");
+    }
+  });
+
   it("asks a PR task for a tight body ending in human decisions", async () => {
     const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
     const { createTask } = await import("../src/db/tasks.js");
