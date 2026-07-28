@@ -300,7 +300,7 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
     const ready = readyTasks();
     if (ready.length > 0) {
       // Same accounting as the scheduler's auto-spawn pass: workers parked
-      // under a live reviewer are exempt, so they are never named as the
+      // under a running reviewer are exempt, so they are never named as the
       // blockage — but they are reported, so the count adds up for the human.
       const { counted: liveWorkers, parked } = workerSlots({ agents, tasks });
 

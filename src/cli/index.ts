@@ -614,7 +614,7 @@ interface SchedulerInfo {
   status: {
     /** workers occupying a slot — comparable to max_concurrent */
     live_workers: number;
-    /** live workers parked in review; exempt from the cap */
+    /** live workers parked under a running reviewer; exempt from the cap */
     parked_workers?: number;
     spawns_today: number;
   };

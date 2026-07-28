@@ -164,8 +164,8 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
   // tasks retain the historical direct scheduler path, so capacity accounting
   // and spawning both operate on the direct-dispatch queue.
   const ready = readyTasks("direct");
-  // Workers parked in review hold no slot (see capacity.ts) — during a review
-  // wave they would otherwise pin the whole fleet at zero throughput.
+  // Workers parked under a running reviewer hold no slot (see capacity.ts) —
+  // during a review wave they would otherwise pin the fleet at zero throughput.
   const { counted: liveWorkers, parked } = workerSlots();
   let capacity = cfg.max_concurrent - liveWorkers.length;
   if (capacity <= 0) {

@@ -1437,7 +1437,7 @@ export function buildApp(): Hono {
 
   app.get("/api/scheduler", (c) => {
     // live_workers is the number of workers OCCUPYING a slot, so it is directly
-    // comparable to max_concurrent; workers parked under a live reviewer are
+    // comparable to max_concurrent; workers parked under a running reviewer are
     // exempt from the cap and reported separately.
     const { counted, parked } = workerSlots();
     return c.json({
