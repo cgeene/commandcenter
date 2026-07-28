@@ -590,6 +590,13 @@ describe("Codex worker permission policy", () => {
       "tmux kill-server",
       "/opt/homebrew/bin/tmux -L cc kill-session -t cc",
       "git status && tmux send-keys -t cc:main Enter",
+      // tmux aliases and unambiguous abbreviations of the same verbs
+      "tmux send -t cc:main 'echo hi' Enter",
+      "tmux killw -t cc:@1",
+      "tmux killp -t cc:@1.0",
+      "tmux kill-serv",
+      "tmux respawnp -t cc:@1.0",
+      "tmux -S /private/tmp/tmux-501/default send-k -t cc:main Enter",
       "pkill -f tmux",
       "killall tmux",
     ]) {
