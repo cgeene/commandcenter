@@ -25,6 +25,10 @@ Everything is under `$CC_DATA_DIR` (default `~/.commandcenter`):
 - **`scratch/`** — mode-`0700`, non-Git investigation workspaces, one per task.
 - **`prompts/`, `settings/`, `mcp/`** — generated per-agent files.
 - **`docs/`** (or `$CC_DOCS_DIR`) — the internal doc store, as plain markdown.
+- **`depcache/`** — installed `node_modules` trees keyed by repo and lockfile
+  hash, materialized into new worktrees so workers and reviewers don't each pay
+  `npm ci`. A branch that changes a lockfile never matches, so its agent
+  installs for real; every outcome is logged as a `worktree.deps_*` event.
 
 ## How agents talk to the platform
 

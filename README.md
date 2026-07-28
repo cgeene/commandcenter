@@ -519,6 +519,9 @@ Full reference: [`docs/configuration.md`](docs/configuration.md).
 | `CC_REPO_ROOTS` | unset | Path-delimited allow-list for the repository picker and main-agent catalog (`CC_REPO_ROOT` is a single-root alias) |
 | `CC_SCRATCH_DIR` | `$CC_DATA_DIR/scratch` | Command Center-owned investigation workspaces |
 | `CC_SCRATCH_RETENTION_DAYS` | `7` | Retain terminal/orphaned scratch workspaces for 1–90 days before daily cleanup |
+| `CC_DEPCACHE_DIR` | `$CC_DATA_DIR/depcache` | Shared `node_modules` cache (per repo + lockfile hash) so worktrees skip `npm ci` |
+| `CC_DEPCACHE_MODE` | `clone` on macOS, `off` elsewhere | `clone` (copy-on-write, private), `symlink` (shared — an install in the worktree corrupts the cache), or `off` |
+| `CC_DEPCACHE_KEEP` | `3` | Lockfile generations kept per package root (1–10) |
 | `CC_CONTEXT_ROOTS` | `{}` | JSON map of `dir-prefix → CLAUDE.md path(s)` injected into worktrees under that prefix (on top of inferred ancestor context). Malformed JSON is ignored. E.g. `{"/Users/me/projects/nylas":"/Users/me/notes/nylas.md"}` |
 | `CC_PORT` | `4711` | Daemon port (localhost only) |
 | `CC_URL` | `http://127.0.0.1:$CC_PORT` | Base URL agents/hooks use to reach the daemon |

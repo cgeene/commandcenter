@@ -17,6 +17,43 @@ export function worktreesDir(): string {
   return path.join(dataDir(), "worktrees");
 }
 
+/** Shared node_modules cache keyed by repo + lockfile hash, so a fresh
+ *  worker/reviewer worktree can start with dependencies already in place
+ *  instead of paying `npm ci` every time. */
+export function depCacheDir(): string {
+  return process.env.CC_DEPCACHE_DIR ?? path.join(dataDir(), "depcache");
+}
+
+export type DepCacheMode = "clone" | "symlink" | "off";
+
+/**
+ * How a cached node_modules lands in a worktree.
+ *  - "clone": copy-on-write copy (APFS clonefile via `cp -c`). Near-free on
+ *    APFS and, unlike a symlink, PRIVATE — an agent that runs `npm install`
+ *    anyway mutates only its own copy, never the shared cache.
+ *  - "symlink": a single symlink, cheapest of all, but an `npm install` in the
+ *    worktree writes THROUGH into the shared cache and corrupts it for every
+ *    later worktree. Opt-in only.
+ *  - "off": no cache; worktrees start bare as before.
+ * Measured on this repo (APFS, 159M root + 92M web/ node_modules): cloning
+ * both trees takes ~40s against the 2-4 minutes of a real `npm ci`, so the
+ * mutation-safe mode is also the one worth defaulting to.
+ * Default: clone on macOS (APFS, where clonefile always works), off elsewhere
+ * — on a filesystem without copy-on-write the only cheap option is the unsafe
+ * one, so the cache stays disabled until an operator opts in.
+ */
+export function depCacheMode(): DepCacheMode {
+  const raw = process.env.CC_DEPCACHE_MODE?.trim().toLowerCase();
+  if (raw === "clone" || raw === "symlink" || raw === "off") return raw;
+  return process.platform === "darwin" ? "clone" : "off";
+}
+
+/** Lockfile generations kept per package root before the oldest are evicted. */
+export function depCacheKeep(): number {
+  const parsed = Number(process.env.CC_DEPCACHE_KEEP ?? 3);
+  return Number.isInteger(parsed) && parsed >= 1 && parsed <= 10 ? parsed : 3;
+}
+
 /** Command Center-owned, non-Git workspaces for investigation-only tasks. */
 export function scratchWorkspacesDir(): string {
   return process.env.CC_SCRATCH_DIR ?? path.join(dataDir(), "scratch");

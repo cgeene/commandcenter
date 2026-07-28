@@ -4,6 +4,7 @@ import path from "node:path";
 import { resolveWorktreesDir } from "../db/settings.js";
 import { logEvent } from "../db/events.js";
 import { injectWorkspaceContext } from "./context.js";
+import { primeWorktreeDeps } from "./depcache.js";
 import { type AgentProvider } from "../providers.js";
 import { type PublicationMode } from "../publication.js";
 
@@ -130,6 +131,7 @@ export function createWorktree(
     // Already set up (respawn case) — still refresh injected context so a
     // resumed worker picks up any workspace-file changes since it was created.
     injectWorkspaceContext(repo, dir, taskId, provider);
+    primeWorktreeDeps(repo, dir, taskId);
     return { dir, branch };
   }
   fs.mkdirSync(resolveWorktreesDir(), { recursive: true });
@@ -148,6 +150,7 @@ export function createWorktree(
   }
   if (publicationMode === "human") hardenTaskUpstream(dir, branch);
   injectWorkspaceContext(repo, dir, taskId, provider);
+  primeWorktreeDeps(repo, dir, taskId);
   return { dir, branch };
 }
 
@@ -247,12 +250,14 @@ export function createReviewWorktree(
   if (fs.existsSync(dir)) {
     git(dir, "checkout", "--detach", target);
     injectWorkspaceContext(repo, dir, taskId, provider);
+    primeWorktreeDeps(repo, dir, taskId);
     return dir;
   }
   fs.mkdirSync(resolveWorktreesDir(), { recursive: true });
   git(repo, "worktree", "add", "--detach", dir, target);
   // Reviewers benefit from the same workspace context as workers.
   injectWorkspaceContext(repo, dir, taskId, provider);
+  primeWorktreeDeps(repo, dir, taskId);
   return dir;
 }
 
@@ -275,6 +280,7 @@ export function createSnapshotReviewWorktree(
   }
   git(dir, "read-tree", "--reset", "-u", tree);
   injectWorkspaceContext(repo, dir, taskId, provider);
+  primeWorktreeDeps(repo, dir, taskId);
   return dir;
 }
 
