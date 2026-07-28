@@ -219,6 +219,8 @@ const TEMPLATES: Record<string, Template> = {
   // --- misc ---
   "main.escalated": (_e, p) => `Main agent escalated: ${clip(p.title, 80)}`,
   "attention.dismissed": () => `Dismissed a "needs you" item`,
+  "attention.pr_state_unknown": (e) =>
+    `Withheld the merge reminder for ${taskRef(e)} — its PR state is unresolved until PR sync catches up`,
   "scheduler.config": () => `Scheduler settings changed`,
   "watchdog.tmux_unavailable": () => `tmux health observation unavailable — no agents changed`,
   "watchdog.tmux_recovered": () => `tmux health observation recovered`,
