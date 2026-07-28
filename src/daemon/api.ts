@@ -577,12 +577,35 @@ export function buildApp(): Hono {
     if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
       return c.json({ error: "task blockers are not done" }, 409);
     }
-    // Report what actually happened rather than collapsing "held for later" into
-    // a plain failure: a busy/mid-draft composer defers the send, and the click
-    // is persisted for the queue flush instead of being delivered now. Only a
-    // genuinely undeliverable ping (no live main window) is an error.
+    // Report what actually happened rather than collapsing every non-delivery
+    // into one failure. A busy/mid-draft composer defers the send and the click
+    // is persisted for the queue flush (202, not an error); the reasons a ping
+    // will never land are distinct and get distinct messages, because only one
+    // of them is fixed by spawning a main agent.
     const outcome = await delegateTaskToMainDetailed(id);
-    if (outcome === "skipped") {
+    if (outcome === "delivered") return c.json({ status: "delivered" });
+    if (outcome === "queued" || outcome === "already_queued") {
+      return c.json(
+        {
+          status: outcome,
+          detail:
+            outcome === "already_queued"
+              ? "main agent busy — a delivery for this task is already queued and will flush automatically"
+              : "main agent busy — delivery queued and will flush automatically",
+        },
+        202,
+      );
+    }
+    if (outcome === "self_filed") {
+      return c.json(
+        {
+          error:
+            "Claude main filed this task itself and already knows about it — it is never pinged for its own tasks; dispatch it from main, or spawn this task's worker directly",
+        },
+        409,
+      );
+    }
+    if (outcome === "no_main") {
       return c.json(
         {
           error:
@@ -591,17 +614,7 @@ export function buildApp(): Hono {
         409,
       );
     }
-    if (outcome === "delivered") return c.json({ status: "delivered" });
-    return c.json(
-      {
-        status: outcome,
-        detail:
-          outcome === "already_queued"
-            ? "main agent busy — a delivery for this task is already queued and will flush automatically"
-            : "main agent busy — delivery queued and will flush automatically",
-      },
-      202,
-    );
+    return c.json({ error: "task is not awaiting main-agent triage" }, 409);
   });
 
   app.get("/api/tasks/:id/diff", (c) => {

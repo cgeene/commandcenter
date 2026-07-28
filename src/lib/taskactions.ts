@@ -4,10 +4,11 @@
  * suite and the web bundle can use them (same contract as src/lib/board.ts).
  */
 
-/** The minimal task shape the drawer's actions need. */
+/** The minimal task shape the drawer's actions need. Both the daemon and web
+ *  `Task` types satisfy it structurally. */
 export interface ActionTask {
   status: string;
-  dispatch_mode: string;
+  dispatch_mode: "direct" | "orchestrated";
   workspace_kind?: "repo" | "portfolio" | "scratch";
 }
 
@@ -19,6 +20,11 @@ export interface ActionTask {
  * straight from the dashboard (POST /api/agents), which is what the button
  * does. Portfolio parents are never spawnable — they exist only to be split
  * into per-repository children.
+ *
+ * blocked_by is deliberately not consulted: a task waiting on a blocker stays
+ * "queued", and the human overriding that (as direct mode has always allowed)
+ * is a legitimate call. The triage ping is the thing that must respect the
+ * queue order, not a hand-started worker.
  */
 export function canSpawnWorker(task: ActionTask): boolean {
   if (task.workspace_kind === "portfolio") return false;

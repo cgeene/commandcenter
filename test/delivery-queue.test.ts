@@ -383,4 +383,47 @@ describe("POST /api/tasks/:id/delegate response shape", () => {
       error: expect.stringContaining("spawn a main agent"),
     });
   });
+
+  // Main is never pinged about its own tasks — and every task main files
+  // (portfolio children included) is orchestrated + queued, so this is the
+  // common case, not an edge. Claiming "no live main, spawn one" here would
+  // be false with a main running and would prescribe a duplicate.
+  it("409s a task main filed itself without denying that a live main exists", async () => {
+    const { main, task } = await setup("idle");
+    panes.set(MAIN, CLEAR_PROMPT);
+    const { logEvent } = await import("../src/db/events.js");
+    logEvent("task.created", {
+      taskId: task.id,
+      agentId: main.id,
+      payload: { creator_kind: "main" },
+    });
+    const { buildApp } = await import("../src/daemon/api.js");
+
+    const res = await buildApp().request(`/api/tasks/${task.id}/delegate`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(409);
+    const { error } = (await res.json()) as { error: string };
+    expect(error).toContain("already knows");
+    expect(error).not.toContain("no live Claude main");
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  it("409s a task that is not awaiting triage at all", async () => {
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({
+      title: "t",
+      prompt: "x",
+      repo,
+      dispatch_mode: "direct",
+    });
+    const { buildApp } = await import("../src/daemon/api.js");
+    const res = await buildApp().request(`/api/tasks/${task.id}/delegate`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: "task is not awaiting main-agent triage",
+    });
+  });
 });
