@@ -1,8 +1,14 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Terminal as Xterm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { handleTerminalKeyEvent } from "../../src/lib/terminal-keys";
+import {
+  composeBarEnabled,
+  composePayload,
+  isTouchLike,
+  setComposeBarEnabled,
+} from "../../src/lib/terminal-compose";
 
 const BAR_KEYS: { label: string; seq: string }[] = [
   { label: "esc", seq: "\x1b" },
@@ -13,14 +19,111 @@ const BAR_KEYS: { label: string; seq: string }[] = [
   { label: "^C", seq: "\x03" },
 ];
 
+/** Tallest the compose field grows before it scrolls internally — roughly three
+ *  lines at the 16px font below, which is as much as can sit above a phone
+ *  keyboard without eating the terminal. */
+const COMPOSE_MAX_HEIGHT_PX = 84;
+
+/** True when the browser reports a virtual keyboard (phone/tablet), which is
+ *  the only place the compose bar shows up unless it's been toggled on. */
+function touchDevice(): boolean {
+  return isTouchLike(
+    window.matchMedia?.("(pointer: coarse)").matches ?? false,
+    navigator.maxTouchPoints ?? 0,
+  );
+}
+
 /** A line that looks like a numbered menu option, e.g. "❯ 1. Yes" or "  2. No". */
 const OPTION_RE = /^\s*(?:❯\s*)?(\d{1,2})[.)]\s+\S/;
 /** The selection marker Claude Code menus render on the highlighted row. */
 const MARKER_RE = /^\s*❯/;
 
+/**
+ * A native text field docked under the terminal, for phones.
+ *
+ * Everything typed here goes through the browser's ordinary text input — so
+ * autocorrect, double-space-for-a-period, predictive text and dictation all
+ * work, none of which survive xterm's hidden textarea (see
+ * src/lib/terminal-compose.ts). The finished buffer reaches the pty as a single
+ * write when the operator sends it.
+ */
+function ComposeBar({ send }: { send: (data: string) => void }) {
+  const [text, setText] = useState("");
+  // Whether a send also presses Enter. On by default (the common case: say
+  // something to a worker and submit it); off for typing into a prompt you
+  // don't want to answer yet, e.g. filling a worker's composer.
+  const [submitOnSend, setSubmitOnSend] = useState(true);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Grow with the content up to ~3 lines, then scroll. Runs after every text
+  // change, including the reset to "" on send.
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, COMPOSE_MAX_HEIGHT_PX)}px`;
+  }, [text]);
+
+  const flush = (submit: boolean) => {
+    const payload = composePayload(text, submit);
+    if (payload !== null) send(payload);
+    setText("");
+    inputRef.current?.focus(); // keep the virtual keyboard up for the next line
+  };
+
+  /** Buttons must not steal focus from the field, or the keyboard drops and
+   *  (on iOS) the page scrolls back. Same trick as the key bar above. */
+  const keepFocus = (e: { preventDefault: () => void }) => e.preventDefault();
+
+  return (
+    <div className="compose">
+      <textarea
+        ref={inputRef}
+        className="compose-input"
+        aria-label="Compose message"
+        rows={1}
+        value={text}
+        placeholder={submitOnSend ? "Message…" : "Message… (no ⏎)"}
+        // Deliberately NOT disabling any of these: they are the whole point of
+        // the compose bar. autoCorrect/autoCapitalize are non-standard but are
+        // what iOS Safari reads.
+        autoCorrect="on"
+        autoCapitalize="sentences"
+        spellCheck
+        enterKeyHint={submitOnSend ? "send" : "enter"}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          // Mid-composition Enter belongs to the IME/autocorrect candidate,
+          // never to us.
+          if (e.nativeEvent.isComposing) return;
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault(); // Shift+Enter still inserts a literal newline
+            flush(submitOnSend);
+          }
+        }}
+      />
+      <button
+        className={`compose-newline${submitOnSend ? " on" : ""}`}
+        aria-pressed={submitOnSend}
+        title={submitOnSend ? "Send with Enter" : "Send without Enter"}
+        onMouseDown={keepFocus}
+        onClick={() => setSubmitOnSend((v) => !v)}
+      >
+        ⏎
+      </button>
+      <button className="primary" onMouseDown={keepFocus} onClick={() => flush(submitOnSend)}>
+        Send
+      </button>
+    </div>
+  );
+}
+
 export function Terminal({ agentId }: { agentId: number }) {
   const ref = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  // Compose bar on by default on touch devices only; an explicit toggle is
+  // remembered per browser.
+  const [compose, setCompose] = useState(() => composeBarEnabled(localStorage, touchDevice()));
 
   const send = (d: string) => {
     const ws = wsRef.current;
@@ -173,8 +276,28 @@ export function Terminal({ agentId }: { agentId: number }) {
             {k.label}
           </button>
         ))}
+        <div className="spacer" />
+        {/* The key bar stays put in compose mode: single keys (menu digits,
+            ^C, arrows) still need to go through raw, as does tapping the
+            terminal itself. */}
+        <button
+          className={`compose-toggle${compose ? " on" : ""}`}
+          aria-label="Toggle compose bar"
+          aria-pressed={compose}
+          title={compose ? "Hide compose bar" : "Show compose bar"}
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() =>
+            setCompose((on) => {
+              setComposeBarEnabled(localStorage, !on);
+              return !on;
+            })
+          }
+        >
+          abc
+        </button>
       </div>
       <div className="terminal" ref={ref} />
+      {compose && <ComposeBar send={send} />}
     </div>
   );
 }
