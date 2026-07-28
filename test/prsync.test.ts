@@ -4,9 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import type { PrState } from "../src/daemon/prsync.js";
 
+const sendText = vi.fn(async () => {});
+
 vi.mock("../src/daemon/tmux.js", () => ({
   windowExists: () => true,
-  sendText: async () => {},
+  sendText: (...args: unknown[]) => sendText(...args),
   capturePane: () => "",
 }));
 
@@ -17,6 +19,8 @@ beforeEach(async () => {
   process.env.CC_DATA_DIR = tmpDir;
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
+  sendText.mockClear();
+  sendText.mockImplementation(async () => {});
 });
 
 afterEach(async () => {
@@ -312,6 +316,38 @@ describe("applyPrState", () => {
     expect(w.state).toBe("working");
     // resumed workers must not trip the stall watchdog on pre-resume silence
     expect(w.last_event_at).not.toBeNull();
+  });
+
+  it("leaves a live worker associated when tmux feedback delivery times out", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { task } = await setupPrTask();
+    const worker = createAgent({
+      kind: "worker",
+      state: "idle",
+      task_id: task.id,
+      tmux_target: "cc:@7",
+    });
+    updateTask(task.id, { agent_id: worker.id });
+    sendText.mockRejectedValueOnce(
+      Object.assign(new Error("must not escape"), { code: "timeout" }),
+    );
+
+    await applyPrState(
+      task.id,
+      open({
+        comments: [
+          { author: "caleb", body: "fix this", created_at: "2026-07-04T02:00:00Z" },
+        ],
+      }),
+    );
+
+    const current = getTask(task.id)!;
+    expect(current.status).toBe("review");
+    expect(current.agent_id).toBe(worker.id);
+    expect(current.pr_feedback_at).toBeNull();
+    expect(getAgent(worker.id)?.state).toBe("idle");
   });
 
   it("defers feedback while the worker sits on a permission prompt", async () => {

@@ -375,6 +375,7 @@ main { display: flex; }
   font-size: var(--font-size-meta); color: var(--muted-strong);
 }
 .chip.agent-chip { color: var(--green); font-family: var(--font-mono); }
+.chip.session-chip { color: var(--accent); font-family: var(--font-mono); }
 .chip.bad { color: var(--red); }
 .chip.approved { color: var(--green); }
 .card-summary {
@@ -562,6 +563,22 @@ dt { color: var(--muted); }
    monospace sets them apart from their muted sans labels and keeps them
    scannable. */
 dd { font-family: var(--font-mono); word-break: break-all; }
+.session-id { user-select: all; }
+.session-copy {
+  margin-top: var(--space-2);
+  font-family: var(--font-sans);
+}
+.resume-command {
+  display: block;
+  margin-top: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: all;
+}
 .actions { display: flex; gap: var(--group-gap); flex-wrap: wrap; }
 
 .clamp-wrap { margin-bottom: var(--space-6); }

@@ -535,6 +535,21 @@ describe("open_pr prompt wiring", () => {
     expect(prompt).toContain("A missing PR is NOT a defect");
   });
 
+  it("reviewer and worker prompts forbid direct host tmux control", async () => {
+    const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
+    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "safe terminal", prompt: "x", repo: "/r" });
+
+    const reviewer = buildReviewerPrompt(task);
+    expect(reviewer).toContain("run relevant tests, builds, typechecks");
+    expect(reviewer).toContain("do not invoke tmux kill/respawn/send-keys");
+
+    const worker = _buildWorkerPromptForTest(task, "agent/task-1");
+    expect(worker).toContain("Never control Command Center's terminal infrastructure");
+    expect(worker).toContain("do not invoke tmux kill/respawn/send-keys");
+  });
+
   it("reviewer prompt states a PR is expected for normal tasks", async () => {
     const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
     const { createTask } = await import("../src/db/tasks.js");

@@ -1,8 +1,14 @@
 import { getAgent, updateAgent } from "../db/agents.js";
 import { logEvent } from "../db/events.js";
-import { sendEnter, sendText, windowExists } from "./tmux.js";
+import { sendEnter, sendText } from "./tmux.js";
+import type { TmuxFailureCode } from "./tmux.js";
 
-export type ResumeOutcome = "sent" | "not_live" | "waiting_input" | "deferred";
+export type ResumeOutcome =
+  | "sent"
+  | "not_live"
+  | "waiting_input"
+  | "deferred"
+  | "delivery_failed";
 
 /**
  * Last-moment checks around the keystrokes themselves, for callers that must
@@ -22,18 +28,43 @@ export interface SendGuard {
   beforeSubmit?: () => boolean;
 }
 
+function deliveryFailureReason(error: unknown): TmuxFailureCode {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? (error as { code?: unknown }).code
+      : undefined;
+  return [
+    "timeout",
+    "session_absent",
+    "target_missing",
+    "no_client",
+    "failed",
+  ].includes(String(code))
+    ? (code as TmuxFailureCode)
+    : "failed";
+}
+
+function failedDeliveryOutcome(error: unknown): ResumeOutcome {
+  const reason = deliveryFailureReason(error);
+  return reason === "session_absent" || reason === "target_missing"
+    ? "not_live"
+    : "delivery_failed";
+}
+
 /**
  * The one way to inject text into an agent's interactive session.
  *
  * Owns the whole resume transition so call sites can't drift:
- * - liveness check (not dead, window still exists);
+ * - liveness check (not dead, target recorded). The bounded send itself is
+ *   the authoritative window check; a separate synchronous preflight can
+ *   race and can misclassify an observation timeout as a vanished worker;
  * - the waiting_input guard — text typed into a pending permission menu is
  *   interpreted as an answer to that menu, so unsolicited messages (PR
  *   feedback, reviewer notes) are refused; callers pass `interrupt` only
  *   when the text IS the answer to what the agent asked;
  * - send-before-commit ordering: nothing is persisted until the text is in
- *   the pane, so a failed send reports "not_live" and the caller can fall
- *   back (requeue, retry next pass) instead of losing the message;
+ *   the pane, so a failed send reports either a vanished target or a
+ *   controlled delivery failure instead of losing the message;
  * - the state flip. No provider hook fires when a resumed session picks
  *   work back up — Notification is the only thing that sets waiting_input
  *   and only Stop clears it — so delivered input is the one signal that the
@@ -49,8 +80,7 @@ export async function resumeAgent(
   if (
     !agent ||
     agent.state === "dead" ||
-    !agent.tmux_target ||
-    !windowExists(agent.tmux_target)
+    !agent.tmux_target
   ) {
     return "not_live";
   }
@@ -66,13 +96,13 @@ export async function resumeAgent(
       ? await sendText(agent.tmux_target, text, { beforeSubmit })
       : await sendText(agent.tmux_target, text);
   } catch (err) {
-    // window died between the check and the send
+    const reason = deliveryFailureReason(err);
     logEvent("agent.send_failed", {
       agentId,
       taskId: agent.task_id ?? undefined,
-      payload: { error: err instanceof Error ? err.message : String(err) },
+      payload: { reason },
     });
-    return "not_live";
+    return failedDeliveryOutcome(err);
   }
 
   // Typed but held back by beforeSubmit: the text sits in the composer unsent,
@@ -105,21 +135,21 @@ export async function submitPending(agentId: number): Promise<ResumeOutcome> {
   if (
     !agent ||
     agent.state === "dead" ||
-    !agent.tmux_target ||
-    !windowExists(agent.tmux_target)
+    !agent.tmux_target
   ) {
     return "not_live";
   }
 
   try {
-    sendEnter(agent.tmux_target);
+    await sendEnter(agent.tmux_target);
   } catch (err) {
+    const reason = deliveryFailureReason(err);
     logEvent("agent.send_failed", {
       agentId,
       taskId: agent.task_id ?? undefined,
-      payload: { error: err instanceof Error ? err.message : String(err) },
+      payload: { reason },
     });
-    return "not_live";
+    return failedDeliveryOutcome(err);
   }
 
   const fresh = getAgent(agentId);

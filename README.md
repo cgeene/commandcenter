@@ -76,7 +76,7 @@ The primitives:
 | **`agentd`** | The daemon. Owns the SQLite queue, a localhost REST API + WebSocket, the tmux/worktree lifecycle, the scheduler, PR sync, and serves the dashboard. |
 | **`agp`** | CLI client for the daemon (`agp task add`, `agp agent spawn`, …). |
 | **`cc-mcp`** | MCP server exposing the platform to agents (scoped per role). |
-| **Workers** | Claude Code or Codex sessions, one per executable task, in either an `agent/task-N` worktree + branch or a private scratch directory. |
+| **Workers** | Claude Code or Codex sessions, one per executable task, in either an `agent/task-N` (or resumed `agent/task-N-resume-K`) worktree + branch or a private scratch directory. |
 | **Reviewers** | Independent read-only `claude`/`codex` sessions that adversarially proof a branch. |
 | **Main agent** | An orchestrator `claude` session that triages the queue and manages workers. |
 | **Dashboard** | React SPA served by the daemon: board, PRs, tokens, live terminals. |
@@ -134,6 +134,29 @@ queued → claimed → in_progress → blocked / review → done / failed
 `cancelled` is reachable from **any** state (`agp task cancel <id>`). Claiming is
 a single atomic SQLite `UPDATE`, so two agents can never take the same task.
 
+Done and cancelled tasks move to **Archive**. Use the task drawer's **Resume
+Task** action, tell Claude main to resume task `#N`, or run
+`agp task resume <id> --prompt "changed requirements"` to reopen the same task
+instead of creating a duplicate. Command Center preserves its provider/model,
+session ownership, surviving workspace, task history, token total, and JIRA link while
+clearing stale result/reviewer/publication state. If the same-provider
+transcript still exists, the respawn uses `claude --resume` or `codex resume`;
+otherwise the prior result/review/PR handoff is already folded into the prompt
+for a safe fresh-session fallback. An expired scratch directory is recreated.
+A merged/closed PR gets a new
+`agent/task-N-resume-K` branch from the current upstream default branch.
+
+An approved task can remain active in **Review** after its worker is stopped:
+the watchdog reaps that tmux window after the configured grace period so it
+does not consume a worker slot while waiting for human publication. The task
+drawer shows **Terminal** only while the linked worker is live. Once reaped it
+shows **Resume Worker** instead. Resuming reopens the same task, invalidates the
+old approval, preserves its worktree/provider/history, and restores the saved
+Claude or Codex session when its transcript exists. You can also tell Claude
+main to resume the worker; its `resume_worker` lifecycle tool performs the same
+single managed operation. **Transcript** and **Copy resume command** remain available
+without reopening the task.
+
 Interactive workspace modes:
 
 | Workspace | Main-agent behavior | Worker boundary |
@@ -148,9 +171,10 @@ A **worker** is an interactive Claude Code or Codex session for one task in a
 dedicated worktree. When a worker moves a task to `review` with commits on its
 branch, an independent **reviewer** proofs it: a *fresh* session in its own
 detached worktree at the task's branch with **Edit/Write/commit/push denied** —
-it gets the same inputs as the worker (prompt, branch, claimed summary) but
-**none of its conversation**, and is prompted to find reasons to **reject**. It
-calls `submit_review(approve|reject, notes)`.
+the reviewer can run tests and builds but cannot change or publish the work. It
+gets the same inputs as the worker (prompt, branch, claimed summary) but **none
+of its conversation**, and is prompted to find reasons to **reject**. It calls
+`submit_review(approve|reject, notes)`.
 
 - **Reject** → notes go back into the worker's session (or the respawn prompt if
   it's gone), task returns to `in_progress`. A ready PR is converted back to a
@@ -452,8 +476,10 @@ running. Full reference: [`docs/cli.md`](docs/cli.md).
 | `agp task add <title> …` | File a main-orchestrated task (`-w` workspace, `-r` repo, `-p` prompt, `-v` verify, `--provider`, `-m` model, `-P` priority, `-b` blocked-by). |
 | `agp task ls` / `task show <id>` / `task diff <id>` | List / inspect a task / show its branch diff. |
 | `agp task cancel <id>` | Close a task from any state; kills its live agents. Approved unpublished Human-publishes work is retained unless destructive cleanup is explicitly acknowledged. |
+| `agp task resume <id>` | Reopen an archived task in place; `--prompt`/`--prompt-file` adds changed requirements. |
 | `agp main` | Spawn the Claude orchestrator (one at a time). |
 | `agp agent ls` / `agent peek <id>` / `agent send <id> …` | List agents / view a terminal without attaching / send text into a session. |
+| `agp agent session <id>` | Show the retained provider session and its exact detached resume command. For Codex, use this generated command rather than plain `codex resume`: Command Center sessions live under `CC_CODEX_HOME`, not `~/.codex`. |
 | `agp attach <id>` | Attach to an agent's tmux window (detach with `Ctrl-b d`). |
 | `agp review <id>` | Spawn an adversarial reviewer for a task in `review`. |
 | `agp scheduler on\|off\|status\|set …` | Control autonomous spawning (see [Configuration](#scheduler-config)). |
@@ -635,10 +661,13 @@ about, on your own machine.
   file — commandcenter never touches your `~/.claude/settings.json`. Workers may
   push only their own branch and open a PR in the default mode; Human publishes
   denies worker/reviewer publication and hands the approved snapshot to you.
-  Reviewers deny Edit/Write/commit/push.
-  Codex workers use an isolated profile with `workspace-write`, network disabled
-  in the sandbox, and a fail-closed push policy. The read-only allowlist is an
-  explicit, auditable list in
+  Reviewers deny Edit/Write/commit/push while retaining Bash for independent
+  tests and builds; targeted deny rules block destructive terminal control.
+  Every provider process is launched without the host `TMUX` context and with
+  its own private tmux socket namespace, so an agent cannot accidentally control
+  Command Center's shared terminal server. Codex workers use an isolated profile
+  with `workspace-write`, network disabled in the sandbox, and a fail-closed
+  push policy. The read-only allowlist is an explicit, auditable list in
   [`src/daemon/permissions.ts`](src/daemon/permissions.ts).
 - **Trust stays human.** Provider repository/folder trust (which enables
   project-local hooks and policy) is surfaced in the browser for an explicit
