@@ -13,10 +13,13 @@ import type { NotifyEventKey } from "../notify-events.js";
  * swallowed — push is best-effort and must never affect platform state.
  *
  * This is the raw transport. Call sites go through `notifyEvent` instead, so
- * every push is classified, individually switchable, and de-duplicated.
+ * every push is classified and individually switchable.
  *
- * Returns whether a request was actually dispatched (i.e. a URL is configured);
- * notifyEvent uses that to avoid burning a de-dup latch on a push nobody got.
+ * Returns whether a request was DISPATCHED — i.e. a URL is configured — not
+ * whether it arrived. The fetch is fire-and-forget by design (a push must never
+ * affect platform state), so a network error or a 4xx from ntfy still counts as
+ * dispatched. notifyEvent uses this to avoid burning a de-dup latch on a push
+ * that was never even attempted; a push lost in flight is not recoverable.
  */
 export function notify(
   title: string,
@@ -46,7 +49,9 @@ export interface NotifyEventOpts {
    * ever (persisted). Bake the discriminator into the key — an approved SHA, a
    * round number, a streak count — so a genuinely new occurrence re-arms
    * naturally. Omit it for pushes that are edges rather than standing state
-   * (the escalate tool, a per-day budget warning that already throttles itself).
+   * (the escalate tool, a per-day budget warning that already throttles itself),
+   * and for callers that already own a richer escalate-once latch of their own
+   * (quotaalert.ts — see the comment there for why layering both is wrong).
    */
   once?: string;
 }
