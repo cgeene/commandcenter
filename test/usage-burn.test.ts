@@ -406,14 +406,15 @@ describe("quota settings", () => {
     });
 
     setQuotaSettings({ monthly_quota_usd: 250, cycle_reset_day: 15 });
-    expect(getQuotaSettings()).toMatchObject({
+    expect(getQuotaSettings()).toEqual({
       monthly_quota_usd: 250,
       cycle_reset_day: 15,
+      alert_threshold_percent: 80,
     });
 
     // A patch touching one field leaves the others alone.
     setQuotaSettings({ monthly_quota_usd: 400 });
-    expect(getQuotaSettings()).toMatchObject({
+    expect(getQuotaSettings()).toEqual({
       monthly_quota_usd: 400,
       cycle_reset_day: 15,
       alert_threshold_percent: 80,
@@ -421,16 +422,18 @@ describe("quota settings", () => {
 
     // Clearing the quota drops the budget line but keeps the cycle.
     setQuotaSettings({ monthly_quota_usd: null });
-    expect(getQuotaSettings()).toMatchObject({
+    expect(getQuotaSettings()).toEqual({
       monthly_quota_usd: null,
       cycle_reset_day: 15,
+      alert_threshold_percent: 80,
     });
 
     // The alert threshold is independently clearable (null = alerting off).
     setQuotaSettings({ alert_threshold_percent: null });
-    expect(getQuotaSettings()).toMatchObject({
-      alert_threshold_percent: null,
+    expect(getQuotaSettings()).toEqual({
+      monthly_quota_usd: null,
       cycle_reset_day: 15,
+      alert_threshold_percent: null,
     });
   });
 });

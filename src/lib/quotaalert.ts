@@ -16,10 +16,35 @@
  * Pure: no db, no fetch, no node. Shared with the web bundle (src/lib pattern).
  */
 
-import { resetsIn, type LiveUsage, type UsageMeter } from "./usage.js";
+import {
+  LIVE_USAGE_POLL_MS,
+  resetsIn,
+  type LiveUsage,
+  type UsageMeter,
+} from "./usage.js";
 
 /** Default page-me line, as a percentage of the headline meter's window. */
 export const QUOTA_ALERT_THRESHOLD_DEFAULT = 80;
+
+/**
+ * How old the last SUCCESSFUL reading may be before it stops counting as a
+ * description of right now. Three missed polls: one transient 503 (or a token
+ * caught mid-refresh) must not blank a real crossing, but a feed that has been
+ * down for hours is history, not news.
+ *
+ * This matters because the cache is deliberately sticky — usagelive's
+ * noteFailure keeps the previous `usage` so the dashboard doesn't blank on a
+ * blip, and nothing clears it when the poller stops entirely (expired token,
+ * CC_LIVE_USAGE turned off, daemon down). Without an age bound, a reading that
+ * happened to catch `spend.limit_reached` would keep re-raising a red, urgent
+ * "spend limit reached" item forever: unlike the threshold item, it carries no
+ * reset instant that could age it out.
+ *
+ * Anchored on `usage.fetched_at`, NOT `LiveUsageState.checked_at` — checked_at
+ * is bumped by every ATTEMPT including failed ones, so an hourly poller failing
+ * forever would keep it eternally fresh while the numbers underneath rot.
+ */
+export const QUOTA_READING_MAX_AGE_MS = 3 * LIVE_USAGE_POLL_MS;
 
 /** Above this the item is drawn hotter — a meter this close to its ceiling is
  *  going to stop work inside the current window, not eventually. */
@@ -83,23 +108,54 @@ export interface QuotaConditions {
  * Identity of the window a meter is measuring. The reset instant is part of it
  * so the next 5-hour window is a different window even though the meter key is
  * unchanged — that is what makes "reset, then cross again" page a second time.
+ *
+ * Known wrinkle: we latch on the HEADLINE meter, and pickHeadline (lib/usage.ts)
+ * hands back whichever meter is closest to its ceiling. If two meters are both
+ * over the threshold and they swap places between polls — say the weekly bar
+ * overtakes the 5-hour one — the window id changes and the operator gets a
+ * second page for what is arguably one situation. Left as-is deliberately: the
+ * alternative is a latch per meter, which pages once per meter and is strictly
+ * noisier in the common case, and the swap only happens when a SECOND ceiling
+ * is also in trouble — which is worth knowing about.
  */
 export function quotaWindowId(meter: UsageMeter): string {
   return `${meter.key}@${meter.resets_at ?? "-"}`;
 }
 
-/** Read the current situation off a cached usage snapshot. Never throws. */
+/**
+ * Whether a cached reading is recent enough to describe the present.
+ * See {@link QUOTA_READING_MAX_AGE_MS} for why this is anchored on fetched_at.
+ */
+export function quotaReadingFresh(
+  usage: LiveUsage | null,
+  nowMs: number,
+  maxAgeMs = QUOTA_READING_MAX_AGE_MS,
+): boolean {
+  if (!usage) return false;
+  const fetched = Date.parse(usage.fetched_at);
+  if (!Number.isFinite(fetched)) return false;
+  return nowMs - fetched < maxAgeMs;
+}
+
+/**
+ * Read the current situation off a cached usage snapshot. Never throws.
+ *
+ * A reading too old to be current yields `unknown` / `null`, exactly like no
+ * feed at all — so both consumers (the pager and the "Needs You" panel) inherit
+ * the staleness rule by construction rather than each remembering to apply it.
+ */
 export function quotaConditions(
   usage: LiveUsage | null,
   threshold: number | null,
   nowMs: number,
+  maxAgeMs = QUOTA_READING_MAX_AGE_MS,
 ): QuotaConditions {
   const none: QuotaConditions = {
     threshold_state: "unknown",
     over: null,
     spend_limit: null,
   };
-  if (!usage) return none;
+  if (!usage || !quotaReadingFresh(usage, nowMs, maxAgeMs)) return none;
 
   // A spend block that exists but reports false is real evidence the cap is not
   // hit; an absent block tells us nothing and must not clear the latch.

@@ -3,6 +3,7 @@ import {
   EMPTY_QUOTA_ALERT_LATCH,
   evaluateQuotaAlerts,
   quotaConditions,
+  quotaReadingFresh,
   type QuotaAlertLatch,
 } from "../src/lib/quotaalert.js";
 import type { LiveUsage, UsageMeter } from "../src/lib/usage.js";
@@ -155,13 +156,19 @@ describe("evaluateQuotaAlerts — threshold latch", () => {
   it("never pages off a reading whose window already elapsed, but does re-arm", () => {
     const latched = poll(usage({ headline: meter({ percent: 90 }) }), EMPTY_QUOTA_ALERT_LATCH)
       .latch;
-    // Same reading observed after its window closed — the feed just hasn't
-    // refreshed yet. Stale percentage: no page, latch cleared for the next one.
-    const stale = poll(usage({ headline: meter({ percent: 90 }) }), latched, {
-      now: new Date("2026-07-27T18:00:00.000Z"),
-    });
-    expect(stale.alerts).toHaveLength(0);
-    expect(stale.latch.threshold_window).toBeNull();
+    // A recent poll (17:30) whose window closed at 17:00 — the upstream feed
+    // hasn't rolled the window over yet. Stale percentage: no page, but the
+    // latch clears so the new window gets its own.
+    const elapsed = poll(
+      usage({
+        headline: meter({ percent: 90 }),
+        fetched_at: "2026-07-27T17:30:00.000Z",
+      }),
+      latched,
+      { now: new Date("2026-07-27T18:00:00.000Z") },
+    );
+    expect(elapsed.alerts).toHaveLength(0);
+    expect(elapsed.latch.threshold_window).toBeNull();
   });
 
   it("respects a non-default threshold and an explicit disable", () => {
@@ -175,6 +182,43 @@ describe("evaluateQuotaAlerts — threshold latch", () => {
         threshold: null,
       }).alerts,
     ).toHaveLength(0);
+  });
+});
+
+describe("quotaReadingFresh", () => {
+  it("accepts a recent reading and rejects one past the age bound", () => {
+    const recent = usage({ fetched_at: "2026-07-27T11:30:00.000Z" });
+    expect(quotaReadingFresh(recent, NOW.getTime())).toBe(true);
+    // Anchored on fetched_at (the last SUCCESSFUL poll), so a feed that keeps
+    // failing ages out even though its checked_at is bumped every hour.
+    const old = usage({ fetched_at: "2026-07-27T02:00:00.000Z" });
+    expect(quotaReadingFresh(old, NOW.getTime())).toBe(false);
+    expect(quotaReadingFresh(null, NOW.getTime())).toBe(false);
+    expect(quotaReadingFresh(usage({ fetched_at: "not a date" }), NOW.getTime())).toBe(false);
+  });
+
+  it("makes a stale reading indistinguishable from no feed at all", () => {
+    const stale = usage({
+      headline: meter({ percent: 99 }),
+      fetched_at: "2026-07-20T12:00:00.000Z",
+      spend: {
+        used_usd: 50,
+        limit_usd: 50,
+        percent: 100,
+        enabled: true,
+        limit_reached: true,
+        disabled_reason: null,
+      },
+    });
+    const cond = quotaConditions(stale, 80, NOW.getTime());
+    expect(cond).toEqual({ threshold_state: "unknown", over: null, spend_limit: null });
+
+    // …and therefore cannot page, nor disturb an existing latch.
+    const latched = poll(usage({ headline: meter({ percent: 90 }) }), EMPTY_QUOTA_ALERT_LATCH)
+      .latch;
+    const out = poll(stale, latched);
+    expect(out.alerts).toHaveLength(0);
+    expect(out.latch).toEqual(latched);
   });
 });
 

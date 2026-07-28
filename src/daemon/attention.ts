@@ -1,5 +1,6 @@
 import { dismissedKeys } from "../db/attention.js";
 import { listAgents } from "../db/agents.js";
+import { liveUsageEnabled } from "../config.js";
 import {
   countEventsToday,
   earliestEventTsAfter,
@@ -347,11 +348,24 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   // --- quota: the live Claude feed says we are near (or past) a ceiling. The
   //     daemon pages once per crossing via runQuotaAlerts; this is the standing
   //     item, so the situation stays visible until the window rolls over or
-  //     utilization drops. Derived from the cached reading rather than the
-  //     latch so it self-heals like every other kind here — the latch only
-  //     supplies the crossing time (the age anchor) and the dismissal
-  //     discriminator. A missing/unreadable feed yields nothing at all. -------
-  const live = getLiveUsageCache();
+  //     utilization drops.
+  //
+  //     Derived from the cached reading rather than the latch so it self-heals
+  //     like every other kind here — the latch only supplies the crossing time
+  //     (the age anchor) and the dismissal discriminator.
+  //
+  //     Two guards, because unlike tasks/agents/events this source can go
+  //     STALE while still holding a hot value: usagelive's noteFailure keeps
+  //     the last good `usage` on failure, and nothing clears it when the poller
+  //     stops for good. So (a) an install that opted out of reading the
+  //     credential surfaces nothing at all, and (b) quotaConditions discards a
+  //     reading older than QUOTA_READING_MAX_AGE_MS. Without (b) a single poll
+  //     that happened to catch spend.limit_reached would re-raise a red, urgent
+  //     item on every render forever — that item has no reset instant to age it
+  //     out the way the threshold item does. ---------------------------------
+  const live = liveUsageEnabled()
+    ? getLiveUsageCache()
+    : { usage: null, error: null, checked_at: null };
   const quotaCond = quotaConditions(
     live.usage,
     getQuotaSettings().alert_threshold_percent,
@@ -362,6 +376,13 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
     const over = quotaCond.over;
     const pct = Math.round(over.percent);
     const left = resetsIn(over.resets_at, now);
+    // The latch's crossing time only describes THIS window. It can legitimately
+    // be left behind on an older one — alerting off, or an unreadable stretch,
+    // leaves the latch untouched by design — and stamping a new window with an
+    // hours-old instant would both mis-badge the age and mis-rank the item in
+    // the oldest-first sort below.
+    const crossedAt =
+      quotaLatch.threshold_window === over.window ? quotaLatch.threshold_at : null;
     push({
       // Window id in the key: the next window is a new situation, so a
       // dismissal covers this crossing only.
@@ -376,7 +397,7 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
       task_id: null,
       agent_id: null,
       pr_url: null,
-      created_at: quotaLatch.threshold_at ?? live.usage?.fetched_at ?? now.toISOString(),
+      created_at: crossedAt ?? live.usage?.fetched_at ?? now.toISOString(),
     });
   }
   if (quotaCond.spend_limit === true) {

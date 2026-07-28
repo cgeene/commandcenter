@@ -2510,9 +2510,15 @@ function WorkspaceSection({
 }
 
 /**
- * Budget line for the LOCAL estimate. Deliberately narrow in scope: when the
- * live Claude usage feed is reachable it brings its own limits and this is
- * ignored, so the section says so rather than implying it drives the headline.
+ * Two settings that both concern spend but read from opposite sources, which is
+ * why the copy works so hard to separate them:
+ *
+ *  - monthly quota + cycle reset day draw a budget line against the LOCAL
+ *    estimate. When the live Claude feed is reachable it brings its own limits
+ *    and these are ignored, so the section says so rather than implying they
+ *    drive the headline.
+ *  - the alert threshold is the other direction entirely: it watches the LIVE
+ *    feed's headline meter and is what pages the operator.
  */
 function QuotaSection({
   settings,
@@ -2599,7 +2605,7 @@ function QuotaSection({
       <SettingRow
         label="Quota alert threshold (%)"
         when="immediate"
-        hint="Pushes a notification (and raises a Needs You item) once the live feed's busiest meter reaches this share of its window — once per crossing, not once per hourly poll. Blank turns the alert off. Needs live Claude usage enabled."
+        hint="Pushes a notification (and raises a Needs You item) once the live feed's busiest meter reaches this share of its window — once per crossing, not once per hourly poll. Blank turns off the utilization alert; hitting the org spend cap still alerts either way. Needs live Claude usage enabled."
       >
         <input
           type="number"

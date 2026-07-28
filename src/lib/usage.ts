@@ -12,6 +12,13 @@
  * Pure: no fetch, no node, no DOM. Shared with the web bundle (src/lib pattern).
  */
 
+/**
+ * How often the daemon refreshes the feed (daemon/usagelive.ts owns the timer).
+ * It lives here because consumers need it to judge how old a cached reading is,
+ * and those consumers are shared with the web bundle.
+ */
+export const LIVE_USAGE_POLL_MS = 3_600_000;
+
 /** One quota bar — a rate-limit window, or a dollar budget when the plan has one. */
 export interface UsageMeter {
   /** Stable identity for React keys and ordering. */

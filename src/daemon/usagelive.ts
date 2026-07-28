@@ -5,7 +5,11 @@ import { promisify } from "node:util";
 import { claudeHomeDir, liveUsageEnabled } from "../config.js";
 import { logEvent } from "../db/events.js";
 import { getLiveUsageCache, setLiveUsageCache } from "../db/settings.js";
-import { normalizeOauthUsage, type LiveUsageState } from "../lib/usage.js";
+import {
+  LIVE_USAGE_POLL_MS,
+  normalizeOauthUsage,
+  type LiveUsageState,
+} from "../lib/usage.js";
 import { runQuotaAlerts } from "./quotaalert.js";
 
 export type { LiveUsageState };
@@ -36,7 +40,9 @@ export type { LiveUsageState };
  */
 
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
-const POLL_MS = 3_600_000; // hourly; the dashboard also exposes a manual refresh
+/** Hourly; the dashboard also exposes a manual refresh. Shared with the staleness
+ *  check in lib/quotaalert.ts, hence the constant lives in lib/usage.ts. */
+const POLL_MS = LIVE_USAGE_POLL_MS;
 const KEYCHAIN_SERVICE = "Claude Code-credentials";
 /** The live entry's account. A second, stale entry exists under the operator's
  *  email address and a bare lookup returns THAT one — always ask by account. */
