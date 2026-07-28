@@ -275,16 +275,16 @@ function buildWorkerAsk(_task: Task): string[] {
   return [...DANGEROUS_PUSH_ASK];
 }
 
-/** Reviewers run read-only and deliberately do not receive the blanket Bash
- *  permission used by implementation workers. The platform runs verify_cmd
- *  mechanically before review; reviewers inspect that evidence, the diff,
- *  and files through narrowly-scoped read tools. Under `dontAsk`, arbitrary
- *  shell commands fail closed instead of prompting or mutating host state. */
+/** Reviewers run read-only: they get the same frictionless Bash catch-all so
+ *  they can independently run tests and builds, while editing, Git publishing,
+ *  and destructive host-control commands remain explicitly denied. Under
+ *  `dontAsk`, deny rules take precedence over this blanket allow. */
 function buildReviewerAllow(_task: Task): string[] {
-  return [...REVIEWER_TOOL_ALLOW, ...readOnlyProfileAllow()].filter(
-    (pattern) =>
-      pattern !== BASH_TOOL_ALLOW && !/^Bash\(\s*\*\s*\)$/.test(pattern),
-  );
+  return [
+    ...REVIEWER_TOOL_ALLOW,
+    BASH_TOOL_ALLOW,
+    ...readOnlyProfileAllow(),
+  ];
 }
 
 function buildReviewerDeny(task?: Task): string[] {

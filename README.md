@@ -171,10 +171,9 @@ A **worker** is an interactive Claude Code or Codex session for one task in a
 dedicated worktree. When a worker moves a task to `review` with commits on its
 branch, an independent **reviewer** proofs it: a *fresh* session in its own
 detached worktree at the task's branch with **Edit/Write/commit/push denied** —
-and without blanket Bash access. The platform runs `verify_cmd` before review;
-the reviewer uses the recorded result plus narrowly scoped read tools. It gets
-the same inputs as the worker (prompt, branch, claimed summary) but **none of
-its conversation**, and is prompted to find reasons to **reject**. It calls
+the reviewer can run tests and builds but cannot change or publish the work. It
+gets the same inputs as the worker (prompt, branch, claimed summary) but **none
+of its conversation**, and is prompted to find reasons to **reject**. It calls
 `submit_review(approve|reject, notes)`.
 
 - **Reject** → notes go back into the worker's session (or the respawn prompt if
@@ -662,7 +661,8 @@ about, on your own machine.
   file — commandcenter never touches your `~/.claude/settings.json`. Workers may
   push only their own branch and open a PR in the default mode; Human publishes
   denies worker/reviewer publication and hands the approved snapshot to you.
-  Reviewers deny Edit/Write/commit/push and receive no blanket Bash permission.
+  Reviewers deny Edit/Write/commit/push while retaining Bash for independent
+  tests and builds; targeted deny rules block destructive terminal control.
   Every provider process is launched without the host `TMUX` context and with
   its own private tmux socket namespace, so an agent cannot accidentally control
   Command Center's shared terminal server. Codex workers use an isolated profile

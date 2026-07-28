@@ -242,10 +242,9 @@ When a task reaches `review` with commits, an independent reviewer is spawned
 (auto, if `auto_review` is on; or `agp review <id>` / the main agent's
 `spawn_reviewer`). It is a **fresh** `claude` session in its own detached
 worktree at the task's branch, with `Edit`, `Write`, `NotebookEdit`,
-`git commit`, and `git push` **denied** and no blanket Bash permission. The
-platform runs `verify_cmd` before spawning the reviewer; the reviewer checks
-that recorded evidence, the diff, and repository files through narrowly scoped
-read tools. It gets the same *inputs* as the worker (task prompt, branch,
+`git commit`, and `git push` **denied**. It retains Bash so it can independently
+run tests, builds, and typechecks, while targeted deny rules block destructive
+terminal control. It gets the same *inputs* as the worker (task prompt, branch,
 claimed summary) but **none of its conversation** — independence is the point
 — and is prompted to find reasons to **reject**. It calls
 `submit_review(approve|reject, notes)`:

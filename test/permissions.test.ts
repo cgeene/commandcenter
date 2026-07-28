@@ -124,17 +124,9 @@ describe("spawn.ts allow-list builders", () => {
     for (const entry of READ_ONLY_PROFILE) expect(allow).toContain(entry);
   });
 
-  it("reviewer settings fail closed for arbitrary Bash", async () => {
+  it("reviewer settings allow Bash for independent tests and builds", async () => {
     const { _buildReviewerAllowForTest } = await import("../src/daemon/spawn.js");
-    const { setSchedulerConfig } = await import("../src/db/settings.js");
     const { createTask } = await import("../src/db/tasks.js");
-    setSchedulerConfig({
-      read_only_extra_allow: [
-        "Bash",
-        "Bash(*)",
-        "mcp__claude_ai_Linear__getIssue*",
-      ],
-    });
     const task = createTask({
       title: "t",
       prompt: "x",
@@ -142,10 +134,8 @@ describe("spawn.ts allow-list builders", () => {
       verify_cmd: "npm install && npm run build && npm test",
     });
     const allow = _buildReviewerAllowForTest(task);
-    expect(allow).not.toContain("Bash");
-    expect(allow).not.toContain("Bash(*)");
+    expect(allow).toContain("Bash");
     expect(allow).toContain("Bash(git diff*)");
-    expect(allow).toContain("mcp__claude_ai_Linear__getIssue*");
   });
 
   it("reviewer edits, Git publishing, and host tmux control are denied", async () => {

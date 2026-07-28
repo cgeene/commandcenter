@@ -542,7 +542,7 @@ describe("open_pr prompt wiring", () => {
     const task = createTask({ title: "safe terminal", prompt: "x", repo: "/r" });
 
     const reviewer = buildReviewerPrompt(task);
-    expect(reviewer).toContain("Arbitrary Bash is intentionally unavailable");
+    expect(reviewer).toContain("run relevant tests, builds, typechecks");
     expect(reviewer).toContain("do not invoke tmux kill/respawn/send-keys");
 
     const worker = _buildWorkerPromptForTest(task, "agent/task-1");

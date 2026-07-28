@@ -64,8 +64,8 @@ export function readOnlyProfileAllow(): string[] {
 /**
  * Frictionless self-verification for Claude workers.
  *
- * Workers run under permission `defaultMode: "dontAsk"` — the baseline is
- * DENY, so anything not matched by an allow rule is refused
+ * Workers and reviewers run under permission `defaultMode: "dontAsk"` — the
+ * baseline is DENY, so anything not matched by an allow rule is refused
  * without prompting the human. That is deliberate: routine work never pages
  * the human, and the *only* things that still surface a prompt are the ones
  * we explicitly route to the `ask` list below. But it means the safe tooling
