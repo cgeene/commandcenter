@@ -39,12 +39,11 @@ function mutatesHostTmux(command: string, depth = 0): boolean {
   if (depth > 4) return false;
   for (const argv of commandSegments(command)) {
     const verb = tmuxVerb(argv);
-    if (
-      verb &&
-      /^(?:kill-(?:server|session|window|pane)|respawn-(?:window|pane)|send-keys)$/.test(
-        verb,
-      )
-    ) {
+    // Stems, not full verbs: tmux accepts aliases (killw, killp, send,
+    // respawnp, respawnw) and any unambiguous abbreviation (kill-serv). The
+    // only tmux commands starting with these stems are the kill/respawn/send
+    // families, so stem matching catches every spelling without false hits.
+    if (verb && /^(?:kill|respawn|send)/.test(verb)) {
       return true;
     }
     if (processTargetsTmux(argv)) return true;

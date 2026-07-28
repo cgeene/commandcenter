@@ -150,8 +150,12 @@ describe("spawn.ts allow-list builders", () => {
         "Bash(git push*)",
         "Bash(sudo *)",
         "Bash(gh pr merge*)",
-        "Bash(tmux kill-*)",
-        "Bash(*tmux * kill-*)",
+        // Stem globs so tmux aliases/abbreviations (killw, send, kill-serv)
+        // are denied alongside the full verbs.
+        "Bash(tmux kill*)",
+        "Bash(*tmux * kill*)",
+        "Bash(tmux send*)",
+        "Bash(tmux respawn*)",
         "Bash(*pkill *tmux*)",
       ]),
     );
@@ -208,8 +212,8 @@ describe("spawn.ts allow-list builders", () => {
           "Bash(rm -rf /*)",
           "Bash(gh pr merge*)",
           "Bash(gh repo delete*)",
-          "Bash(tmux kill-*)",
-          "Bash(*tmux * send-keys*)",
+          "Bash(tmux kill*)",
+          "Bash(*tmux * send*)",
           "Bash(killall *tmux*)",
         ]),
       );

@@ -73,8 +73,8 @@ describe("main orchestrator spawn", () => {
     );
     expect(settings.permissions.deny).toEqual(
       expect.arrayContaining([
-        "Bash(tmux kill-*)",
-        "Bash(*tmux * kill-*)",
+        "Bash(tmux kill*)",
+        "Bash(*tmux * kill*)",
       ]),
     );
   });
