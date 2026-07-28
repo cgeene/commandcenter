@@ -75,6 +75,7 @@ describe("notification defaults", () => {
         "daemon_stale_build",
         "escalation",
         "pr_state_mismatch",
+        "quota_spend_limit",
         "quota_threshold",
         "review_approved_ready",
         "review_exhausted",
@@ -91,10 +92,98 @@ describe("notification defaults", () => {
     }
   });
 
-  it("keeps a pathway for the quota alerts that are not wired up yet", async () => {
+  it("covers both quota alert kinds under platform health", async () => {
     const { NOTIFY_EVENTS } = await import("../src/notify-events.js");
-    expect(NOTIFY_EVENTS.quota_threshold.category).toBe("platform");
-    expect(NOTIFY_EVENTS.quota_threshold.default_enabled).toBe(true);
+    for (const key of ["quota_threshold", "quota_spend_limit"] as const) {
+      expect(NOTIFY_EVENTS[key].category).toBe("platform");
+      expect(NOTIFY_EVENTS[key].default_enabled).toBe(true);
+    }
+  });
+});
+
+/* ------------------------------------------------------------------ *
+ * Quota alerting routes through the catalog too.                      *
+ * ------------------------------------------------------------------ */
+
+describe("quota alerts", () => {
+  /** A live-usage reading whose headline meter sits at `percent`. */
+  function usageAt(percent: number, now: Date, spendLimit: boolean | null = null) {
+    const resets = new Date(now.getTime() + 3_600_000).toISOString();
+    const headline = {
+      key: "session",
+      label: "Session (5h)",
+      percent,
+      resets_at: resets,
+      severity: null,
+      used_usd: null,
+      limit_usd: null,
+    };
+    return {
+      fetched_at: now.toISOString(),
+      source: "claude-code-oauth" as const,
+      meters: [headline],
+      headline,
+      spend:
+        spendLimit === null
+          ? null
+          : { limit_reached: spendLimit, used_usd: null, limit_usd: null, disabled_reason: null },
+      plan: "team",
+    };
+  }
+
+  it("pages through the catalog when the threshold is crossed", async () => {
+    const { runQuotaAlerts } = await import("../src/daemon/quotaalert.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const now = new Date("2026-07-28T12:00:00.000Z");
+
+    runQuotaAlerts(usageAt(88, now) as never, now);
+
+    const sent = pushes();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].title).toBe("Claude quota 88% used");
+    // Classified, not raw: the push is recorded against its catalog event.
+    const pushed = listEvents(30).filter((e) => e.kind === "notify.pushed");
+    expect(pushed).toHaveLength(1);
+    expect(JSON.parse(pushed[0].payload!).event).toBe("quota_threshold");
+  });
+
+  it("is silenced by the quota_threshold toggle, but still logs the event", async () => {
+    const { setNotificationSettings } = await import("../src/db/settings.js");
+    setNotificationSettings({ events: { quota_threshold: false } });
+    const { runQuotaAlerts } = await import("../src/daemon/quotaalert.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const now = new Date("2026-07-28T12:00:00.000Z");
+
+    runQuotaAlerts(usageAt(88, now) as never, now);
+
+    expect(pushes()).toEqual([]);
+    // The dashboard still learns about it — only the phone buzz is suppressed.
+    expect(listEvents(30).map((e) => e.kind)).toContain("usage.quota_threshold");
+  });
+
+  it("switches the two quota kinds independently", async () => {
+    const { setNotificationSettings } = await import("../src/db/settings.js");
+    setNotificationSettings({ events: { quota_threshold: false } });
+    const { runQuotaAlerts } = await import("../src/daemon/quotaalert.js");
+    const now = new Date("2026-07-28T12:00:00.000Z");
+
+    runQuotaAlerts(usageAt(88, now, true) as never, now);
+
+    const sent = pushes();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].title).toBe("Claude spend limit reached");
+  });
+
+  it("still pages only once per crossing (the quota latch is the de-dup)", async () => {
+    const { runQuotaAlerts } = await import("../src/daemon/quotaalert.js");
+    const now = new Date("2026-07-28T12:00:00.000Z");
+
+    // Three polls re-observing the SAME window (same reset instant), which is
+    // what an hourly feed actually reports while a window stays hot.
+    const reading = usageAt(88, now);
+    for (let i = 0; i < 3; i++) runQuotaAlerts(reading as never, now);
+
+    expect(pushes()).toHaveLength(1);
   });
 });
 

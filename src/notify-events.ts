@@ -51,6 +51,7 @@ export const NOTIFY_EVENT_KEYS = [
   // --- platform health ---
   "daemon_stale_build",
   "quota_threshold",
+  "quota_spend_limit",
   // --- informational ---
   "task_review_entered",
   "task_completed",
@@ -132,9 +133,17 @@ export const NOTIFY_EVENTS: Record<NotifyEventKey, NotifyEventSpec> = {
   quota_threshold: {
     key: "quota_threshold",
     category: "platform",
-    label: "Usage quota threshold",
+    label: "Usage quota threshold crossed",
     description:
-      "Model usage crossed a configured quota threshold. Reserved for the quota-alerting work; nothing emits it yet.",
+      "Live Claude usage crossed the alert threshold in Settings → Usage. Fires on the crossing, not on every poll: it re-arms when the rate-limit window rolls over or utilization drops back below the line.",
+    default_enabled: true,
+  },
+  quota_spend_limit: {
+    key: "quota_spend_limit",
+    category: "platform",
+    label: "Spend limit reached",
+    description:
+      "Extra-usage spending hit its cap. Agents start failing mid-task until the cap is raised or the cycle rolls over.",
     default_enabled: true,
   },
   task_review_entered: {

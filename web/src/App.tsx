@@ -2605,7 +2605,7 @@ function QuotaSection({
       <SettingRow
         label="Quota alert threshold (%)"
         when="immediate"
-        hint="Pushes a notification (and raises a Needs You item) once the live feed's busiest meter reaches this share of its window — once per crossing, not once per hourly poll. Blank turns off the utilization alert; hitting the org spend cap still alerts either way. Needs live Claude usage enabled."
+        hint="Pushes a notification (and raises a Needs You item) once the live feed's busiest meter reaches this share of its window — once per crossing, not once per hourly poll. Blank turns off the utilization alert; hitting the org spend cap still alerts either way. Needs live Claude usage enabled. The push itself can be silenced under Notifications → What gets pushed, which leaves the Needs You item in place."
       >
         <input
           type="number"
