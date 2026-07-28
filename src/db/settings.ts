@@ -302,6 +302,92 @@ export function jiraEnabledRepos(): string[] {
 }
 
 /**
+ * PR integration behavior: how the platform keeps open agent PRs mergeable
+ * while the default branch advances under them (see src/daemon/freshen.ts and
+ * src/lib/integration.ts).
+ *
+ * The defaults encode the policy: freshening is ON (it is cheap and mechanical),
+ * strict per-repo serialization is OFF everywhere (parallel work in one repo is
+ * allowed; overlap is judged at triage via blocked_by), and merging is never
+ * automated — the nudge only tells the human that waiting is now costing
+ * something.
+ */
+export interface IntegrationSettings {
+  /** Merge the default branch into open agent PRs when they fall behind. */
+  auto_freshen: boolean;
+  /** Freshen attempts one task may accumulate before the platform stops and
+   *  asks the human to merge or take over, instead of burning more tokens. */
+  freshen_max_attempts: number;
+  /** Tasks freshened per pass. A merge burst queues: the rest are picked up on
+   *  the following pass rather than spawning a respawn storm at once. */
+  freshen_per_pass_limit: number;
+  /** Absolute repo paths where only ONE task may be active at a time (active =
+   *  claimed/in_progress/review, or still holding an open agent PR). Opt-in,
+   *  empty by default — the blunt guarantee for repos that want it. */
+  strict_serial_repos: string[];
+  /** Minutes an approved, mergeable PR may sit unmerged while other tasks in
+   *  the same repo are queued/active before the human is nudged once. null
+   *  disables the nudge. */
+  merge_nudge_minutes: number | null;
+}
+
+export const INTEGRATION_SETTINGS_DEFAULTS: IntegrationSettings = {
+  auto_freshen: true,
+  freshen_max_attempts: 3,
+  freshen_per_pass_limit: 2,
+  strict_serial_repos: [],
+  merge_nudge_minutes: 120,
+};
+
+/**
+ * Effective integration settings, sanitized. A hand-edited or older stored
+ * group can hold the wrong shape (a string where a list belongs, a zero limit
+ * that would silently disable freshening), so every field is coerced back into
+ * range here — this is the only read point.
+ */
+export function getIntegrationSettings(): IntegrationSettings {
+  const raw = readGroup("integration", INTEGRATION_SETTINGS_DEFAULTS);
+  const positive = (value: unknown, fallback: number): number =>
+    typeof value === "number" && Number.isFinite(value) && value >= 1
+      ? Math.floor(value)
+      : fallback;
+  return {
+    auto_freshen:
+      typeof raw.auto_freshen === "boolean"
+        ? raw.auto_freshen
+        : INTEGRATION_SETTINGS_DEFAULTS.auto_freshen,
+    freshen_max_attempts: positive(
+      raw.freshen_max_attempts,
+      INTEGRATION_SETTINGS_DEFAULTS.freshen_max_attempts,
+    ),
+    freshen_per_pass_limit: positive(
+      raw.freshen_per_pass_limit,
+      INTEGRATION_SETTINGS_DEFAULTS.freshen_per_pass_limit,
+    ),
+    strict_serial_repos: Array.isArray(raw.strict_serial_repos)
+      ? raw.strict_serial_repos.filter(
+          (r): r is string => typeof r === "string" && r.trim().length > 0,
+        )
+      : [],
+    merge_nudge_minutes:
+      raw.merge_nudge_minutes === null
+        ? null
+        : positive(
+            raw.merge_nudge_minutes,
+            INTEGRATION_SETTINGS_DEFAULTS.merge_nudge_minutes ?? 120,
+          ),
+  };
+}
+
+export function setIntegrationSettings(
+  patch: Partial<IntegrationSettings>,
+): IntegrationSettings {
+  const merged = { ...getIntegrationSettings(), ...patch };
+  setSetting("integration", JSON.stringify(merged));
+  return getIntegrationSettings();
+}
+
+/**
  * Spend-quota display settings for the Tokens tab and the dashboard's spend
  * panel. Only used to draw a budget line against the LOCAL estimate — when the
  * live Claude usage feed is available it carries its own limits and these are

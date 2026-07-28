@@ -18,7 +18,10 @@ import {
   WorkspaceValidationError,
 } from "./workspaces.js";
 
-const MAX_TASK_PROMPT_LENGTH = 100_000;
+/** Ceiling on a task prompt once a respawn flow has appended context to it.
+ *  Shared with the integration-fix respawn (src/daemon/freshen.ts), which
+ *  appends its brief the same way an archived resume appends its handoff. */
+export const MAX_TASK_PROMPT_LENGTH = 100_000;
 const ARCHIVED_STATUSES = new Set(["done", "cancelled"]);
 const TERMINAL_PR_STATES = new Set(["merged", "closed"]);
 

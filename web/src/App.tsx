@@ -2311,6 +2311,194 @@ function SchedulerSection({
   );
 }
 
+/**
+ * PR integration: what the platform does about the window where finished work
+ * waits to be merged. Two-task-per-repo parallelism is the default and is safe
+ * (each worker has its own worktree); what is not safe is two PRs sitting open
+ * while the default branch moves, so freshening re-merges them and the nudge
+ * asks for a merge sooner.
+ *
+ * Strict-serial repos are a TOGGLE PER KNOWN REPOSITORY rather than a text
+ * field on purpose: the stored value is compared against `tasks.repo`, so a
+ * mistyped absolute path would read as "strict-serial is on" while matching
+ * nothing at all. A stored path the catalog no longer lists is still shown (as a
+ * removable stale row) so saving can never silently drop it either.
+ */
+function IntegrationSection({
+  settings,
+  repositories,
+  onSaved,
+  onError,
+}: {
+  settings: AppSettings;
+  repositories: WorkspaceCatalog["repositories"];
+  onSaved: () => void;
+  onError: (m: string) => void;
+}) {
+  const { stored } = settings.integration;
+  const [autoFreshen, setAutoFreshen] = useState(stored.auto_freshen);
+  const [maxAttempts, setMaxAttempts] = useState(String(stored.freshen_max_attempts));
+  const [perPass, setPerPass] = useState(String(stored.freshen_per_pass_limit));
+  const [nudge, setNudge] = useState(
+    stored.merge_nudge_minutes === null ? "" : String(stored.merge_nudge_minutes),
+  );
+  const [serial, setSerial] = useState<string[]>(stored.strict_serial_repos);
+  const [saving, setSaving] = useState(false);
+
+  const toggleSerial = (path: string, on: boolean) =>
+    setSerial((cur) =>
+      on ? Array.from(new Set([...cur, path])) : cur.filter((p) => p !== path),
+    );
+
+  const known = new Set(repositories.map((r) => r.path));
+  const stale = serial.filter((p) => !known.has(p));
+
+  const save = async () => {
+    setSaving(true);
+    onError("");
+    try {
+      const whole = (raw: string, label: string, max: number): number => {
+        const n = Number(raw.trim());
+        if (!Number.isInteger(n) || n < 1 || n > max) {
+          throw new Error(`${label} must be a whole number from 1 to ${max}.`);
+        }
+        return n;
+      };
+      const nudgeRaw = nudge.trim();
+      await api("PATCH", "/api/settings/integration", {
+        auto_freshen: autoFreshen,
+        freshen_max_attempts: whole(maxAttempts, "Re-merge attempt limit", 20),
+        freshen_per_pass_limit: whole(perPass, "Re-merges per pass", 20),
+        strict_serial_repos: serial,
+        merge_nudge_minutes:
+          nudgeRaw === "" ? null : whole(nudgeRaw, "Merge nudge", 10080),
+      });
+      onSaved();
+    } catch (e) {
+      onError(errMsg(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="settings-section">
+      <h2>PR integration</h2>
+      <p className="muted">
+        Two tasks may work in one repository at the same time — that is the
+        default, and overlapping ones are sequenced with <code>blocked_by</code>{" "}
+        when the work is triaged. What conflicts is not the work but the wait:
+        once another PR merges, every still-open branch is missing those commits.
+        Nothing here ever merges a PR — that stays yours.
+      </p>
+      <SettingRow label="Auto-freshen open PRs" when="immediate">
+        <label className="setting-check">
+          <input
+            type="checkbox"
+            checked={autoFreshen}
+            onChange={(e) => setAutoFreshen(e.target.checked)}
+          />
+          Re-merge the default branch into open agent PRs that fall behind it
+        </label>
+      </SettingRow>
+      <SettingRow
+        label="Re-merge attempt limit"
+        when="immediate"
+        hint="A clean re-merge whose verification passes is pushed to the same branch; a conflict or a failed verification pushes nothing and relaunches the task's worker to reconcile it. After this many attempts without the PR merging, the platform stops touching it and notifies you instead."
+      >
+        <input
+          type="number"
+          min="1"
+          max="20"
+          step="1"
+          value={maxAttempts}
+          onChange={(e) => setMaxAttempts(e.target.value)}
+        />
+      </SettingRow>
+      <SettingRow
+        label="Re-merges per pass"
+        when="immediate"
+        hint="How many PRs may be re-merged in one PR-sync pass (~2 min). A burst of merges queues instead of relaunching a crowd of workers at once; the rest are picked up on the next pass."
+      >
+        <input
+          type="number"
+          min="1"
+          max="20"
+          step="1"
+          value={perPass}
+          onChange={(e) => setPerPass(e.target.value)}
+        />
+      </SettingRow>
+      <SettingRow
+        label="Merge nudge (minutes)"
+        when="immediate"
+        hint="Notify you once when an approved, mergeable PR has waited this long while other tasks in the same repo are queued or running — merging it then is what stops the other branches needing a re-merge. Blank turns the nudge off. It only notifies; merging is never automated. The push itself can be silenced under Notifications → What gets pushed."
+      >
+        <input
+          type="number"
+          min="1"
+          max="10080"
+          step="30"
+          placeholder="off"
+          value={nudge}
+          onChange={(e) => setNudge(e.target.value)}
+        />
+      </SettingRow>
+
+      <div className="jira-repos">
+        <div className="setting-head">
+          <span className="setting-label">Strict-serial repositories</span>
+          <ApplyBadge when="immediate" />
+        </div>
+        <span className="setting-hint muted">
+          The blunt opt-in guarantee: <b>one active task per repository</b>{" "}
+          (active = claimed, in progress, in review, or still holding an open
+          agent PR). Everything else queues, and a spawn is refused while the
+          repo is busy. Off for every repo by default — the normal mode is
+          parallel work with overlap sequenced by <code>blocked_by</code> at
+          triage. Turn it on only where you want the guarantee more than the
+          throughput.
+        </span>
+
+        {repositories.length === 0 && stale.length === 0 && (
+          <p className="muted">
+            No repositories in the catalog yet — nothing to serialize.
+          </p>
+        )}
+
+        <div className="repo-toggle-list">
+          {repositories.map((r) => (
+            <label className="repo-toggle" key={r.path}>
+              <input
+                type="checkbox"
+                checked={serial.includes(r.path)}
+                onChange={(e) => toggleSerial(r.path, e.target.checked)}
+              />
+              <span>{r.name}</span>
+              <code>{r.path}</code>
+            </label>
+          ))}
+          {stale.map((p) => (
+            <div className="repo-toggle" key={p}>
+              <span className="repo-toggle-stale">Not in the catalog</span>
+              <code>{p}</code>
+              <button className="link-btn" onClick={() => toggleSerial(p, false)}>
+                Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="settings-actions">
+        <button className="primary" disabled={saving} onClick={save}>
+          {saving ? "Saving…" : "Save PR Integration"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function AgentsSection({
   settings,
   onSaved,
@@ -3204,7 +3392,9 @@ function JiraSection({
 function SettingsView() {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [scheduler, setScheduler] = useState<SchedulerInfo | null>(null);
-  const [repoSuggestions, setRepoSuggestions] = useState<string[]>([]);
+  const [repositories, setRepositories] = useState<
+    WorkspaceCatalog["repositories"]
+  >([]);
   const [error, setError] = useState<string>("");
   const [loaded, setLoaded] = useState(false);
 
@@ -3226,17 +3416,23 @@ function SettingsView() {
     load();
   }, [load]);
 
-  // Known repos, offered as JIRA per-repo add-suggestions. Best-effort — a
-  // failure just means no autocomplete, never a broken settings page.
+  // The server-validated repository catalog: JIRA per-repo add-suggestions and
+  // the strict-serial toggles both come from it, so a repo key/path is never
+  // typed by hand. Best-effort — a failure means no suggestions and no toggles,
+  // never a broken settings page.
   useEffect(() => {
     api<WorkspaceCatalog>("GET", "/api/workspaces")
-      .then((cat) => {
-        const paths = cat.repositories.map((r) => r.path);
-        const named = cat.repositories.map((r) => r.name);
-        setRepoSuggestions(Array.from(new Set([...paths, ...named])));
-      })
-      .catch(() => setRepoSuggestions([]));
+      .then((cat) => setRepositories(cat.repositories))
+      .catch(() => setRepositories([]));
   }, []);
+
+  const repoSuggestions = useMemo(
+    () =>
+      Array.from(
+        new Set(repositories.flatMap((r) => [r.path, r.name])),
+      ),
+    [repositories],
+  );
 
   return (
     <main className="settings-view">
@@ -3254,6 +3450,13 @@ function SettingsView() {
       )}
       {settings && (
         <>
+          <IntegrationSection
+            key={`i${JSON.stringify(settings.integration.stored)}`}
+            settings={settings}
+            repositories={repositories}
+            onSaved={load}
+            onError={setError}
+          />
           <AgentsSection
             key={`a${JSON.stringify(settings.agents.stored)}`}
             settings={settings}

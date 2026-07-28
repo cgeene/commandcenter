@@ -9,6 +9,7 @@ import {
   updateTask,
   type Task,
 } from "../db/tasks.js";
+import { integrationPass } from "./freshen.js";
 import { notifyEvent } from "./notify.js";
 import { notifyApprovedReady, reviewLoopSweep, reviewMaxCycles } from "./review.js";
 import { resumeAgent } from "./resume.js";
@@ -530,6 +531,13 @@ export async function prSyncPass(): Promise<void> {
       recordSyncFailure(task.id, err instanceof Error ? err.message : String(err));
     }
   }
+  // Self-healing integration (task #184): now that pr_state is current, re-merge
+  // the default branch into any open agent PR that has fallen behind it, and
+  // nudge on merge latency. Runs BEFORE the review sweep so a freshened branch
+  // and its carried-over approval are already consistent when the sweep looks at
+  // them. Never throws — see integrationPass.
+  await integrationPass();
+
   // Safety net for the auto-review loop: catch a stale approval (post-approval
   // push with no clean worker Stop) or any review-status task the Stop-hook
   // trigger missed. Each call is a no-op when there is nothing new to review.

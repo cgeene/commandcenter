@@ -52,6 +52,7 @@ import {
   WORKER_TOOL_ALLOW,
 } from "./permissions.js";
 import { resolveReviewDelta } from "./reviewstate.js";
+import { strictSerialHolder, strictSerialReason } from "./serial.js";
 import { findProviderTranscript } from "./transcript.js";
 import { killWindow, newWindow, paneProcess, windowExists } from "./tmux.js";
 import { sweepVanishedPaneGroup } from "./proctree.js";
@@ -507,6 +508,13 @@ export function spawnWorker(
 ): { agent: Agent; task: Task } {
   const task = getTask(taskId);
   if (!task) throw new Error(`task ${taskId} not found`);
+
+  // Opt-in strict-serial repos: refuse before claiming, so a gated task stays
+  // exactly as it was. No-op unless an operator listed this repo (see serial.ts).
+  const holder = strictSerialHolder(task);
+  if (holder) {
+    throw new WorkerSpawnValidationError(strictSerialReason(task, holder));
+  }
 
   if (task.status === "queued") {
     if (!claimTask(taskId)) {

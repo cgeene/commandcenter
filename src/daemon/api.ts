@@ -61,7 +61,9 @@ import {
   resolveWorktreesDir,
   getQuotaSettings,
   getOrgCostCache,
+  getIntegrationSettings,
   setAgentSettings,
+  setIntegrationSettings,
   setJiraConfig,
   setNotificationSettings,
   setQuotaSettings,
@@ -95,7 +97,6 @@ import {
   getTask,
   listTasks,
   markTaskTriaged,
-  readyTasks,
   REVIEW_MODES,
   updateTask,
   WORKSPACE_KINDS,
@@ -141,6 +142,7 @@ import {
 } from "../reasoning.js";
 import { CLAUDE_MODEL_SLUGS, providerModels } from "./provider-models.js";
 import { delegateTaskToMain, delegateTaskToMainDetailed } from "./orchestration.js";
+import { dispatchableTasks } from "./serial.js";
 import {
   allocateScratchWorkspace,
   removeScratchWorkspace,
@@ -380,8 +382,10 @@ export function buildApp(): Hono {
     if (c.req.query("dispatch_mode") && !dispatchResult.success) {
       return c.json({ error: "invalid dispatch mode" }, 400);
     }
+    // "ready" means dispatchable NOW: a task a strict-serial repo is holding is
+    // not offered to the orchestrator, because spawning it would be refused.
     const tasks = c.req.query("ready") === "true"
-      ? readyTasks(dispatchMode)
+      ? dispatchableTasks(dispatchMode)
       : listTasks(status).filter(
           (task) => !dispatchMode || task.dispatch_mode === dispatchMode,
         );
@@ -823,8 +827,11 @@ export function buildApp(): Hono {
     if (task.dispatch_mode !== "orchestrated" || task.status !== "queued") {
       return c.json({ error: "task is not awaiting main-agent triage" }, 409);
     }
-    if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
-      return c.json({ error: "task blockers are not done" }, 409);
+    if (!dispatchableTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
+      return c.json(
+        { error: "task blockers are not done, or its repo is strict-serial and busy" },
+        409,
+      );
     }
     // Hitting this route deliberately IS the re-flag: the human (or the
     // dashboard's "notify main" action) is asking for this task to be put in
@@ -1775,6 +1782,11 @@ export function buildApp(): Hono {
         base_url: jiraBaseUrl(),
         email: jiraEmail() ?? null,
       },
+      integration: {
+        // PR-integration behavior only: which repos are strict-serial, and how
+        // hard the platform tries to keep open agent PRs mergeable.
+        stored: getIntegrationSettings(),
+      },
       quota: {
         stored: getQuotaSettings(),
         // Presence only — the admin key itself never crosses the boundary,
@@ -1845,6 +1857,38 @@ export function buildApp(): Hono {
         },
       },
     });
+  });
+
+  // Repo paths must be absolute (they are compared against tasks.repo, which
+  // always is) and are stored as given; a non-existent path is accepted so a
+  // repo can be pre-listed before it is cloned.
+  const integrationSettingsPatchSchema = z.object({
+    auto_freshen: z.boolean().optional(),
+    freshen_max_attempts: z.number().int().min(1).max(20).optional(),
+    freshen_per_pass_limit: z.number().int().min(1).max(20).optional(),
+    strict_serial_repos: z
+      .array(z.string().trim().min(1))
+      .max(100)
+      .optional()
+      .superRefine((v, ctx) => {
+        if (!v) return;
+        for (const repo of v) {
+          if (!path.isAbsolute(repo)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              message: `repo path must be absolute: ${repo}`,
+            });
+          }
+        }
+      }),
+    merge_nudge_minutes: z.number().int().min(1).max(10_080).nullable().optional(),
+  });
+
+  app.patch("/api/settings/integration", async (c) => {
+    const patch = integrationSettingsPatchSchema.parse(await c.req.json());
+    const integration = setIntegrationSettings(patch);
+    logEvent("settings.config", { payload: { group: "integration", patch } });
+    return c.json({ integration: { stored: integration } });
   });
 
   app.patch("/api/settings/jira", async (c) => {

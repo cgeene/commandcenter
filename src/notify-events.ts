@@ -48,6 +48,8 @@ export const NOTIFY_EVENT_KEYS = [
   "review_exhausted",
   "escalation",
   "pr_state_mismatch",
+  "merge_latency",
+  "integration_halted",
   // --- platform health ---
   "daemon_stale_build",
   "quota_threshold",
@@ -120,6 +122,22 @@ export const NOTIFY_EVENTS: Record<NotifyEventKey, NotifyEventSpec> = {
     label: "PR draft/ready state is wrong",
     description:
       "A `gh pr ready` (or `--undo`) failed, so GitHub's draft state no longer matches the internal verdict. Needs a manual fix or an un-reviewed PR looks mergeable.",
+    default_enabled: true,
+  },
+  merge_latency: {
+    key: "merge_latency",
+    category: "action",
+    label: "Approved PR waiting while its repo moves on",
+    description:
+      "An approved, mergeable PR has been sitting unmerged while other tasks in the same repository are queued or running. Merging is always yours to do — this fires once per approval, because every hour it waits is another branch that has to be re-merged.",
+    default_enabled: true,
+  },
+  integration_halted: {
+    key: "integration_halted",
+    category: "action",
+    label: "Stopped re-merging a PR",
+    description:
+      "The platform re-merged the default branch into an open agent PR its full budget of times and the PR still has not merged, so it stopped instead of burning more tokens. Merge it or take the branch over.",
     default_enabled: true,
   },
   daemon_stale_build: {

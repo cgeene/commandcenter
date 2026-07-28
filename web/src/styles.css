@@ -1149,6 +1149,19 @@ dd { font-family: var(--font-mono); word-break: break-all; }
   text-transform: uppercase; letter-spacing: var(--letter-spacing-label);
   color: var(--muted);
 }
+/* Per-repository toggles (strict-serial repos), sourced from the catalog. */
+.repo-toggle-list { display: flex; flex-direction: column; gap: var(--space-4); }
+.repo-toggle {
+  display: flex; align-items: center; gap: var(--space-5); flex-wrap: wrap;
+  font-size: var(--font-size-body); color: var(--fg);
+}
+.repo-toggle input { width: auto; }
+.repo-toggle code {
+  font-size: var(--font-size-meta); font-family: var(--font-mono);
+  color: var(--muted); word-break: break-all;
+}
+.repo-toggle-stale { color: var(--yellow); font-size: var(--font-size-meta); }
+
 .link-btn {
   background: none; border: none; color: var(--muted); cursor: pointer;
   font-size: var(--font-size-meta); text-decoration: underline; padding: 0;

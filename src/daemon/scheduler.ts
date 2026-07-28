@@ -9,13 +9,7 @@ import {
   logEvent,
 } from "../db/events.js";
 import { getSchedulerConfig, type SchedulerConfig } from "../db/settings.js";
-import {
-  createTask,
-  getTask,
-  listTasks,
-  readyTasks,
-  updateTask,
-} from "../db/tasks.js";
+import { createTask, getTask, listTasks, updateTask } from "../db/tasks.js";
 import { workerSlots } from "./capacity.js";
 import { flushMainQueue } from "./notifqueue.js";
 import { notifyEvent } from "./notify.js";
@@ -31,6 +25,7 @@ import { versionInfo } from "./version.js";
 import { WAIT_HOOK_EVENTS } from "./waiting.js";
 import { pruneScratchWorkspaces } from "./workspaces.js";
 import { delegatePendingTaskToLiveMain } from "./orchestration.js";
+import { dispatchableTasks } from "./serial.js";
 
 /** Task statuses that mean the worker has nothing left to do — safe to reap. */
 const TERMINAL_STATUSES = ["done", "cancelled", "failed"];
@@ -163,7 +158,7 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
   // Human/UI tasks are main-orchestrated; only explicit compatibility/cron
   // tasks retain the historical direct scheduler path, so capacity accounting
   // and spawning both operate on the direct-dispatch queue.
-  const ready = readyTasks("direct");
+  const ready = dispatchableTasks("direct");
   // Workers parked under a running reviewer hold no slot (see capacity.ts) —
   // during a review wave they would otherwise pin the fleet at zero throughput.
   const { counted: liveWorkers, parked } = workerSlots();

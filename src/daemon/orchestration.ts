@@ -4,12 +4,13 @@ import {
   clearTriageQueueForTask,
   listQueuedNotifications,
 } from "../db/notifications.js";
-import { getTask, readyTasks, type Task } from "../db/tasks.js";
+import { getTask, type Task } from "../db/tasks.js";
 import {
   buildTriageMessage,
   deliverToMainIfClear,
   queueDelivery,
 } from "./notifqueue.js";
+import { dispatchableTasks } from "./serial.js";
 import { windowExists } from "./tmux.js";
 import {
   pendingHumanWorkerResume,
@@ -85,7 +86,8 @@ function queuedTriageRows(mainId: number): Map<number, string> {
  * - "no_main": there is no live main window to deliver to — the only outcome
  *   that a new main agent would fix.
  * - "not_triageable": the task is not awaiting triage at all (wrong
- *   dispatch_mode/status, or its blockers are not done).
+ *   dispatch_mode/status, its blockers are not done, or its repo is configured
+ *   strict-serial and another task is holding it).
  */
 export type DelegateOutcome =
   | "delivered"
@@ -203,7 +205,7 @@ export async function delegateTaskToMainDetailed(
   ) {
     return "self_filed";
   }
-  if (!readyTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
+  if (!dispatchableTasks("orchestrated").some((candidate) => candidate.id === task.id)) {
     return "not_triageable";
   }
   const main = availableMain(preferredMain);
@@ -235,7 +237,7 @@ export async function delegateTaskToMain(
  * delivered but never acknowledged is eventually repeated rather than lost.
  */
 export function pendingTriageTasks(main: Agent, nowMs: number = Date.now()): Task[] {
-  return readyTasks("orchestrated").filter((task) => {
+  return dispatchableTasks("orchestrated").filter((task) => {
     // Skip main-created tasks: they need no triage. A failed human-requested
     // worker resume is different — the task was reopened outside Main's current
     // turn and still needs a managed spawn retry.
@@ -300,5 +302,5 @@ export async function delegatePendingTaskToLiveMain(): Promise<boolean> {
 }
 
 export function pendingOrchestratedTasks(): Task[] {
-  return readyTasks("orchestrated");
+  return dispatchableTasks("orchestrated");
 }
