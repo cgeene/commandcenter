@@ -17,7 +17,7 @@ import { buildDreamPrompt } from "../prompts/dreamer.js";
 import type { Agent } from "../db/agents.js";
 import type { Event } from "../db/events.js";
 import type { Task } from "../db/tasks.js";
-import { blockerNote } from "../lib/blockers.js";
+import { blockerNote, parseBlockedByFlag } from "../lib/blockers.js";
 import { gitToplevel } from "../daemon/worktree.js";
 import { writeCodexConfig } from "../daemon/genconfig.js";
 import { countRepositoriesUnder } from "../daemon/workspaces.js";
@@ -146,13 +146,12 @@ task
   )
   .option("--result <summary>")
   .action(async (id: string, opts) => {
-    // "none" is the clear verb: the API takes null, which the shell can't send.
+    // Parsed (and rejected) before the request is built: an unparseable id
+    // would otherwise reach the API as null and clear the dependency.
     const blockedBy =
       opts.blockedBy === undefined
         ? undefined
-        : ["none", "null", ""].includes(String(opts.blockedBy))
-          ? null
-          : Number(opts.blockedBy);
+        : parseBlockedByFlag(String(opts.blockedBy));
     const t = await api<Task>("PATCH", `/api/tasks/${id}`, {
       status: opts.status,
       priority: opts.priority !== undefined ? Number(opts.priority) : undefined,
@@ -163,7 +162,9 @@ task
       result_summary: opts.result,
     });
     console.log(`task #${t.id}: ${t.status}`);
-    if (t.blocked_by != null && blockedBy != null) {
+    if (blockedBy === null) {
+      console.log(`task #${t.id} is no longer blocked by another task`);
+    } else if (blockedBy !== undefined && t.blocked_by != null) {
       const blocker = await api<Task>("GET", `/api/tasks/${t.blocked_by}`);
       console.log(blockerNote(blocker.id, blocker.status));
     }

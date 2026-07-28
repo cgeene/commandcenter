@@ -61,6 +61,31 @@ export function blockerEffect(status: string): BlockerEffect {
   return "pending";
 }
 
+/** Verbs that mean "clear the dependency" on the command line — the shell
+ *  cannot send a JSON null. */
+const CLEAR_VERBS = ["none", "null", ""];
+
+/**
+ * Parse a CLI --blocked-by value into what the API takes: a positive task id,
+ * or null to clear.
+ *
+ * Strict on purpose. `Number("abc")` is NaN, `JSON.stringify(NaN)` is `null`,
+ * and the API's blocked_by is nullable — so a typo'd id would sail through as
+ * an explicit CLEAR and silently destroy the very sequencing this flag exists
+ * to record. Anything that is not a clear verb or a positive integer throws
+ * before the request is built.
+ */
+export function parseBlockedByFlag(value: string): number | null {
+  const raw = value.trim();
+  if (CLEAR_VERBS.includes(raw.toLowerCase())) return null;
+  if (!/^\d+$/.test(raw) || Number(raw) < 1) {
+    throw new BlockerValidationError(
+      `--blocked-by must be a positive task id or 'none' to clear, got: ${value}`,
+    );
+  }
+  return Number(raw);
+}
+
 /** One-line explanation of a blocker's effect, for tool/CLI output. */
 export function blockerNote(blockerId: number, status: string): string {
   switch (blockerEffect(status)) {

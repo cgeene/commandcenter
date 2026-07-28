@@ -6,6 +6,7 @@ import {
   blockerChainReaches,
   blockerEffect,
   blockerNote,
+  parseBlockedByFlag,
 } from "../src/lib/blockers.js";
 
 let tmpDir: string;
@@ -72,6 +73,53 @@ describe("blocker chain helpers", () => {
     expect(blockerEffect("in_progress")).toBe("pending");
     expect(blockerNote(7, "done")).toMatch(/already done/);
     expect(blockerNote(7, "cancelled")).toMatch(/never become done/);
+  });
+});
+
+describe("CLI --blocked-by parsing", () => {
+  it("accepts a positive task id", () => {
+    expect(parseBlockedByFlag("9")).toBe(9);
+    expect(parseBlockedByFlag(" 9 ")).toBe(9);
+  });
+
+  it("treats the clear verbs as null", () => {
+    for (const verb of ["none", "NONE", "null", ""]) {
+      expect(parseBlockedByFlag(verb)).toBeNull();
+    }
+  });
+
+  it("rejects anything that is not an id or a clear verb", () => {
+    for (const bad of ["abc", "#9", "tsk-9", "9,10", "9.5", "-1", "0", "1e3"]) {
+      expect(() => parseBlockedByFlag(bad)).toThrow(/positive task id/);
+    }
+  });
+
+  it("an unparseable id never reaches the API, so the blocker survives", async () => {
+    const { createTask, getTask } = await import("../src/db/tasks.js");
+    const blocker = createTask({ title: "b", prompt: "x", repo: "/r" });
+    const dependent = createTask({
+      title: "d",
+      prompt: "x",
+      repo: "/r",
+      blocked_by: blocker.id,
+    });
+
+    // The hazard this guard exists for: Number("abc") is NaN, JSON.stringify
+    // turns NaN into null, and blocked_by is nullable — so an unvalidated typo
+    // would land as an explicit CLEAR.
+    expect(JSON.stringify({ blocked_by: Number("abc") })).toBe('{"blocked_by":null}');
+    expect((await patch(dependent.id, { blocked_by: null })).status).toBe(200);
+    expect(getTask(dependent.id)?.blocked_by).toBeNull();
+
+    // With the guard, the CLI throws before any request is built.
+    const restored = createTask({
+      title: "d2",
+      prompt: "x",
+      repo: "/r",
+      blocked_by: blocker.id,
+    });
+    expect(() => parseBlockedByFlag("abc")).toThrow(/positive task id/);
+    expect(getTask(restored.id)?.blocked_by).toBe(blocker.id);
   });
 });
 
