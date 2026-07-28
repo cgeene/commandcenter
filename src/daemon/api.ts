@@ -1377,6 +1377,9 @@ export function buildApp(): Hono {
     // 1-28 so every month has the day. Larger values are pinned to the month's
     // last day downstream, but the UI shouldn't offer them.
     cycle_reset_day: z.number().int().min(1).max(28).optional(),
+    // Live-feed alert line, or null to turn the alert off. Below 1% every poll
+    // would page; 100 is "only when the window is actually exhausted".
+    alert_threshold_percent: z.number().int().min(1).max(100).nullable().optional(),
   });
 
   app.get("/api/settings", (c) => {

@@ -9,7 +9,14 @@ import {
   latestTaskEvent,
 } from "../db/events.js";
 import { JIRA_SYNC_FAIL_THRESHOLD } from "../lib/jira.js";
-import { getSchedulerConfig } from "../db/settings.js";
+import { quotaConditions, quotaIsCritical } from "../lib/quotaalert.js";
+import { resetsIn } from "../lib/usage.js";
+import {
+  getLiveUsageCache,
+  getQuotaAlertLatch,
+  getQuotaSettings,
+  getSchedulerConfig,
+} from "../db/settings.js";
 import { listTasks, readyTasks } from "../db/tasks.js";
 import { reviewMaxCycles } from "./review.js";
 import { prStates } from "./prcache.js";
@@ -31,7 +38,8 @@ export type AttentionKind =
   | "stale_waiting"
   | "scheduler_stalled"
   | "orchestration"
-  | "jira_sync";
+  | "jira_sync"
+  | "quota";
 
 export type Severity = "red" | "orange" | "yellow";
 
@@ -334,6 +342,58 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
         }
       }
     }
+  }
+
+  // --- quota: the live Claude feed says we are near (or past) a ceiling. The
+  //     daemon pages once per crossing via runQuotaAlerts; this is the standing
+  //     item, so the situation stays visible until the window rolls over or
+  //     utilization drops. Derived from the cached reading rather than the
+  //     latch so it self-heals like every other kind here — the latch only
+  //     supplies the crossing time (the age anchor) and the dismissal
+  //     discriminator. A missing/unreadable feed yields nothing at all. -------
+  const live = getLiveUsageCache();
+  const quotaCond = quotaConditions(
+    live.usage,
+    getQuotaSettings().alert_threshold_percent,
+    nowMs,
+  );
+  const quotaLatch = getQuotaAlertLatch();
+  if (quotaCond.over) {
+    const over = quotaCond.over;
+    const pct = Math.round(over.percent);
+    const left = resetsIn(over.resets_at, now);
+    push({
+      // Window id in the key: the next window is a new situation, so a
+      // dismissal covers this crossing only.
+      id: `quota:threshold:${over.window}`,
+      kind: "quota",
+      title: `Claude quota ${pct}% used — ${over.label}`,
+      context: left
+        ? `Past the ${over.threshold}% alert threshold; window resets in ${left}`
+        : `Past the ${over.threshold}% alert threshold`,
+      severity: quotaIsCritical(over.percent) ? "orange" : "yellow",
+      urgent: false,
+      task_id: null,
+      agent_id: null,
+      pr_url: null,
+      created_at: quotaLatch.threshold_at ?? live.usage?.fetched_at ?? now.toISOString(),
+    });
+  }
+  if (quotaCond.spend_limit === true) {
+    const since = quotaLatch.spend_limit_at ?? live.usage?.fetched_at ?? now.toISOString();
+    push({
+      id: `quota:spend_limit:${since}`, // a later episode re-raises a dismissal
+      kind: "quota",
+      title: "Claude spend limit reached",
+      context:
+        "Extra-usage spending is capped — agents will fail mid-task until the limit is raised or the cycle rolls over.",
+      severity: "red",
+      urgent: true,
+      task_id: null,
+      agent_id: null,
+      pr_url: null,
+      created_at: since,
+    });
   }
 
   // severity desc, then oldest first (a problem that has festered ranks above

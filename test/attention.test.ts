@@ -539,6 +539,124 @@ describe("deriveAttention — jira_sync", () => {
   });
 });
 
+describe("deriveAttention — quota", () => {
+  const RESETS = "2099-01-01T00:00:00.000Z"; // never elapsed
+
+  /** Seed the live-usage cache the way a successful poll would. */
+  async function seedUsage(
+    percent: number | null,
+    over: { resets_at?: string | null; limit_reached?: boolean } = {},
+  ) {
+    const { setLiveUsageCache } = await import("../src/db/settings.js");
+    const headline = {
+      key: "session",
+      label: "Session (5h)",
+      percent,
+      resets_at: over.resets_at === undefined ? RESETS : over.resets_at,
+      severity: null,
+      used_usd: null,
+      limit_usd: null,
+    };
+    setLiveUsageCache({
+      usage: {
+        fetched_at: new Date().toISOString(),
+        source: "claude-code-oauth",
+        meters: [headline],
+        headline,
+        spend:
+          over.limit_reached === undefined
+            ? null
+            : {
+                used_usd: 50,
+                limit_usd: 50,
+                percent: 100,
+                enabled: true,
+                limit_reached: over.limit_reached,
+                disabled_reason: null,
+              },
+        plan: "team",
+      },
+      error: null,
+      checked_at: new Date().toISOString(),
+    });
+  }
+
+  it("raises nothing without a live feed", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    expect(deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota")).toHaveLength(
+      0,
+    );
+  });
+
+  it("raises nothing below the threshold", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    await seedUsage(70);
+    expect(deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota")).toHaveLength(
+      0,
+    );
+  });
+
+  it("raises a quota item above the threshold", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    await seedUsage(88);
+    const quota = deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota");
+    expect(quota).toHaveLength(1);
+    expect(quota[0]).toMatchObject({ severity: "yellow", task_id: null });
+    expect(quota[0].title).toContain("88%");
+  });
+
+  it("goes hotter as the meter approaches exhaustion", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    await seedUsage(97);
+    const quota = deriveAttention({ isPrOpen: allOpen }).find((i) => i.kind === "quota")!;
+    expect(quota.severity).toBe("orange");
+  });
+
+  it("drops the item once the window it measured has elapsed", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    await seedUsage(97, { resets_at: "2020-01-01T00:00:00.000Z" });
+    expect(deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota")).toHaveLength(
+      0,
+    );
+  });
+
+  it("raises a red item when the spend cap is hit", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    await seedUsage(10, { limit_reached: true });
+    const quota = deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota");
+    expect(quota).toHaveLength(1);
+    expect(quota[0]).toMatchObject({ severity: "red", urgent: true });
+  });
+
+  it("honours the configured threshold and an explicit disable", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { setQuotaSettings } = await import("../src/db/settings.js");
+    await seedUsage(55);
+    setQuotaSettings({ alert_threshold_percent: 50 });
+    expect(deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota")).toHaveLength(
+      1,
+    );
+    setQuotaSettings({ alert_threshold_percent: null });
+    expect(deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota")).toHaveLength(
+      0,
+    );
+  });
+
+  it("re-raises in the next window after a dismissal", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { dismissAttention } = await import("../src/db/attention.js");
+    await seedUsage(90);
+    const first = deriveAttention({ isPrOpen: allOpen }).find((i) => i.kind === "quota")!;
+    dismissAttention(first.id);
+    expect(deriveAttention({ isPrOpen: allOpen }).some((i) => i.kind === "quota")).toBe(false);
+
+    await seedUsage(90, { resets_at: "2099-06-01T00:00:00.000Z" }); // next window
+    const second = deriveAttention({ isPrOpen: allOpen }).find((i) => i.kind === "quota");
+    expect(second).toBeTruthy();
+    expect(second!.id).not.toBe(first.id);
+  });
+});
+
 describe("prcache", () => {
   it("returns a fresh cached value without shelling out", async () => {
     const { prState, _seedPrCache } = await import("../src/daemon/prcache.js");

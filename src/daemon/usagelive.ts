@@ -6,6 +6,7 @@ import { claudeHomeDir, liveUsageEnabled } from "../config.js";
 import { logEvent } from "../db/events.js";
 import { getLiveUsageCache, setLiveUsageCache } from "../db/settings.js";
 import { normalizeOauthUsage, type LiveUsageState } from "../lib/usage.js";
+import { runQuotaAlerts } from "./quotaalert.js";
 
 export type { LiveUsageState };
 
@@ -212,6 +213,9 @@ export async function refreshLiveUsage(): Promise<LiveUsageState> {
     checked_at: new Date().toISOString(),
   };
   setLiveUsageCache(state);
+  // Only on the success path: alerting off a stale cached reading would page
+  // for a window that may already have rolled over.
+  runQuotaAlerts(usage);
   return state;
 }
 
