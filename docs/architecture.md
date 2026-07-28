@@ -299,30 +299,53 @@ Counted:
 - workers on `claimed` / `in_progress` tasks, including a rework round after a
   rejection;
 - a worker with no task yet (a manual or mid-spawn agent);
-- a worker whose task is in `review` with nobody reviewing it — see below;
-- a worker idling on a finished or blocked task until the watchdog reaps it —
-  a real squatter, so it stays visible to the cap rather than being forgiven.
+- a worker whose task is in `review` with no reviewer still working on it — see
+  below;
+- a worker idling on a finished task until the watchdog reaps it, or on a
+  `blocked` task, which the watchdog does not reap at all (the reap covers
+  `done`/`cancelled`/`failed` plus approved-awaiting-merge, so a task blocked by
+  an exhausted review loop keeps its worker until someone kills it). Both are
+  real squatters, so they stay visible to the cap rather than being forgiven.
 
-Exempt — **parked under review**: a worker is parked when a live reviewer agent
-is judging its task and no verdict has landed yet. It is idle by construction —
-it handed the work to the reviewer and owns no further state change — and stays
-alive for exactly one reason: a rejection can then be delivered into its existing
-session, which is much cheaper than a respawn. Counting those idle workers took
-the fleet to zero throughput during review waves, every slot held by a parked
-worker while triaged tasks queued. Within the parked case the exemption ignores
-agent state, so a missed Stop hook or a permission prompt cannot silently
-re-consume a slot the reviewer is responsible for releasing.
+Exempt — **parked under review**: a worker is parked when a reviewer that is
+still going to produce a verdict is judging its task and no verdict has landed
+yet. It is idle by construction — it handed the work to the reviewer and owns no
+further state change — and stays alive for exactly one reason: a rejection can
+then be delivered into its existing session, which is much cheaper than a
+respawn. Counting those idle workers took the fleet to zero throughput during
+review waves, every slot held by a parked worker while triaged tasks queued.
+Within the parked case the exemption ignores the *worker's* own state, so a
+missed Stop hook or a permission prompt cannot silently re-consume a slot the
+reviewer is responsible for releasing.
 
-The exemption is keyed on the **reviewer**, not on the `review` status, because a
-task can sit in `review` with nobody coming to release it: a repo task with no PR
-(auto-review skips it), `auto_review` off, the daily review budget spent, a
-submission with nothing reviewable, or a reviewer that died before submitting. A
-worker in that review limbo is exactly the squatter described above, so it counts
-— bounded by the cap and named by `scheduler.capacity_blocked` and the Needs You
-"scheduler stalled" item, instead of accumulating live provider processes with no
-limit and no signal. A worker whose task was already **approved** counts for the
-same reason: no rejection can arrive for that round, and the watchdog's
-approved-awaiting-merge reap retires it.
+The exemption is keyed on the **reviewer**, not on the `review` status, and it
+requires positive evidence that the reviewer is still running — a reviewer row
+that merely exists and isn't `dead` is not enough. A task can sit in `review`
+with nobody coming to release the worker:
+
+- no reviewer was ever spawned: a repo task with no PR (auto-review skips it),
+  `auto_review` off, the daily review budget spent, or a submission with nothing
+  reviewable;
+- the reviewer's spawn threw after its row was created, so it never got a tmux
+  pane and no process exists (it sits in `spawning`/`stalled` with a null
+  `tmux_target`; the vanished-agent reaper only looks at agents that have one);
+- the reviewer's turn ended without submitting a verdict, or it stalled. Nothing
+  reaps a reviewer — the watchdog's reap branch is workers-only — so that row
+  stays live, usually `idle`, indefinitely. `reviewer.stopped_incomplete` marks
+  it and the human is paged once.
+
+A worker in any of those states is exactly the squatter described above, so it
+counts — bounded by the cap and named by `scheduler.capacity_blocked` and the
+Needs You "scheduler stalled" item, instead of accumulating live provider
+processes with no limit and no signal. A worker whose task was already
+**approved** counts for the same reason: no rejection can arrive for that round,
+and the watchdog's approved-awaiting-merge reap retires it.
+
+That list is an enumeration, and an enumeration can always miss a mode, so the
+exemption also **expires**: a round that has been running longer than
+`MAX_REVIEW_PARK_MS` (4 hours — orders of magnitude above a real review) counts
+its worker again regardless of what the reviewer looks like. That is a backstop,
+not a policy; it means a leak is impossible rather than merely enumerated away.
 
 When a rejection is delivered into a parked worker, its task returns to
 `in_progress` and the worker re-enters the count. Rework is a continuation of

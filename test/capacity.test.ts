@@ -57,12 +57,12 @@ async function workerOn(status: "in_progress" | "review" | "done", state = "idle
   return { task, agent };
 }
 
-/** A live reviewer judging the task — what makes its worker cap-exempt. */
-async function reviewerOn(taskId: number) {
+/** A running reviewer judging the task — what makes its worker cap-exempt. */
+async function reviewerOn(taskId: number, state = "working") {
   const { createAgent } = await import("../src/db/agents.js");
   return createAgent({
     kind: "reviewer",
-    state: "working",
+    state: state as "working",
     task_id: taskId,
     tmux_target: `cc:@r${taskId}`,
   });
@@ -116,6 +116,64 @@ describe("workerSlots", () => {
     const slots = workerSlots();
     expect(slots.counted.map((a) => a.id)).toEqual([stuck.agent.id]);
     expect(slots.parked).toHaveLength(0);
+  });
+
+  it("counts a worker whose reviewer stopped without submitting a verdict", async () => {
+    const { workerSlots } = await import("../src/daemon/capacity.js");
+    const { updateAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    // hooks.reviewerStopped deliberately leaves a verdict-less reviewer alive
+    // (idle) for the human to inspect, and nothing ever reaps a reviewer — so
+    // "not dead" is no evidence at all that a verdict is still coming.
+    const stuck = await parkedWorker();
+    updateAgent(stuck.reviewer.id, { state: "idle" });
+    logEvent("reviewer.stopped_incomplete", {
+      agentId: stuck.reviewer.id,
+      taskId: stuck.task.id,
+    });
+
+    const slots = workerSlots();
+    expect(slots.parked).toHaveLength(0);
+    expect(slots.counted.map((a) => a.id)).toEqual([stuck.agent.id]);
+  });
+
+  it("counts a worker whose reviewer is stalled or was never attached to a pane", async () => {
+    const { workerSlots } = await import("../src/daemon/capacity.js");
+    const { createAgent, updateAgent } = await import("../src/db/agents.js");
+    const stalled = await parkedWorker();
+    updateAgent(stalled.reviewer.id, { state: "stalled" });
+    // Spawn threw after createAgent but before the pane was attached, so no
+    // process exists; the vanished-agent reaper skips it for lacking a target.
+    const paneless = await workerOn("review");
+    createAgent({ kind: "reviewer", state: "spawning", task_id: paneless.task.id });
+
+    const slots = workerSlots();
+    expect(slots.parked).toHaveLength(0);
+    expect(slots.counted.map((a) => a.id).sort()).toEqual(
+      [stalled.agent.id, paneless.agent.id].sort(),
+    );
+  });
+
+  it("expires the exemption once the review round has run too long", async () => {
+    const { workerSlots } = await import("../src/daemon/capacity.js");
+    const parked = await parkedWorker();
+    // The reviewer looks perfectly healthy — this is the backstop for failure
+    // modes the checks above do not enumerate.
+    expect(workerSlots().parked).toHaveLength(1);
+
+    const slots = workerSlots({ nowMs: Date.now() + 5 * 60 * 60_000 });
+    expect(slots.parked).toHaveLength(0);
+    expect(slots.counted.map((a) => a.id)).toEqual([parked.agent.id]);
+  });
+
+  it("keeps exempting a worker whose reviewer is waiting on input", async () => {
+    const { workerSlots } = await import("../src/daemon/capacity.js");
+    const { updateAgent } = await import("../src/db/agents.js");
+    // A permission prompt is escalated and answered; the round still finishes.
+    const parked = await parkedWorker();
+    updateAgent(parked.reviewer.id, { state: "waiting_input" });
+
+    expect(workerSlots().parked.map((a) => a.id)).toEqual([parked.agent.id]);
   });
 
   it("re-counts a parked worker when its reviewer dies without a verdict", async () => {
