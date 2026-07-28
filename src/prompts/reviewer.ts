@@ -75,6 +75,8 @@ export function buildReviewerPrompt(
     "## What to check",
     ...(light ? lightChecks() : fullChecks()),
     "",
+    "Comment wording, density, or completeness is NOT a finding unless a comment is factually wrong or stale — misleading comments are real defects; style preferences are zero-cost observations at most, never rejection grounds or listed action items.",
+    "",
     "## Verdict",
     "When you have evidence either way, call submit_review exactly once:",
     '- verdict "reject" with specific, actionable notes (file, problem, what acceptance requires) if ANY check above fails. Vague notes are useless — the worker gets your notes verbatim as its fix list.',
