@@ -155,6 +155,34 @@ export function jiraToken(): string | undefined {
   return process.env.CC_JIRA_TOKEN;
 }
 
+/** Anthropic Admin API key (`sk-ant-admin01-...`) for the org cost report.
+ *  Env-only and never persisted or logged — same contract as CC_JIRA_TOKEN.
+ *  Unset ⇒ the org-billing poller stays inert. */
+export function anthropicAdminKey(): string | undefined {
+  return process.env.CC_ANTHROPIC_ADMIN_KEY?.trim() || undefined;
+}
+
+/**
+ * Opt-in switch for the live Claude-usage poller.
+ *
+ * OFF unless CC_LIVE_USAGE=1. That poller reads the OAuth access token Claude
+ * Code stores on this machine (macOS keychain / ~/.claude/.credentials.json)
+ * and sends it to an undocumented endpoint. Reading a credential the daemon
+ * has never previously touched is the operator's decision to make, not a
+ * default — so it is gated exactly like CC_ANTHROPIC_ADMIN_KEY gates the org
+ * cost report: absent env, the subsystem never arms and costs nothing.
+ */
+export function liveUsageEnabled(): boolean {
+  const raw = process.env.CC_LIVE_USAGE?.trim().toLowerCase() ?? "";
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+
+/** Directory holding Claude Code's own state, including the Linux/WSL
+ *  credentials file. Overridable so tests never touch the real one. */
+export function claudeHomeDir(): string {
+  return process.env.CC_CLAUDE_HOME?.trim() || path.join(os.homedir(), ".claude");
+}
+
 export function claudeProjectsDir(): string {
   return (
     process.env.CC_CLAUDE_PROJECTS ??

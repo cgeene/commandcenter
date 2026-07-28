@@ -167,7 +167,8 @@ export type AttentionKind =
   | "stale_waiting"
   | "scheduler_stalled"
   | "orchestration"
-  | "jira_sync";
+  | "jira_sync"
+  | "quota";
 
 export interface JiraMeta {
   base_url: string;
@@ -245,6 +246,79 @@ export interface SchedulerInfo {
   status: { live_workers: number; spawns_today: number };
 }
 
+/* ---- spend / quota ---- */
+
+export interface UsageMeter {
+  key: string;
+  label: string;
+  percent: number | null;
+  resets_at: string | null;
+  severity: string | null;
+  used_usd: number | null;
+  limit_usd: number | null;
+}
+
+export interface LiveUsage {
+  fetched_at: string;
+  source: "claude-code-oauth" | "anthropic-admin-api";
+  meters: UsageMeter[];
+  headline: UsageMeter | null;
+  spend: {
+    used_usd: number;
+    limit_usd: number | null;
+    percent: number | null;
+    enabled: boolean;
+    limit_reached: boolean;
+    disabled_reason: string | null;
+  } | null;
+  plan: string | null;
+}
+
+export interface DaySpend {
+  day: string;
+  tokens: number;
+  cost_usd: number;
+  unpriced_tokens: number;
+}
+
+export interface ModelSpend {
+  model: string;
+  tokens: number;
+  cost_usd: number;
+  priced: boolean;
+}
+
+export interface LocalBurnWindow {
+  days: DaySpend[];
+  cost_usd: number;
+  tokens: number;
+  by_model: ModelSpend[];
+}
+
+/** GET /api/usage — every spend source at once, each labelled with its origin
+ *  so the UI never presents an estimate as billing truth. */
+export interface UsagePayload {
+  live: { usage: LiveUsage | null; error: string | null; checked_at: string | null };
+  org: {
+    total_usd: number | null;
+    days: Record<string, number>;
+    cycle_start: string | null;
+    fetched_at: string | null;
+    error: string | null;
+  };
+  local: {
+    cycle: LocalBurnWindow & {
+      start: string;
+      end: string;
+      days_total: number;
+      days_elapsed: number;
+    };
+    all_time: LocalBurnWindow;
+    tracked_since: string | null;
+  };
+  quota: { monthly_quota_usd: number | null; cycle_reset_day: number };
+}
+
 /** Runtime settings surfaced by the Settings tab (GET /api/settings).
  *  `stored` holds explicit overrides (null = unset → env/default fallback);
  *  `effective` is the resolved value actually in use. The ntfy token is a
@@ -282,6 +356,18 @@ export interface AppSettings {
     stored: { ntfy_url: string | null; events: Record<string, boolean> };
     ntfy_token_set: boolean;
     effective: { ntfy_url: string | null; events: Record<string, boolean> };
+  };
+  quota: {
+    stored: {
+      monthly_quota_usd: number | null;
+      cycle_reset_day: number;
+      alert_threshold_percent: number | null;
+    };
+    /** Derived from CC_ANTHROPIC_ADMIN_KEY — the key itself never crosses. */
+    admin_key_set: boolean;
+    /** Whether the daemon was opted into reading Claude Code's stored OAuth
+     *  credential (CC_LIVE_USAGE=1). Off unless explicitly enabled. */
+    live_usage_enabled: boolean;
   };
   jira: {
     stored: JiraConfig;

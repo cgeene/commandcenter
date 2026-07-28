@@ -289,8 +289,34 @@ export interface SessionTokens {
   input: number;
   output: number;
   cache_read: number;
+  /** Total cache-write tokens across both TTLs. */
   cache_creation: number;
+  /** The 1-hour-TTL subset of cache_creation. Billed at 2x input rather than
+   *  the 5-minute 1.25x, and in practice most writes here are 1h — so pricing
+   *  the lump sum at 1.25x materially understates cost. */
+  cache_creation_1h: number;
   total: number;
+}
+
+/** Split a turn's cache-write tokens by TTL.
+ *
+ *  `usage.cache_creation_input_tokens` is the flat total; `usage.cache_creation`
+ *  is an object breaking it down (`ephemeral_1h_input_tokens` /
+ *  `ephemeral_5m_input_tokens`). Older transcripts carry only the flat number,
+ *  so an absent breakdown yields 0 for the 1h portion and the caller prices the
+ *  whole thing at the cheaper rate rather than guessing high. */
+function cacheWrites(u: Record<string, unknown>): { total: number; oneHour: number } {
+  const flat = typeof u.cache_creation_input_tokens === "number" ? u.cache_creation_input_tokens : 0;
+  const split = u.cache_creation;
+  if (typeof split !== "object" || split === null) return { total: flat, oneHour: 0 };
+  const s = split as Record<string, unknown>;
+  const n = (k: string) => (typeof s[k] === "number" ? (s[k] as number) : 0);
+  const oneHour = n("ephemeral_1h_input_tokens");
+  const fiveMin = n("ephemeral_5m_input_tokens");
+  // Prefer the flat total when present — it's the field that has always been
+  // authoritative — but never let the 1h portion exceed it.
+  const total = flat || oneHour + fiveMin;
+  return { total, oneHour: Math.min(oneHour, total) };
 }
 
 /** Sum the per-turn usage a session's transcript records for its assistant
@@ -299,7 +325,14 @@ export function sessionTokens(sessionId: string): SessionTokens | undefined {
   const file = findTranscript(sessionId);
   if (!file) return undefined;
 
-  const t: SessionTokens = { input: 0, output: 0, cache_read: 0, cache_creation: 0, total: 0 };
+  const t: SessionTokens = {
+    input: 0,
+    output: 0,
+    cache_read: 0,
+    cache_creation: 0,
+    cache_creation_1h: 0,
+    total: 0,
+  };
   for (const line of fs.readFileSync(file, "utf8").split("\n")) {
     if (!line.includes('"usage"')) continue;
     let row: { type?: string; message?: { usage?: Record<string, unknown> } };
@@ -312,13 +345,68 @@ export function sessionTokens(sessionId: string): SessionTokens | undefined {
     const u = row.message?.usage;
     if (!u) continue;
     const n = (k: string) => (typeof u[k] === "number" ? (u[k] as number) : 0);
+    const writes = cacheWrites(u);
     t.input += n("input_tokens");
     t.output += n("output_tokens");
     t.cache_read += n("cache_read_input_tokens");
-    t.cache_creation += n("cache_creation_input_tokens");
+    t.cache_creation += writes.total;
+    t.cache_creation_1h += writes.oneHour;
   }
   t.total = t.input + t.output + t.cache_read + t.cache_creation;
   return t;
+}
+
+/**
+ * Same walk as sessionTokens, but split by the model that served each turn.
+ * The per-day burn table prices each model separately, and a single session
+ * routinely spans models (a /model switch, or a subagent on a cheaper tier),
+ * so a lumped total can't be costed. Turns with no model recorded land under
+ * `fallbackModel` — the agent's configured model, our best available guess.
+ */
+export function sessionTokensByModel(
+  sessionId: string,
+  fallbackModel: string,
+): Map<string, SessionTokens> {
+  const out = new Map<string, SessionTokens>();
+  const file = findTranscript(sessionId);
+  if (!file) return out;
+
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    if (!line.includes('"usage"')) continue;
+    let row: { type?: string; message?: { model?: unknown; usage?: Record<string, unknown> } };
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (row.type !== "assistant") continue;
+    const u = row.message?.usage;
+    if (!u) continue;
+    const model =
+      typeof row.message?.model === "string" && row.message.model
+        ? row.message.model
+        : fallbackModel;
+    const t =
+      out.get(model) ??
+      {
+        input: 0,
+        output: 0,
+        cache_read: 0,
+        cache_creation: 0,
+        cache_creation_1h: 0,
+        total: 0,
+      };
+    const n = (k: string) => (typeof u[k] === "number" ? (u[k] as number) : 0);
+    const writes = cacheWrites(u);
+    t.input += n("input_tokens");
+    t.output += n("output_tokens");
+    t.cache_read += n("cache_read_input_tokens");
+    t.cache_creation += writes.total;
+    t.cache_creation_1h += writes.oneHour;
+    t.total = t.input + t.output + t.cache_read + t.cache_creation;
+    out.set(model, t);
+  }
+  return out;
 }
 
 function codexSessionTokens(file: string): SessionTokens {
@@ -327,6 +415,7 @@ function codexSessionTokens(file: string): SessionTokens {
     output: 0,
     cache_read: 0,
     cache_creation: 0,
+    cache_creation_1h: 0,
     total: 0,
   };
   for (const line of fs.readFileSync(file, "utf8").split("\n")) {
@@ -354,6 +443,7 @@ function codexSessionTokens(file: string): SessionTokens {
       output,
       cache_read: n("cached_input_tokens"),
       cache_creation: 0,
+      cache_creation_1h: 0,
       total: n("total_tokens") || n("input_tokens") + output,
     };
   }
@@ -368,4 +458,20 @@ export function providerSessionTokens(
   if (provider === "claude") return sessionTokens(sessionId);
   const file = findCodexTranscript(sessionId, transcriptPath);
   return file ? codexSessionTokens(file) : undefined;
+}
+
+/** Per-model cumulative totals for a session, whichever provider ran it.
+ *  Codex transcripts record only a running whole-session total with no model
+ *  on it, so those collapse into a single `fallbackModel` bucket. */
+export function providerSessionTokensByModel(
+  provider: AgentProvider,
+  sessionId: string,
+  fallbackModel: string,
+  transcriptPath?: string | null,
+): Map<string, SessionTokens> {
+  if (provider === "claude") return sessionTokensByModel(sessionId, fallbackModel);
+  const file = findCodexTranscript(sessionId, transcriptPath);
+  if (!file) return new Map();
+  const t = codexSessionTokens(file);
+  return t.total > 0 ? new Map([[fallbackModel, t]]) : new Map();
 }

@@ -14,6 +14,13 @@ import {
   isPublicationMode,
   type PublicationMode,
 } from "../publication.js";
+import { DEFAULT_CYCLE_RESET_DAY } from "../lib/pricing.js";
+import {
+  EMPTY_QUOTA_ALERT_LATCH,
+  QUOTA_ALERT_THRESHOLD_DEFAULT,
+  type QuotaAlertLatch,
+} from "../lib/quotaalert.js";
+import type { LiveUsageState } from "../lib/usage.js";
 import {
   isNotifyEventKey,
   NOTIFY_EVENT_DEFAULTS,
@@ -292,6 +299,98 @@ export function jiraEnabledRepos(): string[] {
   return Object.entries(cfg.repos)
     .filter(([, r]) => r?.enabled)
     .map(([repo]) => repo);
+}
+
+/**
+ * Spend-quota display settings for the Tokens tab and the dashboard's spend
+ * panel. Only used to draw a budget line against the LOCAL estimate — when the
+ * live Claude usage feed is available it carries its own limits and these are
+ * ignored. Unset quota ⇒ burn is shown with no budget line.
+ */
+export interface QuotaSettings {
+  /** Monthly budget in USD to measure the local estimate against. */
+  monthly_quota_usd: number | null;
+  /** Day of month the budget resets (1-28; a stored larger value is pinned to
+   *  the month's last day so February still works). */
+  cycle_reset_day: number;
+  /** Page the operator once the LIVE feed's headline meter reaches this
+   *  percentage of its window. null disables the alert. Unlike the two fields
+   *  above, this one is about the live feed, not the local estimate. */
+  alert_threshold_percent: number | null;
+}
+
+export const QUOTA_SETTINGS_DEFAULTS: QuotaSettings = {
+  monthly_quota_usd: null,
+  cycle_reset_day: DEFAULT_CYCLE_RESET_DAY,
+  alert_threshold_percent: QUOTA_ALERT_THRESHOLD_DEFAULT,
+};
+
+export function getQuotaSettings(): QuotaSettings {
+  return readGroup("quota", QUOTA_SETTINGS_DEFAULTS);
+}
+
+export function setQuotaSettings(patch: Partial<QuotaSettings>): QuotaSettings {
+  const merged = { ...getQuotaSettings(), ...patch };
+  setSetting("quota", JSON.stringify(merged));
+  return merged;
+}
+
+/* ---- poller caches (daemon-written, not operator-editable) ---- *
+ *
+ * Cached so the dashboard renders a number immediately on load and keeps
+ * showing the last known one across daemon restarts and upstream outages,
+ * rather than blanking while an hourly poll comes round again. Neither cache
+ * ever holds a credential — only the derived figures.
+ */
+
+const EMPTY_LIVE_USAGE: LiveUsageState = { usage: null, error: null, checked_at: null };
+
+export function getLiveUsageCache(): LiveUsageState {
+  return readGroup("usage_live", EMPTY_LIVE_USAGE);
+}
+
+export function setLiveUsageCache(state: LiveUsageState): void {
+  setSetting("usage_live", JSON.stringify(state));
+}
+
+/**
+ * Escalate-once state for the quota alert (daemon/quotaalert.ts). Persisted
+ * rather than held in memory so a daemon restart doesn't re-page the operator
+ * for a crossing they were already told about.
+ */
+export function getQuotaAlertLatch(): QuotaAlertLatch {
+  return readGroup("quota_alert", EMPTY_QUOTA_ALERT_LATCH);
+}
+
+export function setQuotaAlertLatch(latch: QuotaAlertLatch): void {
+  setSetting("quota_alert", JSON.stringify(latch));
+}
+
+/** Anthropic Admin API cost-report roll-up (org billing dollars). */
+export interface OrgCostCache {
+  /** Total for the cycle window below, in USD. */
+  total_usd: number | null;
+  /** Per-day USD, keyed YYYY-MM-DD. */
+  days: Record<string, number>;
+  cycle_start: string | null;
+  fetched_at: string | null;
+  error: string | null;
+}
+
+const EMPTY_ORG_COST: OrgCostCache = {
+  total_usd: null,
+  days: {},
+  cycle_start: null,
+  fetched_at: null,
+  error: null,
+};
+
+export function getOrgCostCache(): OrgCostCache {
+  return readGroup("org_cost", EMPTY_ORG_COST);
+}
+
+export function setOrgCostCache(cache: OrgCostCache): void {
+  setSetting("org_cost", JSON.stringify(cache));
 }
 
 /* ---- resolvers: the DB > env > default read points ---- */

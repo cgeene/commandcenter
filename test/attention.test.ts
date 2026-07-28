@@ -539,6 +539,211 @@ describe("deriveAttention — jira_sync", () => {
   });
 });
 
+describe("deriveAttention — quota", () => {
+  const RESETS = "2099-01-01T00:00:00.000Z"; // never elapsed
+
+  let savedLiveUsage: string | undefined;
+  beforeEach(() => {
+    // The panel surfaces nothing at all on an install that opted out of
+    // reading the OAuth credential, so every case here has to opt in.
+    savedLiveUsage = process.env.CC_LIVE_USAGE;
+    process.env.CC_LIVE_USAGE = "1";
+  });
+  afterEach(() => {
+    if (savedLiveUsage === undefined) delete process.env.CC_LIVE_USAGE;
+    else process.env.CC_LIVE_USAGE = savedLiveUsage;
+  });
+
+  /** Seed the live-usage cache the way a poll would. `error`/`fetched_at`
+   *  model a feed that has since broken while its last good reading lingers. */
+  async function seedUsage(
+    percent: number | null,
+    over: {
+      resets_at?: string | null;
+      limit_reached?: boolean;
+      error?: string;
+      fetched_at?: string;
+    } = {},
+  ) {
+    const { setLiveUsageCache } = await import("../src/db/settings.js");
+    const headline = {
+      key: "session",
+      label: "Session (5h)",
+      percent,
+      resets_at: over.resets_at === undefined ? RESETS : over.resets_at,
+      severity: null,
+      used_usd: null,
+      limit_usd: null,
+    };
+    setLiveUsageCache({
+      usage: {
+        fetched_at: over.fetched_at ?? new Date().toISOString(),
+        source: "claude-code-oauth",
+        meters: [headline],
+        headline,
+        spend:
+          over.limit_reached === undefined
+            ? null
+            : {
+                used_usd: 50,
+                limit_usd: 50,
+                percent: 100,
+                enabled: true,
+                limit_reached: over.limit_reached,
+                disabled_reason: null,
+              },
+        plan: "team",
+      },
+      error: over.error ?? null,
+      // Bumped by every attempt, successful or not — which is exactly why the
+      // staleness check keys off fetched_at instead.
+      checked_at: new Date().toISOString(),
+    });
+  }
+
+  const hoursAgo = (h: number) => new Date(Date.now() - h * 3_600_000).toISOString();
+  const quotaItems = async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    return deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota");
+  };
+
+  it("raises nothing without a live feed", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    expect(deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota")).toHaveLength(
+      0,
+    );
+  });
+
+  it("raises nothing below the threshold", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    await seedUsage(70);
+    expect(deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota")).toHaveLength(
+      0,
+    );
+  });
+
+  it("raises a quota item above the threshold", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    await seedUsage(88);
+    const quota = deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota");
+    expect(quota).toHaveLength(1);
+    expect(quota[0]).toMatchObject({ severity: "yellow", task_id: null });
+    expect(quota[0].title).toContain("88%");
+  });
+
+  it("goes hotter as the meter approaches exhaustion", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    await seedUsage(97);
+    const quota = deriveAttention({ isPrOpen: allOpen }).find((i) => i.kind === "quota")!;
+    expect(quota.severity).toBe("orange");
+  });
+
+  it("drops the item once the window it measured has elapsed", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    await seedUsage(97, { resets_at: "2020-01-01T00:00:00.000Z" });
+    expect(deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota")).toHaveLength(
+      0,
+    );
+  });
+
+  it("raises a red item when the spend cap is hit", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    await seedUsage(10, { limit_reached: true });
+    const quota = deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota");
+    expect(quota).toHaveLength(1);
+    expect(quota[0]).toMatchObject({ severity: "red", urgent: true });
+  });
+
+  it("honours the configured threshold and an explicit disable", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { setQuotaSettings } = await import("../src/db/settings.js");
+    await seedUsage(55);
+    setQuotaSettings({ alert_threshold_percent: 50 });
+    expect(deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota")).toHaveLength(
+      1,
+    );
+    setQuotaSettings({ alert_threshold_percent: null });
+    expect(deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota")).toHaveLength(
+      0,
+    );
+  });
+
+  // The cache is sticky by design (usagelive keeps the last good reading on a
+  // failed poll, and nothing clears it when the poller stops for good), so a
+  // hot value can outlive the situation it described.
+  it("keeps raising through a brief outage — one 503 must not blank a real crossing", async () => {
+    await seedUsage(90, { error: "HTTP 503", fetched_at: hoursAgo(1) });
+    expect(await quotaItems()).toHaveLength(1);
+  });
+
+  it("drops a threshold item whose reading has gone stale behind a broken feed", async () => {
+    await seedUsage(90, { error: "HTTP 401", fetched_at: hoursAgo(9) });
+    expect(await quotaItems()).toHaveLength(0);
+  });
+
+  it("drops a stale spend-cap item — it has no reset instant to age it out", async () => {
+    // The reviewer's repro: the last good poll caught the cap, then the token
+    // expired. Without the age bound this red/urgent item never goes away.
+    await seedUsage(10, {
+      limit_reached: true,
+      error: "Claude Code OAuth token expired — it refreshes on next use",
+      fetched_at: hoursAgo(30),
+    });
+    expect(await quotaItems()).toHaveLength(0);
+
+    // Same reading, freshly fetched: still very much the operator's problem.
+    await seedUsage(10, { limit_reached: true });
+    expect(await quotaItems()).toHaveLength(1);
+  });
+
+  it("surfaces nothing when the operator opted out of the live feed", async () => {
+    await seedUsage(97, { limit_reached: true });
+    expect(await quotaItems()).toHaveLength(2);
+    delete process.env.CC_LIVE_USAGE;
+    expect(await quotaItems()).toHaveLength(0);
+  });
+
+  it("anchors the age on the latch only when it belongs to this window", async () => {
+    const { setQuotaAlertLatch } = await import("../src/db/settings.js");
+    const fetched = hoursAgo(1);
+
+    // Latch left behind on an EARLIER window (alerting was off while the
+    // window rolled, so evaluateQuotaAlerts never cleared it).
+    setQuotaAlertLatch({
+      threshold_window: "session@1999-01-01T00:00:00.000Z",
+      threshold_at: "1999-01-01T00:00:00.000Z",
+      spend_limit: false,
+      spend_limit_at: null,
+    });
+    await seedUsage(90, { fetched_at: fetched });
+    expect((await quotaItems())[0].created_at).toBe(fetched);
+
+    // Latch that does describe this window supplies the real crossing time.
+    const crossed = hoursAgo(2);
+    setQuotaAlertLatch({
+      threshold_window: `session@${RESETS}`,
+      threshold_at: crossed,
+      spend_limit: false,
+      spend_limit_at: null,
+    });
+    expect((await quotaItems())[0].created_at).toBe(crossed);
+  });
+
+  it("re-raises in the next window after a dismissal", async () => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { dismissAttention } = await import("../src/db/attention.js");
+    await seedUsage(90);
+    const first = deriveAttention({ isPrOpen: allOpen }).find((i) => i.kind === "quota")!;
+    dismissAttention(first.id);
+    expect(deriveAttention({ isPrOpen: allOpen }).some((i) => i.kind === "quota")).toBe(false);
+
+    await seedUsage(90, { resets_at: "2099-06-01T00:00:00.000Z" }); // next window
+    const second = deriveAttention({ isPrOpen: allOpen }).find((i) => i.kind === "quota");
+    expect(second).toBeTruthy();
+    expect(second!.id).not.toBe(first.id);
+  });
+});
+
 describe("prcache", () => {
   it("returns a fresh cached value without shelling out", async () => {
     const { prState, _seedPrCache } = await import("../src/daemon/prcache.js");

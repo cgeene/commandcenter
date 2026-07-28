@@ -21,7 +21,11 @@ import { resumeAgent } from "./resume.js";
 import { maybeAutoReview } from "./review.js";
 import { killAgent } from "./spawn.js";
 import { detectTransientApiError } from "./stall.js";
-import { providerSessionTokens } from "./transcript.js";
+import {
+  providerSessionTokens,
+  providerSessionTokensByModel,
+} from "./transcript.js";
+import { recordTokenSample } from "../db/tokens.js";
 import { capturePane, windowExists } from "./tmux.js";
 import { WAIT_HOOK_EVENTS } from "./waiting.js";
 import { codexPermissionDecision } from "../codex-policy.js";
@@ -622,6 +626,7 @@ export async function handleHookEvent(
     case "Stop": {
       updateAgent(agentId, { state: "idle" });
       recordTokens(agent, body.session_id);
+      recordDailyBurn(agent, body.session_id);
       if (agent.kind === "main") {
         // The main's turn just ended — its prompt should be clear now, so
         // flush any notifications queued while it was busy (batched, and only
@@ -657,6 +662,42 @@ function recordTokens(agent: Agent, sessionId?: string): void {
     if (t?.total) updateTask(agent.task_id, { tokens_used: t.total });
   } catch {
     /* transcript unreadable — not worth failing a hook over */
+  }
+}
+
+/**
+ * Fold this session's usage into the per-day burn table (src/db/tokens.ts).
+ *
+ * Deliberately wider than recordTokens above: that one is worker-only because
+ * it OVERWRITES a per-task total, whereas this accumulates deltas, so counting
+ * reviewers and the main orchestrator is both safe and necessary — they spend
+ * real tokens and a cycle total that omitted them would understate the burn.
+ */
+function recordDailyBurn(agent: Agent, sessionId?: string): void {
+  const sid = sessionId ?? agent.session_id;
+  if (!sid) return;
+  try {
+    const totals = providerSessionTokensByModel(
+      agent.provider,
+      sid,
+      agent.model ?? agent.provider,
+      agent.transcript_path,
+    );
+    const counts = new Map(
+      [...totals].map(([model, t]) => [
+        model,
+        {
+          input_tokens: t.input,
+          output_tokens: t.output,
+          cache_read: t.cache_read,
+          cache_creation: t.cache_creation,
+          cache_creation_1h: t.cache_creation_1h,
+        },
+      ]),
+    );
+    recordTokenSample(sid, agent.kind, counts);
+  } catch {
+    /* transcript unreadable — burn tracking must never fail a hook */
   }
 }
 
