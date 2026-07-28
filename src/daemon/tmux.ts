@@ -3,12 +3,17 @@ import { tmuxSession } from "../config.js";
 import { localeEnv } from "./locale.js";
 import { normalizeTty, terminatePaneTree, type PaneProcess } from "./proctree.js";
 
-const TMUX_TIMEOUT_MS = 1_000;
+const TMUX_TIMEOUT_MS = 5_000;
+const MAX_TEST_TMUX_TIMEOUT_MS = 30_000;
 const TMUX_MAX_BUFFER = 1024 * 1024;
 let tmuxTimeoutMs = TMUX_TIMEOUT_MS;
 
 export function _setTmuxTimeoutForTest(timeoutMs = TMUX_TIMEOUT_MS): void {
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > TMUX_TIMEOUT_MS) {
+  if (
+    !Number.isInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > MAX_TEST_TMUX_TIMEOUT_MS
+  ) {
     throw new Error("invalid test tmux timeout");
   }
   tmuxTimeoutMs = timeoutMs;

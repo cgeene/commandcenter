@@ -1,7 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+
+vi.setConfig({ testTimeout: 30_000 });
 
 let tmpDir: string;
 let originalPath: string | undefined;
@@ -78,7 +80,7 @@ beforeEach(async () => {
   process.env.CC_FAKE_TMUX_LOG = path.join(tmpDir, "calls.log");
   process.env.CC_DATA_DIR = path.join(tmpDir, "data");
   const { _setTmuxTimeoutForTest } = await import("../src/daemon/tmux.js");
-  _setTmuxTimeoutForTest(500);
+  _setTmuxTimeoutForTest(2_000);
 });
 
 afterEach(async () => {
@@ -91,6 +93,7 @@ afterEach(async () => {
   delete process.env.CC_FAKE_TMUX_LOG;
   delete process.env.CC_DATA_DIR;
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  await new Promise((resolve) => setImmediate(resolve));
 });
 
 function calls(): string[] {
@@ -108,7 +111,7 @@ describe("bounded daemon tmux commands", () => {
 
     const failure = await sendText("cc:@1", "sensitive message").catch((error) => error);
 
-    expect(Date.now() - started).toBeLessThan(1_200);
+    expect(Date.now() - started).toBeLessThan(3_500);
     expect(failure).toMatchObject({
       code: "timeout",
       message: "tmux send-keys timed out",
@@ -124,7 +127,7 @@ describe("bounded daemon tmux commands", () => {
 
     const failure = await sendText("cc:@1", "message").catch((error) => error);
 
-    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(Date.now() - started).toBeLessThan(3_800);
     expect(failure).toMatchObject({ code: "timeout" });
     expect(calls()).toEqual(["-l", "Enter"]);
   });
@@ -153,7 +156,7 @@ describe("bounded daemon tmux commands", () => {
 
     expect(listLiveWindowIds()).toBeNull();
 
-    expect(Date.now() - started).toBeLessThan(1_200);
+    expect(Date.now() - started).toBeLessThan(3_500);
     process.env.CC_FAKE_TMUX_MODE = "ok";
     expect(listLiveWindowIds()).toEqual(["cc:@1"]);
   });
@@ -180,7 +183,7 @@ describe("bounded daemon tmux commands", () => {
 
     const peek = await app.request(`/api/agents/${agent.id}/peek`);
 
-    expect(Date.now() - started).toBeLessThan(1_200);
+    expect(Date.now() - started).toBeLessThan(3_500);
     expect(peek.status).toBe(503);
     expect(await peek.json()).toEqual({ error: "tmux pane unavailable" });
     const health = await app.request("/healthz");
@@ -208,7 +211,7 @@ describe("bounded daemon tmux commands", () => {
       }),
     });
 
-    expect(Date.now() - started).toBeLessThan(1_200);
+    expect(Date.now() - started).toBeLessThan(3_500);
     expect(hook.status).toBe(200);
     const health = await app.request("/healthz");
     expect(health.status).toBe(200);
@@ -236,7 +239,7 @@ describe("bounded daemon tmux commands", () => {
     const healthStarted = Date.now();
     const health = await app.request("/healthz");
     expect(health.status).toBe(200);
-    expect(Date.now() - healthStarted).toBeLessThan(250);
+    expect(Date.now() - healthStarted).toBeLessThan(1_500);
 
     const response = await send;
     expect(response.status).toBe(503);

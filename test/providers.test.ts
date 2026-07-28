@@ -543,6 +543,18 @@ describe("Codex worker permission policy", () => {
     ).toBe("deny");
     expect(
       codexPermissionDecision(
+        payload("git push origin main"),
+        {
+          taskId: "12",
+          taskBranch: "main",
+          workspaceKind: "repo",
+          publicationMode: "agent",
+          role: "worker",
+        },
+      )?.behavior,
+    ).toBe("deny");
+    expect(
+      codexPermissionDecision(
         payload("git push origin agent/task-12-resume-2"),
         {
           taskId: "12",
@@ -587,6 +599,13 @@ describe("Codex worker permission policy", () => {
     }
     expect(
       codexPermissionDecision(payload("tmux list-windows"), "12", "repo"),
+    ).toBeUndefined();
+    expect(
+      codexPermissionDecision(
+        payload('grep -rn "tmux send-keys" src/'),
+        "12",
+        "repo",
+      ),
     ).toBeUndefined();
   });
 });

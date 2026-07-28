@@ -11,12 +11,48 @@ export interface CodexPermissionDecision {
   message?: string;
 }
 
-function mutatesHostTmux(command: string): boolean {
-  return (
-    /\btmux\b[\s\S]*\b(?:kill-(?:server|session|window|pane)|respawn-(?:window|pane)|send-keys)\b/i.test(
-      command,
-    ) ||
-    /\b(?:pkill|killall)\b[\s\S]*\btmux\b/i.test(command)
+const TMUX_VALUE_OPTIONS = new Set(["-c", "-f", "-L", "-S", "-T"]);
+
+function tmuxVerb(argv: string[]): string | undefined {
+  const args = unwrapCommand(argv);
+  if (executableName(args[0] ?? "") !== "tmux") return undefined;
+  let index = 1;
+  while (index < args.length && args[index].startsWith("-")) {
+    if (args[index] === "--") {
+      index += 1;
+      break;
+    }
+    const option = args[index].slice(0, 2);
+    index += TMUX_VALUE_OPTIONS.has(option) && args[index] === option ? 2 : 1;
+  }
+  return args[index]?.toLowerCase();
+}
+
+function processTargetsTmux(argv: string[]): boolean {
+  const args = unwrapCommand(argv);
+  const executable = executableName(args[0] ?? "");
+  if (executable !== "pkill" && executable !== "killall") return false;
+  return args.slice(1).some((arg) => /(^|[^a-z0-9])tmux([^a-z0-9]|$)/i.test(arg));
+}
+
+function mutatesHostTmux(command: string, depth = 0): boolean {
+  if (depth > 4) return false;
+  for (const argv of commandSegments(command)) {
+    const verb = tmuxVerb(argv);
+    if (
+      verb &&
+      /^(?:kill-(?:server|session|window|pane)|respawn-(?:window|pane)|send-keys)$/.test(
+        verb,
+      )
+    ) {
+      return true;
+    }
+    if (processTargetsTmux(argv)) return true;
+    const nested = nestedShellCommand(argv);
+    if (nested && mutatesHostTmux(nested, depth + 1)) return true;
+  }
+  return substitutions(command).some((nested) =>
+    mutatesHostTmux(nested, depth + 1),
   );
 }
 
@@ -285,18 +321,37 @@ function substitutions(command: string): string[] {
   return found;
 }
 
+function validatedTaskBranch(
+  taskId: string,
+  taskBranch?: string,
+): string | undefined {
+  if (!/^[1-9]\d*$/.test(taskId)) return undefined;
+  const expectedBranch = taskBranch ?? `agent/task-${taskId}`;
+  if (
+    expectedBranch.length > 255 ||
+    !new RegExp(`^agent/task-${taskId}(?:-resume-[1-9]\\d*)?$`).test(
+      expectedBranch,
+    )
+  ) {
+    return undefined;
+  }
+  return expectedBranch;
+}
+
 function exactOwnPush(
   invocation: GitInvocation,
   taskId: string,
   taskBranch?: string,
 ): boolean {
   if (invocation.verb !== "push") return false;
+  const expectedBranch = validatedTaskBranch(taskId, taskBranch);
+  if (!expectedBranch) return false;
   const args = invocation.argv.slice(invocation.verbIndex + 1);
   if (args[0] === "-u" || args[0] === "--set-upstream") args.shift();
   return (
     args.length === 2 &&
     args[0] === "origin" &&
-    args[1] === (taskBranch || `agent/task-${taskId}`)
+    args[1] === expectedBranch
   );
 }
 
@@ -396,7 +451,12 @@ function legacyAgentDecision(
   if (typeof command !== "string" || !taskId || !/^\d+$/.test(taskId)) {
     return undefined;
   }
-  const ownBranch = context.taskBranch || `agent/task-${taskId}`;
+  const ownBranch = validatedTaskBranch(taskId, context.taskBranch);
+  if (!ownBranch) {
+    return /\bgit\b[\s\S]*\bpush\b/i.test(command)
+      ? { behavior: "deny", message: AGENT_MESSAGE }
+      : undefined;
+  }
   const escapedBranch = ownBranch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const ownPush = new RegExp(
     `^\\s*git\\s+push\\s+(?:-u\\s+)?origin\\s+${escapedBranch}\\s*$`,

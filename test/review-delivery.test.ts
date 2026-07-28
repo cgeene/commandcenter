@@ -10,7 +10,7 @@ vi.mock("../src/daemon/tmux.js", () => ({
   sendEnter: vi.fn(async () => {}),
   windowExists: () => true,
   capturePane: () => "",
-  killWindow: vi.fn(),
+  killWindow: vi.fn(() => []),
 }));
 
 let tmpDir: string;
@@ -30,8 +30,8 @@ afterEach(async () => {
 });
 
 describe("review rejection delivery failure", () => {
-  it("preserves the worker association and the reviewer evidence", async () => {
-    const { createAgent } = await import("../src/db/agents.js");
+  it("requeues with the reviewer evidence and frees the worker slot", async () => {
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
     const { listEvents } = await import("../src/db/events.js");
     const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
     const { handleVerdict } = await import("../src/daemon/review.js");
@@ -55,14 +55,18 @@ describe("review rejection delivery failure", () => {
     await handleVerdict(task.id, 99, "reject", "the timeout path loses state");
 
     expect(getTask(task.id)).toMatchObject({
-      status: "review",
-      agent_id: worker.id,
-      review_verdict: "reject",
+      status: "queued",
+      agent_id: null,
+      review_verdict: null,
       review_notes: "the timeout path loses state",
       review_cycles: 1,
     });
-    expect(listEvents(20).map((event) => event.kind)).toContain(
-      "review.feedback_delivery_failed",
+    expect(getAgent(worker.id)?.state).toBe("dead");
+    expect(listEvents(20).map((event) => event.kind)).toEqual(
+      expect.arrayContaining([
+        "review.feedback_delivery_failed",
+        "task.requeued",
+      ]),
     );
   });
 });

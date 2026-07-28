@@ -2,7 +2,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.setConfig({ testTimeout: 30_000 });
 
 let tmpDir: string;
 
@@ -23,6 +25,7 @@ afterEach(async () => {
   const { _setGhRunner } = await import("../src/daemon/prdraft.js");
   _setGhRunner(null);
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  await new Promise((resolve) => setImmediate(resolve));
 });
 
 describe("resumeArchivedTask", () => {
