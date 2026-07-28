@@ -1,17 +1,12 @@
-import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import pty from "node-pty";
 import type { WebSocket } from "ws";
 import { getAgent } from "../db/agents.js";
 import { localeEnv } from "./locale.js";
-import { windowExists } from "./tmux.js";
+import { runTmuxCommand, windowExists } from "./tmux.js";
 
 function tmux(...args: string[]): Promise<void> {
-  return new Promise((resolve, reject) => {
-    execFile("tmux", args, { env: localeEnv() }, (err) =>
-      err ? reject(err) : resolve(),
-    );
-  });
+  return runTmuxCommand(args).then(() => undefined);
 }
 
 /**
@@ -58,8 +53,8 @@ export async function attachTerminal(
       "window-size",
       "latest",
     );
-  } catch (err) {
-    ws.send(`\r\n[commandcenter] failed to create viewer session: ${err}\r\n`);
+  } catch {
+    ws.send("\r\n[commandcenter] failed to create viewer session\r\n");
     ws.close();
     return;
   }
@@ -76,10 +71,10 @@ export async function attachTerminal(
       rows: size?.rows ?? 32,
       env: localeEnv(),
     });
-  } catch (err) {
+  } catch {
     // e.g. node-pty spawn-helper missing exec bit — never crash the daemon
     tmux("kill-session", "-t", viewer).catch(() => {});
-    ws.send(`\r\n[commandcenter] pty spawn failed: ${err}\r\n`);
+    ws.send("\r\n[commandcenter] terminal process failed to start\r\n");
     ws.close();
     return;
   }

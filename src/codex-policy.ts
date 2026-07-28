@@ -11,8 +11,54 @@ export interface CodexPermissionDecision {
   message?: string;
 }
 
+const TMUX_VALUE_OPTIONS = new Set(["-c", "-f", "-L", "-S", "-T"]);
+
+function tmuxVerb(argv: string[]): string | undefined {
+  const args = unwrapCommand(argv);
+  if (executableName(args[0] ?? "") !== "tmux") return undefined;
+  let index = 1;
+  while (index < args.length && args[index].startsWith("-")) {
+    if (args[index] === "--") {
+      index += 1;
+      break;
+    }
+    const option = args[index].slice(0, 2);
+    index += TMUX_VALUE_OPTIONS.has(option) && args[index] === option ? 2 : 1;
+  }
+  return args[index]?.toLowerCase();
+}
+
+function processTargetsTmux(argv: string[]): boolean {
+  const args = unwrapCommand(argv);
+  const executable = executableName(args[0] ?? "");
+  if (executable !== "pkill" && executable !== "killall") return false;
+  return args.slice(1).some((arg) => /(^|[^a-z0-9])tmux([^a-z0-9]|$)/i.test(arg));
+}
+
+function mutatesHostTmux(command: string, depth = 0): boolean {
+  if (depth > 4) return false;
+  for (const argv of commandSegments(command)) {
+    const verb = tmuxVerb(argv);
+    if (
+      verb &&
+      /^(?:kill-(?:server|session|window|pane)|respawn-(?:window|pane)|send-keys)$/.test(
+        verb,
+      )
+    ) {
+      return true;
+    }
+    if (processTargetsTmux(argv)) return true;
+    const nested = nestedShellCommand(argv);
+    if (nested && mutatesHostTmux(nested, depth + 1)) return true;
+  }
+  return substitutions(command).some((nested) =>
+    mutatesHostTmux(nested, depth + 1),
+  );
+}
+
 export interface CodexPolicyContext {
   taskId?: string;
+  taskBranch?: string;
   workspaceKind?: "repo" | "portfolio" | "scratch";
   publicationMode?: PublicationMode;
 }
@@ -275,14 +321,37 @@ function substitutions(command: string): string[] {
   return found;
 }
 
-function exactOwnPush(invocation: GitInvocation, taskId: string): boolean {
+function validatedTaskBranch(
+  taskId: string,
+  taskBranch?: string,
+): string | undefined {
+  if (!/^[1-9]\d*$/.test(taskId)) return undefined;
+  const expectedBranch = taskBranch ?? `agent/task-${taskId}`;
+  if (
+    expectedBranch.length > 255 ||
+    !new RegExp(`^agent/task-${taskId}(?:-resume-[1-9]\\d*)?$`).test(
+      expectedBranch,
+    )
+  ) {
+    return undefined;
+  }
+  return expectedBranch;
+}
+
+function exactOwnPush(
+  invocation: GitInvocation,
+  taskId: string,
+  taskBranch?: string,
+): boolean {
   if (invocation.verb !== "push") return false;
+  const expectedBranch = validatedTaskBranch(taskId, taskBranch);
+  if (!expectedBranch) return false;
   const args = invocation.argv.slice(invocation.verbIndex + 1);
   if (args[0] === "-u" || args[0] === "--set-upstream") args.shift();
   return (
     args.length === 2 &&
     args[0] === "origin" &&
-    args[1] === `agent/task-${taskId}`
+    args[1] === expectedBranch
   );
 }
 
@@ -332,7 +401,7 @@ function bashDecision(
       if (
         context.workspaceKind === "repo" &&
         context.taskId &&
-        exactOwnPush(git, context.taskId) &&
+        exactOwnPush(git, context.taskId, context.taskBranch) &&
         depth === 0 &&
         segments.length === 1 &&
         nestedSubstitutions.length === 0
@@ -382,8 +451,15 @@ function legacyAgentDecision(
   if (typeof command !== "string" || !taskId || !/^\d+$/.test(taskId)) {
     return undefined;
   }
+  const ownBranch = validatedTaskBranch(taskId, context.taskBranch);
+  if (!ownBranch) {
+    return /\bgit\b[\s\S]*\bpush\b/i.test(command)
+      ? { behavior: "deny", message: AGENT_MESSAGE }
+      : undefined;
+  }
+  const escapedBranch = ownBranch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const ownPush = new RegExp(
-    `^\\s*git\\s+push\\s+(?:-u\\s+)?origin\\s+agent/task-${taskId}\\s*$`,
+    `^\\s*git\\s+push\\s+(?:-u\\s+)?origin\\s+${escapedBranch}\\s*$`,
   );
   if (context.workspaceKind === "repo" && ownPush.test(command)) {
     return { behavior: "allow" };
@@ -416,12 +492,22 @@ export function codexPermissionDecision(
   if (!["PreToolUse", "PermissionRequest"].includes(payload.hook_event_name ?? "")) {
     return undefined;
   }
+  const command = payload.tool_input?.command;
+  if (
+    payload.tool_name === "Bash" &&
+    typeof command === "string" &&
+    mutatesHostTmux(command)
+  ) {
+    return {
+      behavior: "deny",
+      message: "Agent sessions may not control Command Center's terminal infrastructure.",
+    };
+  }
   const humanOnly = context.publicationMode === "human";
   if (!humanOnly) return legacyAgentDecision(payload, context);
   if (humanOnly && githubMcpMutation(payload.tool_name ?? "")) {
     return { behavior: "deny", message: HUMAN_MESSAGE };
   }
-  const command = payload.tool_input?.command;
   if (payload.tool_name !== "Bash" || typeof command !== "string") return undefined;
   return bashDecision(command, context);
 }

@@ -51,6 +51,7 @@ import type {
   SchedulerConfig,
   SchedulerInfo,
   Task,
+  TaskSession,
   TranscriptEntry,
   WorkspaceCatalog,
   WorkspaceKind,
@@ -600,6 +601,7 @@ export function App() {
         <TaskPanel
           key={selTask.id}
           task={selTask}
+          agents={agents}
           onClose={closePanel}
           onAction={act}
           onTerminal={openTerminal}
@@ -784,6 +786,14 @@ function TaskCard({
         {task.reasoning_effort && <span className="chip">{task.reasoning_effort}</span>}
         <span className="chip">{task.worker_provider}</span>
         {task.agent_id && <span className="chip agent-chip">a{task.agent_id}</span>}
+        {task.session_id && (
+          <span
+            className="chip session-chip"
+            title={`${task.session_provider ?? task.worker_provider} session ${task.session_id}`}
+          >
+            session {task.session_id.slice(0, 8)}…
+          </span>
+        )}
         <JiraChipView task={task} meta={meta} />
       </div>
       {summary && <div className="card-summary">{summary}</div>}
@@ -3921,12 +3931,14 @@ function MainAgentSpawn({
 
 function TaskPanel({
   task,
+  agents,
   onClose,
   onAction,
   onTerminal,
   onTranscript,
 }: {
   task: Task;
+  agents: Agent[];
   onClose: () => void;
   onAction: (fn: () => Promise<unknown>) => Promise<void>;
   onTerminal: (agentId: number) => void;
@@ -3937,6 +3949,51 @@ function TaskPanel({
   // busy or mid-draft composer defers the send and the ping is queued instead.
   // Say so, rather than letting a silent success imply instant delivery.
   const [delegateNote, setDelegateNote] = useState<string | null>(null);
+  const [sessionDetails, setSessionDetails] = useState<TaskSession | null>(null);
+  const [sessionCopyState, setSessionCopyState] = useState<
+    "idle" | "loading" | "copied" | "manual" | "error"
+  >("idle");
+  const linkedAgent = task.agent_id
+    ? agents.find((agent) => agent.id === task.agent_id)
+    : undefined;
+  const liveTaskAgent = agents.find(
+    (agent) => agent.task_id === task.id && agent.kind !== "main",
+  );
+  // `agents` is the daemon's live-only list. A task keeps its historical
+  // agent_id after reaping for transcript/session provenance, so presence in
+  // this list—not agent_id alone—is what makes Terminal a valid action.
+  const terminalLive = Boolean(linkedAgent);
+  const approvedWorkerIsStopped =
+    task.status === "review" &&
+    task.review_verdict === "approve" &&
+    !liveTaskAgent;
+
+  useEffect(() => {
+    setSessionDetails(null);
+    setSessionCopyState("idle");
+  }, [task.id, task.session_id]);
+
+  const copyResumeCommand = async () => {
+    setSessionCopyState("loading");
+    try {
+      const details = await api<TaskSession>(
+        "GET",
+        `/api/tasks/${task.id}/session`,
+      );
+      setSessionDetails(details);
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+        await navigator.clipboard.writeText(details.resume_command);
+        setSessionCopyState("copied");
+      } catch {
+        setSessionCopyState("manual");
+      }
+    } catch {
+      setSessionDetails(null);
+      setSessionCopyState("error");
+    }
+  };
+
   return (
     <div className="drawer">
       <div className="drawer-head">
@@ -3995,6 +4052,45 @@ function TaskPanel({
               <dd>{task.worktree}</dd>
             </>
           )}
+          {task.session_id && (
+            <>
+              <dt>Session</dt>
+              <dd>
+                <div>
+                  {task.session_provider ?? task.worker_provider} ·{" "}
+                  <span className="session-id">{task.session_id}</span>
+                </div>
+                <button
+                  className="session-copy"
+                  disabled={sessionCopyState === "loading"}
+                  onClick={() => void copyResumeCommand()}
+                >
+                  {sessionCopyState === "loading"
+                    ? "Loading…"
+                    : sessionCopyState === "copied"
+                      ? "✓ Resume command copied"
+                      : sessionCopyState === "error"
+                        ? "Retry resume command"
+                      : "Copy resume command"}
+                </button>
+                {sessionDetails && (
+                  <code className="resume-command">
+                    {sessionDetails.resume_command}
+                  </code>
+                )}
+                {sessionCopyState === "manual" && (
+                  <div className="muted">
+                    Clipboard access is unavailable; copy the command shown above.
+                  </div>
+                )}
+                {sessionCopyState === "error" && (
+                  <div className="muted">
+                    Could not load the resume command. Try again.
+                  </div>
+                )}
+              </dd>
+            </>
+          )}
           {task.verify_cmd && (
             <>
               <dt>Verify</dt>
@@ -4047,6 +4143,17 @@ function TaskPanel({
               )}
             </div>
           )}
+        {approvedWorkerIsStopped && (
+          <div className="prompt">
+            The approved worker is no longer live. Command Center normally
+            stops it after the grace period to free its concurrency slot.
+            {task.session_id
+              ? " Its provider session is preserved."
+              : " No resumable provider session was recorded, so resuming will start a fresh one with the saved handoff."}{" "}
+            Resume it only if you want more work: doing so reopens the task and
+            invalidates this approval.
+          </div>
+        )}
         <div className="actions">
           {["queued", "claimed"].includes(task.status) &&
             task.dispatch_mode === "direct" &&
@@ -4078,8 +4185,29 @@ function TaskPanel({
               Notify Claude Main
             </button>
           )}
-          {task.agent_id && (
+          {terminalLive && task.agent_id && (
             <button onClick={() => onTerminal(task.agent_id!)}>Terminal</button>
+          )}
+          {approvedWorkerIsStopped && (
+            <button
+              className="primary"
+              onClick={() => {
+                const instructions = window.prompt(
+                  `Resume the worker for task #${task.id}?\n\nThis reopens the task and invalidates its current automated approval. Add the follow-up or changed requirement below, or leave it blank to continue from the preserved session.`,
+                  "",
+                );
+                if (instructions === null) return;
+                void onAction(() =>
+                  api("POST", `/api/tasks/${task.id}/resume-worker`, {
+                    ...(instructions.trim()
+                      ? { instructions: instructions.trim() }
+                      : {}),
+                  }),
+                );
+              }}
+            >
+              ↺ Resume Worker
+            </button>
           )}
           {task.session_id && (
             <button
@@ -4125,7 +4253,11 @@ function TaskPanel({
               ✓ Mark Done
             </button>
           )}
-          {["blocked", "review", "failed", "cancelled"].includes(task.status) && (
+          {["blocked", "review", "failed"].includes(task.status) &&
+            !(
+              task.status === "review" &&
+              task.review_verdict === "approve"
+            ) && (
             <button
               onClick={() =>
                 onAction(() =>
@@ -4134,6 +4266,25 @@ function TaskPanel({
               }
             >
               ↺ Requeue
+            </button>
+          )}
+          {isArchived(task.status) && (
+            <button
+              className="primary"
+              onClick={() => {
+                const instructions = window.prompt(
+                  `Resume task #${task.id}?\n\nAdd changed requirements, or leave this blank to continue from the archived result.${task.dispatch_mode === "orchestrated" ? " Claude main will triage it before the worker resumes." : ""}`,
+                  "",
+                );
+                if (instructions === null) return;
+                void onAction(() =>
+                  api("POST", `/api/tasks/${task.id}/resume`, {
+                    ...(instructions.trim() ? { instructions: instructions.trim() } : {}),
+                  }),
+                );
+              }}
+            >
+              ↺ Resume Task
             </button>
           )}
           {!["done", "cancelled"].includes(task.status) && (

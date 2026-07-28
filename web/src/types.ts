@@ -91,6 +91,17 @@ export interface Agent {
   spawned_at: string;
 }
 
+export interface TaskSession {
+  agent_id: number | null;
+  provider: AgentProvider;
+  model: string | null;
+  reasoning_effort: ReasoningEffort | null;
+  session_id: string;
+  transcript_path: string | null;
+  cwd: string | null;
+  resume_command: string;
+}
+
 export interface Event {
   id: number;
   ts: string;

@@ -43,9 +43,8 @@ afterEach(async () => {
 describe("main orchestrator spawn", () => {
   it("defaults to fable, runs in $HOME, and waits for SessionStart", async () => {
     // The orchestrator now defaults to Fable 5 (suited to long-running
-    // orchestration and delegation); everything else about main's spawn is
-    // unchanged from the Codex landing: cwd = $HOME, no extra deny list, and
-    // it stays "spawning" until its SessionStart hook reports in.
+    // orchestration and delegation), runs in $HOME, and stays "spawning"
+    // until its SessionStart hook reports in.
     const { spawnMain } = await import("../src/daemon/spawn.js");
 
     const main = spawnMain();
@@ -61,6 +60,22 @@ describe("main orchestrator spawn", () => {
       "main",
       os.homedir(),
       expect.any(String),
+    );
+    const command = String(newWindow.mock.calls[0]?.[2]);
+    const isolationDir = path.join(tmpDir, "agent-tmux", String(main.id));
+    expect(command).toContain(
+      `env -u TMUX -u TMUX_PANE TMUX_TMPDIR='${isolationDir}'`,
+    );
+    expect(fs.statSync(isolationDir).mode & 0o777).toBe(0o700);
+
+    const settings = JSON.parse(
+      fs.readFileSync(main.runtime_config_path!, "utf8"),
+    );
+    expect(settings.permissions.deny).toEqual(
+      expect.arrayContaining([
+        "Bash(tmux kill-*)",
+        "Bash(*tmux * kill-*)",
+      ]),
     );
   });
 

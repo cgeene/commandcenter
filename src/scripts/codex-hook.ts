@@ -38,6 +38,7 @@ async function main(): Promise<void> {
   const publicationMode = process.env.CC_PUBLICATION_MODE;
   const decision = codexPermissionDecision(payload, {
     taskId: process.env.CC_TASK_ID,
+    taskBranch: process.env.CC_TASK_BRANCH,
     workspaceKind:
       workspaceKind === "repo" ||
       workspaceKind === "portfolio" ||

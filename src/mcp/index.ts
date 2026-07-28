@@ -518,6 +518,61 @@ if (ROLE === "main") {
   );
 
   server.registerTool(
+    "resume_task",
+    {
+      description:
+        "Reopen an archived done/cancelled task IN PLACE. Reuses the same task, provider session (when its transcript still exists), workspace/unfinished branch, and history; it does not create a duplicate. Completion/review state is safely reset. After this succeeds, inspect the returned task and spawn_worker for repo/scratch tasks.",
+      inputSchema: {
+        task_id: z.number().int().positive(),
+        instructions: z
+          .string()
+          .max(20_000)
+          .optional()
+          .describe("the human's changed or additional requirements"),
+      },
+    },
+    async ({ task_id, instructions }) =>
+      asText(
+        await call("POST", `/api/tasks/${task_id}/resume`, {
+          instructions,
+          agent_id: process.env.CC_AGENT_ID
+            ? Number(process.env.CC_AGENT_ID)
+            : undefined,
+        }),
+      ),
+  );
+
+  server.registerTool(
+    "resume_worker",
+    {
+      description:
+        "Resume the stopped worker of a reviewer-approved task IN PLACE. Use when the human wants more work on an active task that is still in review after its worker stopped or was reaped. This invalidates the old approval, preserves the same task/worktree/history, and immediately spawns a managed worker using the same provider session when available. Do not call spawn_worker directly on a task in review.",
+      inputSchema: {
+        task_id: z.number().int().positive(),
+        instructions: z
+          .string()
+          .max(20_000)
+          .optional()
+          .describe("the human's changed, additional, or follow-up requirements"),
+        fresh: z
+          .boolean()
+          .optional()
+          .describe("force a fresh provider session instead of resuming the saved one"),
+      },
+    },
+    async ({ task_id, instructions, fresh }) =>
+      asText(
+        await call("POST", `/api/tasks/${task_id}/resume-worker`, {
+          instructions,
+          fresh,
+          agent_id: process.env.CC_AGENT_ID
+            ? Number(process.env.CC_AGENT_ID)
+            : undefined,
+        }),
+      ),
+  );
+
+  server.registerTool(
     "confirm_human_publication",
     {
       description:

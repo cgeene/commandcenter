@@ -62,7 +62,7 @@ export function readOnlyProfileAllow(): string[] {
 }
 
 /**
- * Frictionless self-verification for Claude workers/reviewers.
+ * Frictionless self-verification for Claude workers.
  *
  * Workers and reviewers run under permission `defaultMode: "dontAsk"` — the
  * baseline is DENY, so anything not matched by an allow rule is refused
@@ -120,7 +120,12 @@ export const REVIEWER_TOOL_ALLOW: readonly string[] = [
 /** Commands blocked outright even inside an isolated worktree. Deny rules
  *  take precedence over the blanket Bash allow and match through leading
  *  env-var assignments and each subcommand of a compound, so a dangerous
- *  subcommand anywhere in a `&&` chain blocks the whole command. */
+ *  subcommand anywhere in a `&&` chain blocks the whole command.
+ *
+ *  Agent processes also run with an isolated tmux socket (spawn.ts), but the
+ *  host-control rules are retained as defense in depth. A worker/reviewer
+ *  must use the cc MCP lifecycle tools rather than controlling Command
+ *  Center's tmux server directly. */
 export const DANGEROUS_BASH_DENY: readonly string[] = [
   "Bash(sudo *)",
   "Bash(sudo)",
@@ -136,6 +141,22 @@ export const DANGEROUS_BASH_DENY: readonly string[] = [
   "Bash(gh repo delete*)",
   "Bash(git push --delete*)",
   "Bash(git push -d *)",
+  "Bash(tmux kill-*)",
+  "Bash(tmux * kill-*)",
+  "Bash(*tmux kill-*)",
+  "Bash(*tmux * kill-*)",
+  "Bash(tmux respawn-*)",
+  "Bash(tmux * respawn-*)",
+  "Bash(*tmux respawn-*)",
+  "Bash(*tmux * respawn-*)",
+  "Bash(tmux send-keys*)",
+  "Bash(tmux * send-keys*)",
+  "Bash(*tmux send-keys*)",
+  "Bash(*tmux * send-keys*)",
+  "Bash(pkill *tmux*)",
+  "Bash(*pkill *tmux*)",
+  "Bash(killall *tmux*)",
+  "Bash(*killall *tmux*)",
 ];
 
 /** Pushes that must still prompt rather than run silently: force-pushes and

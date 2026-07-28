@@ -1,7 +1,87 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { tmuxSession } from "../config.js";
 import { localeEnv } from "./locale.js";
 import { normalizeTty, terminatePaneTree, type PaneProcess } from "./proctree.js";
+
+const TMUX_TIMEOUT_MS = 5_000;
+const MAX_TEST_TMUX_TIMEOUT_MS = 30_000;
+const TMUX_MAX_BUFFER = 1024 * 1024;
+let tmuxTimeoutMs = TMUX_TIMEOUT_MS;
+
+export function _setTmuxTimeoutForTest(timeoutMs = TMUX_TIMEOUT_MS): void {
+  if (
+    !Number.isInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > MAX_TEST_TMUX_TIMEOUT_MS
+  ) {
+    throw new Error("invalid test tmux timeout");
+  }
+  tmuxTimeoutMs = timeoutMs;
+}
+
+export type TmuxFailureCode =
+  | "timeout"
+  | "session_absent"
+  | "target_missing"
+  | "no_client"
+  | "failed";
+
+/**
+ * A deliberately sanitised tmux failure. Child-process errors include the
+ * complete argv (which can contain prompts, environment values and session
+ * targets), so none of those errors may escape this module.
+ */
+export class TmuxCommandError extends Error {
+  constructor(
+    readonly code: TmuxFailureCode,
+    readonly operation: string,
+  ) {
+    super(`tmux ${operation} ${code === "timeout" ? "timed out" : "failed"}`);
+    this.name = "TmuxCommandError";
+  }
+}
+
+function rawFailureDetail(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const childError = error as Error & {
+    code?: unknown;
+    signal?: unknown;
+    stderr?: unknown;
+  };
+  return [
+    childError.message,
+    childError.code,
+    childError.signal,
+    childError.stderr,
+  ]
+    .map(String)
+    .join(" ");
+}
+
+function sanitiseFailure(error: unknown, operation: string): TmuxCommandError {
+  const detail = rawFailureDetail(error);
+  if (/ETIMEDOUT|SIGKILL|timed out/i.test(detail)) {
+    return new TmuxCommandError("timeout", operation);
+  }
+  if (
+    /can't find session|no server running|failed to connect to server|error connecting to .*\((?:no such file or directory|connection refused)\)/i.test(
+      detail,
+    )
+  ) {
+    return new TmuxCommandError("session_absent", operation);
+  }
+  if (/can't find (?:window|pane)|no such (?:window|pane)|unknown target/i.test(detail)) {
+    return new TmuxCommandError("target_missing", operation);
+  }
+  if (/no current client/i.test(detail)) {
+    return new TmuxCommandError("no_client", operation);
+  }
+  return new TmuxCommandError("failed", operation);
+}
+
+export function tmuxFailureCode(error: unknown): TmuxFailureCode {
+  return error instanceof TmuxCommandError ? error.code : "failed";
+}
 
 function tmux(...args: string[]): string {
   // Run with a UTF-8 locale so the tmux server (and worker processes it
@@ -9,19 +89,63 @@ function tmux(...args: string[]): string {
   // Pipe stderr (rather than letting it inherit the daemon's console) so
   // tmux's own diagnostics — e.g. "error connecting to .../default" on the
   // first call before any server exists — don't leak to stdout as scary
-  // boot noise. Callers that need the text read it from the thrown error's
-  // `.stderr` (see tmuxSessionIsDefinitelyAbsent).
-  return execFileSync("tmux", args, {
-    encoding: "utf8",
-    env: localeEnv(),
-    stdio: ["ignore", "pipe", "pipe"],
+  // boot noise. Raw child errors are classified locally, then discarded so
+  // argv and stderr cannot escape through logs or API responses.
+  try {
+    return execFileSync("tmux", args, {
+      encoding: "utf8",
+      env: localeEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: tmuxTimeoutMs,
+      killSignal: "SIGKILL",
+      maxBuffer: TMUX_MAX_BUFFER,
+    });
+  } catch (error) {
+    throw sanitiseFailure(error, args[0] ?? "command");
+  }
+}
+
+/**
+ * Non-blocking control-plane invocation. In addition to killing the client,
+ * the timer settles the Promise immediately, so HTTP/MCP work is not held
+ * hostage waiting for a misbehaving child-process callback.
+ */
+export function runTmuxCommand(args: readonly string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const child = execFile(
+      "tmux",
+      [...args],
+      {
+        encoding: "utf8",
+        env: localeEnv(),
+        maxBuffer: TMUX_MAX_BUFFER,
+      },
+      (error, stdout) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (error) {
+          reject(sanitiseFailure(error, args[0] ?? "command"));
+        } else {
+          resolve(stdout);
+        }
+      },
+    );
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(new TmuxCommandError("timeout", args[0] ?? "command"));
+    }, tmuxTimeoutMs);
   });
 }
 
 export function ensureSession(): void {
   try {
     tmux("has-session", "-t", tmuxSession());
-  } catch {
+  } catch (error) {
+    if (tmuxFailureCode(error) !== "session_absent") throw error;
     tmux("new-session", "-d", "-s", tmuxSession(), "-n", "hub");
   }
 }
@@ -155,11 +279,7 @@ export function listWindowIds(): string[] {
 export type LiveWindowSnapshot = string[] | null;
 
 function tmuxSessionIsDefinitelyAbsent(error: unknown): boolean {
-  const detail =
-    error instanceof Error
-      ? `${error.message} ${String((error as Error & { stderr?: unknown }).stderr ?? "")}`
-      : String(error);
-  return /can't find session|no server running/i.test(detail);
+  return tmuxFailureCode(error) === "session_absent";
 }
 
 /** Live process windows across all local tmux sessions. `remain-on-exit`
@@ -208,10 +328,10 @@ export async function sendText(
   text: string,
   opts: { beforeSubmit?: () => boolean } = {},
 ): Promise<boolean> {
-  tmux("send-keys", "-t", target, "-l", text);
+  await runTmuxCommand(["send-keys", "-t", target, "-l", text]);
   await new Promise((r) => setTimeout(r, 300));
   if (opts.beforeSubmit && !opts.beforeSubmit()) return false;
-  tmux("send-keys", "-t", target, "Enter");
+  await runTmuxCommand(["send-keys", "-t", target, "Enter"]);
   return true;
 }
 
@@ -239,11 +359,11 @@ export function capturePane(
 
 /** Press Enter without typing anything — submits whatever's already sitting
  *  in the input line, instead of retyping it. */
-export function sendEnter(target: string): void {
-  tmux("send-keys", "-t", target, "Enter");
+export async function sendEnter(target: string): Promise<void> {
+  await runTmuxCommand(["send-keys", "-t", target, "Enter"]);
 }
 
 /** Ctrl-U: clear the input line back to the prompt without submitting it. */
-export function clearInputLine(target: string): void {
-  tmux("send-keys", "-t", target, "C-u");
+export async function clearInputLine(target: string): Promise<void> {
+  await runTmuxCommand(["send-keys", "-t", target, "C-u"]);
 }
