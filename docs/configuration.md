@@ -31,6 +31,7 @@ commandcenter has two kinds of configuration:
 | `CC_CODEX_MCP_SOURCE_HOME` | unset | Optional trusted normal Codex home whose explicit and plugin-provided MCP transports are mirrored into the isolated home; no auth/session/hook/trust state is copied. |
 | `CC_WORKER_PROVIDER` | `claude` | Default provider for newly created tasks and crons (`claude` or `codex`). |
 | `CC_TMUX_SESSION` | `cc` | tmux session name that hosts agent windows. |
+| `CC_REAP_GRACE_MS` | `3000` | Milliseconds a reaped pane's processes get between `SIGTERM` and `SIGKILL`. |
 | `CC_MAIN_MODEL` | `fable` | Default Claude model for the main orchestrator (`agp main`); override with `CC_MAIN_MODEL=opus`. |
 | `CC_REVIEWER_MODEL` | unset | Claude reviewer model override; otherwise preserve a Claude task model or use `opus` when reviewing Codex-worker output. Never applied to a Codex reviewer. |
 | `CC_REVIEWER_PROVIDER` | unset | Pin the reviewer provider (`claude` or `codex`). Overrides the variety policy; invalid values fall back to `claude`. |
@@ -91,7 +92,7 @@ button. Unknown keys fall back to the defaults below.
 | `auto_review` | `true` | Auto-spawn an adversarial reviewer when a task reaches `review`. Report-only tasks (e.g. the dreamer) are skipped. |
 | `escalate_minutes` | `5` | Minutes a worker may sit in `waiting_input` (after the main agent was asked to unblock it) before the human is paged. |
 | `attention_stale_minutes` | `10` | Minutes an agent may sit in `waiting_input` before the "Needs You" panel flags it as stale. |
-| `reap_after_minutes` | `10` | Minutes a worker on a **terminal** task (`done`/`cancelled`/`failed`) may sit idle before the watchdog auto-reaps it — kills its tmux window and frees the `max_concurrent` slot. The grace window lets a human read the terminal right after completion. |
+| `reap_after_minutes` | `10` | Minutes a worker on a **terminal** task (`done`/`cancelled`/`failed`) may sit idle before the watchdog auto-reaps it — kills its tmux window along with the pane's whole process tree, and frees the `max_concurrent` slot. The grace window lets a human read the terminal right after completion. |
 | `read_only_extra_allow` | `[]` | Extra **read-only** permission patterns appended to the baked-in read-only profile for worker/reviewer settings. |
 
 ### `read_only_extra_allow` — a safety note

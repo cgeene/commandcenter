@@ -64,6 +64,7 @@ export function buildReviewerPrompt(
       ? "- This task is BRANCH-ONLY by design: the worker was explicitly told NOT to open a PR — the branch itself is the deliverable. A missing PR is NOT a defect; do not reject for it. If the worker opened one anyway, that IS a scope violation — reject for it."
       : `- This task expects a PR opened against the repo's default branch (pr_url: ${task.pr_url ?? "not set — worth checking whether one exists and just wasn't recorded"}).`,
     ...verifySetup(task, light),
+    "- Anything you start in the background (`&`, `nohup`, a dev server, a watcher, a synthetic load generator) must be stopped before you submit your verdict — you are terminated as soon as the verdict lands, and cleanup you left for later will not run. Prefer your harness's managed background-process facility over a bare `&`.",
     ...(ctx?.prior ? ["", ...deltaSection(ctx.prior)] : []),
     "",
     "## What to check",

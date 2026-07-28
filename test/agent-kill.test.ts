@@ -8,7 +8,8 @@ let tmpDir: string;
 // killAgent / the kill endpoint touch tmux; stub it so the DB path is all we test.
 vi.mock("../src/daemon/tmux.js", () => ({
   windowExists: () => false,
-  killWindow: () => {},
+  killWindow: () => [],
+  paneProcess: () => null,
   capturePane: () => "",
   clearInputLine: () => {},
   sendText: async () => {},

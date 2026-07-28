@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { tmuxSession } from "../config.js";
 import { localeEnv } from "./locale.js";
+import { normalizeTty, terminatePaneTree, type PaneProcess } from "./proctree.js";
 
 function tmux(...args: string[]): string {
   // Run with a UTF-8 locale so the tmux server (and worker processes it
@@ -78,8 +79,53 @@ export function newWindow(
   return target;
 }
 
-export function killWindow(target: string): void {
+/**
+ * The shell running in a window's pane, or null when there isn't a live one.
+ *
+ * Two ways this returns null rather than a pid, both of which would otherwise
+ * hand a process-killing caller the wrong process:
+ *
+ *  - `display-message` does NOT fail on a target that no longer exists. It
+ *    quietly evaluates the format against the session's *current* window
+ *    instead, which for a vanished agent window means the pid of some other
+ *    agent's pane. So the resolved window id is read back and must match.
+ *  - a window kept alive by `remain-on-exit` still reports the pid of the
+ *    process that already exited, and that pid may since have been reused.
+ */
+export function paneProcess(target: string): PaneProcess | null {
+  let out: string;
+  try {
+    out = tmux(
+      "display-message",
+      "-p",
+      "-t",
+      target,
+      "#{session_name}:#{window_id}\t#{pane_dead}\t#{pane_pid}\t#{pane_tty}",
+    ).trim();
+  } catch {
+    return null;
+  }
+  const [resolved, dead, pid, tty] = out.split("\t");
+  if (resolved !== target) return null;
+  if (dead !== "0") return null;
+  const panePid = Number(pid);
+  if (!Number.isInteger(panePid) || panePid <= 1) return null;
+  return { pid: panePid, tty: normalizeTty(tty ?? "") };
+}
+
+/**
+ * Tear a window down, processes first.
+ *
+ * `kill-window` on its own leaves anything the pane backgrounded into another
+ * process group running and orphaned (see proctree.ts), so the pane's whole
+ * process tree is signalled while it is still walkable, and only then does the
+ * window go away. Returns the pids that were signalled.
+ */
+export function killWindow(target: string): number[] {
+  const pane = paneProcess(target);
+  const killed = pane ? terminatePaneTree(pane) : [];
   tmux("kill-window", "-t", target);
+  return killed;
 }
 
 /** All local tmux window targets, including an older agent session retained
