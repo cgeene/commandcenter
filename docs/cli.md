@@ -61,7 +61,7 @@ and is delivered here before any worker is spawned.
 |---|---|
 | `scheduler status` | Show scheduler state (default subcommand). |
 | `scheduler on` / `scheduler off` | Enable / disable autonomous spawning for direct legacy and cron tasks (the kill switch). Explicit workspace tasks remain owned by Claude main. |
-| `scheduler set` | `--max <n>`, `--limit <n>` (daily spawn budget), `--stall <minutes>`, `--hours <"22-6"\|"always">`, `--auto-review <on\|off>`, `--escalate <minutes>`. |
+| `scheduler set` | `--max <n>`, `--limit <n>` (daily spawn budget), `--verify-concurrency <n>` (`verify_cmd` runs allowed at once, fleet-wide), `--stall <minutes>`, `--hours <"22-6"\|"always">`, `--auto-review <on\|off>`, `--escalate <minutes>`. |
 
 See [`configuration.md`](configuration.md) for what each knob does and its default.
 

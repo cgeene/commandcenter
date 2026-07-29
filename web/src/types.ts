@@ -243,6 +243,7 @@ export interface SchedulerConfig {
   enabled: boolean;
   max_concurrent: number;
   daily_spawn_limit: number;
+  verify_concurrency: number;
   stall_minutes: number;
   active_hours: { start: number; end: number } | null;
   auto_review: boolean;

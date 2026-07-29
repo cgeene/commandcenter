@@ -605,6 +605,7 @@ interface SchedulerInfo {
     enabled: boolean;
     max_concurrent: number;
     daily_spawn_limit: number;
+    verify_concurrency: number;
     stall_minutes: number;
     active_hours: { start: number; end: number } | null;
     auto_review: boolean;
@@ -633,7 +634,7 @@ async function printSchedulerStatus(): Promise<void> {
     ? ` (+${status.parked_workers} parked in review)`
     : "";
   console.log(
-    `scheduler: ${config.enabled ? "ON" : "OFF"} · workers ${status.live_workers}/${config.max_concurrent}${parked} · spawns today ${status.spawns_today}/${config.daily_spawn_limit} · window ${hours} · stall ${config.stall_minutes}m · auto-review ${config.auto_review ? "on" : "off"} · escalate ${config.escalate_minutes}m · reap ${config.reap_after_minutes}m`,
+    `scheduler: ${config.enabled ? "ON" : "OFF"} · workers ${status.live_workers}/${config.max_concurrent}${parked} · spawns today ${status.spawns_today}/${config.daily_spawn_limit} · window ${hours} · verify ≤${config.verify_concurrency} at once · stall ${config.stall_minutes}m · auto-review ${config.auto_review ? "on" : "off"} · escalate ${config.escalate_minutes}m · reap ${config.reap_after_minutes}m`,
   );
 }
 
@@ -663,6 +664,7 @@ scheduler
   .description("update scheduler settings")
   .option("--max <n>", "max concurrent workers")
   .option("--limit <n>", "daily autonomous spawn budget")
+  .option("--verify-concurrency <n>", "verify_cmd runs allowed at once across the whole fleet")
   .option("--stall <minutes>", "stall detection threshold")
   .option("--hours <range>", '"22-6" for overnight, or "always"')
   .option("--auto-review <on|off>", "auto-review tasks when they reach review")
@@ -675,6 +677,8 @@ scheduler
     if (opts.escalate) patch.escalate_minutes = Number(opts.escalate);
     if (opts.reap) patch.reap_after_minutes = Number(opts.reap);
     if (opts.limit) patch.daily_spawn_limit = Number(opts.limit);
+    if (opts.verifyConcurrency)
+      patch.verify_concurrency = Number(opts.verifyConcurrency);
     if (opts.stall) patch.stall_minutes = Number(opts.stall);
     if (opts.hours === "always") patch.active_hours = null;
     else if (opts.hours) {

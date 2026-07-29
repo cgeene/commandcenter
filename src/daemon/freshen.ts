@@ -392,10 +392,19 @@ async function freshenTask(
     if (task.verify_cmd) {
       // The freshened tree needs its dependencies before anything can be run.
       primeWorktreeDeps(task.repo, dir, task.id);
-      const result = await (deps.runVerify ?? runVerifyCommand)(
-        task.verify_cmd,
-        dir,
-      );
+      // Queues behind worker verifications on the shared verify semaphore (see
+      // verifyenv.ts), so an integration check on the daemon's own timer cannot
+      // land on top of a worker's suite. Its own event kind: verify.queued is
+      // reserved for the Stop transition, whose stall predicate reads it.
+      const result = await (deps.runVerify ??
+        ((cmd: string, cwd: string) =>
+          runVerifyCommand(cmd, cwd, {
+            onQueued: (ahead) =>
+              logEvent("pr.freshen_verify_queued", {
+                taskId: task.id,
+                payload: { ahead },
+              }),
+          })))(task.verify_cmd, dir);
       // Verification can run for minutes. If the world moved on while it did —
       // the human merged or closed the PR, the task was cancelled, a worker was
       // spawned — this result is stale: pushing or respawning off it would

@@ -117,8 +117,11 @@ const TEMPLATES: Record<string, Template> = {
     `${taskRef(e)} blocked — its reviewer was replaced ${p.replacements_spent} time(s) and each one also stopped without a verdict; no more will be spawned`,
 
   // --- verify ---
+  "verify.queued": (e, p) =>
+    `${taskRef(e)} is waiting to verify — ${str(p.ahead) || "0"} other verification(s) running first`,
   "verify.passed": (e) => `${taskRef(e)} passed verification`,
-  "verify.failed": (e) => `${taskRef(e)} failed verification`,
+  "verify.failed": (e, p) =>
+    `${taskRef(e)} failed verification${p.contended ? " while another verification was running — may be contention, not a defect" : ""}`,
 
   // --- PRs ---
   // pr.merged now fires ONLY in the guarded override branch: a human merged the
