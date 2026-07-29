@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { clearComposer, permissionMenu } from "./fixtures/pane.js";
+import { clearComposer, draftComposer, permissionMenu } from "./fixtures/pane.js";
 
 /**
  * What a review rejection does with the worker it just rejected, and what
@@ -25,6 +25,28 @@ vi.mock("../src/daemon/tmux.js", () => ({
   paneProcess: () => null,
   listLiveWindowIds: () => [],
 }));
+
+/**
+ * A box sitting ABOVE a live composer — deliberately composed from two
+ * live-captured fixtures rather than transcribed from one capture, because
+ * that is the shape the pane read exists to catch and no single capture of
+ * today's TUI produces it: a menu that appeared AFTER the idle_prompt hook was
+ * recorded. The permission fixture on its own renders no composer at all, so it
+ * only ever exercises the "cannot locate the composer" arm.
+ */
+const menuOverComposer = () => permissionMenu() + clearComposer();
+
+/** An unnumbered box (so it is a question, not a permission menu) above a live
+ *  composer, with the agent's ask on the line before it. */
+const questionOverComposer = () =>
+  [
+    "⏺ Should I delete the legacy table?",
+    "",
+    `╭${"─".repeat(50)}╮`,
+    `│ waiting on your answer${" ".repeat(27)}│`,
+    `╰${"─".repeat(50)}╯`,
+    "",
+  ].join("\n") + clearComposer();
 
 const killAgent = vi.fn((_id: number) => {});
 const spawnWorker = vi.fn((_id: number) => {});
@@ -63,6 +85,10 @@ beforeEach(async () => {
   // automatic spawn, and the default is off.
   const { setSchedulerConfig } = await import("../src/db/settings.js");
   setSchedulerConfig({ enabled: true });
+  // watchdog() keeps module state (window-missing confirmations, tmux
+  // observability) that outlives the per-test in-memory db.
+  const { _resetSchedulerState } = await import("../src/daemon/scheduler.js");
+  _resetSchedulerState();
 });
 
 afterEach(async () => {
@@ -92,6 +118,10 @@ async function parkedWorker(
     repo: tmpDir,
     open_pr: false,
     workspace_kind: opts.workspaceKind ?? "scratch",
+    // The strand only exists for orchestrated tasks: a direct-dispatch task is
+    // picked up by the scheduler's own auto-spawn pass. Every case here uses the
+    // shape the incident had.
+    dispatch_mode: "orchestrated",
   });
   const worker = createAgent({
     kind: "worker",
@@ -141,10 +171,20 @@ describe("rejecting a worker parked in waiting_input", () => {
   });
 
   // Everything the platform cannot positively read as "only idle" keeps the old
-  // behavior: unsolicited text must never be typed into a pending menu.
+  // behavior: unsolicited text must never be typed into a pending menu. One case
+  // per condition, each isolating a single one — parsePane suppresses
+  // pending_question and unsubmitted_input whenever a permission is up, so these
+  // cannot mask each other, and removing any one guard fails exactly one case.
   const refused: [string, string | null, () => string][] = [
     ["the provider reported a permission prompt", "permission_prompt", clearComposer],
-    ["the pane shows a permission menu", "idle_prompt", permissionMenu],
+    ["a permission menu is up over a live composer", "idle_prompt", menuOverComposer],
+    ["a question box is up over a live composer", "idle_prompt", questionOverComposer],
+    [
+      "text is already sitting in the composer",
+      "idle_prompt",
+      () => draftComposer("half a sentence a human was typ"),
+    ],
+    ["the composer cannot be located at all", "idle_prompt", permissionMenu],
     ["there is no hook behind the wait at all", null, clearComposer],
   ];
   for (const [why, notificationType, pane] of refused) {
@@ -206,6 +246,31 @@ describe("a rejection that requeues never goes silent", () => {
       logEvent("agent.spawned", { agentId: agent.id, taskId });
     });
   }
+
+  // The whole incident, driven through the production entry point: nothing calls
+  // reworkDispatchSweep in the daemon except watchdog(), so a test that only ever
+  // calls the sweep directly would keep passing if that call were dropped.
+  it("watchdog() restarts the worker on an orchestrated task, with no main agent involved", async () => {
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listAgents } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task } = await requeued();
+    expect(getTask(task.id)!.dispatch_mode).toBe("orchestrated");
+    // No main agent exists, which is what made the real incident silent: an
+    // orchestrated task is main's to dispatch and main is never pinged about one
+    // it filed itself.
+    expect(listAgents({ live: true }).some((a) => a.kind === "main")).toBe(false);
+    await realisticSpawn();
+
+    watchdog(deps(Date.now()));
+
+    expect(spawnWorker).toHaveBeenCalledWith(task.id);
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("in_progress");
+    expect(t.agent_id).not.toBeNull();
+    expect(listEvents(60).map((e) => e.kind)).toContain("review.rework_respawned");
+  });
 
   it("the watchdog sweep restarts a worker on it", async () => {
     const { reworkDispatchSweep } = await import("../src/daemon/scheduler.js");
