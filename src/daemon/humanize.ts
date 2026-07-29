@@ -133,6 +133,10 @@ const TEMPLATES: Record<string, Template> = {
     const cr = p.changes_requested ? ", changes requested" : "";
     return `New PR feedback on ${taskRef(e)} (${n} comment${n === 1 ? "" : "s"}${cr})`;
   },
+  "pr.feedback_deferred": (e, p) =>
+    `Held PR feedback for ${taskRef(e)} — ${worker(e)} can't take it (attempt ${str(p.attempt) || "?"}/${str(p.max) || "?"})`,
+  "pr.feedback_delivery_failed": (e, p) =>
+    `Could not hand PR feedback to ${worker(e)} after ${str(p.attempts) || "several"} tries — ${taskRef(e)} requeued with the feedback in its notes`,
   "pr.human_approved": (e, p) => {
     const who = Array.isArray(p.reviewers) ? (p.reviewers as string[]).join(", ") : "";
     return `Human approved the PR for ${taskRef(e)}${who ? ` (${who})` : ""} — no changes requested`;

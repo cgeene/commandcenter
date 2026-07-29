@@ -3,13 +3,25 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { PrState } from "../src/daemon/prsync.js";
+import { clearComposer, permissionMenu } from "./fixtures/pane.js";
 
 const sendText = vi.fn(async () => {});
+
+/** What the worker's pane shows right now; "" means nothing is readable. */
+let paneContent = "";
+
+/** SGR sequences, built from char codes so this file holds no control bytes. */
+const SGR_RE = new RegExp("[\\u001B\\u009B]\\[[0-?]*[ -/]*[@-~]", "g");
 
 vi.mock("../src/daemon/tmux.js", () => ({
   windowExists: () => true,
   sendText: (...args: unknown[]) => sendText(...args),
-  capturePane: () => "",
+  // Mirrors the real thing: only `-e` (opts.escapes) keeps the SGR codes, which
+  // is what lets parsePane tell a dim autosuggestion from a human's draft.
+  capturePane: (_t: string, _n?: number, opts?: { escapes?: boolean }) =>
+    opts?.escapes ? paneContent : paneContent.replace(SGR_RE, ""),
+  killWindow: () => [],
+  paneProcess: () => null,
 }));
 
 let tmpDir: string;
@@ -19,6 +31,7 @@ beforeEach(async () => {
   process.env.CC_DATA_DIR = tmpDir;
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
+  paneContent = "";
   sendText.mockClear();
   sendText.mockImplementation(async () => {});
 });
@@ -374,6 +387,206 @@ describe("applyPrState", () => {
     expect(t.status).toBe("review"); // untouched
     expect(t.pr_feedback_at).toBeNull(); // watermark NOT advanced — retried next pass
     expect(getAgent(worker.id)?.state).toBe("waiting_input");
+  });
+
+  /**
+   * A worker parked in `waiting_input` with the pane and the hook history that
+   * `notificationType` implies. "idle_prompt" over an empty composer is what
+   * EVERY worker looks like ~60s after finishing a round; "permission_prompt" is
+   * a real menu holding the session.
+   */
+  async function parkedWorker(notificationType: string, pane: string) {
+    const { updateTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { task } = await setupPrTask();
+    const worker = createAgent({
+      kind: "worker",
+      state: "waiting_input",
+      task_id: task.id,
+      tmux_target: "cc:@7",
+    });
+    updateTask(task.id, { agent_id: worker.id });
+    logEvent("hook.stop", { agentId: worker.id, taskId: task.id });
+    logEvent("hook.notification", {
+      agentId: worker.id,
+      taskId: task.id,
+      payload: { notification_type: notificationType },
+    });
+    paneContent = pane;
+    return { task, worker };
+  }
+
+  const feedback = open({
+    comments: [
+      { author: "caleb", body: "fix this", created_at: "2026-07-04T02:00:00Z" },
+    ],
+  });
+
+  it("delivers feedback into the live session of a merely idle-parked worker", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, worker } = await parkedWorker("idle_prompt", clearComposer());
+
+    await applyPrState(task.id, feedback);
+
+    expect(sendText).toHaveBeenCalledTimes(1);
+    expect(String(sendText.mock.calls[0][1])).toContain("fix this");
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("in_progress");
+    expect(t.agent_id).toBe(worker.id);
+    expect(t.pr_feedback_at).toBe("2026-07-04T02:00:00Z");
+    expect(getAgent(worker.id)?.state).toBe("working");
+    const kinds = listEvents(30).map((e) => e.kind);
+    expect(kinds).toContain("agent.idle_wait_cleared");
+    expect(kinds).not.toContain("task.requeued");
+  });
+
+  it("never types feedback into a real menu, and converges instead of retrying forever", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    // Provider reported a permission prompt AND the pane shows the menu, so
+    // neither signal can carry this on its own.
+    const { task, worker } = await parkedWorker("permission_prompt", permissionMenu());
+
+    // Each call models one ~2min sync pass. The defect was that this never
+    // ended: nothing resolves a menu park, so an unbounded defer re-polls the
+    // same feedback forever without persisting it or saying anything.
+    const MAX_PASSES = 10;
+    let passes = 0;
+    while (getTask(task.id)?.status === "review" && passes < MAX_PASSES) {
+      await applyPrState(task.id, feedback);
+      passes++;
+      // Until it gives up, the watermark must stay put or the feedback is lost.
+      if (getTask(task.id)?.status === "review") {
+        expect(getTask(task.id)?.pr_feedback_at).toBeNull();
+      }
+    }
+
+    expect(sendText).not.toHaveBeenCalled();
+    expect(passes).toBeLessThan(MAX_PASSES);
+    const kinds = listEvents(60).map((e) => e.kind);
+    expect(kinds).toContain("pr.feedback_deferred");
+    expect(kinds).toContain("pr.feedback_delivery_failed");
+    expect(kinds).toContain("task.requeued");
+    expect(kinds).not.toContain("agent.idle_wait_cleared");
+    // Given up on in-session delivery: the feedback now lives in the notes the
+    // respawn prompt carries, which is what makes advancing the watermark safe.
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("queued");
+    expect(t.agent_id).toBeNull();
+    expect(t.review_notes).toContain("fix this");
+    expect(t.pr_feedback_at).toBe("2026-07-04T02:00:00Z");
+    expect(getAgent(worker.id)?.state).toBe("dead");
+  });
+
+  /** Deferral attempt numbers as logged, oldest first. */
+  async function loggedAttempts(): Promise<number[]> {
+    const { listEvents } = await import("../src/db/events.js");
+    return listEvents(80)
+      .filter((e) => e.kind === "pr.feedback_deferred")
+      .map((e) => Number(JSON.parse(e.payload!).attempt))
+      .reverse();
+  }
+
+  it("starts a fresh defer budget once a round of feedback has been delivered", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { updateAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { task, worker } = await parkedWorker("idle_prompt", clearComposer());
+
+    await applyPrState(task.id, feedback);
+    expect(getTask(task.id)?.status).toBe("in_progress");
+
+    // The worker finished that round and went back into review, then parked on a
+    // real menu. A later comment is a new episode: the delivered one is closed.
+    updateTask(task.id, { status: "review" });
+    updateAgent(worker.id, { state: "waiting_input" });
+    logEvent("hook.notification", {
+      agentId: worker.id,
+      taskId: task.id,
+      payload: { notification_type: "permission_prompt" },
+    });
+    paneContent = permissionMenu();
+    await applyPrState(
+      task.id,
+      open({
+        comments: [
+          { author: "caleb", body: "and this", created_at: "2026-07-04T04:00:00Z" },
+        ],
+      }),
+    );
+
+    expect(await loggedAttempts()).toEqual([1]);
+    expect(getTask(task.id)?.status).toBe("review");
+  });
+
+  it("gives a resumed task's new PR the full budget, not the old PR's spent one", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { task } = await parkedWorker("permission_prompt", permissionMenu());
+
+    // Episode 1 burns the whole budget and requeues.
+    const drain = async () => {
+      let passes = 0;
+      while (getTask(task.id)?.status === "review" && passes < 20) {
+        await applyPrState(task.id, feedback);
+        passes++;
+      }
+      return passes;
+    };
+    const firstEpisode = await drain();
+    expect(getTask(task.id)?.status).toBe("queued");
+
+    // What taskresume does to a task whose PR reached a terminal state: the
+    // watermark AND the pr_url are cleared, so nothing derived from them can
+    // tell episode 1's deferrals apart from the new PR's first one. Events are
+    // never pruned, so they are all still on the task.
+    const revived = createAgent({
+      kind: "worker",
+      state: "waiting_input",
+      task_id: task.id,
+      tmux_target: "cc:@8",
+    });
+    updateTask(task.id, {
+      status: "review",
+      agent_id: revived.id,
+      pr_url: "https://github.com/nylas/unicorn-k8s/pull/2400",
+      pr_feedback_at: null,
+      review_notes: null,
+    });
+    logEvent("task.archived_resumed", { taskId: task.id });
+    logEvent("hook.notification", {
+      agentId: revived.id,
+      taskId: task.id,
+      payload: { notification_type: "permission_prompt" },
+    });
+
+    // First pass of the NEW episode: a defer, not a give-up. The live worker
+    // keeps the task — one transient failure must not cost it its session.
+    await applyPrState(task.id, feedback);
+    const mid = getTask(task.id)!;
+    expect(mid.status).toBe("review");
+    expect(mid.agent_id).toBe(revived.id);
+    expect(mid.pr_feedback_at).toBeNull();
+    expect(getAgent(revived.id)?.state).toBe("waiting_input");
+
+    // And the rest of the budget is there too: the same number of passes as the
+    // first episode, restarting the count at 1.
+    const secondEpisode = 1 + (await drain());
+    expect(secondEpisode).toBe(firstEpisode);
+    expect(await loggedAttempts()).toEqual([
+      ...Array.from({ length: firstEpisode }, (_, i) => i + 1),
+      ...Array.from({ length: secondEpisode }, (_, i) => i + 1),
+    ]);
+    expect(getTask(task.id)?.review_notes).toContain("fix this");
   });
 
   it("defers feedback while an adversarial reviewer is live", async () => {
