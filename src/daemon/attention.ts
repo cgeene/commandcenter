@@ -14,6 +14,7 @@ import {
 import { stalledFinishedWorkers } from "./hooks.js";
 import { JIRA_SYNC_FAIL_THRESHOLD } from "../lib/jira.js";
 import { normalizePrState } from "../lib/prstate.js";
+import { resolveMain } from "./reviewerhealth.js";
 import { quotaConditions, quotaIsCritical } from "../lib/quotaalert.js";
 import { resetsIn } from "../lib/usage.js";
 import {
@@ -131,7 +132,7 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
     }
     return task.blocked_by === null || tasksById.get(task.blocked_by)?.status === "done";
   });
-  const main = agents.find((agent) => agent.kind === "main");
+  const main = resolveMain(agents, nowMs);
   const mainAvailable = main && ["working", "idle"].includes(main.state);
   if (pendingOrchestration.length > 0 && !mainAvailable) {
     const ordered = [...pendingOrchestration].sort((a, b) => a.id - b.id);

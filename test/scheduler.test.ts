@@ -835,6 +835,100 @@ describe("watchdog", () => {
     expect(getTask(task.id)?.status).toBe("queued");
   });
 
+  it("recovers a falsely vanished main past a live main row that never got a pane", async () => {
+    // An interrupted spawn leaves a live main row with no pane, and nothing
+    // retires it. Refusing recovery while it sits there discards a session whose
+    // process is still running — its context and in-flight delegations with it —
+    // and buys a cold start instead.
+    const { createAgent, getAgent, updateAgent } = await import("../src/db/agents.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    // The state the SessionStart timeout leaves behind, per the relabel above.
+    const leaked = createAgent({ kind: "main", provider: "claude", state: "stalled" });
+    const main = createAgent({
+      kind: "main",
+      provider: "claude",
+      state: "working",
+      tmux_target: "cc:@9",
+    });
+    updateAgent(main.id, { session_id: "s1" });
+    logEvent("agent.vanished", { agentId: main.id });
+    updateAgent(main.id, { state: "dead" });
+
+    watchdog({
+      spawn: () => {},
+      windows: () => seen(["cc:@9"]),
+      now: () => new Date(),
+    });
+
+    expect(getAgent(main.id)?.state).toBe("working");
+    expect(listEvents(20).map((event) => event.kind)).toContain("agent.recovered");
+    // The paneless row is left exactly as the relabel left it: retiring rows is
+    // spawnMain's job, and pre-empting it here would consume the
+    // agent.session_start_missing signal the human is owed.
+    expect(getAgent(leaked.id)?.state).toBe("stalled");
+  });
+
+  it("refuses to recover a main when a paneless row's session did come up", async () => {
+    // A daemon death between newWindow and attachPane leaves a real orchestrator
+    // in a window no row claims; it handshakes anyway. Two live orchestrators
+    // would compete over triage and merges, so this recovery must not happen.
+    const { createAgent, getAgent, updateAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const unclaimed = createAgent({ kind: "main", provider: "claude", state: "spawning" });
+    logEvent("hook.sessionstart", { agentId: unclaimed.id });
+    const main = createAgent({
+      kind: "main",
+      provider: "claude",
+      state: "working",
+      tmux_target: "cc:@9",
+    });
+    updateAgent(main.id, { session_id: "s1" });
+    logEvent("agent.vanished", { agentId: main.id });
+    updateAgent(main.id, { state: "dead" });
+
+    watchdog({
+      spawn: () => {},
+      windows: () => seen(["cc:@9"]),
+      now: () => new Date(),
+    });
+
+    expect(getAgent(main.id)?.state).toBe("dead");
+  });
+
+  it("refuses to recover a main while another one holds a pane", async () => {
+    const { createAgent, getAgent, updateAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    createAgent({
+      kind: "main",
+      provider: "claude",
+      state: "idle",
+      tmux_target: "cc:@3",
+    });
+    const main = createAgent({
+      kind: "main",
+      provider: "claude",
+      state: "working",
+      tmux_target: "cc:@9",
+    });
+    updateAgent(main.id, { session_id: "s1" });
+    logEvent("agent.vanished", { agentId: main.id });
+    updateAgent(main.id, { state: "dead" });
+
+    watchdog({
+      spawn: () => {},
+      windows: () => seen(["cc:@9", "cc:@3"]),
+      now: () => new Date(),
+    });
+
+    expect(getAgent(main.id)?.state).toBe("dead");
+  });
+
   it("marks silent working agents stalled", async () => {
     const { createTask, updateTask } = await import("../src/db/tasks.js");
     const { createAgent, getAgent, updateAgent } = await import("../src/db/agents.js");

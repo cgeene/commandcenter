@@ -81,6 +81,40 @@ describe("deriveAttention — kinds", () => {
     expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
   });
 
+  it("pages to START main when the only main row never got a pane", async () => {
+    // A live main row is not an orchestrator: an interrupted spawn leaves a
+    // paneless one behind and nothing retires it. Resolving to it would report
+    // the queue as owned, and name the item "Unblock" when the answer is to
+    // start one.
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    createTask({
+      title: "needs triage",
+      prompt: "x",
+      repo: "/r",
+      dispatch_mode: "orchestrated",
+    });
+    // The state the watchdog's SessionStart timeout leaves such a row in.
+    const leaked = createAgent({ kind: "main", state: "stalled" });
+    const real = createAgent({ kind: "main", state: "idle", tmux_target: "cc:@main" });
+
+    expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
+
+    const { updateAgent } = await import("../src/db/agents.js");
+    updateAgent(real.id, { state: "dead" });
+    const items = deriveAttention({ isPrOpen: allOpen });
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: "orchestration",
+      title: expect.stringContaining("Start Claude main"),
+      agent_id: null,
+    });
+    // The dismissal key names the resolved main; the shell must not appear as it.
+    expect(items[0].id).toBe("orchestration:1:none");
+    expect(items[0].id).not.toBe(`orchestration:1:${leaked.id}`);
+  });
+
   it("does not page for an orchestrated task whose blocker is still open", async () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     const { createTask } = await import("../src/db/tasks.js");
