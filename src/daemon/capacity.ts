@@ -1,7 +1,26 @@
 import { listAgents, type Agent } from "../db/agents.js";
-import { countAgentEvents, logEvent } from "../db/events.js";
+import { countAgentEvents, countEventsToday, logEvent } from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { getTask, type Task } from "../db/tasks.js";
+
+/**
+ * Sessions started today without anyone asking interactively, all of which draw
+ * on the same `daily_spawn_limit`: the scheduler's auto-spawn pass, an
+ * auto-spawned reviewer, and a rework respawn after a rejection.
+ *
+ * One helper because every consumer must agree on the denominator — the
+ * scheduler's own gate, the review loop's budget check, and the Needs-You item
+ * that tells the human the budget is why the queue stopped moving. A kind
+ * counted in one place and not another would let the fleet quietly overspend, or
+ * report a budget as spent that the spawner still considers open.
+ */
+export function autonomousSpawnsToday(): number {
+  return (
+    countEventsToday("scheduler.spawned") +
+    countEventsToday("reviewer.auto_spawned") +
+    countEventsToday("review.rework_respawned")
+  );
+}
 
 /**
  * Worker-concurrency accounting: which live workers actually occupy one of the

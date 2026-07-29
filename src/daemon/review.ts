@@ -1,13 +1,12 @@
 import { getAgent, listAgents, updateAgent, type Agent } from "../db/agents.js";
 import {
-  countEventsToday,
   latestTaskEvent,
   latestTaskEventId,
   logEvent,
 } from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { getTask, listTasks, updateTask, type Task } from "../db/tasks.js";
-import { noteReworkOverCap } from "./capacity.js";
+import { autonomousSpawnsToday, noteReworkOverCap } from "./capacity.js";
 import { notifyEvent } from "./notify.js";
 import { markPrDraft, markPrReady } from "./prdraft.js";
 import { resumeAgent } from "./resume.js";
@@ -241,9 +240,7 @@ export class ReviewStateError extends Error {
  */
 function withinReviewBudget(task: Task): boolean {
   const cfg = getSchedulerConfig();
-  const spent =
-    countEventsToday("scheduler.spawned") + countEventsToday("reviewer.auto_spawned");
-  if (spent < cfg.daily_spawn_limit) return true;
+  if (autonomousSpawnsToday() < cfg.daily_spawn_limit) return true;
   logEvent("reviewer.budget_skipped", { taskId: task.id });
   notifyEvent(
     "capacity_or_budget",
@@ -503,6 +500,18 @@ function clearIdleWait(agentId: number): void {
   });
 }
 
+/**
+ * Prefix shared by both reasons a rejection's own requeue records, and the
+ * discriminator strandedReworkTasks matches on.
+ *
+ * `task.requeued` is written by several unrelated routes — PR feedback that
+ * could not be delivered (prsync), a vanished worker (the watchdog, which owns
+ * its own one-retry budget) — and only the rejection's own requeue is owed the
+ * respawn this loop promises. Keep both reasons below built from this constant
+ * so the writer and the reader cannot drift.
+ */
+const REJECTION_REQUEUE_REASON = "review rejected;";
+
 /** Return a rejected task to the queue with the reviewer's notes attached. */
 function requeueAfterRejection(
   task: Task,
@@ -522,11 +531,26 @@ function requeueAfterRejection(
   logEvent("task.requeued", { taskId: task.id, payload: { reason } });
 }
 
-/** A rejection whose task is queued with nobody working it. */
+/** A task sitting in the queue on a rejection's own requeue, with nobody on it. */
 export interface StrandedRework {
   task: Task;
-  /** The rejection that put it there — the age anchor and the dedup key. */
-  rejected: { id: number; ts: string };
+  /** The requeue that put it there — the age anchor and the dedup key. */
+  requeued: { id: number; ts: string };
+}
+
+/** Did this `task.requeued` event come from a review rejection, as opposed to
+ *  PR feedback or a vanished worker? */
+function requeuedByRejection(payload: string | null | undefined): boolean {
+  if (!payload) return false;
+  try {
+    const parsed = JSON.parse(payload) as { reason?: unknown };
+    return (
+      typeof parsed?.reason === "string" &&
+      parsed.reason.startsWith(REJECTION_REQUEUE_REASON)
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -540,27 +564,41 @@ export interface StrandedRework {
  * the scheduler's auto-spawn pass only covers direct-dispatch tasks. So the task
  * sat in `queued` with no agent and no signal to anybody.
  *
- * Derived from standing state rather than from the requeue event, so it covers
- * every route into that state — a respawn that could not run, a daemon that died
- * between the requeue and the respawn, a worker killed by hand — and clears
- * itself as soon as a worker starts or the status moves. The rejection is the
- * anchor: an `agent.spawned` after it means the rework is already under way.
+ * Scoped to the rejection's OWN queue entry, not merely to "queued with a
+ * rejection somewhere in its history". Post-#86 the ordinary rejection resolves
+ * in place, so the same task can be requeued later by an unrelated route — PR
+ * feedback (prsync) or a vanished worker (the watchdog, which promises the human
+ * one retry and does its own accounting) — and neither is this loop's to restart
+ * or to describe. Hence: the task's most recent lifecycle event must BE the
+ * requeue a rejection wrote. Anything after it (a spawn, a reopen, another
+ * requeue route) means that queue entry is no longer the one being waited on.
+ *
+ * Standing state otherwise, so it still covers every route into the strand — a
+ * respawn that could not run, a daemon that died between the requeue and the
+ * respawn, a worker killed by hand — and clears itself as soon as a worker
+ * starts or the task moves on.
  *
  * Both consumers read this one predicate — the watchdog that respawns
  * (scheduler.reworkDispatchSweep) and the Needs-You item that names the ones it
- * could not (attention.ts) — so they can never disagree about what is stranded.
+ * has not started (attention.ts) — so they can never disagree.
  */
 export function strandedReworkTasks(): StrandedRework[] {
   const live = listAgents({ live: true });
   const stranded: StrandedRework[] = [];
   for (const task of listTasks("queued")) {
     if (task.review_cycles === 0) continue;
-    const rejected = latestTaskEvent(task.id, ["review.rejected"]);
-    if (!rejected) continue;
-    const spawned = latestTaskEventId(task.id, ["agent.spawned"]);
-    if (spawned && spawned > rejected.id) continue;
+    const marker = latestTaskEvent(task.id, [
+      "task.requeued",
+      "task.reopened",
+      "task.archived_resumed",
+      "task.worker_resume_requested",
+      "task.claimed",
+      "agent.spawned",
+    ]);
+    if (marker?.kind !== "task.requeued") continue;
+    if (!requeuedByRejection(marker.payload)) continue;
     if (live.some((a) => a.kind === "worker" && a.task_id === task.id)) continue;
-    stranded.push({ task, rejected: { id: rejected.id, ts: rejected.ts } });
+    stranded.push({ task, requeued: { id: marker.id, ts: marker.ts } });
   }
   return stranded;
 }
@@ -937,7 +975,7 @@ export async function handleVerdict(
       task,
       notes,
       cycles,
-      "review rejected; feedback delivery failed — notes go into the respawn prompt",
+      `${REJECTION_REQUEUE_REASON} feedback delivery failed — notes go into the respawn prompt`,
     );
   } else {
     // A worker parked on a permission prompt can't take the notes, and the
@@ -948,7 +986,7 @@ export async function handleVerdict(
       task,
       notes,
       cycles,
-      "review rejected; worker gone — notes go into the respawn prompt",
+      `${REJECTION_REQUEUE_REASON} worker gone — notes go into the respawn prompt`,
     );
   }
   return getTask(taskId)!;

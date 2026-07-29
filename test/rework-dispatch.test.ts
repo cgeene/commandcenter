@@ -59,6 +59,10 @@ beforeEach(async () => {
   });
   spawnWorker.mockReset();
   spawnWorker.mockImplementation(() => {});
+  // The respawn sweep answers to the same master switch as every other
+  // automatic spawn, and the default is off.
+  const { setSchedulerConfig } = await import("../src/db/settings.js");
+  setSchedulerConfig({ enabled: true });
 });
 
 afterEach(async () => {
@@ -75,7 +79,10 @@ afterEach(async () => {
  * a wait with no hook history behind it at all — what the watchdog leaves after
  * re-deriving state from a pane on daemon restart.
  */
-async function parkedWorker(notificationType: string | null) {
+async function parkedWorker(
+  notificationType: string | null,
+  opts: { workspaceKind?: "scratch" | "repo" } = {},
+) {
   const { createTask, updateTask } = await import("../src/db/tasks.js");
   const { createAgent } = await import("../src/db/agents.js");
   const { logEvent } = await import("../src/db/events.js");
@@ -84,7 +91,7 @@ async function parkedWorker(notificationType: string | null) {
     prompt: "x",
     repo: tmpDir,
     open_pr: false,
-    workspace_kind: "scratch",
+    workspace_kind: opts.workspaceKind ?? "scratch",
   });
   const worker = createAgent({
     kind: "worker",
@@ -165,13 +172,13 @@ describe("rejecting a worker parked in waiting_input", () => {
 });
 
 describe("a rejection that requeues never goes silent", () => {
-  /** A rejected task back in the queue with no live worker — what the requeue
-   *  branch leaves behind. `notificationType` picks the branch it took. */
-  async function requeued() {
+  /** A rejection's own requeue: menu-parked worker, killed, task back in the
+   *  queue with nobody on it — the state the sweep owns. */
+  async function requeued(opts: { workspaceKind?: "scratch" | "repo" } = {}) {
     const { handleVerdict } = await import("../src/daemon/review.js");
     const { getTask } = await import("../src/db/tasks.js");
     paneContent = permissionMenu();
-    const { task, worker } = await parkedWorker("permission_prompt");
+    const { task, worker } = await parkedWorker("permission_prompt", opts);
     await handleVerdict(task.id, 99, "reject", "fix the empty-input case");
     expect(getTask(task.id)!.status).toBe("queued");
     return { task, worker };
@@ -298,6 +305,221 @@ describe("a rejection that requeues never goes silent", () => {
       (call) => (call[1] as { headers: Record<string, string> }).headers.Title,
     );
     expect(pushed.filter((t) => t.includes("nobody fixing it"))).toHaveLength(1);
+  });
+
+  // Post-#86 the ordinary rejection resolves IN PLACE, so a task can carry a
+  // rejection in its history and be requeued LATER by a route that owns its own
+  // handling. Those requeues are not this sweep's to restart, and the Needs-You
+  // item must not describe them as a rejection's.
+  describe("other requeue routes are left alone", () => {
+    /** An in-place rejection: the worker was only idle, took the notes, and the
+     *  task went back to in_progress (task.reopened). */
+    async function reworkedInPlace() {
+      const { handleVerdict } = await import("../src/daemon/review.js");
+      const { getTask } = await import("../src/db/tasks.js");
+      paneContent = clearComposer();
+      const { task, worker } = await parkedWorker("idle_prompt");
+      await handleVerdict(task.id, 99, "reject", "fix the empty-input case");
+      expect(getTask(task.id)!.status).toBe("in_progress");
+      return { task, worker };
+    }
+
+    it("a PR-feedback requeue is not treated as the rejection's", async () => {
+      const { strandedReworkTasks } = await import("../src/daemon/review.js");
+      const { reworkDispatchSweep } = await import("../src/daemon/scheduler.js");
+      const { updateTask } = await import("../src/db/tasks.js");
+      const { logEvent } = await import("../src/db/events.js");
+      const { updateAgent } = await import("../src/db/agents.js");
+      const { task, worker } = await reworkedInPlace();
+
+      // Exactly what prsync writes when it cannot deliver PR feedback in
+      // session (src/daemon/prsync.ts).
+      updateAgent(worker.id, { state: "dead" });
+      updateTask(task.id, { status: "queued", agent_id: null });
+      logEvent("task.requeued", { taskId: task.id, payload: { reason: "pr feedback" } });
+
+      expect(strandedReworkTasks()).toEqual([]);
+      reworkDispatchSweep(deps(Date.now()));
+      expect(spawnWorker).not.toHaveBeenCalled();
+      expect(await attentionItems(PAST_GRACE())).toEqual([]);
+    });
+
+    it("a vanished-worker requeue is left to the watchdog's own retry", async () => {
+      const { strandedReworkTasks } = await import("../src/daemon/review.js");
+      const { reworkDispatchSweep } = await import("../src/daemon/scheduler.js");
+      const { updateTask } = await import("../src/db/tasks.js");
+      const { logEvent } = await import("../src/db/events.js");
+      const { updateAgent } = await import("../src/db/agents.js");
+      const { task, worker } = await reworkedInPlace();
+
+      // What the watchdog writes for a vanished worker: no payload at all, and
+      // it promises the human exactly one retry of its own.
+      updateAgent(worker.id, { state: "dead" });
+      updateTask(task.id, { status: "queued", agent_id: null });
+      logEvent("task.requeued", { taskId: task.id });
+
+      expect(strandedReworkTasks()).toEqual([]);
+      reworkDispatchSweep(deps(Date.now()));
+      expect(spawnWorker).not.toHaveBeenCalled();
+      expect(await attentionItems(PAST_GRACE())).toEqual([]);
+    });
+
+    it("a rejection requeue followed by a respawn and a vanish is left alone too", async () => {
+      const { strandedReworkTasks } = await import("../src/daemon/review.js");
+      const { updateTask } = await import("../src/db/tasks.js");
+      const { logEvent } = await import("../src/db/events.js");
+      const { updateAgent } = await import("../src/db/agents.js");
+      const { reworkDispatchSweep } = await import("../src/daemon/scheduler.js");
+      const { task } = await requeued();
+      await realisticSpawn();
+      reworkDispatchSweep(deps(Date.now()));
+      const { getTask } = await import("../src/db/tasks.js");
+      const respawnedId = getTask(task.id)!.agent_id!;
+
+      updateAgent(respawnedId, { state: "dead" });
+      updateTask(task.id, { status: "queued", agent_id: null });
+      logEvent("task.requeued", { taskId: task.id });
+
+      expect(strandedReworkTasks()).toEqual([]);
+      expect(await attentionItems(PAST_GRACE())).toEqual([]);
+    });
+  });
+
+  // A gate is not a failure. blocked_by is enforced ONLY by the ready queue
+  // (spawnWorker checks status and strict-serial, never the blocker), so this
+  // sweep is the one path that could start a task whose blocker is not done.
+  describe("gates hold the respawn without spending its budget", () => {
+    it("waits for an unfinished blocker, then starts once it is done", async () => {
+      const { reworkDispatchSweep } = await import("../src/daemon/scheduler.js");
+      const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+      const { listEvents } = await import("../src/db/events.js");
+      const { task } = await requeued();
+      const blocker = createTask({ title: "blocker", prompt: "y", repo: tmpDir });
+      updateTask(task.id, { blocked_by: blocker.id });
+      await realisticSpawn();
+
+      let now = Date.now();
+      for (let i = 0; i < 4; i++) reworkDispatchSweep(deps((now += 61_000)));
+
+      expect(spawnWorker).not.toHaveBeenCalled();
+      expect(getTask(task.id)!.status).toBe("queued");
+      // No attempt consumed, so the budget is intact for when the gate clears.
+      expect(
+        listEvents(80).some((e) => e.kind === "review.rework_dispatch_failed"),
+      ).toBe(false);
+
+      updateTask(blocker.id, { status: "done" });
+      reworkDispatchSweep(deps((now += 61_000)));
+
+      expect(spawnWorker).toHaveBeenCalledWith(task.id);
+      expect(getTask(task.id)!.status).toBe("in_progress");
+    });
+
+    it("waits for a strict-serial repo to free up, then starts", async () => {
+      const { reworkDispatchSweep } = await import("../src/daemon/scheduler.js");
+      const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+      const { setIntegrationSettings } = await import("../src/db/settings.js");
+      const { listEvents } = await import("../src/db/events.js");
+      const { task } = await requeued({ workspaceKind: "repo" });
+      const holder = createTask({ title: "holder", prompt: "y", repo: tmpDir });
+      updateTask(holder.id, { status: "in_progress" });
+      setIntegrationSettings({ strict_serial_repos: [tmpDir] });
+      await realisticSpawn();
+
+      let now = Date.now();
+      for (let i = 0; i < 4; i++) reworkDispatchSweep(deps((now += 61_000)));
+
+      expect(spawnWorker).not.toHaveBeenCalled();
+      expect(
+        listEvents(80).some((e) => e.kind === "review.rework_dispatch_failed"),
+      ).toBe(false);
+
+      // The holder finishes: the gate clears and the full budget is still there.
+      updateTask(holder.id, { status: "done" });
+      reworkDispatchSweep(deps((now += 61_000)));
+
+      expect(spawnWorker).toHaveBeenCalledWith(task.id);
+      expect(getTask(task.id)!.status).toBe("in_progress");
+    });
+  });
+
+  // It starts a real session, so it obeys the same policy as every other
+  // automatic spawn. The strand stays named the whole time it is held.
+  describe("autonomous-spawn policy", () => {
+    it("does not spawn while autonomous dispatch is off, but still names it", async () => {
+      const { reworkDispatchSweep } = await import("../src/daemon/scheduler.js");
+      const { setSchedulerConfig } = await import("../src/db/settings.js");
+      const { getTask } = await import("../src/db/tasks.js");
+      const { task } = await requeued();
+      setSchedulerConfig({ enabled: false });
+      await realisticSpawn();
+
+      reworkDispatchSweep(deps(Date.now()));
+
+      expect(spawnWorker).not.toHaveBeenCalled();
+      expect(getTask(task.id)!.status).toBe("queued");
+      expect((await attentionItems(PAST_GRACE())).map((i) => i.task_id)).toEqual([
+        task.id,
+      ]);
+    });
+
+    it("does not spawn outside the active window", async () => {
+      const { reworkDispatchSweep } = await import("../src/daemon/scheduler.js");
+      const { setSchedulerConfig } = await import("../src/db/settings.js");
+      await requeued();
+      await realisticSpawn();
+      // A one-hour window that cannot contain `at`, whatever the local hour is.
+      const at = new Date();
+      const start = (at.getHours() + 2) % 24;
+      setSchedulerConfig({ active_hours: { start, end: (start + 1) % 24 } });
+
+      reworkDispatchSweep(deps(at.getTime()));
+      expect(spawnWorker).not.toHaveBeenCalled();
+
+      setSchedulerConfig({ active_hours: null });
+      reworkDispatchSweep(deps(at.getTime()));
+      expect(spawnWorker).toHaveBeenCalledTimes(1);
+    });
+
+    it("holds off once the daily spawn budget is spent, and says so once", async () => {
+      const { reworkDispatchSweep } = await import("../src/daemon/scheduler.js");
+      const { setSchedulerConfig } = await import("../src/db/settings.js");
+      const { logEvent, listEvents } = await import("../src/db/events.js");
+      const { task } = await requeued();
+      setSchedulerConfig({ daily_spawn_limit: 2 });
+      logEvent("scheduler.spawned", {});
+      logEvent("reviewer.auto_spawned", {});
+      await realisticSpawn();
+
+      let now = Date.now();
+      reworkDispatchSweep(deps(now));
+      reworkDispatchSweep(deps((now += 61_000)));
+
+      expect(spawnWorker).not.toHaveBeenCalled();
+      const skips = listEvents(80).filter(
+        (e) => e.kind === "review.rework_budget_skipped",
+      );
+      expect(skips).toHaveLength(1); // standing condition, not once per tick
+      // No attempt was consumed, so raising the limit starts it immediately.
+      expect(
+        listEvents(80).some((e) => e.kind === "review.rework_dispatch_failed"),
+      ).toBe(false);
+      setSchedulerConfig({ daily_spawn_limit: 20 });
+      reworkDispatchSweep(deps((now += 61_000)));
+      expect(spawnWorker).toHaveBeenCalledWith(task.id);
+    });
+
+    it("charges its own respawn to the shared daily budget", async () => {
+      const { autonomousSpawnsToday } = await import("../src/daemon/capacity.js");
+      const { reworkDispatchSweep } = await import("../src/daemon/scheduler.js");
+      await requeued();
+      await realisticSpawn();
+      expect(autonomousSpawnsToday()).toBe(0);
+
+      reworkDispatchSweep(deps(Date.now()));
+
+      expect(autonomousSpawnsToday()).toBe(1);
+    });
   });
 
   it("stops naming a task whose status moved on without a respawn", async () => {

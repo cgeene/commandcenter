@@ -82,6 +82,8 @@ const TEMPLATES: Record<string, Template> = {
     `Restarted a worker on ${taskRef(e)} to address review round ${Number(p.round) || 0}`,
   "review.rework_dispatch_failed": (e, p) =>
     `${taskRef(e)} is queued with the reviewer's notes but no worker could be started${p.error ? `: ${clip(p.error, 80)}` : ""}`,
+  "review.rework_budget_skipped": (e) =>
+    `${taskRef(e)} is queued with the reviewer's notes — today's spawn budget is spent, so no worker was restarted`,
   "review.round_started": (e, p) => {
     const round = Number(p.round) || 0;
     const max = Number(p.max) || 0;
