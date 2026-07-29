@@ -23,7 +23,7 @@ import {
 } from "../db/settings.js";
 import { listTasks, readyTasks } from "../db/tasks.js";
 import { reviewMaxCycles, strandedReworkTasks } from "./review.js";
-import { WAIT_HOOK_EVENTS } from "./waiting.js";
+import { WAIT_HOOK_EVENTS, waitIsMoot } from "./waiting.js";
 
 /**
  * The "Needs You" action queue: an ordered list of things only the human can
@@ -362,15 +362,21 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   }
 
   // --- escalation: a live worker still waiting after the human was paged ---
+  //     Both wait producers below are anchored on EVENTS, so they keep firing
+  //     for a wait whose task has since moved out of the worker's reach — the
+  //     wait event and the escalation are both still the newest of their kind.
+  //     waitIsMoot is therefore re-checked here against live task status rather
+  //     than trusted from whatever was true when the wait began.
   const escalated = new Set<number>();
   for (const a of agents) {
     if (a.kind === "main" || a.state !== "waiting_input") continue;
+    const task = a.task_id ? tasks.find((t) => t.id === a.task_id) : undefined;
+    if (waitIsMoot(a, task)) continue;
     const waitStart = latestAgentEventTs(a.id, [...WAIT_HOOK_EVENTS]);
     const esc = latestAgentEvent(a.id, ["waiting.escalated"]);
     // only if THIS wait episode was escalated (esc newer than the wait start)
     if (!waitStart || !esc || esc.ts < waitStart) continue;
     escalated.add(a.id);
-    const task = a.task_id ? tasks.find((t) => t.id === a.task_id) : undefined;
     push({
       id: `escalation:a${a.id}:${esc.id}`, // event id -> new episode, new key
       kind: "escalation",
@@ -393,9 +399,10 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   for (const a of agents) {
     if (a.kind === "main" || a.state !== "waiting_input") continue;
     if (escalated.has(a.id)) continue;
+    const task = a.task_id ? tasks.find((t) => t.id === a.task_id) : undefined;
+    if (waitIsMoot(a, task)) continue;
     const waitStart = latestAgentEventTs(a.id, [...WAIT_HOOK_EVENTS]);
     if (!waitStart || nowMs - Date.parse(waitStart) < staleMs) continue;
-    const task = a.task_id ? tasks.find((t) => t.id === a.task_id) : undefined;
     push({
       id: `stale_waiting:a${a.id}:${waitStart}`, // new wait episode -> new key
       kind: "stale_waiting",

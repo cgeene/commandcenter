@@ -17,6 +17,7 @@ import { parsePane } from "./pane.js";
 import { resumeAgent } from "./resume.js";
 import { capturePane, windowExists } from "./tmux.js";
 import { batchableTriagePrompt } from "./triageprompt.js";
+import { waitIsMoot } from "./waiting.js";
 
 const PANE_TAIL_LINES = 60;
 
@@ -430,8 +431,10 @@ export async function delegateToMain(worker: Agent, message: string): Promise<vo
  *
  * Late delivery of a moot ping is worse than no delivery: it sends the
  * orchestrator to triage a task somebody already dispatched, or to rescue a
- * worker that is long since unblocked. Both kinds are therefore re-validated
- * against live state at flush time, not just at enqueue time.
+ * worker that is long since unblocked — or whose task has since moved somewhere
+ * the worker cannot act on. Both kinds are therefore re-validated against live
+ * state at flush time, not just at enqueue time, and against the TASK as well as
+ * the agent, because a queued ping outlives the state it was queued from.
  */
 function stalenessReason(
   it: QueuedNotification,
@@ -454,6 +457,13 @@ function stalenessReason(
   const worker = getAgent(it.worker_id);
   if (!worker) return "worker_gone";
   if (worker.state !== "waiting_input") return `worker_${worker.state}`;
+  // The agent state alone cannot see this: a worker that idled mid-verify is
+  // still, correctly, `waiting_input` when the verify passes and sends its task
+  // to review. Delivering then sends the orchestrator to rescue a worker whose
+  // work is already under a live reviewer. Read the worker's CURRENT task, not
+  // the id snapshotted at enqueue.
+  const task = worker.task_id != null ? getTask(worker.task_id) : undefined;
+  if (task && waitIsMoot(worker, task)) return `task_${task.status}`;
   return null;
 }
 
