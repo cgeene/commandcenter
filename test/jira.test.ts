@@ -75,69 +75,32 @@ describe("tasksNeedingJiraSync", () => {
 });
 
 describe("tasksNeedingJiraCreate", () => {
-  async function seed() {
-    const { createTask, updateTask } = await import("../src/db/tasks.js");
-    return { createTask, updateTask };
-  }
-
-  it("selects a PR-bearing, ticketless task in an enabled repo", async () => {
-    const { createTask, updateTask } = await seed();
-    const t = createTask({ title: "t", prompt: "x", repo: "/enabled" });
-    updateTask(t.id, { pr_url: "https://gh/pr/1" });
-    const { tasksNeedingJiraCreate } = await import("../src/db/tasks.js");
-    expect(tasksNeedingJiraCreate(["/enabled"]).map((x) => x.id)).toEqual([t.id]);
-  });
-
-  it("excludes doc-only tasks via the open_pr != 0 gate", async () => {
-    const { createTask, updateTask } = await seed();
-    const t = createTask({ title: "doc", prompt: "x", repo: "/enabled", open_pr: false });
-    // Even with a pr_url present, open_pr = 0 structurally excludes it.
-    updateTask(t.id, { pr_url: "https://gh/pr/2" });
-    const { tasksNeedingJiraCreate } = await import("../src/db/tasks.js");
-    expect(tasksNeedingJiraCreate(["/enabled"])).toEqual([]);
-  });
-
-  it("excludes tasks with no pr_url", async () => {
-    const { createTask } = await seed();
-    createTask({ title: "nopr", prompt: "x", repo: "/enabled" });
-    const { tasksNeedingJiraCreate } = await import("../src/db/tasks.js");
-    expect(tasksNeedingJiraCreate(["/enabled"])).toEqual([]);
-  });
-
-  it("excludes tasks that already have a ticket (jira_key idempotency guard)", async () => {
-    const { createTask, updateTask } = await seed();
-    const t = createTask({ title: "has key", prompt: "x", repo: "/enabled" });
-    updateTask(t.id, { pr_url: "https://gh/pr/3", jira_key: "EN-99" });
-    const { tasksNeedingJiraCreate } = await import("../src/db/tasks.js");
-    expect(tasksNeedingJiraCreate(["/enabled"])).toEqual([]);
-  });
-
-  it("excludes cancelled and failed tasks", async () => {
-    const { createTask, updateTask } = await seed();
-    const cancelled = createTask({ title: "c", prompt: "x", repo: "/enabled" });
-    updateTask(cancelled.id, { pr_url: "https://gh/pr/4", status: "cancelled" });
-    const failed = createTask({ title: "f", prompt: "x", repo: "/enabled" });
-    updateTask(failed.id, { pr_url: "https://gh/pr/5", status: "failed" });
-    const { tasksNeedingJiraCreate } = await import("../src/db/tasks.js");
-    expect(tasksNeedingJiraCreate(["/enabled"])).toEqual([]);
-  });
-
-  it("excludes tasks whose repo is not in the enabled list", async () => {
-    const { createTask, updateTask } = await seed();
-    const t = createTask({ title: "t", prompt: "x", repo: "/disabled" });
-    updateTask(t.id, { pr_url: "https://gh/pr/6" });
-    const { tasksNeedingJiraCreate } = await import("../src/db/tasks.js");
-    expect(tasksNeedingJiraCreate(["/enabled"])).toEqual([]);
-    // ...but included once its repo is enabled.
-    expect(tasksNeedingJiraCreate(["/enabled", "/disabled"]).map((x) => x.id)).toEqual([t.id]);
-  });
-
-  it("returns nothing when no repos are enabled (empty gate)", async () => {
-    const { createTask, updateTask } = await seed();
-    const t = createTask({ title: "t", prompt: "x", repo: "/enabled" });
-    updateTask(t.id, { pr_url: "https://gh/pr/7" });
-    const { tasksNeedingJiraCreate } = await import("../src/db/tasks.js");
-    expect(tasksNeedingJiraCreate([])).toEqual([]);
+  // The create gate, one row per exclusion. These were seven tests of the same
+  // three lines: make a task, run the selector, expect it in or out. The gate is
+  // the idempotency guard for ticket creation, so every exclusion is kept.
+  it("selects only PR-bearing, ticketless, live tasks in an enabled repo", async () => {
+    const { createTask, updateTask, tasksNeedingJiraCreate } = await import(
+      "../src/db/tasks.js"
+    );
+    const { getDb } = await import("../src/db/db.js");
+    for (const { why, create, patch, enabled, selected } of [
+      { why: "a PR-bearing, ticketless task in an enabled repo", create: {}, patch: { pr_url: "https://gh/pr/1" }, enabled: ["/enabled"], selected: true },
+      // Even with a pr_url present, open_pr = 0 structurally excludes it.
+      { why: "a doc-only task (open_pr = 0)", create: { open_pr: false }, patch: { pr_url: "https://gh/pr/2" }, enabled: ["/enabled"], selected: false },
+      { why: "a task with no pr_url", create: {}, patch: {}, enabled: ["/enabled"], selected: false },
+      { why: "a task that already has a ticket", create: {}, patch: { pr_url: "https://gh/pr/3", jira_key: "EN-99" }, enabled: ["/enabled"], selected: false },
+      { why: "a cancelled task", create: {}, patch: { pr_url: "https://gh/pr/4", status: "cancelled" }, enabled: ["/enabled"], selected: false },
+      { why: "a failed task", create: {}, patch: { pr_url: "https://gh/pr/5", status: "failed" }, enabled: ["/enabled"], selected: false },
+      { why: "a task whose repo is not enabled", create: {}, patch: { pr_url: "https://gh/pr/6" }, enabled: ["/other"], selected: false },
+      { why: "...the same task once its repo IS enabled", create: {}, patch: { pr_url: "https://gh/pr/6" }, enabled: ["/enabled"], selected: true },
+      { why: "no repos enabled at all (empty gate)", create: {}, patch: { pr_url: "https://gh/pr/7" }, enabled: [], selected: false },
+    ] as const) {
+      getDb().prepare("DELETE FROM tasks").run(); // per-row isolation
+      const t = createTask({ title: "t", prompt: "x", repo: "/enabled", ...(create as object) });
+      if (Object.keys(patch).length > 0) updateTask(t.id, patch as never);
+      const got = tasksNeedingJiraCreate([...enabled]).map((x) => x.id);
+      expect(got, why).toEqual(selected ? [t.id] : []);
+    }
   });
 });
 
