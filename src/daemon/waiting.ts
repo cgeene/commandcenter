@@ -74,8 +74,14 @@ export function idleParked(agent: Agent): boolean {
   if (waitCause(agent.id) !== "idle") return false;
   if (!agent.tmux_target) return false;
   try {
+    // `escapes` is load-bearing, not decoration: Claude paints a DIM
+    // autosuggestion into an idle composer, and parsePane can only tell that
+    // ghost text from a human's real draft while the SGR codes are present (see
+    // visibleNonGhost). Capture it unstyled and every idle composer showing a
+    // suggestion reads as "a draft is waiting" — which fails this check closed
+    // and silently costs the worker the in-place delivery this exists for.
     const pane = parsePane(
-      capturePane(agent.tmux_target, PANE_TAIL_LINES),
+      capturePane(agent.tmux_target, PANE_TAIL_LINES, { escapes: true }),
       agent.provider,
     );
     if (!pane.composer_found) return false;

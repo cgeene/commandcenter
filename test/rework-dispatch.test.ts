@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { clearComposer, draftComposer, permissionMenu } from "./fixtures/pane.js";
+import {
+  clearComposer,
+  draftComposer,
+  ghostComposer,
+  permissionMenu,
+} from "./fixtures/pane.js";
 
 /**
  * What a review rejection does with the worker it just rejected, and what
@@ -16,11 +21,26 @@ import { clearComposer, draftComposer, permissionMenu } from "./fixtures/pane.js
 
 const sendText = vi.fn(async () => true);
 let paneContent = "";
+
+/** SGR sequences, built from char codes so this file holds no control bytes. */
+const SGR_RE = new RegExp("[\\u001B\\u009B]\\[[0-?]*[ -/]*[@-~]", "g");
+
+/** What `tmux capture-pane -p` (no -e) yields for a styled pane. */
+const stripSgr = (pane: string) => pane.replace(SGR_RE, "");
+
+/**
+ * Modelled on the real thing: `tmux capture-pane -p` returns the pane's TEXT,
+ * and only `-e` (opts.escapes) keeps the SGR codes. That distinction decides
+ * whether parsePane can tell Claude's dim autosuggestion from a human's draft,
+ * so a caller that forgets `escapes` must fail a test here rather than quietly
+ * lose the ghost-text discrimination in production.
+ */
 vi.mock("../src/daemon/tmux.js", () => ({
   sendText: (...a: unknown[]) => sendText(...a),
   sendEnter: vi.fn(async () => {}),
   windowExists: () => true,
-  capturePane: () => paneContent,
+  capturePane: (_t: string, _n?: number, opts?: { escapes?: boolean }) =>
+    opts?.escapes ? paneContent : stripSgr(paneContent),
   killWindow: () => [],
   paneProcess: () => null,
   listLiveWindowIds: () => [],
@@ -147,28 +167,41 @@ async function parkedWorker(
 }
 
 describe("rejecting a worker parked in waiting_input", () => {
-  it("delivers the notes into the live session when it is only idle", async () => {
-    const { handleVerdict } = await import("../src/daemon/review.js");
-    const { getTask } = await import("../src/db/tasks.js");
-    const { getAgent } = await import("../src/db/agents.js");
-    const { listEvents } = await import("../src/db/events.js");
-    paneContent = clearComposer();
-    const { task, worker } = await parkedWorker("idle_prompt");
+  // Three panes that all mean "finished its turn, nothing being asked". The
+  // ghost-text one is the case a plain (un-`-e`) capture gets wrong: Claude's dim
+  // autosuggestion is indistinguishable from a human's draft once the SGR codes
+  // are gone, so it would read as a pending draft and cost the worker its
+  // session. The escape-free clear composer is the other direction — a pane with
+  // no styling at all must still classify as idle.
+  const delivered: [string, () => string][] = [
+    ["the composer is empty", clearComposer],
+    ["the composer shows a dim ghost suggestion", ghostComposer],
+    ["the pane carries no styling at all", () => stripSgr(clearComposer())],
+  ];
+  for (const [why, pane] of delivered) {
+    it(`delivers the notes into the live session when ${why}`, async () => {
+      const { handleVerdict } = await import("../src/daemon/review.js");
+      const { getTask } = await import("../src/db/tasks.js");
+      const { getAgent } = await import("../src/db/agents.js");
+      const { listEvents } = await import("../src/db/events.js");
+      paneContent = pane();
+      const { task, worker } = await parkedWorker("idle_prompt");
 
-    await handleVerdict(task.id, 99, "reject", "the retry test was deleted");
+      await handleVerdict(task.id, 99, "reject", "the retry test was deleted");
 
-    expect(sendText).toHaveBeenCalledTimes(1);
-    expect(String(sendText.mock.calls[0][1])).toContain("retry test was deleted");
-    const t = getTask(task.id)!;
-    expect(t.status).toBe("in_progress");
-    expect(t.agent_id).toBe(worker.id);
-    expect(t.review_cycles).toBe(1);
-    expect(killAgent).not.toHaveBeenCalled();
-    expect(getAgent(worker.id)?.state).toBe("working");
-    const kinds = listEvents(30).map((e) => e.kind);
-    expect(kinds).toContain("agent.idle_wait_cleared");
-    expect(kinds).not.toContain("task.requeued");
-  });
+      expect(sendText).toHaveBeenCalledTimes(1);
+      expect(String(sendText.mock.calls[0][1])).toContain("retry test was deleted");
+      const t = getTask(task.id)!;
+      expect(t.status).toBe("in_progress");
+      expect(t.agent_id).toBe(worker.id);
+      expect(t.review_cycles).toBe(1);
+      expect(killAgent).not.toHaveBeenCalled();
+      expect(getAgent(worker.id)?.state).toBe("working");
+      const kinds = listEvents(30).map((e) => e.kind);
+      expect(kinds).toContain("agent.idle_wait_cleared");
+      expect(kinds).not.toContain("task.requeued");
+    });
+  }
 
   // Everything the platform cannot positively read as "only idle" keeps the old
   // behavior: unsolicited text must never be typed into a pending menu. One case
