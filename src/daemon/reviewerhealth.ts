@@ -31,7 +31,8 @@ export function reviewerActive(reviewer: Agent): boolean {
   if (!reviewer.tmux_target) return false;
   if (STOPPED_STATES.has(reviewer.state)) return false;
   // Its turn ended without a verdict at least once (hooks.reviewerStopped).
-  // Auto-nudge recovery is already exhausted by then; the human has been paged.
+  // Auto-nudge recovery is already exhausted by then, and the one-time human
+  // notification has already been raised.
   return countAgentEvents(reviewer.id, ["reviewer.stopped_incomplete"]) === 0;
 }
 
@@ -46,7 +47,7 @@ export function reviewerActive(reviewer: Agent): boolean {
  * below only supply the anchor.
  *
  * A reviewer whose spawn never reached a pane is covered by `stalled`: the
- * watchdog's SessionStart timeout moves it there within 90s and its
+ * watchdog's SessionStart timeout moves it there a minute or two in, and its
  * `agent.session_start_missing` marker is the anchor. The vanished-agent pass
  * deliberately does not claim those rows — a paneless agent is "did not
  * initialize", which that pass would report as a window that disappeared.
