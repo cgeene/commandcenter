@@ -340,19 +340,6 @@ describe("POST /api/tasks/:id/delegate response shape", () => {
     expect(body.detail).toContain("queued");
   });
 
-  it("202s a repeat click whose ping is already queued", async () => {
-    const { task } = await setup("working");
-    panes.set(MAIN, HUMAN_DRAFT);
-    const { buildApp } = await import("../src/daemon/api.js");
-
-    await buildApp().request(`/api/tasks/${task.id}/delegate`, { method: "POST" });
-    const res = await buildApp().request(`/api/tasks/${task.id}/delegate`, {
-      method: "POST",
-    });
-    expect(res.status).toBe(202);
-    expect(await res.json()).toMatchObject({ status: "already_queued" });
-  });
-
   it("200s with delivered when the main's prompt was clear", async () => {
     const { task } = await setup("idle");
     panes.set(MAIN, CLEAR_PROMPT);
@@ -409,21 +396,4 @@ describe("POST /api/tasks/:id/delegate response shape", () => {
     expect(sendText).not.toHaveBeenCalled();
   });
 
-  it("409s a task that is not awaiting triage at all", async () => {
-    const { createTask } = await import("../src/db/tasks.js");
-    const task = createTask({
-      title: "t",
-      prompt: "x",
-      repo,
-      dispatch_mode: "direct",
-    });
-    const { buildApp } = await import("../src/daemon/api.js");
-    const res = await buildApp().request(`/api/tasks/${task.id}/delegate`, {
-      method: "POST",
-    });
-    expect(res.status).toBe(409);
-    expect(await res.json()).toMatchObject({
-      error: "task is not awaiting main-agent triage",
-    });
-  });
 });

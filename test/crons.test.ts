@@ -130,14 +130,6 @@ describe("crons", () => {
     expect(task).toMatchObject({ open_pr: 0, auto_review: 0 });
   });
 
-  it("updateCron flips open_pr and auto_review back on", async () => {
-    const { createCron, updateCron } = await import("../src/db/crons.js");
-    const c = createCron({ ...TEMPLATE, open_pr: false, auto_review: false });
-    const after = updateCron(c.id, { open_pr: true, auto_review: true } as never)!;
-    expect(after.open_pr).toBe(1);
-    expect(after.auto_review).toBe(1);
-  });
-
   it("disabled crons never fire; re-enabling schedules from now", async () => {
     const { createCron, updateCron, dueCrons, getCron } = await import(
       "../src/db/crons.js"

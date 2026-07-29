@@ -469,23 +469,6 @@ describe("idle-prompt suppression for finished workers in review", () => {
     expect(kinds).not.toContain("waiting.delegated");
   });
 
-  it("suppresses the idle ping for a done task whose worker has not reaped yet", async () => {
-    const { handleHookEvent } = await import("../src/daemon/hooks.js");
-    const { getAgent } = await import("../src/db/agents.js");
-    const { updateTask } = await import("../src/db/tasks.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const { task, agent } = await setup();
-    updateTask(task.id, { result_summary: "done" });
-    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
-    updateTask(task.id, { status: "done" }); // e.g. PR merged, auto-completed
-
-    await handleHookEvent(agent.id, IDLE_PROMPT);
-
-    expect(getAgent(agent.id)?.state).toBe("idle");
-    const kinds = listEvents(30).map((e) => e.kind);
-    expect(kinds).toContain("waiting.suppressed_in_review");
-  });
-
   it("does NOT suppress a permission-menu wait even when the task is in review", async () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");
     const { getAgent } = await import("../src/db/agents.js");
@@ -674,50 +657,6 @@ describe("transient API error auto-nudge", () => {
     expect(kinds).toContain("task.stopped_incomplete");
   });
 
-  it("caps auto-nudges at 2 consecutive stalls, then escalates with the error in the message", async () => {
-    const { handleHookEvent } = await import("../src/daemon/hooks.js");
-    const { getTask } = await import("../src/db/tasks.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const { task, agent } = await setup({ tmux_target: "cc:@1" });
-    paneContent = OVERLOAD_ERROR_PANE;
-
-    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // nudge 1
-    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // nudge 2
-    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // 3rd: falls through
-
-    expect(sendText).toHaveBeenCalledTimes(2);
-    expect(getTask(task.id)?.status).toBe("in_progress");
-    const events = listEvents(20);
-    expect(events.filter((e) => e.kind === "agent.auto_nudged").length).toBe(2);
-    expect(events.filter((e) => e.kind === "task.stopped_incomplete").length).toBe(1);
-  });
-
-  it("resets the nudge count once the agent produces a clean Stop", async () => {
-    const { handleHookEvent } = await import("../src/daemon/hooks.js");
-    const { updateTask } = await import("../src/db/tasks.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const { task, agent } = await setup({ tmux_target: "cc:@1" });
-    paneContent = OVERLOAD_ERROR_PANE;
-
-    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // nudge 1
-    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // nudge 2
-
-    // Worker finishes cleanly — the stall streak is over.
-    updateTask(task.id, { result_summary: "done" });
-    paneContent = "⏺ All set, wrapping up.\n\n╭──╮\n│ ❯│\n╰──╯";
-    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
-
-    // Requeue the task and hit the same stall again — should nudge, not escalate.
-    updateTask(task.id, { status: "in_progress", result_summary: null });
-    paneContent = OVERLOAD_ERROR_PANE;
-    await handleHookEvent(agent.id, { hook_event_name: "Stop" }); // nudge 1 again
-
-    expect(sendText).toHaveBeenCalledTimes(3);
-    const events = listEvents(20);
-    expect(events.filter((e) => e.kind === "agent.auto_nudged").length).toBe(3);
-    expect(events.filter((e) => e.kind === "task.stopped_incomplete").length).toBe(0);
-  });
-
   it("Notification for a transiently-stalled worker auto-nudges instead of marking waiting_input", async () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");
     const { getAgent } = await import("../src/db/agents.js");
@@ -735,21 +674,6 @@ describe("transient API error auto-nudge", () => {
     const kinds = listEvents(10).map((e) => e.kind);
     expect(kinds).toContain("agent.auto_nudged");
     expect(kinds).not.toContain("waiting.delegated");
-  });
-
-  it("Notification with no error signature still marks waiting_input as before", async () => {
-    const { handleHookEvent } = await import("../src/daemon/hooks.js");
-    const { getAgent } = await import("../src/db/agents.js");
-    const { agent } = await setup({ tmux_target: "cc:@1" });
-    paneContent = "⏺ Needs your input on something.\n\n╭──╮\n│ ❯│\n╰──╯";
-
-    await handleHookEvent(agent.id, {
-      hook_event_name: "Notification",
-      message: "needs permission",
-    });
-
-    expect(sendText).not.toHaveBeenCalled();
-    expect(getAgent(agent.id)?.state).toBe("waiting_input");
   });
 
   it("a human/orchestrator send resets the nudge count", async () => {

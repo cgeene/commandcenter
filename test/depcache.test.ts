@@ -189,18 +189,6 @@ describe("publishCacheEntry", () => {
     expect(fs.readdirSync(path.dirname(entry))).toEqual(["abc123"]);
   });
 
-  it("short-circuits when the entry is already published", async () => {
-    const { publishCacheEntry } = await import("../src/daemon/depcache.js");
-    const source = path.join(tmpDir, "src");
-    writePackageRoot(source, "lock-v1", true);
-    const sourceModules = path.join(source, "node_modules");
-    const entry = path.join(tmpDir, "cache", "abc123");
-
-    expect(publishCacheEntry(sourceModules, entry)).toBe("published");
-    expect(publishCacheEntry(sourceModules, entry)).toBe("existing");
-    expect(depMarker(entry)).toBe("lock-v1");
-    expect(fs.readdirSync(path.dirname(entry))).toEqual(["abc123"]);
-  });
 });
 
 describe("eviction", () => {

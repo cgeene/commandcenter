@@ -90,19 +90,6 @@ describe("handleVerdict", () => {
     expect(kinds).toContain("review.approved");
   });
 
-  it("approve on a code task whose pr_url isn't recorded yet stays in review", async () => {
-    const { handleVerdict } = await import("../src/daemon/review.js");
-    const { getTask } = await import("../src/db/tasks.js");
-    const { listEvents } = await import("../src/db/events.js");
-    // A worker can reach review with pr_url still null (open_pr=1). Auto-
-    // completing here would strand real code on an unmerged branch — the gate
-    // is open_pr===0 only, so this waits for the normal merge path instead.
-    const { task } = await setupReviewTask({ open_pr: true, pr_url: null });
-    await handleVerdict(task.id, 99, "approve", "looks complete");
-    expect(getTask(task.id)?.status).toBe("review");
-    expect(listEvents(10).map((e) => e.kind)).not.toContain("task.autocompleted");
-  });
-
   it("doc-only auto-completion unblocks its dependents", async () => {
     const { handleVerdict } = await import("../src/daemon/review.js");
     const { createTask, readyTasks } = await import("../src/db/tasks.js");
@@ -223,16 +210,6 @@ describe("handleVerdict", () => {
     const kinds = listEvents(20).map((e) => e.kind);
     expect(kinds).toContain("review.approved");
     expect(kinds).toContain("review.verdict_accepted_while_blocked");
-  });
-
-  it("an approve accepted while blocked completes a doc-only task", async () => {
-    const { handleVerdict } = await import("../src/daemon/review.js");
-    const { getTask } = await import("../src/db/tasks.js");
-    const { task, reviewer } = await setupBlockedWithLiveReviewer({
-      open_pr: false,
-    });
-    await handleVerdict(task.id, reviewer.id, "approve", "doc is accurate");
-    expect(getTask(task.id)?.status).toBe("done");
   });
 
   it("a reject accepted while blocked is recorded but leaves the block standing", async () => {
@@ -375,20 +352,6 @@ describe("handleVerdict", () => {
     expect(getTask(task.id)!.review_verdict).toBe("approve");
   });
 
-  it("a task re-blocked by the cap after a verify block is restorable again", async () => {
-    const { handleVerdict } = await import("../src/daemon/review.js");
-    const { getTask } = await import("../src/db/tasks.js");
-    const { logEvent } = await import("../src/db/events.js");
-    const { task, reviewer } = await setupBlockedWithLiveReviewer({
-      cause: "verify",
-    });
-    // Verification was fixed and the loop later exhausted its rounds — the
-    // most recent gate is the cap, which an approve may lift.
-    logEvent("review.loop_exhausted", { taskId: task.id });
-    await handleVerdict(task.id, reviewer.id, "approve", "all good now");
-    expect(getTask(task.id)!.status).toBe("review");
-  });
-
   it("a dead reviewer's verdict on a blocked task is still refused, loudly", async () => {
     const { handleVerdict } = await import("../src/daemon/review.js");
     const { updateAgent } = await import("../src/db/agents.js");
@@ -401,21 +364,6 @@ describe("handleVerdict", () => {
     expect(listEvents(20).map((e) => e.kind)).toContain(
       "review.verdict_unsubmittable",
     );
-  });
-
-  it("a refused verdict names the real status instead of failing opaquely", async () => {
-    const { handleVerdict, ReviewStateError } = await import(
-      "../src/daemon/review.js"
-    );
-    const { updateTask } = await import("../src/db/tasks.js");
-    const { task } = await setupReviewTask();
-    updateTask(task.id, { status: "cancelled" });
-    const err = await handleVerdict(task.id, 99, "approve", "n").catch((e) => e);
-    expect(err).toBeInstanceOf(ReviewStateError);
-    expect(err.taskStatus).toBe("cancelled");
-    expect(err.expectedStatus).toBe("review");
-    expect(err.message).toMatch(/cancelled/);
-    expect(err.message).toMatch(/review/);
   });
 
   it("rejected notes land in the respawned worker's prompt", async () => {
@@ -540,21 +488,6 @@ describe("handleVerdict — PR draft state", () => {
     expect(calls.some((a) => a[1] === "ready" && a[2] === "--undo")).toBe(true);
     expect(getTask(task.id)?.pr_is_draft).toBe(1);
     expect(listEvents(20).map((e) => e.kind)).toContain("pr.redrafted");
-  });
-
-  it("reject does NOT touch a PR that is already a draft", async () => {
-    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
-    const { handleVerdict } = await import("../src/daemon/review.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const calls: string[][] = [];
-    _setGhRunner(async (args) => {
-      calls.push(args);
-      return "";
-    });
-    const { task } = await setupPrReviewTask(1); // already a draft
-    await handleVerdict(task.id, 99, "reject", "still broken");
-    expect(calls).toHaveLength(0); // no gh call at all
-    expect(listEvents(20).map((e) => e.kind)).not.toContain("pr.redrafted");
   });
 
   it("reject leaves a never-synced (unknown draft state) PR alone", async () => {

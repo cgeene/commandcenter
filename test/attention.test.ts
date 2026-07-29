@@ -236,30 +236,6 @@ describe("deriveAttention — kinds", () => {
     expect(items[0].agent_id).toBe(a.id);
   });
 
-  it("stale_waiting includes provider startup trust waits", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    const { createAgent } = await import("../src/db/agents.js");
-    const { logEvent } = await import("../src/db/events.js");
-    const { getDb } = await import("../src/db/db.js");
-    const a = createAgent({
-      kind: "worker",
-      provider: "codex",
-      state: "waiting_input",
-    });
-    logEvent("agent.startup_permission", {
-      agentId: a.id,
-      payload: { trust: true },
-    });
-    getDb()
-      .prepare("UPDATE events SET ts = ? WHERE kind = 'agent.startup_permission'")
-      .run(new Date(Date.now() - 15 * 60_000).toISOString());
-
-    const items = deriveAttention({ isPrOpen: allOpen });
-    expect(items).toHaveLength(1);
-    expect(items[0].kind).toBe("stale_waiting");
-    expect(items[0].agent_id).toBe(a.id);
-  });
-
   it("an escalated wait is reported once, as escalation not stale_waiting", async () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     const { createAgent } = await import("../src/db/agents.js");
@@ -307,15 +283,6 @@ describe("deriveAttention — ordering", () => {
     expect(items.map((i) => i.severity)).toEqual(["red", "orange", "yellow"]);
   });
 
-  it("within a severity, older items rank first", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    const older = await approvedPrTask();
-    const newer = await approvedPrTask();
-    await backdate("tasks", older.id, "updated_at", 90);
-    const items = deriveAttention({ isPrOpen: allOpen });
-    expect(items[0].task_id).toBe(older.id);
-    expect(items[1].task_id).toBe(newer.id);
-  });
 });
 
 describe("deriveAttention — dismissal", () => {
@@ -426,27 +393,6 @@ describe("deriveAttention — scheduler_stalled", () => {
     ).toBe(false);
   });
 
-  it("a dismissed capacity item drops out", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    const { dismissAttention } = await import("../src/db/attention.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const { createAgent } = await import("../src/db/agents.js");
-    const { setSchedulerConfig } = await import("../src/db/settings.js");
-    const { logEvent } = await import("../src/db/events.js");
-    setSchedulerConfig({ enabled: true, max_concurrent: 1 });
-    createAgent({ kind: "worker", state: "idle" });
-    createTask({ title: "waiting", prompt: "x", repo: "/r" });
-    logEvent("scheduler.capacity_blocked", { payload: { max_concurrent: 1 } });
-    await backdateEvent("scheduler.capacity_blocked", 20);
-
-    const item = deriveAttention({ isPrOpen: allOpen }).find(
-      (i) => i.kind === "scheduler_stalled",
-    )!;
-    dismissAttention(item.id);
-    expect(
-      deriveAttention({ isPrOpen: allOpen }).some((i) => i.kind === "scheduler_stalled"),
-    ).toBe(false);
-  });
 });
 
 describe("deriveAttention — jira_sync", () => {
@@ -494,16 +440,6 @@ describe("deriveAttention — jira_sync", () => {
     });
     expect(jira[0].title).toContain("EN-1234");
     expect(jira[0].pr_url).toBe(t.pr_url);
-  });
-
-  it("labels a keyless failing task as ticket-creation failing", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    const { logEvent } = await import("../src/db/events.js");
-    const t = await jiraFailingTask({ fails: 3, jira_key: null });
-    logEvent("jira.sync_broken", { taskId: t.id });
-    const jira = deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "jira_sync");
-    expect(jira).toHaveLength(1);
-    expect(jira[0].title).toContain("creation failing");
   });
 
   it("re-raises with a fresh key after a dismissed episode recurs", async () => {

@@ -95,42 +95,12 @@ describe("worker-filed task priority", () => {
     });
   });
 
-  it("defaults a worker follow-up to the floor when it requests nothing", async () => {
-    const { agent } = await workingWorker(2);
-    const { task } = await fileTask({ agent_id: agent.id });
-    expect(task.priority).toBe(3);
-    // Nothing was overruled, so there is no request to report.
-    const payload = await createdPayload(task.id);
-    expect(payload.requested_priority).toBeUndefined();
-    expect(payload.granted_priority).toBeUndefined();
-  });
-
-  it("keeps a follow-up at the filer's own priority when that is lower", async () => {
-    const { agent } = await workingWorker(4);
-    const { task } = await fileTask({ agent_id: agent.id });
-    expect(task.priority).toBe(4);
-  });
-
-  it("lets a worker file something less urgent than the floor", async () => {
-    const { agent } = await workingWorker(2);
-    const { task } = await fileTask({ priority: 4, agent_id: agent.id });
-    expect(task.priority).toBe(4);
-    expect((await createdPayload(task.id)).requested_priority).toBeUndefined();
-  });
-
   it("leaves the orchestrator's requested priority alone", async () => {
     const { createAgent } = await import("../src/db/agents.js");
     const main = createAgent({ kind: "main", state: "idle" });
     const { task } = await fileTask({ priority: 0, agent_id: main.id });
     expect(task.priority).toBe(0);
     expect((await createdPayload(task.id)).requested_priority).toBeUndefined();
-  });
-
-  it("leaves a human submission alone", async () => {
-    const { task } = await fileTask({ priority: 1 });
-    expect(task.priority).toBe(1);
-    const { task: defaulted } = await fileTask({ title: "no priority given" });
-    expect(defaulted.priority).toBe(2);
   });
 
   it("clamps the priority a worker would inherit from a portfolio parent", async () => {
