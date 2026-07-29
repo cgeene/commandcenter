@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { listAgents } from "../db/agents.js";
-import { latestTaskEvent, logEvent } from "../db/events.js";
+import { countTaskEventsAfter, latestTaskEventId, logEvent } from "../db/events.js";
 import { normalizePrState } from "../lib/prstate.js";
 import {
   getTask,
@@ -235,23 +235,31 @@ function reapTaskAgents(task: Task, opts?: { rmWorktree?: boolean }): void {
 const MAX_FEEDBACK_DEFERRALS = 5;
 
 /**
+ * Events that end a feedback episode, and so start the defer budget over.
+ *
+ * `pr.feedback` is logged both when the worker takes the feedback and when the
+ * requeue path folds it into the notes; pr.feedback_delivery_failed precedes
+ * that requeue. task.archived_resumed is here because resuming a task with a
+ * terminal PR clears pr_url and pr_feedback_at (see taskresume.ts) — the next
+ * PR's first episode must not inherit the old PR's spent budget.
+ */
+const FEEDBACK_EPISODE_END = [
+  "pr.feedback",
+  "pr.feedback_delivery_failed",
+  "task.archived_resumed",
+] as const;
+
+/**
  * Deferrals already spent on the CURRENT undelivered feedback episode.
  *
- * Keyed on `since` (the pr_feedback_at watermark the episode started from),
- * which is stable precisely because an undelivered defer must not advance the
- * watermark: a delivery or a requeue moves it, so the next episode starts from
- * a fresh budget while a retry of this one keeps counting up.
+ * Counted from the last episode-ending event rather than keyed on the
+ * pr_feedback_at watermark: the watermark is not monotonic over a task's life
+ * (a resume resets it to NULL), so a key derived from it recurs and would hand
+ * a fresh episode an already-spent budget.
  */
-function feedbackDeferrals(taskId: number, since: string): number {
-  const last = latestTaskEvent(taskId, ["pr.feedback_deferred"]);
-  if (!last?.payload) return 0;
-  try {
-    const p = JSON.parse(last.payload) as { since?: unknown; attempt?: unknown };
-    if (p.since !== since) return 0;
-    return typeof p.attempt === "number" ? p.attempt : 0;
-  } catch {
-    return 0;
-  }
+function feedbackDeferrals(taskId: number): number {
+  const anchor = latestTaskEventId(taskId, [...FEEDBACK_EPISODE_END]) ?? 0;
+  return countTaskEventsAfter(taskId, "pr.feedback_deferred", anchor);
 }
 
 /** Apply a PR's state to its task. Pure of gh — unit-testable. */
@@ -420,12 +428,11 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
     // passes, but bounded — nothing here changes a menu park, so an unbounded
     // defer never converges and the feedback is never seen by anybody.
     if (outcome === "waiting_input" || outcome === "delivery_failed") {
-      const attempt = feedbackDeferrals(taskId, since) + 1;
+      const attempt = feedbackDeferrals(taskId) + 1;
       logEvent("pr.feedback_deferred", {
         taskId,
         agentId: task.agent_id,
         payload: {
-          since,
           attempt,
           max: MAX_FEEDBACK_DEFERRALS,
           outcome,

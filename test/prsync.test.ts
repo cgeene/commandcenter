@@ -484,15 +484,35 @@ describe("applyPrState", () => {
     expect(getAgent(worker.id)?.state).toBe("dead");
   });
 
-  it("counts deferrals per undelivered episode, not across all history", async () => {
+  /** Deferral attempt numbers as logged, oldest first. */
+  async function loggedAttempts(): Promise<number[]> {
+    const { listEvents } = await import("../src/db/events.js");
+    return listEvents(80)
+      .filter((e) => e.kind === "pr.feedback_deferred")
+      .map((e) => Number(JSON.parse(e.payload!).attempt))
+      .reverse();
+  }
+
+  it("starts a fresh defer budget once a round of feedback has been delivered", async () => {
     const { applyPrState } = await import("../src/daemon/prsync.js");
     const { getTask, updateTask } = await import("../src/db/tasks.js");
-    const { task } = await parkedWorker("permission_prompt", permissionMenu());
+    const { updateAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { task, worker } = await parkedWorker("idle_prompt", clearComposer());
 
     await applyPrState(task.id, feedback);
-    // A later round: the watermark has moved on (an earlier batch was
-    // delivered), so this batch is a new episode and starts from a fresh budget.
-    updateTask(task.id, { pr_feedback_at: "2026-07-04T03:00:00Z" });
+    expect(getTask(task.id)?.status).toBe("in_progress");
+
+    // The worker finished that round and went back into review, then parked on a
+    // real menu. A later comment is a new episode: the delivered one is closed.
+    updateTask(task.id, { status: "review" });
+    updateAgent(worker.id, { state: "waiting_input" });
+    logEvent("hook.notification", {
+      agentId: worker.id,
+      taskId: task.id,
+      payload: { notification_type: "permission_prompt" },
+    });
+    paneContent = permissionMenu();
     await applyPrState(
       task.id,
       open({
@@ -502,12 +522,71 @@ describe("applyPrState", () => {
       }),
     );
 
-    const { listEvents } = await import("../src/db/events.js");
-    const attempts = listEvents(60)
-      .filter((e) => e.kind === "pr.feedback_deferred")
-      .map((e) => JSON.parse(e.payload!).attempt);
-    expect(attempts).toEqual([1, 1]); // newest first; both episodes started at 1
+    expect(await loggedAttempts()).toEqual([1]);
     expect(getTask(task.id)?.status).toBe("review");
+  });
+
+  it("gives a resumed task's new PR the full budget, not the old PR's spent one", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { task } = await parkedWorker("permission_prompt", permissionMenu());
+
+    // Episode 1 burns the whole budget and requeues.
+    const drain = async () => {
+      let passes = 0;
+      while (getTask(task.id)?.status === "review" && passes < 20) {
+        await applyPrState(task.id, feedback);
+        passes++;
+      }
+      return passes;
+    };
+    const firstEpisode = await drain();
+    expect(getTask(task.id)?.status).toBe("queued");
+
+    // What taskresume does to a task whose PR reached a terminal state: the
+    // watermark AND the pr_url are cleared, so nothing derived from them can
+    // tell episode 1's deferrals apart from the new PR's first one. Events are
+    // never pruned, so they are all still on the task.
+    const revived = createAgent({
+      kind: "worker",
+      state: "waiting_input",
+      task_id: task.id,
+      tmux_target: "cc:@8",
+    });
+    updateTask(task.id, {
+      status: "review",
+      agent_id: revived.id,
+      pr_url: "https://github.com/nylas/unicorn-k8s/pull/2400",
+      pr_feedback_at: null,
+      review_notes: null,
+    });
+    logEvent("task.archived_resumed", { taskId: task.id });
+    logEvent("hook.notification", {
+      agentId: revived.id,
+      taskId: task.id,
+      payload: { notification_type: "permission_prompt" },
+    });
+
+    // First pass of the NEW episode: a defer, not a give-up. The live worker
+    // keeps the task — one transient failure must not cost it its session.
+    await applyPrState(task.id, feedback);
+    const mid = getTask(task.id)!;
+    expect(mid.status).toBe("review");
+    expect(mid.agent_id).toBe(revived.id);
+    expect(mid.pr_feedback_at).toBeNull();
+    expect(getAgent(revived.id)?.state).toBe("waiting_input");
+
+    // And the rest of the budget is there too: the same number of passes as the
+    // first episode, restarting the count at 1.
+    const secondEpisode = 1 + (await drain());
+    expect(secondEpisode).toBe(firstEpisode);
+    expect(await loggedAttempts()).toEqual([
+      ...Array.from({ length: firstEpisode }, (_, i) => i + 1),
+      ...Array.from({ length: secondEpisode }, (_, i) => i + 1),
+    ]);
+    expect(getTask(task.id)?.review_notes).toContain("fix this");
   });
 
   it("defers feedback while an adversarial reviewer is live", async () => {
