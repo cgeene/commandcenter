@@ -543,56 +543,71 @@ describe("watchdog auto-reap", () => {
     return a.id;
   }
 
-  it("early-reaps an approved worker whose PR has flipped ready, after the grace", async () => {
-    const fns = await setup();
-    const id = await approvedReadyWorker(fns);
-    const killed: number[] = [];
-    fns.watchdog(reapDeps(killed, "2026-07-03T10:20:00.000Z")); // 20m > 10m grace
-    expect(killed).toEqual([id]);
-    const reaped = fns.listEvents().find((e) => e.kind === "agent.reaped");
-    expect(JSON.parse(reaped?.payload ?? "{}").reason).toBe("approved_awaiting_merge");
-  });
-
-  it("early-reaps an approved no-PR task's worker", async () => {
-    const fns = await setup();
-    const id = await approvedReadyWorker(fns, { open_pr: 0, pr_is_draft: null });
-    const killed: number[] = [];
-    fns.watchdog(reapDeps(killed, "2026-07-03T10:20:00.000Z"));
-    expect(killed).toEqual([id]);
-  });
-
-  it("does NOT early-reap while the PR is still a draft (internal review pending)", async () => {
-    const fns = await setup();
-    await approvedReadyWorker(fns, { pr_is_draft: 1 });
-    const killed: number[] = [];
-    fns.watchdog(reapDeps(killed, "2026-07-03T11:00:00.000Z"));
-    expect(killed).toEqual([]);
-  });
-
-  it("does NOT early-reap a rejected or unreviewed in-review worker (a fix round may resume it live)", async () => {
-    const fns = await setup();
-    await approvedReadyWorker(fns, { review_verdict: "reject" });
-    await approvedReadyWorker(fns, { review_verdict: null });
-    const killed: number[] = [];
-    fns.watchdog(reapDeps(killed, "2026-07-03T11:00:00.000Z"));
-    expect(killed).toEqual([]);
-  });
-
-  it("never early-reaps a worker that is still mid-turn (not idle)", async () => {
-    const fns = await setup();
-    const id = await approvedReadyWorker(fns);
-    fns.updateAgent(id, { state: "working" }); // resumed / still working
-    const killed: number[] = [];
-    fns.watchdog(reapDeps(killed, "2026-07-03T11:00:00.000Z"));
-    expect(killed).toEqual([]);
-  });
-
-  it("does NOT early-reap before the grace period elapses", async () => {
-    const fns = await setup();
-    await approvedReadyWorker(fns);
-    const killed: number[] = [];
-    fns.watchdog(reapDeps(killed, "2026-07-03T10:05:00.000Z")); // 5m < 10m grace
-    expect(killed).toEqual([]);
+  // One table for the whole early-reap decision. These were six tests differing
+  // in a single task/agent field each. Reaping wrongly costs a worker that a fix
+  // round could have resumed in-session, so every input is kept as a row.
+  it("early-reaps only an approved, idle worker whose PR is out of internal review", async () => {
+    for (const { why, overrides, agentPatch, now, reaped } of [
+      {
+        why: "an approved worker whose PR has flipped ready, after the grace",
+        now: "2026-07-03T10:20:00.000Z", // 20m > 10m grace
+        reaped: true,
+      },
+      {
+        why: "an approved no-PR task's worker",
+        overrides: { open_pr: 0, pr_is_draft: null },
+        now: "2026-07-03T10:20:00.000Z",
+        reaped: true,
+      },
+      {
+        why: "NOT while the PR is still a draft (internal review pending)",
+        overrides: { pr_is_draft: 1 },
+        now: "2026-07-03T11:00:00.000Z",
+        reaped: false,
+      },
+      {
+        why: "NOT a rejected in-review worker (a fix round may resume it live)",
+        overrides: { review_verdict: "reject" },
+        now: "2026-07-03T11:00:00.000Z",
+        reaped: false,
+      },
+      {
+        why: "NOT an unreviewed in-review worker",
+        overrides: { review_verdict: null },
+        now: "2026-07-03T11:00:00.000Z",
+        reaped: false,
+      },
+      {
+        why: "NOT a worker that is still mid-turn (resumed / working)",
+        agentPatch: { state: "working" },
+        now: "2026-07-03T11:00:00.000Z",
+        reaped: false,
+      },
+      {
+        why: "NOT before the grace period elapses",
+        now: "2026-07-03T10:05:00.000Z", // 5m < 10m grace
+        reaped: false,
+      },
+    ] as const) {
+      const fns = await setup();
+      // Per-row isolation: setup() re-imports the modules but shares the
+      // database, so an agent left by the previous row is still reapable and
+      // would be counted against this row's expectation.
+      const { getDb } = await import("../src/db/db.js");
+      getDb().prepare("DELETE FROM agents").run();
+      getDb().prepare("DELETE FROM tasks").run();
+      const id = await approvedReadyWorker(fns, overrides ?? {});
+      if (agentPatch) fns.updateAgent(id, agentPatch);
+      const killed: number[] = [];
+      fns.watchdog(reapDeps(killed, now));
+      expect(killed, why).toEqual(reaped ? [id] : []);
+      if (reaped) {
+        const event = fns.listEvents().find((e) => e.kind === "agent.reaped");
+        expect(JSON.parse(event?.payload ?? "{}").reason, why).toBe(
+          "approved_awaiting_merge",
+        );
+      }
+    }
   });
 
 });

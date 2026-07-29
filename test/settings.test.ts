@@ -198,6 +198,34 @@ describe("env-fallback precedence (setting > env > default)", () => {
 });
 
 describe("settings API validation", () => {
+  // Every settings PATCH rejection, one row each. These were ten tests spread
+  // across two describes, all the same three lines with a different bad literal:
+  // the validator is one shared code path and what matters is that each field's
+  // rule is enforced at the boundary rather than written through to the store.
+  it("rejects an invalid value on every settings group", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const app = buildApp();
+    for (const { why, group, body } of [
+      { why: "a model outside the allow-list", group: "agents", body: { default_main_model: "gpt-4" } },
+      { why: "an invalid worker provider", group: "agents", body: { default_worker_provider: "gemini" } },
+      { why: "an invalid publication mode", group: "agents", body: { worker_publication_mode: "automatic" } },
+      { why: "a relative workspace path", group: "workspace", body: { worktrees_dir: "relative/path" } },
+      { why: "an absolute path that does not exist", group: "workspace", body: { main_workspace_dir: path.join(tmpDir, "nope") } },
+      { why: "a non-http ntfy URL", group: "notifications", body: { ntfy_url: "ftp://bad" } },
+      { why: "a project key violating ^[A-Z][A-Z0-9]+$", group: "jira", body: { repos: { "acme/api": { enabled: true, project: "en-lower" } } } },
+      { why: "a classifier model outside the allow-list", group: "jira", body: { classifier_model: "gpt-4" } },
+      { why: "a repo key that is neither an existing path nor owner/name", group: "jira", body: { repos: { "not a repo key": { enabled: true, project: "EN" } } } },
+      { why: "a relative path repo key that does not exist", group: "jira", body: { repos: { [path.join(tmpDir, "nope")]: { enabled: true, project: "EN" } } } },
+    ]) {
+      const res = await app.request(`/api/settings/${group}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      expect(res.status, `${group}: ${why}`).toBe(400);
+    }
+  });
+
   it("accepts a valid agent patch and round-trips via GET", async () => {
     const { buildApp } = await import("../src/daemon/api.js");
     const app = buildApp();
@@ -218,56 +246,6 @@ describe("settings API validation", () => {
     expect(get.agents.stored.reviewer_variety).toBe(true);
     expect(get.agents.stored.worker_publication_mode).toBe("human");
     expect(get.agents.effective.worker_publication_mode).toBe("human");
-  });
-
-  it("rejects a model outside the allow-list", async () => {
-    const { buildApp } = await import("../src/daemon/api.js");
-    const res = await buildApp().request("/api/settings/agents", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ default_main_model: "gpt-4" }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("rejects an invalid provider", async () => {
-    const { buildApp } = await import("../src/daemon/api.js");
-    const res = await buildApp().request("/api/settings/agents", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ default_worker_provider: "gemini" }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("rejects an invalid publication mode", async () => {
-    const { buildApp } = await import("../src/daemon/api.js");
-    const res = await buildApp().request("/api/settings/agents", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ worker_publication_mode: "automatic" }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("rejects a relative workspace path", async () => {
-    const { buildApp } = await import("../src/daemon/api.js");
-    const res = await buildApp().request("/api/settings/workspace", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ worktrees_dir: "relative/path" }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("rejects an absolute path that does not exist", async () => {
-    const { buildApp } = await import("../src/daemon/api.js");
-    const res = await buildApp().request("/api/settings/workspace", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ main_workspace_dir: path.join(tmpDir, "nope") }),
-    });
-    expect(res.status).toBe(400);
   });
 
   it("accepts an existing absolute directory and clears with null", async () => {
@@ -293,15 +271,6 @@ describe("settings API validation", () => {
     expect(get.workspace.effective.main_workspace_dir).toBe(os.homedir());
   });
 
-  it("rejects a non-http ntfy URL", async () => {
-    const { buildApp } = await import("../src/daemon/api.js");
-    const res = await buildApp().request("/api/settings/notifications", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ntfy_url: "ftp://bad" }),
-    });
-    expect(res.status).toBe(400);
-  });
 });
 
 describe("JIRA settings", () => {
@@ -394,52 +363,6 @@ describe("JIRA settings", () => {
     // Per-repo opt-in defaults OFF even when the master switch is on.
     expect(get.jira.stored.repos["acme/api"].enabled).toBe(false);
     expect(get.jira.stored.repos["acme/api"].projects).toEqual(["EN", "UN"]);
-  });
-
-  it("rejects a project key that violates ^[A-Z][A-Z0-9]+$", async () => {
-    const { buildApp } = await import("../src/daemon/api.js");
-    const res = await buildApp().request("/api/settings/jira", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        repos: { "acme/api": { enabled: true, project: "en-lower" } },
-      }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("rejects a classifier model outside the allow-list", async () => {
-    const { buildApp } = await import("../src/daemon/api.js");
-    const res = await buildApp().request("/api/settings/jira", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ classifier_model: "gpt-4" }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("rejects a repo key that is neither an existing path nor owner/name", async () => {
-    const { buildApp } = await import("../src/daemon/api.js");
-    const res = await buildApp().request("/api/settings/jira", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        repos: { "not a repo key": { enabled: true, project: "EN" } },
-      }),
-    });
-    expect(res.status).toBe(400);
-  });
-
-  it("rejects a relative path repo key that does not exist", async () => {
-    const { buildApp } = await import("../src/daemon/api.js");
-    const res = await buildApp().request("/api/settings/jira", {
-      method: "PATCH",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        repos: { [path.join(tmpDir, "nope")]: { enabled: true, project: "EN" } },
-      }),
-    });
-    expect(res.status).toBe(400);
   });
 
   it("accepts an absolute existing directory as a repo key", async () => {

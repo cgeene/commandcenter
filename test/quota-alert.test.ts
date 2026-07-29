@@ -11,6 +11,8 @@ import type { LiveUsage, UsageMeter } from "../src/lib/usage.js";
 const NOW = new Date("2026-07-27T12:00:00.000Z");
 /** Comfortably inside the window relative to NOW. */
 const LATER = "2026-07-27T17:00:00.000Z";
+/** The reset instant the feed reports once the session window rolls over. */
+const NEXT_WINDOW = "2026-07-27T22:00:00.000Z";
 
 function meter(over: Partial<UsageMeter> = {}): UsageMeter {
   return {
@@ -99,89 +101,115 @@ describe("quotaConditions", () => {
 });
 
 describe("evaluateQuotaAlerts — threshold latch", () => {
-  it("pages once on the crossing", () => {
-    const below = poll(usage({ headline: meter({ percent: 70 }) }), EMPTY_QUOTA_ALERT_LATCH);
-    expect(below.alerts).toHaveLength(0);
-    expect(below.latch.threshold_window).toBeNull();
+  // The latch state machine, one row per scenario. These were six tests that all
+  // fed a SEQUENCE of readings and asserted the alerts and latch after each
+  // step, so they share one driver: `fresh` restarts from an empty latch,
+  // otherwise the previous step's latch is carried forward — which is what makes
+  // "pages once" and "re-pages" meaningfully different.
+  it("pages exactly once per crossing, and re-arms when it should", () => {
+    for (const { why, steps } of [
+      {
+        why: "pages once on the crossing",
+        steps: [
+          { percent: 70, alerts: 0, window: null },
+          {
+            percent: 82,
+            alerts: 1,
+            kind: "quota_threshold",
+            title: "82%",
+            window: `session@${LATER}`,
+            at: NOW.toISOString(),
+          },
+        ],
+      },
+      {
+        why: "stays quiet while utilization stays above the threshold",
+        steps: [
+          { percent: 82, alerts: 1 },
+          // the crossing time is preserved, so the panel's age keeps counting
+          { percent: 85, alerts: 0, at: NOW.toISOString() },
+          { percent: 91, alerts: 0, at: NOW.toISOString() },
+          { percent: 99, alerts: 0, at: NOW.toISOString() },
+          { percent: 100, alerts: 0, at: NOW.toISOString() },
+        ],
+      },
+      {
+        why: "re-pages after the window resets and utilization climbs again",
+        steps: [
+          { percent: 90, alerts: 1 },
+          // new window: a later reset instant and a fresh, low number
+          { percent: 4, resets_at: NEXT_WINDOW, alerts: 0, window: null },
+          {
+            percent: 87,
+            resets_at: NEXT_WINDOW,
+            alerts: 1,
+            window: `session@${NEXT_WINDOW}`,
+          },
+        ],
+      },
+      {
+        why: "re-pages after dropping back below and crossing again inside one window",
+        steps: [
+          { percent: 90, alerts: 1 },
+          { percent: 12, alerts: 0, window: null },
+          { percent: 81, alerts: 1 },
+        ],
+      },
+      {
+        why: "never pages off a reading whose window already elapsed, but does re-arm",
+        steps: [
+          { percent: 90, alerts: 1 },
+          // A recent poll (17:30) whose window closed at 17:00 — the upstream
+          // feed hasn't rolled over yet. Stale percentage: no page, but the latch
+          // clears so the new window gets its own.
+          {
+            percent: 90,
+            fetched_at: "2026-07-27T17:30:00.000Z",
+            now: new Date("2026-07-27T18:00:00.000Z"),
+            alerts: 0,
+            window: null,
+          },
+        ],
+      },
+      {
+        why: "respects a non-default threshold and an explicit disable",
+        steps: [
+          { percent: 55, threshold: 50, alerts: 1, fresh: true },
+          { percent: 99, threshold: null, alerts: 0, fresh: true },
+        ],
+      },
+    ] as const) {
+      let latch = EMPTY_QUOTA_ALERT_LATCH;
+      for (const step of steps) {
+        const label = `${why} @ ${step.percent}%`;
+        const opts: Record<string, unknown> = {};
+        if ("now" in step && step.now) opts.now = step.now;
+        if ("threshold" in step) opts.threshold = step.threshold;
+        const reading = usage({
+          headline: meter({
+            percent: step.percent,
+            ...("resets_at" in step && step.resets_at ? { resets_at: step.resets_at } : {}),
+          }),
+          ...("fetched_at" in step && step.fetched_at ? { fetched_at: step.fetched_at } : {}),
+        });
+        const out = poll(reading, "fresh" in step && step.fresh ? EMPTY_QUOTA_ALERT_LATCH : latch, opts);
 
-    const crossed = poll(usage({ headline: meter({ percent: 82 }) }), below.latch);
-    expect(crossed.alerts).toHaveLength(1);
-    expect(crossed.alerts[0]).toMatchObject({ kind: "quota_threshold" });
-    expect(crossed.alerts[0].title).toContain("82%");
-    expect(crossed.latch.threshold_window).toBe(`session@${LATER}`);
-    expect(crossed.latch.threshold_at).toBe(NOW.toISOString());
-  });
-
-  it("stays quiet while utilization stays above the threshold", () => {
-    let latch = poll(usage({ headline: meter({ percent: 82 }) }), EMPTY_QUOTA_ALERT_LATCH)
-      .latch;
-    for (const percent of [85, 91, 99, 100]) {
-      const next = poll(usage({ headline: meter({ percent }) }), latch);
-      expect(next.alerts).toHaveLength(0);
-      // and the crossing time is preserved, so the panel's age keeps counting
-      expect(next.latch.threshold_at).toBe(NOW.toISOString());
-      latch = next.latch;
+        expect(out.alerts, label).toHaveLength(step.alerts);
+        if ("kind" in step && step.kind) {
+          expect(out.alerts[0], label).toMatchObject({ kind: step.kind });
+        }
+        if ("title" in step && step.title) {
+          expect(out.alerts[0].title, label).toContain(step.title);
+        }
+        if ("window" in step) {
+          expect(out.latch.threshold_window, label).toBe(step.window);
+        }
+        if ("at" in step && step.at) {
+          expect(out.latch.threshold_at, label).toBe(step.at);
+        }
+        latch = out.latch;
+      }
     }
-  });
-
-  it("re-pages after the window resets and utilization climbs again", () => {
-    const crossed = poll(usage({ headline: meter({ percent: 90 }) }), EMPTY_QUOTA_ALERT_LATCH);
-    expect(crossed.alerts).toHaveLength(1);
-
-    // New window: the feed hands back a later reset instant and a fresh, low number.
-    const nextWindow = "2026-07-27T22:00:00.000Z";
-    const rolled = poll(
-      usage({ headline: meter({ percent: 4, resets_at: nextWindow }) }),
-      crossed.latch,
-    );
-    expect(rolled.alerts).toHaveLength(0);
-    expect(rolled.latch.threshold_window).toBeNull();
-
-    const recrossed = poll(
-      usage({ headline: meter({ percent: 87, resets_at: nextWindow }) }),
-      rolled.latch,
-    );
-    expect(recrossed.alerts).toHaveLength(1);
-    expect(recrossed.latch.threshold_window).toBe(`session@${nextWindow}`);
-  });
-
-  it("re-pages after dropping back below and crossing again inside one window", () => {
-    const crossed = poll(usage({ headline: meter({ percent: 90 }) }), EMPTY_QUOTA_ALERT_LATCH);
-    const dropped = poll(usage({ headline: meter({ percent: 12 }) }), crossed.latch);
-    expect(dropped.alerts).toHaveLength(0);
-    expect(dropped.latch.threshold_window).toBeNull();
-    expect(poll(usage({ headline: meter({ percent: 81 }) }), dropped.latch).alerts).toHaveLength(1);
-  });
-
-  it("never pages off a reading whose window already elapsed, but does re-arm", () => {
-    const latched = poll(usage({ headline: meter({ percent: 90 }) }), EMPTY_QUOTA_ALERT_LATCH)
-      .latch;
-    // A recent poll (17:30) whose window closed at 17:00 — the upstream feed
-    // hasn't rolled the window over yet. Stale percentage: no page, but the
-    // latch clears so the new window gets its own.
-    const elapsed = poll(
-      usage({
-        headline: meter({ percent: 90 }),
-        fetched_at: "2026-07-27T17:30:00.000Z",
-      }),
-      latched,
-      { now: new Date("2026-07-27T18:00:00.000Z") },
-    );
-    expect(elapsed.alerts).toHaveLength(0);
-    expect(elapsed.latch.threshold_window).toBeNull();
-  });
-
-  it("respects a non-default threshold and an explicit disable", () => {
-    expect(
-      poll(usage({ headline: meter({ percent: 55 }) }), EMPTY_QUOTA_ALERT_LATCH, {
-        threshold: 50,
-      }).alerts,
-    ).toHaveLength(1);
-    expect(
-      poll(usage({ headline: meter({ percent: 99 }) }), EMPTY_QUOTA_ALERT_LATCH, {
-        threshold: null,
-      }).alerts,
-    ).toHaveLength(0);
   });
 });
 
