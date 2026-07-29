@@ -215,6 +215,12 @@ the setting never changes tasks already created.
    task workspace. Pass → `review`. Fail → the failure output is fed back into the
    session (up to 2 nudges, then `blocked`). The `Stop` hook re-verifies even a
    task the worker moved to `review` itself, so `verify_cmd` can't be bypassed.
+   Verify runs are serialized fleet-wide (`verify_concurrency`, default 1): a
+   `verify_cmd` is usually a whole test suite, and N of them at once made
+   verification fail on contention rather than on defects. A run waiting for its
+   turn logs `verify.queued`; `verify.started` means a command is actually
+   executing, which is what the stall predicate and the idle-ping suppression
+   read.
 6. **Review** — an independent reviewer proofs a repository branch (details
    below). In Human publishes mode, the daemon builds a tree object from the
    complete non-ignored working tree using a temporary Git index, pins that
