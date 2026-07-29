@@ -1,10 +1,12 @@
 import { listAgents, type Agent } from "../db/agents.js";
 import {
   countEventsToday,
+  countTaskEvents,
   latestTaskEvent,
   latestTaskEventId,
   logEvent,
 } from "../db/events.js";
+import { reviewerActive } from "./reviewerhealth.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { getTask, listTasks, updateTask, type Task } from "../db/tasks.js";
 import { noteReworkOverCap } from "./capacity.js";
@@ -177,9 +179,21 @@ function liveReviewers(taskId: number): Agent[] {
   );
 }
 
-/** Is there a live reviewer already judging this task? */
+/**
+ * Is a reviewer that will actually land a verdict already judging this task?
+ *
+ * Deliberately NOT the raw `liveReviewers` list. A reviewer whose turn ended
+ * without submitting, or that stalled, or whose spawn never reached a pane,
+ * stays live forever; counting those here is what used to wedge a task in
+ * `review` with no verdict coming and no replacement allowed to start.
+ *
+ * The asymmetry with `submittedByLiveReviewer` below is intentional: refusing
+ * to START a reviewer needs positive evidence one is running, whereas ACCEPTING
+ * a verdict only needs the row to still be ours — work the platform
+ * commissioned is never discarded, even from an agent it had written off.
+ */
 function reviewerLive(taskId: number): boolean {
-  return liveReviewers(taskId).length > 0;
+  return liveReviewers(taskId).some(reviewerActive);
 }
 
 /** Did this exact verdict come from a reviewer the platform still has running
@@ -300,6 +314,74 @@ function exhaustLoop(task: Task, rounds: number): void {
       tags: "rotating_light",
       taskId: task.id,
       once: `task:${task.id}:review_exhausted:${rounds}`,
+    },
+  );
+}
+
+/**
+ * How many reviewers may give up on one task before the platform stops
+ * replacing them. Each replacement is a full-price round, and a task whose
+ * reviewers keep dying is usually saying something about the task (a diff that
+ * blows the reviewer's context, a verify command that hangs) that another
+ * reviewer will not fix.
+ */
+const MAX_ABANDONED_REVIEWERS = 2;
+
+/**
+ * The watchdog reaped a reviewer that stopped without a verdict. Start its
+ * replacement round, or — once too many have given up on this task — hand the
+ * task to the human.
+ *
+ * Recovery goes through `maybeAutoReview` rather than calling `spawnReviewer`
+ * directly so a replacement passes exactly the same gates as any other round
+ * (snapshot pinning, the no-PR gate, the cycle cap, the daily budget) instead
+ * of a second, drifting copy of them.
+ */
+export async function recoverAbandonedReview(reviewer: Agent): Promise<void> {
+  const taskId = reviewer.task_id;
+  if (taskId === null) return;
+  const task = getTask(taskId);
+  // A verdict landed after all, or the task moved on while the grace period
+  // ran: there is nothing left for a replacement to judge.
+  if (!task || task.status !== "review" || task.review_verdict !== null) return;
+
+  // Counts the reap that just happened, so the Nth reviewer to give up is the
+  // one that stops the cycle rather than the (N+1)th.
+  const gaveUp = countTaskEvents(taskId, "reviewer.reaped");
+  if (gaveUp > MAX_ABANDONED_REVIEWERS) {
+    abandonReview(task, gaveUp);
+    return;
+  }
+  logEvent("review.reviewer_replacing", {
+    taskId,
+    agentId: reviewer.id,
+    payload: { attempt: gaveUp, max: MAX_ABANDONED_REVIEWERS },
+  });
+  // The dead round recorded what it was judging, and that fingerprint is what
+  // stops maybeAutoReview from re-reviewing an unchanged HEAD. That guard is
+  // there to stop a worker re-submitting nothing new from looping forever; a
+  // round that produced no verdict is the opposite case and must re-run.
+  updateTask(taskId, { review_head_sha: null, review_result_hash: null });
+  await maybeAutoReview(taskId);
+}
+
+/** Every reviewer this task was given has stopped without a verdict. Nothing
+ *  automatic is left to try, so block it and say why. */
+function abandonReview(task: Task, gaveUp: number): void {
+  updateTask(task.id, { status: "blocked" });
+  logEvent("review.reviewer_unrecoverable", {
+    taskId: task.id,
+    payload: { reviewers_gave_up: gaveUp, max: MAX_ABANDONED_REVIEWERS },
+  });
+  notifyEvent(
+    "review_exhausted",
+    `task #${task.id} blocked — ${gaveUp} reviewers gave up without a verdict`,
+    `${task.title}\nEvery reviewer spawned for this task stopped without submitting, so the platform stopped replacing them. Review it yourself, or look at why reviewers keep dying on it (an oversized diff and a hanging verify command are the usual causes).`,
+    {
+      priority: "high",
+      tags: "rotating_light",
+      taskId: task.id,
+      once: `task:${task.id}:reviewer_unrecoverable:${gaveUp}`,
     },
   );
 }

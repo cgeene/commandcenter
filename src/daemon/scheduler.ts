@@ -11,6 +11,9 @@ import {
 import { getSchedulerConfig, type SchedulerConfig } from "../db/settings.js";
 import { createTask, getTask, listTasks, updateTask } from "../db/tasks.js";
 import { workerSlots } from "./capacity.js";
+import { tryAutoNudge } from "./hooks.js";
+import { recoverAbandonedReview } from "./review.js";
+import { reviewerGaveUpAt } from "./reviewerhealth.js";
 import { flushMainQueue } from "./notifqueue.js";
 import { notifyEvent } from "./notify.js";
 import { parsePane, type PendingPermission } from "./pane.js";
@@ -41,6 +44,10 @@ export interface SchedulerDeps {
   pendingPermission?: (agent: Agent) => PendingPermission | null;
   /** Kill what a vanished agent left running in its pane's process group. */
   sweepPaneGroup?: (panePid: number, ageSec: number) => PaneSweepResult;
+  /** Try to type a silent agent back into working (transient API errors only). */
+  revive?: (agent: Agent) => void;
+  /** Start a replacement round for a reviewer that was reaped without one. */
+  recoverReview?: (reviewer: Agent) => void;
 }
 
 const defaultDeps: SchedulerDeps = {
@@ -49,6 +56,11 @@ const defaultDeps: SchedulerDeps = {
   windowIds: listLiveWindowIds,
   now: () => new Date(),
   sweepPaneGroup: sweepVanishedPaneGroup,
+  // Both are fire-and-forget: a recovery attempt must never break the watchdog
+  // pass, and neither has anything to report back into this loop.
+  revive: (agent) => void tryAutoNudge(agent).catch(() => {}),
+  recoverReview: (reviewer) =>
+    void recoverAbandonedReview(reviewer).catch(() => {}),
   pendingPermission: (agent) => {
     if (!agent.tmux_target) return null;
     try {
@@ -384,6 +396,8 @@ function recoverFalseVanishes(
 export function watchdog(deps: SchedulerDeps = defaultDeps): void {
   const cfg = getSchedulerConfig();
   const kill = deps.kill ?? ((id: number) => void killAgent(id));
+  const revive = deps.revive ?? defaultDeps.revive!;
+  const recoverReview = deps.recoverReview ?? defaultDeps.recoverReview!;
   const sweepPaneGroup = deps.sweepPaneGroup ?? sweepVanishedPaneGroup;
   const windowIds = deps.windowIds();
   const nowMs = deps.now().getTime();
@@ -557,6 +571,37 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
               reason: terminal ? "task_terminal" : "approved_awaiting_merge",
             },
           });
+          continue;
+        }
+      }
+    }
+
+    // reviewer reap: a reviewer that ended its turn without submitting is
+    // deliberately left alive by hooks.reviewerStopped so the human can look at
+    // it, and the stall detector only flags a silent one. Neither kills it —
+    // and while its row is live, nothing may start a replacement, so the task
+    // sits in `review` with no verdict coming and its worker parked. Reap it
+    // once the grace period is up and start a replacement round. The human page
+    // fired at stopped_incomplete stays: this reduces paging, it does not
+    // replace it.
+    if (agent.kind === "reviewer") {
+      const gaveUpAt = reviewerGaveUpAt(agent);
+      if (gaveUpAt) {
+        // A silent reviewer may only be sleeping off a transient API error,
+        // which one keystroke fixes versus a full-price re-review. Nudge first;
+        // the nudge caps itself and puts a revived reviewer back to `working`,
+        // which clears gaveUpAt before the grace period runs out.
+        if (agent.state === "stalled") revive(agent);
+        if (nowMs - Date.parse(gaveUpAt) > cfg.reap_after_minutes * 60_000) {
+          kill(agent.id);
+          // Logged before the recovery reads it back: the replacement cap
+          // counts these.
+          logEvent("reviewer.reaped", {
+            agentId: agent.id,
+            taskId: agent.task_id ?? undefined,
+            payload: { state: agent.state, gave_up_at: gaveUpAt },
+          });
+          recoverReview(agent);
           continue;
         }
       }

@@ -185,8 +185,12 @@ interface StallCheck {
  * at MAX_AUTO_NUDGES consecutive attempts per agent — beyond that the caller
  * falls through to its normal escalation path, with `error` available to
  * fold into that notification's text.
+ *
+ * Exported for the watchdog, which tries this on a silent reviewer before
+ * reaping it: the cheap recovery has to be attempted from there too, because a
+ * reviewer whose session died mid-response never fires a Stop hook.
  */
-async function tryAutoNudge(agent: Agent): Promise<StallCheck> {
+export async function tryAutoNudge(agent: Agent): Promise<StallCheck> {
   if (
     agent.kind === "main" ||
     !agent.tmux_target ||
