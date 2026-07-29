@@ -924,6 +924,11 @@ function signalTitle(kind: string, payload: Record<string, unknown>): string {
     "reviewer.auto_spawned": "Reviewer spawned",
     "reviewer.spawned": "Reviewer spawned",
     "reviewer.spawn_error": "Reviewer failed",
+    "reviewer.reaped": "Reviewer gave up",
+    "reviewer.retired": "Reviewer retired",
+    "review.reviewer_replaced": "Replacement reviewer started",
+    "review.replacement_declined": "Replacement declined",
+    "review.reviewer_unrecoverable": "No reviewer will finish",
     "pr.feedback": payload.changes_requested ? "Changes requested" : "PR feedback",
     "pr.marked_ready": "PR ready",
     "pr.ready_failed": "PR ready failed",
@@ -975,6 +980,7 @@ function signalCategory(kind: string, payload: Record<string, unknown>): SignalF
     kind === "task.stopped_incomplete" ||
     kind === "review.rejected" ||
     kind === "review.verdict_superseded" ||
+    kind === "review.reviewer_unrecoverable" ||
     kind === "waiting.escalated" ||
     kind === "scheduler.capacity_blocked" ||
     kind === "daemon.stale" ||

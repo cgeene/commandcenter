@@ -123,8 +123,8 @@ describe("workerSlots", () => {
     const { updateAgent } = await import("../src/db/agents.js");
     const { logEvent } = await import("../src/db/events.js");
     // hooks.reviewerStopped deliberately leaves a verdict-less reviewer alive
-    // (idle) for the human to inspect, and nothing ever reaps a reviewer — so
-    // "not dead" is no evidence at all that a verdict is still coming.
+    // (idle) for the human to inspect, and the watchdog only reaps it after a
+    // grace period — so "not dead" is no evidence a verdict is still coming.
     const stuck = await parkedWorker();
     updateAgent(stuck.reviewer.id, { state: "idle" });
     logEvent("reviewer.stopped_incomplete", {

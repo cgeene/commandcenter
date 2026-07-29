@@ -381,7 +381,14 @@ describe("applyPrState", () => {
     const { getTask } = await import("../src/db/tasks.js");
     const { createAgent } = await import("../src/db/agents.js");
     const { task } = await setupPrTask();
-    createAgent({ kind: "reviewer", state: "working", task_id: task.id });
+    // tmux_target matters: "judging this state" means a running session, and a
+    // reviewer row without a pane never got one (its spawn threw before attach).
+    createAgent({
+      kind: "reviewer",
+      state: "working",
+      task_id: task.id,
+      tmux_target: "cc:@review",
+    });
     await applyPrState(
       task.id,
       open({
@@ -393,6 +400,35 @@ describe("applyPrState", () => {
     const t = getTask(task.id)!;
     expect(t.status).toBe("review"); // the reviewer's submit_review stays valid
     expect(t.pr_feedback_at).toBeNull();
+  });
+
+  it("forwards feedback when the reviewer has stopped without a verdict", async () => {
+    const { applyPrState } = await import("../src/daemon/prsync.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { task } = await setupPrTask();
+    // A zombie reviewer is judging nothing, so deferring to it would hold the
+    // human's comments until the watchdog reaps it.
+    const zombie = createAgent({
+      kind: "reviewer",
+      state: "idle",
+      task_id: task.id,
+      tmux_target: "cc:@review",
+    });
+    logEvent("reviewer.stopped_incomplete", {
+      agentId: zombie.id,
+      taskId: task.id,
+    });
+    await applyPrState(
+      task.id,
+      open({
+        comments: [
+          { author: "caleb", body: "fix this", created_at: "2026-07-04T02:00:00Z" },
+        ],
+      }),
+    );
+    expect(getTask(task.id)?.pr_feedback_at).not.toBeNull();
   });
 
   it("does nothing for tasks not in review", async () => {

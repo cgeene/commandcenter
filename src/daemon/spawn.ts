@@ -51,6 +51,7 @@ import {
   REVIEWER_TOOL_ALLOW,
   WORKER_TOOL_ALLOW,
 } from "./permissions.js";
+import { reviewerActive } from "./reviewerhealth.js";
 import { resolveReviewDelta } from "./reviewstate.js";
 import { strictSerialHolder, strictSerialReason } from "./serial.js";
 import { findProviderTranscript } from "./transcript.js";
@@ -497,6 +498,23 @@ export const _resolveReviewerProviderForTest = resolveReviewerProvider;
 
 export class WorkerSpawnValidationError extends Error {}
 
+/**
+ * A reviewer could not be started for a reason the caller can act on. Thrown
+ * instead of a bare Error so the API layer can surface the message verbatim: an
+ * orchestrator that asked for a reviewer and got "internal error" back has no
+ * way to tell a benign double-spawn race from a broken daemon.
+ */
+export class ReviewerSpawnError extends Error {
+  constructor(
+    message: string,
+    readonly httpStatus: 404 | 409 = 409,
+    /** the reviewer already on the task, when that is the reason */
+    readonly reviewerAgentId?: number,
+  ) {
+    super(message);
+  }
+}
+
 export function spawnWorker(
   taskId: number,
   modelOverride?: string,
@@ -750,25 +768,36 @@ export function spawnReviewer(
   opts?: ReviewerSpawnOptions,
 ): { agent: Agent; task: Task } {
   let task = getTask(taskId);
-  if (!task) throw new Error(`task ${taskId} not found`);
+  if (!task) throw new ReviewerSpawnError(`task ${taskId} not found`, 404);
   if (task.status !== "review") {
-    throw new Error(`task ${taskId} is ${task.status}; only tasks in review can be reviewed`);
+    throw new ReviewerSpawnError(
+      `task ${taskId} is ${task.status}; only tasks in review can be reviewed`,
+    );
   }
   if (task.workspace_kind === "portfolio") {
-    throw new Error(`task ${taskId} covers all repositories; it has no single tree to review`);
+    throw new ReviewerSpawnError(
+      `task ${taskId} covers all repositories; it has no single tree to review`,
+    );
   }
   // A scratch task has no git branch — the reviewer validates its deliverable
   // (saved docs, transcript, verify_cmd, files) from the workspace directory
   // directly. A repo task is reviewed from a detached worktree at its branch.
   const isScratch = task.workspace_kind === "scratch";
   if (!isScratch && !task.branch) {
-    throw new Error(`task ${taskId} has no branch to review`);
+    throw new ReviewerSpawnError(`task ${taskId} has no branch to review`);
   }
+  // Only a reviewer that is actually going to submit blocks a new one. A
+  // zombie — stopped without a verdict, stalled, or never given a pane — used
+  // to refuse every replacement here and leave the task unreviewable.
   const existing = listAgents({ live: true }).find(
-    (a) => a.kind === "reviewer" && a.task_id === taskId,
+    (a) => a.kind === "reviewer" && a.task_id === taskId && reviewerActive(a),
   );
   if (existing) {
-    throw new Error(`task ${taskId} already has live reviewer a${existing.id}`);
+    throw new ReviewerSpawnError(
+      `task ${taskId} already has a live reviewer (a${existing.id}) judging it — wait for its verdict, or kill a${existing.id} first`,
+      409,
+      existing.id,
+    );
   }
   const humanSnapshotReview =
     task.publication_mode === "human" &&
@@ -830,7 +859,9 @@ export function spawnReviewer(
             provider,
           )
         : (() => {
-            throw new Error(`task ${taskId} has no pinned review snapshot`);
+            throw new ReviewerSpawnError(
+              `task ${taskId} has no pinned review snapshot`,
+            );
           })()
       : createReviewWorktree(
         task.repo,

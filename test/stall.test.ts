@@ -33,6 +33,18 @@ describe("detectTransientApiError", () => {
     expect(detectTransientApiError(pane)).toMatch(/Internal server error/);
   });
 
+  it("matches a connection dropped mid-response", () => {
+    const pane = [
+      "⏺ Read(src/daemon/review.ts)",
+      "  ⎿  Read 200 lines",
+      "",
+      "⏺ API Error: Connection closed mid-response",
+      "",
+      PROMPT_BOX,
+    ].join("\n");
+    expect(detectTransientApiError(pane)).toMatch(/Connection closed/);
+  });
+
   it("matches a 429 rate limit error", () => {
     const pane = [
       "⏺ Reading config",

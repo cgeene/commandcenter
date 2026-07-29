@@ -115,6 +115,7 @@ import { clearReviewSnapshot } from "./reviewsnapshot.js";
 import {
   cancelTask,
   killAgent,
+  ReviewerSpawnError,
   spawnMain,
   spawnReviewer,
   spawnWorker,
@@ -2012,6 +2013,20 @@ export function buildApp(): Hono {
     }
     if (err instanceof WorkerSpawnValidationError) {
       return c.json({ error: err.message }, 409);
+    }
+    // spawn_reviewer's refusals reach an orchestrator verbatim through the MCP
+    // client, so they must name the conflict — most often a reviewer the daemon
+    // auto-spawned moments earlier, which is benign and needs no retry.
+    if (err instanceof ReviewerSpawnError) {
+      return c.json(
+        {
+          error: err.message,
+          ...(err.reviewerAgentId !== undefined
+            ? { reviewer_agent_id: err.reviewerAgentId }
+            : {}),
+        },
+        err.httpStatus,
+      );
     }
     // A reviewer reads this straight out of submit_review, so it must name the
     // conflict it has to act on rather than a generic failure.
