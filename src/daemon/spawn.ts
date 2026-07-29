@@ -55,7 +55,13 @@ import { reviewerActive } from "./reviewerhealth.js";
 import { resolveReviewDelta } from "./reviewstate.js";
 import { strictSerialHolder, strictSerialReason } from "./serial.js";
 import { findProviderTranscript } from "./transcript.js";
-import { killWindow, newWindow, paneProcess, windowExists } from "./tmux.js";
+import {
+  killWindow,
+  newWindow,
+  paneProcess,
+  tmuxFailureCode,
+  windowExists,
+} from "./tmux.js";
 import { sweepVanishedPaneGroup } from "./proctree.js";
 import {
   createReviewWorktree,
@@ -700,7 +706,7 @@ export function spawnWorker(
     });
     return { agent: getAgent(agent.id)!, task: getTask(taskId)! };
   } catch (error) {
-    if (target && windowExists(target)) {
+    if (target && windowExists(target, { whenUnobservable: "present" })) {
       try {
         killWindow(target);
       } catch {
@@ -1132,36 +1138,67 @@ export function paneAgeSeconds(agent: Agent, nowMs = Date.now()): number {
   return Number.isFinite(age) ? Math.max(0, age) : 0;
 }
 
+interface PaneTeardown {
+  killed: number[];
+  /**
+   * False when nothing could be shown to have stopped: tmux would not answer
+   * about the window AND no pane group was swept, so whatever the agent was
+   * running may well still be running.
+   */
+  confirmed: boolean;
+  /** Whether the pane pid survived this teardown, as the row now reads. */
+  handleRetained: boolean;
+}
+
 /**
  * Stop everything the agent's pane was running, and give up the recorded pane
  * pid once we have — a cleared pane_pid is what marks the pane as swept, so a
  * later kill of an already-dead agent knows there is nothing left to chase.
  */
-function reapPaneProcesses(agent: Agent, liveWindow: boolean): number[] {
+function reapPaneProcesses(agent: Agent, mayHaveWindow: boolean): PaneTeardown {
   const killed: number[] = [];
   let paneHandled = true;
-  if (agent.tmux_target && liveWindow) {
+  // Nothing to tear down is itself a settled answer; only an attempt that
+  // could not be carried out leaves this false.
+  let windowSettled = !(agent.tmux_target && mayHaveWindow);
+  if (agent.tmux_target && mayHaveWindow) {
     // Kills the pane's whole process tree, not just its window: an agent that
     // backgrounded a load generator, watcher or dev server would otherwise
     // leave it running, orphaned to pid 1 and invisible to Command Center.
-    killed.push(...killWindow(agent.tmux_target));
+    try {
+      killed.push(...killWindow(agent.tmux_target));
+      windowSettled = true;
+    } catch (error) {
+      // A window that is provably gone needed no teardown. A timeout or an
+      // unreachable server did not do one, and must not be reported as if it
+      // had — the pane sweep below is then the only teardown on offer.
+      const code = tmuxFailureCode(error);
+      windowSettled = code === "target_missing" || code === "session_absent";
+    }
   }
   // An empty result means no live pane was found behind the window — either it
   // is gone, or `remain-on-exit` is holding a corpse whose reported pid is
   // stale and possibly reused, so paneProcess rightly refused it. Either way
   // the pane pid recorded at spawn is now the only trustworthy handle on
   // whatever the agent left running.
+  let swept = false;
   if (killed.length === 0 && agent.pane_pid) {
     const sweep = sweepVanishedPaneGroup(agent.pane_pid, paneAgeSeconds(agent));
     killed.push(...sweep.killed);
     paneHandled = sweep.outcome !== "declined";
+    swept = sweep.outcome === "swept";
   }
   // Only give up the handle once it has actually been acted on. A declined
   // sweep looked at a live pane (or could not look at all) and did nothing.
-  if (agent.pane_pid !== null && paneHandled) {
+  const surrendered = agent.pane_pid !== null && paneHandled;
+  if (surrendered) {
     updateAgent(agent.id, { pane_pid: null });
   }
-  return killed;
+  return {
+    killed,
+    confirmed: windowSettled || swept,
+    handleRetained: agent.pane_pid !== null && !surrendered,
+  };
 }
 
 export function killAgent(
@@ -1170,19 +1207,38 @@ export function killAgent(
 ): Agent {
   const agent = getAgent(agentId);
   if (!agent) throw new Error(`agent ${agentId} not found`);
-  const liveWindow = Boolean(
-    agent.tmux_target && windowExists(agent.tmux_target),
+  // Only a positive "that window is gone" may shrink this teardown; a tmux
+  // that could not be asked has to be treated as still holding the window, or
+  // one transient failure silently downgrades a kill into a no-op.
+  const mayHaveWindow = Boolean(
+    agent.tmux_target &&
+      windowExists(agent.tmux_target, { whenUnobservable: "present" }),
   );
   // A false watchdog observation can leave a live provider process behind a
   // DB row marked dead. "kill" must still stop that split-brain process — and
   // so must it for an agent the watchdog marked dead while its pane was never
   // swept (pane_pid is cleared once it has been), or its leftovers would be
   // unreachable forever.
-  if (agent.state === "dead" && !liveWindow && agent.pane_pid === null) {
+  if (agent.state === "dead" && !mayHaveWindow && agent.pane_pid === null) {
     return agent;
   }
 
-  const killedPids = reapPaneProcesses(agent, liveWindow);
+  const teardown = reapPaneProcesses(agent, mayHaveWindow);
+  const killedPids = teardown.killed;
+  // Never throw on an unreachable tmux. Callers reach this from failure
+  // handling of their own — the review path lands here BECAUSE a tmux send
+  // timed out — and an exception would abandon their bookkeeping mid-way,
+  // stranding the very task they were rescuing. The row is still marked dead
+  // so the caller's contract holds (and a requeued task cannot end up with two
+  // live workers), and pane_pid is deliberately retained above as the handle a
+  // later kill uses to chase whatever is still running.
+  if (!teardown.confirmed) {
+    logEvent("agent.kill_unconfirmed", {
+      agentId,
+      taskId: agent.task_id ?? undefined,
+      payload: { pane_handle_retained: teardown.handleRetained },
+    });
+  }
   updateAgent(agentId, { state: "dead" });
 
   const task = agent.task_id ? getTask(agent.task_id) : undefined;

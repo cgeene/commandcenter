@@ -29,7 +29,7 @@ afterEach(async () => {
 
 const noopDeps = {
   spawn: () => {},
-  windowIds: () => [] as string[],
+  windows: () => ({ live: [] as string[], dead: [], server: "running" }),
   now: () => new Date(),
 };
 

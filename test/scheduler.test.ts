@@ -20,6 +20,16 @@ afterEach(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+/** A successful tmux snapshot listing exactly these windows as live. */
+function seen(live: string[], dead: string[] = []) {
+  return { live, dead, server: "running" as const };
+}
+
+/** What tmux reports when it proves there is no server at all. */
+function noServer() {
+  return { live: [], dead: [], server: "absent" as const };
+}
+
 function deps(
   overrides: Partial<{
     spawned: number[];
@@ -32,10 +42,12 @@ function deps(
     spawned,
     deps: {
       spawn: (id: number) => spawned.push(id),
-      windowIds: () =>
+      windows: () =>
         Object.prototype.hasOwnProperty.call(overrides, "windows")
-          ? (overrides.windows ?? null)
-          : [],
+          ? overrides.windows
+            ? seen(overrides.windows)
+            : null
+          : seen([]),
       now: () => overrides.now ?? new Date("2026-07-03T12:00:00"),
     },
   };
@@ -135,7 +147,7 @@ describe("scheduler tick", () => {
       spawn: () => {
         throw new Error("worktree exploded");
       },
-      windowIds: () => [],
+      windows: () => seen([]),
       now: () => new Date(),
     });
     const after = getTask(t.id)!;
@@ -161,7 +173,7 @@ describe("watchdog", () => {
 
     watchdog({
       spawn: () => {},
-      windowIds: () => [],
+      windows: () => seen([]),
       now: () => new Date("2026-07-03T10:02:00.000Z"),
     });
     expect(getAgent(agent.id)?.state).toBe("stalled");
@@ -179,7 +191,7 @@ describe("watchdog", () => {
     const a1 = createAgent({ kind: "worker", state: "working", task_id: task.id, tmux_target: "cc:@9" });
     updateTask(task.id, { status: "in_progress", agent_id: a1.id });
 
-    const missing = { spawn: () => {}, windowIds: () => [], now: () => new Date() };
+    const missing = { spawn: () => {}, windows: () => seen([]), now: () => new Date() };
     watchdog(missing);
     expect(getAgent(a1.id)?.state).toBe("working");
     expect(getTask(task.id)?.status).toBe("in_progress");
@@ -218,7 +230,7 @@ describe("watchdog", () => {
     const swept: Array<[number, number]> = [];
     const missing = {
       spawn: () => {},
-      windowIds: () => [],
+      windows: () => seen([]),
       now: () => new Date(),
       sweepPaneGroup: (panePid: number, ageSec: number) => {
         swept.push([panePid, ageSec]);
@@ -246,7 +258,7 @@ describe("watchdog", () => {
     const swept: number[] = [];
     const missing = {
       spawn: () => {},
-      windowIds: () => [],
+      windows: () => seen([]),
       now: () => new Date(),
       sweepPaneGroup: (panePid: number) => {
         swept.push(panePid);
@@ -291,7 +303,7 @@ describe("watchdog", () => {
     };
 
     // Two passes with tmux not reporting the window -> a (false) confirmed vanish.
-    const missing = { ...base, windowIds: () => [] };
+    const missing = { ...base, windows: () => seen([]) };
     watchdog(missing);
     watchdog(missing);
     expect(calls).toEqual([[4242, "declined"]]);
@@ -299,7 +311,7 @@ describe("watchdog", () => {
     expect(getAgent(agent.id)?.pane_pid).toBe(4242);
 
     // tmux comes back; recoverFalseVanishes revives the agent.
-    watchdog({ ...base, windowIds: () => ["cc:@9"] });
+    watchdog({ ...base, windows: () => seen(["cc:@9"]) });
     expect(getAgent(agent.id)?.state).toBe("working");
     expect(getAgent(agent.id)?.pane_pid).toBe(4242);
 
@@ -307,7 +319,7 @@ describe("watchdog", () => {
     const swept: Array<[number, string]> = [];
     const genuine = {
       ...base,
-      windowIds: () => [],
+      windows: () => seen([]),
       sweepPaneGroup: (panePid: number) => {
         swept.push([panePid, "swept"]);
         return { outcome: "swept" as const, killed: [8001] };
@@ -333,14 +345,420 @@ describe("watchdog", () => {
     });
     updateTask(task.id, { status: "in_progress", agent_id: agent.id });
 
-    watchdog({ spawn: () => {}, windowIds: () => null, now: () => new Date() });
-    watchdog({ spawn: () => {}, windowIds: () => null, now: () => new Date() });
+    const swept: number[] = [];
+    const blind = {
+      spawn: () => {},
+      windows: () => null,
+      now: () => new Date(),
+      sweepPaneGroup: (panePid: number) => {
+        swept.push(panePid);
+        return { outcome: "swept" as const, killed: [panePid] };
+      },
+    };
+    watchdog(blind);
+    watchdog(blind);
 
     expect(getAgent(agent.id)?.state).toBe("working");
     expect(getTask(task.id)?.status).toBe("in_progress");
+    expect(swept).toEqual([]);
+    const kinds = listEvents(20).map((event) => event.kind);
+    expect(kinds).not.toContain("agent.window_missing");
+    expect(kinds).not.toContain("agent.vanished");
     expect(
       listEvents(20).filter((event) => event.kind === "watchdog.tmux_unavailable"),
     ).toHaveLength(1);
+  });
+
+  it("distrusts a successful listing that shows none of several agents' windows", async () => {
+    // The overnight false vanish: tmux answered, so the snapshot looked
+    // authoritative, and every live agent was flagged in the same pass.
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const agents = ["cc:@1004", "cc:@1015"].map((target, i) => {
+      const task = createTask({ title: `t${i}`, prompt: "x", repo: "/r" });
+      const agent = createAgent({
+        kind: i === 0 ? "worker" : "reviewer",
+        state: "working",
+        task_id: task.id,
+        tmux_target: target,
+      });
+      updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+      return { agent, task };
+    });
+
+    const swept: number[] = [];
+    const empty = {
+      spawn: () => {},
+      windows: () => seen([]),
+      now: () => new Date(),
+      // Asked one at a time, tmux says the windows are right there — the bulk
+      // listing was wrong, and no number of repeats makes it right.
+      probeWindow: () => "present" as const,
+      sweepPaneGroup: (panePid: number) => {
+        swept.push(panePid);
+        return { outcome: "swept" as const, killed: [panePid] };
+      },
+    };
+    for (let pass = 0; pass < 5; pass++) watchdog(empty);
+
+    for (const { agent, task } of agents) {
+      expect(getAgent(agent.id)?.state).toBe("working");
+      expect(getTask(task.id)?.status).toBe("in_progress");
+    }
+    expect(swept).toEqual([]);
+    const kinds = listEvents(20).map((event) => event.kind);
+    expect(kinds).not.toContain("agent.window_missing");
+    expect(kinds).not.toContain("agent.vanished");
+    expect(
+      listEvents(20).filter(
+        (event) => event.kind === "watchdog.tmux_snapshot_implausible",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("stops disbelieving a listing once every window checks out gone", async () => {
+    // `tmux kill-session -t cc` while other sessions keep the server up: the
+    // listing is non-empty and holds no agent window, so it looks broken every
+    // pass, and the only thing that would shrink the claimed set is the vanish
+    // branch the disbelief skips. Left unbounded the queue sits dead until a
+    // human intervenes — the outcome this whole task exists to prevent.
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const made = ["cc:@1004", "cc:@1015"].map((target, i) => {
+      const task = createTask({ title: `t${i}`, prompt: "x", repo: "/r" });
+      const agent = createAgent({
+        kind: "worker",
+        state: "working",
+        task_id: task.id,
+        tmux_target: target,
+      });
+      updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+      return { agent, task };
+    });
+
+    const probed: string[] = [];
+    const elsewhere = {
+      spawn: () => {},
+      windows: () => seen(["viewer:@0", "viewer:@1"]),
+      now: () => new Date(),
+      probeWindow: (target: string) => {
+        probed.push(target);
+        return "absent" as const;
+      },
+    };
+    // Three passes of disbelief, then the probe settles it and the ordinary
+    // two-observation confirmation runs.
+    for (let pass = 0; pass < 4; pass++) watchdog(elsewhere);
+
+    expect(probed).toEqual(["cc:@1004", "cc:@1015"]);
+    for (const { agent, task } of made) {
+      expect(getAgent(agent.id)?.state).toBe("dead");
+      expect(getTask(task.id)?.status).toBe("queued");
+    }
+    expect(listEvents(30).map((event) => event.kind)).toContain(
+      "watchdog.tmux_snapshot_probed",
+    );
+  });
+
+  it("requeues both agents when the tmux server is provably gone", async () => {
+    // The other side of the guard: a server tmux says is not running really
+    // has taken every window with it, so the work must be requeued rather than
+    // parked behind a blind watchdog forever.
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const made = ["cc:@1004", "cc:@1015"].map((target, i) => {
+      const task = createTask({ title: `t${i}`, prompt: "x", repo: "/r" });
+      const agent = createAgent({
+        kind: "worker",
+        state: "working",
+        task_id: task.id,
+        tmux_target: target,
+      });
+      updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+      return { agent, task };
+    });
+
+    const gone = {
+      spawn: () => {},
+      windows: () => noServer(),
+      now: () => new Date(),
+    };
+    watchdog(gone);
+    watchdog(gone);
+
+    for (const { agent, task } of made) {
+      expect(getAgent(agent.id)?.state).toBe("dead");
+      expect(getTask(task.id)?.status).toBe("queued");
+    }
+  });
+
+  it("restarts the confirmation streak after a pass it could not trust", async () => {
+    // Two misses either side of a blind pass are not two consecutive
+    // observations, and must not add up to a confirmed vanish.
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const agent = createAgent({
+      kind: "worker",
+      state: "working",
+      task_id: task.id,
+      tmux_target: "cc:@9",
+    });
+    updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+
+    const base = { spawn: () => {}, now: () => new Date() };
+    watchdog({ ...base, windows: () => seen([]) }); // miss 1
+    watchdog({ ...base, windows: () => null }); // blind: streak discarded
+    watchdog({ ...base, windows: () => seen([]) }); // miss 1 again, not 2
+
+    expect(getAgent(agent.id)?.state).toBe("working");
+    expect(getTask(task.id)?.status).toBe("in_progress");
+
+    watchdog({ ...base, windows: () => seen([]) }); // now confirmed
+    expect(getAgent(agent.id)?.state).toBe("dead");
+  });
+
+  it("still confirms a genuine vanish when tmux is answering properly", async () => {
+    // The guard above must not extend to a lone agent, nor to a listing that
+    // plainly shows other windows.
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const gone = createAgent({
+      kind: "worker",
+      state: "working",
+      task_id: task.id,
+      tmux_target: "cc:@9",
+    });
+    updateTask(task.id, { status: "in_progress", agent_id: gone.id });
+    const alive = createAgent({
+      kind: "main",
+      state: "working",
+      tmux_target: "cc:@1",
+    });
+
+    const present = {
+      spawn: () => {},
+      windows: () => seen(["cc:@1"]),
+      now: () => new Date(),
+    };
+    watchdog(present);
+    watchdog(present);
+
+    expect(getAgent(gone.id)?.state).toBe("dead");
+    expect(getAgent(alive.id)?.state).toBe("working");
+    expect(getTask(task.id)?.status).toBe("queued");
+  });
+
+  it("logs one event per blind spell even when the cause flaps", async () => {
+    // A loaded box alternates between a query that times out and a listing
+    // that comes back short. Re-logging on each flip would emit every 10s and
+    // keep resetting the age the Needs You escalation is measured from.
+    const { createAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    createAgent({ kind: "worker", state: "working", tmux_target: "cc:@1" });
+    createAgent({ kind: "reviewer", state: "working", tmux_target: "cc:@2" });
+
+    const base = { spawn: () => {}, now: () => new Date() };
+    watchdog({ ...base, windows: () => null });
+    watchdog({ ...base, windows: () => seen([]) });
+    watchdog({ ...base, windows: () => null });
+    watchdog({ ...base, windows: () => seen([]) });
+
+    const blind = listEvents(20).filter((event) =>
+      event.kind.startsWith("watchdog.tmux_"),
+    );
+    expect(blind.map((event) => event.kind)).toEqual([
+      "watchdog.tmux_unavailable",
+    ]);
+  });
+
+  it("closes out a blind spell inherited from a previous process", async () => {
+    // Restarting the daemon is the obvious human response to a blind watchdog,
+    // and the fresh process has no memory of the spell. If recovery were only
+    // derived from module state, the Needs You item would stand forever while
+    // the watchdog was healthy.
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const { getDb } = await import("../src/db/db.js");
+    const { watchdog, _resetSchedulerState } = await import(
+      "../src/daemon/scheduler.js"
+    );
+
+    logEvent("watchdog.tmux_unavailable");
+    getDb()
+      .prepare("UPDATE events SET ts = ? WHERE kind = 'watchdog.tmux_unavailable'")
+      .run(new Date(Date.now() - 30 * 60_000).toISOString());
+    expect(
+      deriveAttention({ isPrOpen: () => true }).map((item) => item.title),
+    ).toContain("Watchdog blind — tmux cannot be observed");
+
+    _resetSchedulerState(); // the daemon restarts here
+    watchdog({ spawn: () => {}, windows: () => seen([]), now: () => new Date() });
+
+    expect(listEvents(20).map((event) => event.kind)).toContain(
+      "watchdog.tmux_recovered",
+    );
+    expect(deriveAttention({ isPrOpen: () => true })).toHaveLength(0);
+  });
+
+  it("finishes a teardown that tmux would not confirm, before anything respawns", async () => {
+    // killAgent could not reach tmux, so it marked the row dead and kept the
+    // pane handle. The process is still running behind a live window, and the
+    // rejection path has already requeued the task for a respawn that resumes
+    // the same session in the same worktree — this is the only thing that
+    // reconciles it.
+    const { createAgent, updateAgent, getAgent } = await import("../src/db/agents.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const agent = createAgent({
+      kind: "worker",
+      state: "working",
+      tmux_target: "cc:@7",
+    });
+    updateAgent(agent.id, { pane_pid: 4242 });
+    logEvent("agent.kill_unconfirmed", { agentId: agent.id });
+    updateAgent(agent.id, { state: "dead" });
+
+    const killed: number[] = [];
+    watchdog({
+      spawn: () => {},
+      windows: () => seen(["cc:@7"]),
+      now: () => new Date(),
+      kill: (id: number) => {
+        killed.push(id);
+        updateAgent(id, { pane_pid: null }); // this retry got through
+      },
+    });
+
+    expect(killed).toEqual([agent.id]);
+    expect(getAgent(agent.id)?.pane_pid).toBeNull();
+    expect(listEvents(20).map((event) => event.kind)).toContain(
+      "agent.kill_retried",
+    );
+  });
+
+  it("gives up retrying a teardown rather than looping on it forever", async () => {
+    const { createAgent, updateAgent } = await import("../src/db/agents.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const agent = createAgent({
+      kind: "worker",
+      state: "working",
+      tmux_target: "cc:@7",
+    });
+    updateAgent(agent.id, { pane_pid: 4242 });
+    updateAgent(agent.id, { state: "dead" });
+
+    const killed: number[] = [];
+    const stuck = {
+      spawn: () => {},
+      windows: () => seen(["cc:@7"]),
+      now: () => new Date(),
+      kill: (id: number) => void killed.push(id), // never gets through
+    };
+    for (let pass = 0; pass < 6; pass++) watchdog(stuck);
+
+    expect(killed).toHaveLength(3);
+  });
+
+  it("recovers a false vanish rather than tearing it down as an unfinished kill", async () => {
+    // Both passes key off a dead row with a live window; recovery has to win,
+    // or a transient miss would turn into the kill it was never given.
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, updateAgent, getAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const agent = createAgent({
+      kind: "worker",
+      state: "working",
+      task_id: task.id,
+      tmux_target: "cc:@9",
+    });
+    updateAgent(agent.id, { pane_pid: 4242, session_id: "s1" });
+    updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+    logEvent("agent.vanished", { agentId: agent.id, taskId: task.id });
+    updateAgent(agent.id, { state: "dead" });
+
+    const killed: number[] = [];
+    watchdog({
+      spawn: () => {},
+      windows: () => seen(["cc:@9"]),
+      now: () => new Date(),
+      kill: (id: number) => void killed.push(id),
+    });
+
+    expect(getAgent(agent.id)?.state).toBe("working");
+    expect(killed).toEqual([]);
+  });
+
+  it("reaps the empty window a dead agent leaves behind, once the grace period is up", async () => {
+    const { createAgent, updateAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const agent = createAgent({
+      kind: "worker",
+      state: "working",
+      tmux_target: "cc:@1004",
+    });
+    updateAgent(agent.id, {
+      state: "dead",
+      last_event_at: "2026-07-03T11:40:00.000Z",
+    });
+
+    const reaped: string[] = [];
+    const at = (iso: string) => ({
+      spawn: () => {},
+      windows: () => seen([], ["cc:@1004"]),
+      now: () => new Date(iso),
+      reapWindow: (target: string) => reaped.push(target),
+    });
+
+    // reap_after_minutes defaults to 10: still inspectable at 5.
+    watchdog(at("2026-07-03T11:45:00.000Z"));
+    expect(reaped).toEqual([]);
+
+    watchdog(at("2026-07-03T12:00:00.000Z"));
+    expect(reaped).toEqual(["cc:@1004"]);
+    expect(listEvents(20).map((event) => event.kind)).toContain(
+      "agent.orphan_window_reaped",
+    );
+  });
+
+  it("leaves windows it does not own, and windows whose agent is still live", async () => {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    // A live agent whose pane just died belongs to the vanish path, which
+    // confirms before touching anything; the hub window belongs to nobody.
+    createAgent({ kind: "worker", state: "working", tmux_target: "cc:@9" });
+
+    const reaped: string[] = [];
+    watchdog({
+      spawn: () => {},
+      windows: () => seen([], ["cc:@9", "cc:@0"]),
+      now: () => new Date("2026-07-03T12:00:00.000Z"),
+      reapWindow: (target: string) => reaped.push(target),
+    });
+
+    expect(reaped).toEqual([]);
   });
 
   it("surfaces a startup trust prompt before SessionStart is available", async () => {
@@ -356,7 +774,7 @@ describe("watchdog", () => {
 
     watchdog({
       spawn: () => {},
-      windowIds: () => ["cc:@9"],
+      windows: () => seen(["cc:@9"]),
       now: () => new Date(),
       pendingPermission: () => ({
         question: "Security guide",
@@ -386,14 +804,14 @@ describe("watchdog", () => {
       tmux_target: "cc:@9",
     });
     updateTask(task.id, { status: "in_progress", agent_id: agent.id });
-    const missing = { spawn: () => {}, windowIds: () => [], now: () => new Date() };
+    const missing = { spawn: () => {}, windows: () => seen([]), now: () => new Date() };
     watchdog(missing);
     watchdog(missing);
     expect(getTask(task.id)?.status).toBe("queued");
 
     watchdog({
       spawn: () => {},
-      windowIds: () => ["cc:@9"],
+      windows: () => seen(["cc:@9"]),
       now: () => new Date(),
       pendingPermission: () => ({
         question: "run command?",
@@ -430,7 +848,7 @@ describe("watchdog", () => {
     // 20 minutes later, window still alive, no events since
     watchdog({
       spawn: () => {},
-      windowIds: () => ["cc:@9"],
+      windows: () => seen(["cc:@9"]),
       now: () => new Date("2026-07-03T10:20:00.000Z"),
     });
     expect(getAgent(agent.id)?.state).toBe("stalled");
@@ -453,7 +871,7 @@ describe("watchdog auto-reap", () => {
     return {
       spawn: () => {},
       kill: (id: number) => killed.push(id),
-      windowIds: () => ["cc:@9"],
+      windows: () => seen(["cc:@9"]),
       now: () => new Date(nowIso),
     };
   }
@@ -627,7 +1045,7 @@ describe("watchdog stall detection (unaffected by idle-in-review suppression)", 
     return {
       spawn: () => {},
       kill: () => {},
-      windowIds: () => ["cc:@9"],
+      windows: () => seen(["cc:@9"]),
       now: () => new Date(nowIso),
     };
   }

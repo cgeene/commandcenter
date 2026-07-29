@@ -252,6 +252,97 @@ describe("deriveAttention — kinds", () => {
     expect(items[0].kind).toBe("escalation");
   });
 
+  describe("a teardown tmux would not confirm", () => {
+    async function unconfirmedKill(panePid: number | null) {
+      const { createAgent, updateAgent } = await import("../src/db/agents.js");
+      const { logEvent } = await import("../src/db/events.js");
+      const agent = createAgent({
+        kind: "worker",
+        state: "working",
+        tmux_target: "cc:@7",
+      });
+      updateAgent(agent.id, { pane_pid: panePid });
+      logEvent("agent.kill_unconfirmed", { agentId: agent.id });
+      updateAgent(agent.id, { state: "dead" });
+      return agent;
+    }
+
+    it("surfaces a dead row that may still have a process behind it", async () => {
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      const agent = await unconfirmedKill(4242);
+
+      const items = deriveAttention({ isPrOpen: allOpen });
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({
+        kind: "stalled_transition",
+        agent_id: agent.id,
+        severity: "orange",
+      });
+      expect(items[0].title).toContain("may still be running");
+    });
+
+    it("clears as soon as the retry gets the pane handle surrendered", async () => {
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      const { updateAgent } = await import("../src/db/agents.js");
+      const agent = await unconfirmedKill(4242);
+
+      updateAgent(agent.id, { pane_pid: null });
+
+      expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
+    });
+  });
+
+  describe("a watchdog that cannot read tmux", () => {
+    async function blindFor(kind: string, minutesAgo: number) {
+      const { logEvent } = await import("../src/db/events.js");
+      const { getDb } = await import("../src/db/db.js");
+      logEvent(kind);
+      getDb()
+        .prepare("UPDATE events SET ts = ? WHERE kind = ?")
+        .run(new Date(Date.now() - minutesAgo * 60_000).toISOString(), kind);
+    }
+
+    it("stays quiet while the blind spell is still brief", async () => {
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      await blindFor("watchdog.tmux_unavailable", 2);
+      expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
+    });
+
+    it.each([
+      "watchdog.tmux_unavailable",
+      "watchdog.tmux_snapshot_implausible",
+    ])("surfaces a sustained blind spell (%s)", async (kind) => {
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      await blindFor(kind, 30);
+
+      const items = deriveAttention({ isPrOpen: allOpen });
+      expect(items).toHaveLength(1);
+      expect(items[0].title).toContain("Watchdog blind");
+    });
+
+    it("ages from the start of the spell, not from the latest cause", async () => {
+      // A daemon restart mid-spell re-logs, and the cause can differ from the
+      // one that opened it. Anchoring to the newest event would keep pushing
+      // the deadline out and the fleet would stay unwatched, silently.
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      await blindFor("watchdog.tmux_unavailable", 30);
+      await blindFor("watchdog.tmux_snapshot_implausible", 1);
+
+      const items = deriveAttention({ isPrOpen: allOpen });
+      expect(items).toHaveLength(1);
+      expect(items[0].age_ms).toBeGreaterThan(25 * 60_000);
+    });
+
+    it("clears once tmux is readable again", async () => {
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      const { logEvent } = await import("../src/db/events.js");
+      await blindFor("watchdog.tmux_unavailable", 30);
+      logEvent("watchdog.tmux_recovered");
+
+      expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
+    });
+  });
+
   /**
    * Both wait producers are anchored on EVENTS, so neither notices a task moving
    * on underneath them: the wait hook and the escalation stay the newest of their

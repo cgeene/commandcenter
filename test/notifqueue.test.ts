@@ -35,8 +35,8 @@ const sendText = vi.fn(
 
 vi.mock("../src/daemon/tmux.js", () => ({
   windowExists: () => true,
-  listWindowIds: () => [...panes.keys()],
-  listLiveWindowIds: () => [...panes.keys()],
+  listWindows: () => ({ live: [...panes.keys()], dead: [], server: "running" }),
+  probeWindow: () => "absent" as const,
   sendText: (...args: unknown[]) =>
     (sendText as unknown as (...a: unknown[]) => Promise<boolean>)(...args),
   capturePane: (target: string) => panes.get(target) ?? "",
@@ -395,7 +395,7 @@ describe("safety valve — the escalate-to-human page is unaffected by queuing",
     const { watchdog } = await import("../src/daemon/scheduler.js");
     watchdog({
       spawn: () => {},
-      windowIds: () => [MAIN, W1],
+      windows: () => ({ live: [MAIN, W1], dead: [], server: "running" }),
       now: () => new Date(),
     });
 

@@ -3,6 +3,7 @@ import { listAgents } from "../db/agents.js";
 import { liveUsageEnabled } from "../config.js";
 import { autonomousSpawnsToday, workerSlots } from "./capacity.js";
 import {
+  countAgentEvents,
   earliestEventTsAfter,
   latestAgentEvent,
   latestAgentEventTs,
@@ -82,6 +83,11 @@ const SCHEDULER_STALL_MS = 15 * 60_000;
 // off, the active window, the daily budget, a blocker, a serialized repo), and
 // both are the human's to resolve.
 const REWORK_STRAND_GRACE_MS = 2 * 60_000;
+
+// While the watchdog cannot read tmux it deliberately changes nothing — no
+// vanish detection, no stall detection, no reaping — so a blind spell that
+// outlives a handful of 10s passes means nothing is watching the fleet at all.
+const WATCHDOG_BLIND_MS = 5 * 60_000;
 
 function excerpt(s: string | null | undefined, n = 200): string {
   if (!s) return "";
@@ -478,6 +484,65 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
         }
       }
     }
+  }
+
+  // --- watchdog blind: tmux could not be read (or answered something that
+  //     cannot be true), so the health pass is deliberately doing nothing.
+  //     Anchored to the EARLIEST blindness event since the last recovery, of
+  //     either cause: the age is how long the fleet has gone unwatched, and a
+  //     daemon restart mid-spell re-logs, so taking the latest would keep
+  //     pushing the deadline out of reach. Reported regardless of cfg.enabled —
+  //     the watchdog runs even when auto-spawn is off, and it is the only thing
+  //     watching live agents. ------------------------------------------------
+  const tmuxRecovered = latestEventTs("watchdog.tmux_recovered") ?? null;
+  const blindStarted = [
+    earliestEventTsAfter("watchdog.tmux_unavailable", tmuxRecovered),
+    earliestEventTsAfter("watchdog.tmux_snapshot_implausible", tmuxRecovered),
+  ]
+    .filter((ts): ts is string => Boolean(ts))
+    .sort()
+    .shift();
+  if (blindStarted && nowMs - Date.parse(blindStarted) > WATCHDOG_BLIND_MS) {
+    push({
+      id: `scheduler_stalled:watchdog_blind:${blindStarted}`,
+      kind: "scheduler_stalled",
+      title: "Watchdog blind — tmux cannot be observed",
+      context:
+        "Agent health checks are paused rather than guessing, so nothing is detecting vanished, stalled or finished agents. Check that the tmux server is responsive.",
+      severity: "orange",
+      urgent: false,
+      task_id: null,
+      agent_id: null,
+      pr_url: null,
+      created_at: blindStarted,
+    });
+  }
+
+  // --- unfinished teardown: killAgent could not reach tmux, so the row is
+  //     dead while its provider process may well still be running. Derived
+  //     from the row rather than the event, so it self-heals the moment the
+  //     watchdog's retry gets the handle surrendered — and stands only once
+  //     those retries are spent, which is when it becomes the human's. Two
+  //     live providers can share one worktree and one session here, so this
+  //     outranks the other scheduler items. --------------------------------
+  for (const agent of listAgents()) {
+    if (agent.state !== "dead" || agent.pane_pid === null) continue;
+    if (countAgentEvents(agent.id, ["agent.kill_unconfirmed"]) === 0) continue;
+    const anchor = latestAgentEventTs(agent.id, ["agent.kill_unconfirmed"]);
+    if (!anchor) continue;
+    const task = agent.task_id ? tasksById.get(agent.task_id) : undefined;
+    push({
+      id: `stalled_transition:kill_unconfirmed:${agent.id}:${anchor}`,
+      kind: "stalled_transition",
+      title: `a${agent.id} may still be running — Command Center could not stop it`,
+      context: `tmux was unreachable when it was killed${task ? `, and #${task.id} has moved on without it` : ""}. Check its terminal and stop the process if it is still there.`,
+      severity: "orange",
+      urgent: false,
+      task_id: agent.task_id,
+      agent_id: agent.id,
+      pr_url: null,
+      created_at: anchor,
+    });
   }
 
   // --- quota: the live Claude feed says we are near (or past) a ceiling. The
