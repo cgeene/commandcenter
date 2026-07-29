@@ -1061,7 +1061,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     ? `\n\n(this turn followed ${MAX_AUTO_NUDGES} auto-recovery attempts for a transient error: ${stall.error})`
     : "";
   const loadNote = contended
-    ? `\n\nThe box was running another verification at the same time (${verifyLoadNote(result.load)}), so this failure may be timing rather than your change — re-run the command yourself before assuming a defect.`
+    ? `\n\nThe box was running another test suite at the same time (${verifyLoadNote(result.load)}), so this failure may be timing rather than your change — re-run the command yourself before assuming a defect.`
     : "";
 
   const attempt = round.attempts + 1;
