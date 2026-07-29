@@ -1,4 +1,4 @@
-import { getAgent, listAgents, updateAgent, type Agent } from "../db/agents.js";
+import { listAgents, type Agent } from "../db/agents.js";
 import {
   countTaskEvents,
   latestTaskEvent,
@@ -19,7 +19,7 @@ import {
   hashResult,
 } from "./reviewstate.js";
 import { killAgent, spawnReviewer, type PriorReviewRound } from "./spawn.js";
-import { idleParked } from "./waiting.js";
+import { clearIdleWait } from "./waiting.js";
 import { git } from "./worktree.js";
 import {
   approvedSnapshotIsPublished,
@@ -569,28 +569,6 @@ export async function maybeAutoReview(taskId: number): Promise<void> {
 
   if (!withinReviewBudget(task)) return;
   startReviewRound(task, headSha, prior);
-}
-
-/**
- * Correct an agent whose `waiting_input` is a finished-turn idle park rather
- * than a real question, so the rejection notes can be delivered into its live
- * session instead of costing it its worker.
- *
- * resumeAgent refuses any waiting_input agent by design — unsolicited text
- * typed into a pending permission menu is read as an answer to that menu — and
- * that guard must stay in place for every caller. What is fixed here is the
- * overloaded STATE: idleParked requires both the hook history and the pane to
- * agree that nothing is being asked (see waiting.ts), and anything ambiguous
- * leaves the state alone, so a genuine menu still takes the requeue path.
- */
-function clearIdleWait(agentId: number): void {
-  const agent = getAgent(agentId);
-  if (!agent || !idleParked(agent)) return;
-  updateAgent(agentId, { state: "idle" });
-  logEvent("agent.idle_wait_cleared", {
-    agentId,
-    taskId: agent.task_id ?? undefined,
-  });
 }
 
 /**
