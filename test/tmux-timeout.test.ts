@@ -15,16 +15,27 @@ let originalPath: string | undefined;
 // it was asserting on.
 const TMUX_TIMEOUT_MS = 15_000;
 
-// Bound used by the deliberately-hung cases, via armHang(). Safe to make this
-// short: in those modes the fake tmux execs `sleep 60` and NEVER returns, so
-// there is no completion to race — the only question is whether the bound fires
-// at all, and the elapsed assertions use the wide BOUNDED_MS ceiling below.
+// Bound for the deliberately-hung cases, via armHang().
+//
+// THE RULE, because getting it wrong produces a load flake that looks like a
+// real failure: this short bound is only valid when the FIRST tmux invocation on
+// the path under test is the one that hangs. Then the fake execs `sleep 60`,
+// never returns, and there is nothing to race — the only question is whether the
+// bound fires, and the elapsed assertions use the wide BOUNDED_MS ceiling below.
+//
+// If any tmux call has to SUCCEED before the hanging one, that call must beat the
+// bound too, and on a loaded box spawning /bin/sh can take most of a second. Such
+// cases pass MIXED_PATH_HANG_MS instead. `hang-enter` is exactly that shape:
+// sendText issues `send-keys -l` first and only hangs on the following `Enter`,
+// so a short bound can time out on the literal and the test then fails asserting
+// which calls were made. (`hang-capture` is NOT that shape — capturePane is the
+// only tmux call on the peek path.)
 const HANG_TIMEOUT_MS = 500;
 
-// The one case that is NOT just "did the bound fire": the /healthz ordering test
-// needs the hung send to still be outstanding while health is served, so it pays
-// a wider bound to buy that margin. This is the whole cost of the case.
-const HEALTH_RACE_HANG_MS = 3_000;
+// For paths where something must complete before the hang, and for the /healthz
+// ordering test, which needs the hung send to still be outstanding while health
+// is served. The wider bound is the whole cost of these cases.
+const MIXED_PATH_HANG_MS = 3_000;
 
 // What a bounded call must beat. The fake tmux below hangs for 60s, so any
 // return comfortably under that proves the timeout fired — while staying wide
@@ -154,7 +165,7 @@ describe("bounded daemon tmux commands", () => {
 
   it("bounds Enter delivery after the literal text succeeds", async () => {
     const { sendText } = await import("../src/daemon/tmux.js");
-    await armHang("hang-enter");
+    await armHang("hang-enter", MIXED_PATH_HANG_MS);
     const started = Date.now();
 
     const failure = await sendText("cc:@1", "message").catch((error) => error);
@@ -267,7 +278,7 @@ describe("bounded daemon tmux commands", () => {
     // loaded box could plausibly take to answer one in-process request. At the
     // 500ms armHang() default /healthz would have had ~450ms to win, which is
     // tighter than the 1500ms the previous version of this test allowed.
-    await armHang("hang-literal", HEALTH_RACE_HANG_MS);
+    await armHang("hang-literal", MIXED_PATH_HANG_MS);
 
     const send = app.request(`/api/agents/${agent.id}/send`, {
       method: "POST",
