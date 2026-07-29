@@ -165,7 +165,10 @@ describe("handleVerdict", () => {
 
   /** A blocked task with the reviewer that is still judging it alive. `cause`
    *  picks which gate blocked it: the review loop's own cap (which an approve
-   *  may lift) or a repeatedly-failing verify_cmd (which it may not). */
+   *  may lift) or a repeatedly-failing verify_cmd (which it may not). The gate
+   *  is recorded on the task the way the real blocking paths record it; the
+   *  matching event is logged too, so these cases would still pass if the
+   *  decision were (wrongly) reading event order instead of the column. */
   async function setupBlockedWithLiveReviewer(
     fields: Parameters<typeof setupReviewTask>[0] & {
       cause?: "cap" | "verify";
@@ -186,11 +189,12 @@ describe("handleVerdict", () => {
       state: "working",
       task_id: task.id,
     });
-    updateTask(task.id, { status: "blocked" });
-    logEvent(
-      (fields.cause ?? "cap") === "verify" ? "task.blocked" : "review.loop_exhausted",
-      { taskId: task.id },
-    );
+    const verify = (fields.cause ?? "cap") === "verify";
+    updateTask(task.id, {
+      status: "blocked",
+      block_cause: verify ? "verify_failed" : "review_loop",
+    });
+    logEvent(verify ? "task.blocked" : "review.loop_exhausted", { taskId: task.id });
     return { task, worker, reviewer };
   }
 
@@ -270,6 +274,71 @@ describe("handleVerdict", () => {
     expect(pushes.map((e) => e.payload ?? "").join()).not.toContain(
       "review_approved_ready",
     );
+  });
+
+  // The whole reason the block cause is recorded on the task instead of read
+  // back from event order. A verify-blocked task can still take a rejection,
+  // and that rejection can be the one that reaches the cycle cap — so the cap
+  // is satisfied and the newest review event says "loop exhausted", while the
+  // gate actually holding the task is a verify_cmd that keeps failing.
+  it("a rejection at the cap does not turn a verify-caused block into a restorable one", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    // review_max_cycles is 2 (set by the helper), so this rejection is the cap.
+    const { task, reviewer } = await setupBlockedWithLiveReviewer({
+      cause: "verify",
+      review_cycles: 1,
+    });
+
+    await handleVerdict(task.id, reviewer.id, "reject", "still not fixed");
+
+    const rejected = getTask(task.id)!;
+    expect(rejected.review_cycles).toBe(2); // the cap, by the durable count
+    expect(rejected.block_cause).toBe("verify_failed"); // NOT relabelled
+    // The rejection must not claim the review loop is what holds the task.
+    expect(listEvents(40).map((e) => e.kind)).not.toContain("review.loop_exhausted");
+
+    // Now the live reviewer comes back with an approve on the same task.
+    await handleVerdict(task.id, reviewer.id, "approve", "the diff reads fine");
+
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("blocked"); // the failing verify_cmd still holds it
+    expect(t.block_cause).toBe("verify_failed");
+    expect(t.review_verdict).toBe("approve"); // the round is still not lost
+    const kinds = listEvents(50).map((e) => e.kind);
+    expect(kinds).toContain("review.approved_block_kept");
+    expect(kinds).not.toContain("pr.marked_ready");
+  });
+
+  // The counterpart: when the cap really is the gate, the approve still lifts
+  // it. Blocked by the cap path itself rather than by a hand-set fixture.
+  it("a cap block reached through the reject path is still restorable by an approve", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+    _setGhRunner(vi.fn(() => "")); // the restored approve does flip the PR ready
+    setSchedulerConfig({ review_max_cycles: 2 });
+    const { task } = await setupReviewTask({ review_cycles: 1 });
+
+    // A rejection at the cap blocks it — the review loop is the only gate.
+    await handleVerdict(task.id, 99, "reject", "not converging");
+    const blocked = getTask(task.id)!;
+    expect(blocked.status).toBe("blocked");
+    expect(blocked.block_cause).toBe("review_loop");
+
+    const reviewer = createAgent({
+      kind: "reviewer",
+      state: "working",
+      task_id: task.id,
+    });
+    await handleVerdict(task.id, reviewer.id, "approve", "the last push fixed it");
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("review"); // restored for the merge gate
+    expect(t.block_cause).toBeNull(); // no longer blocked, so no cause
+    expect(t.review_verdict).toBe("approve");
   });
 
   // The dangerous shape: the PR is ALREADY out of draft from an earlier
