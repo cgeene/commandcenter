@@ -38,10 +38,10 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  const { __setVerifyQueueWaitForTests } = await import(
-    "../src/daemon/verifyenv.js"
-  );
+  const { __setVerifyQueueWaitForTests, __setExternalSuiteObserverForTests } =
+    await import("../src/daemon/verifyenv.js");
   __setVerifyQueueWaitForTests(null);
+  __setExternalSuiteObserverForTests(null);
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -415,6 +415,13 @@ describe("a contended verify failure", () => {
 
   it("records the load context on every failure", async () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { __setExternalSuiteObserverForTests } = await import(
+      "../src/daemon/verifyenv.js"
+    );
+    // Whether another agent is running its own suite right now is a property of
+    // the box; pin it so this asserts an uncontended run rather than the luck
+    // of the moment.
+    __setExternalSuiteObserverForTests(() => 0);
     const { task, agent } = await failingWorker();
 
     await handleHookEvent(agent.id, { hook_event_name: "Stop" });
@@ -423,6 +430,7 @@ describe("a contended verify failure", () => {
     expect(failure.contended).toBe(false);
     const load = failure.load as Record<string, number>;
     expect(load.concurrent).toBe(1);
+    expect(load.external_suites).toBe(0);
     expect(load.limit).toBe(1);
     expect(load.cores).toBeGreaterThan(0);
     expect(typeof load.load1).toBe("number");
@@ -489,6 +497,44 @@ describe("a contended verify failure", () => {
 
     const sent = sendText.mock.calls.map((c) => String(c[1])).join("\n");
     expect(sent).toContain("Verification failed");
-    expect(sent).toContain("another verification at the same time");
+    expect(sent).toContain("another test suite at the same time");
+  });
+
+  it("counts an agent-run suite the queue never saw as contention", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const {
+      __setExternalSuiteObserverForTests,
+      verifyWasContended,
+    } = await import("../src/daemon/verifyenv.js");
+    const { task, agent } = await failingWorker();
+
+    // Nothing is queued and nothing bypasses: the only evidence of contention
+    // is a suite running in some agent's own pane, which is the case the
+    // semaphore is structurally blind to.
+    __setExternalSuiteObserverForTests(() => 3);
+    await handleHookEvent(agent.id, { hook_event_name: "Stop" });
+
+    const [failure] = await verifyFailures(task.id);
+    const load = failure.load as Record<string, number>;
+    expect(load.concurrent).toBe(1);
+    expect(load.bypassed_queue).toBeFalsy();
+    expect(load.external_suites).toBe(3);
+    expect(failure.contended).toBe(true);
+    expect(failure.budget_excused).toBe(true);
+    expect(
+      verifyWasContended({
+        concurrent: 1,
+        limit: 1,
+        queued_ms: 0,
+        run_ms: 1,
+        load1: 0,
+        cores: 1,
+        bypassed_queue: false,
+        external_suites: 1,
+      }),
+    ).toBe(true);
+
+    const sent = sendText.mock.calls.map((c) => String(c[1])).join("\n");
+    expect(sent).toContain("3 agent-run test suites outside the queue");
   });
 });

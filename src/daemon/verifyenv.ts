@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import os from "node:os";
 import { getSchedulerConfig } from "../db/settings.js";
 import { localeEnv } from "./locale.js";
+import { observeExternalSuites } from "./suiteload.js";
 
 /** Wall-clock cap on one verify command's EXECUTION. Time spent queued behind
  *  another verify is not counted against it — the semaphore below is acquired
@@ -28,6 +29,11 @@ export const VERIFY_QUEUE_MAX_WAIT_MS = 30 * 60 * 1000;
 const QUEUE_POLL_MS = 5_000;
 
 const VERIFY_MAX_BUFFER = 1024 * 1024;
+
+/** How often a running verify re-counts the agent-run suites competing with it.
+ *  One `ps` sweep, ~60ms on a 1300-process box, against runs measured in
+ *  minutes — frequent enough to catch a suite that starts mid-run. */
+const EXTERNAL_SAMPLE_MS = 15_000;
 
 /**
  * Every setting the daemon reads for itself is CC_-prefixed (see src/config.ts),
@@ -101,6 +107,12 @@ export interface VerifyLoad {
   /** The wait bound expired and the run started without waiting for a slot, so
    *  `concurrent` may exceed `limit`. */
   bypassed_queue: boolean;
+  /** Peak test suites seen running that the daemon did not spawn — a worker or
+   *  reviewer running the suite in its own pane. Those never reach this module,
+   *  so `concurrent` alone says the box was quiet when it was not. Observed,
+   *  not controlled: nothing here can make an agent queue. 0 also means "could
+   *  not look" (see observeExternalSuites). */
+  external_suites: number;
 }
 
 export interface VerifyResult {
@@ -140,6 +152,22 @@ export function __setVerifyQueueWaitForTests(ms: number | null): void {
 
 function queueWaitMs(): number {
   return queueWaitOverrideMs ?? VERIFY_QUEUE_MAX_WAIT_MS;
+}
+
+let externalSuiteObserver: (() => number) | null = null;
+
+/** Test-only: pin the agent-side suite count. Whether another agent happens to
+ *  be running a suite is a property of the box, not of the code under test, and
+ *  a test that reads the real one passes or fails by luck. Pass null to
+ *  restore. */
+export function __setExternalSuiteObserverForTests(
+  observer: (() => number) | null,
+): void {
+  externalSuiteObserver = observer;
+}
+
+function observeExternal(): number {
+  return (externalSuiteObserver ?? observeExternalSuites)();
 }
 
 const active = new Set<Slot>();
@@ -225,12 +253,12 @@ async function acquire(
   }
 }
 
-/** Was this run measurably competing with another verify? True only on the
- *  daemon's own self-knowledge (a second run in flight, or a queue bypass) —
- *  never inferred from load average, which a single honest test suite drives
- *  above the core count all by itself. */
+/** Was this run measurably competing with another test suite? True only on
+ *  counted evidence — a second daemon run in flight, a queue bypass, or a suite
+ *  observed running outside the queue — never inferred from load average, which
+ *  a single honest test suite drives above the core count all by itself. */
 export function verifyWasContended(load: VerifyLoad): boolean {
-  return load.concurrent > 1 || load.bypassed_queue;
+  return load.concurrent > 1 || load.bypassed_queue || load.external_suites > 0;
 }
 
 /** One-line, human-readable version of a VerifyLoad, for notifications. */
@@ -240,6 +268,11 @@ export function verifyLoadNote(load: VerifyLoad): string {
     `load ${load.load1.toFixed(1)} across ${load.cores} cores`,
     `ran ${Math.round(load.run_ms / 1000)}s`,
   ];
+  if (load.external_suites > 0) {
+    parts.push(
+      `${load.external_suites} agent-run test suite${load.external_suites === 1 ? "" : "s"} outside the queue`,
+    );
+  }
   if (load.queued_ms > 0) parts.push(`queued ${Math.round(load.queued_ms / 1000)}s`);
   if (load.bypassed_queue) parts.push("ran without waiting for a free slot");
   return parts.join(", ");
@@ -277,8 +310,19 @@ export async function runVerifyCommand(
 ): Promise<VerifyResult> {
   const { slot, queuedMs, bypassed } = await acquire(opts.onQueued);
   const startedAt = Date.now();
+  let externalPeak = 0;
+  const sampleExternal = (): void => {
+    externalPeak = Math.max(externalPeak, observeExternal());
+  };
+  let sampler: NodeJS.Timeout | undefined;
   try {
     opts.onStart?.();
+    // Sample before spawning too: a suite shorter than one interval would
+    // otherwise go unseen, and the run's own child is not up yet either way.
+    sampleExternal();
+    sampler = setInterval(sampleExternal, EXTERNAL_SAMPLE_MS);
+    // A verify must never be the reason the daemon cannot exit.
+    sampler.unref?.();
     const { ok, output } = await execVerify(cmd, cwd);
     return {
       ok,
@@ -291,9 +335,11 @@ export async function runVerifyCommand(
         load1: os.loadavg()[0],
         cores: os.cpus().length || 1,
         bypassed_queue: bypassed,
+        external_suites: externalPeak,
       },
     };
   } finally {
+    if (sampler) clearInterval(sampler);
     release(slot);
   }
 }
