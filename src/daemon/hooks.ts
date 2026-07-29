@@ -146,9 +146,9 @@ export function __clearBackgroundParkForTests(): void {
 /** Terminal markers of a verify run started by transitionOnStop. */
 const VERIFY_DONE_EVENTS = ["verify.passed", "verify.failed"] as const;
 
-/** Beyond this a `verify.started` with no outcome is not a run in progress —
- *  it is the residue of a daemon that died mid-verify. Without the bound, one
- *  such event would mask the task from the stall sweep permanently. */
+/** Past this, a `verify.started` with no outcome is not a run in progress — it
+ *  is the residue of a daemon that died mid-verify. Comfortably beyond
+ *  runVerify's own timeout, so it can never cut short a live run. */
 const VERIFY_STALE_MS = VERIFY_TIMEOUT_MS + 2 * 60_000;
 
 /**
@@ -158,6 +158,11 @@ const VERIFY_STALE_MS = VERIFY_TIMEOUT_MS + 2 * 60_000;
  * (minutes for a real test suite), and the task stays `in_progress` that whole
  * time. Callers use this to tell "the transition is on its way" apart from
  * "nothing is going to move this task", which from the outside look identical.
+ *
+ * Both consumers — the idle-ping suppression and stalledFinishedWorkers — must
+ * go through this rather than testing for a verify event directly. A daemon
+ * killed mid-verify leaves a verify.started that never resolves, and treating
+ * that as "still running" forever would permanently hide the stall it created.
  */
 export function verifyInFlight(taskId: number, nowMs = Date.now()): boolean {
   const latest = latestTaskEvent(taskId, [
@@ -1046,14 +1051,18 @@ export function stalledFinishedWorkers(
     if (agent.state === "working") continue;
     const stop = latestAgentEvent(agent.id, ["hook.stop"]);
     if (!stop || nowMs - Date.parse(stop.ts) < TRANSITION_STALL_GRACE_MS) continue;
-    // The Stop hook got as far as this task's verify_cmd, so it DID process
-    // this Stop; whatever it decided afterwards (promote, nudge, block) is its
-    // call. This sweep exists for Stops that were never processed at all.
-    const verified = latestTaskEventId(task.id, [
-      "verify.started",
-      ...VERIFY_DONE_EVENTS,
-    ]);
-    if (verified !== undefined && verified > stop.id) continue;
+    // Only while a verify could still be running. Deliberately TIME-bounded
+    // rather than "has a verify event since the Stop": runVerify holds the Stop
+    // handler for up to VERIFY_TIMEOUT_MS and the daemon restarts routinely, so
+    // an unbounded check would permanently hide the single likeliest stall —
+    // a restart mid-verify, which leaves verify.started with no outcome and the
+    // task exactly as this sweep is meant to find it.
+    //
+    // Nothing else needs excluding here: a verify that failed and nudged is
+    // caught by task.verify_nudged below and the working-state skip above, one
+    // that failed without a nudge leaves the task blocked, and one that passed
+    // leaves it review or done — none of those reach listTasks("in_progress").
+    if (verifyInFlight(task.id, nowMs)) continue;
     const advanced = latestTaskEventId(task.id, TRANSITION_ADVANCE_EVENTS);
     if (advanced !== undefined && advanced > stop.id) continue;
     stalled.push({ task, agent, stop: { id: stop.id, ts: stop.ts } });

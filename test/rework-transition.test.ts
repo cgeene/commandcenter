@@ -340,14 +340,16 @@ describe("stalledTransitionSweep", () => {
     expect(stalls.length).toBe(1);
   });
 
-  /** deriveAttention past the sweep's grace period. */
-  const attentionLater = async () => {
+  const attentionAt = async (nowMs: number) => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     return deriveAttention({
-      now: new Date(LATER()),
+      now: new Date(nowMs),
       isPrOpen: () => false,
     }).filter((i) => i.kind === "stalled_transition");
   };
+
+  /** deriveAttention past the sweep's grace period. */
+  const attentionLater = async () => attentionAt(LATER());
 
   // The Needs You item is derived from the same live state the sweep runs on —
   // no event marker — so nothing the sweep logs can bury it. These cases set up
@@ -435,15 +437,38 @@ describe("stalledTransitionSweep", () => {
     expect(spawnReviewer).not.toHaveBeenCalled();
   });
 
-  it("never re-drives a Stop the hook already processed", async () => {
-    // Even with the worker idle again, a verify marker past the Stop means the
-    // hook ran and made its call — the sweep is for Stops nobody processed.
+  // A daemon killed inside runVerify — the likeliest way to strand a task,
+  // since the Stop handler blocks there for minutes. It leaves a verify.started
+  // that never resolves, and treating that as "a verify is running" forever
+  // would hide the exact stall this sweep exists for.
+  it("rescues a task whose verify.started never got an outcome", async () => {
+    const { stalledFinishedWorkers, stalledTransitionSweep, verifyInFlight } =
+      await import("../src/daemon/hooks.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const { task, worker } = await strandedTask({ verify_cmd: "true" });
+    logEvent("verify.started", { agentId: worker.id, taskId: task.id });
+
+    // Past VERIFY_STALE_MS (runVerify's timeout + 2m), so no run can still be up.
+    const long = Date.now() + 24 * 3600_000;
+    expect(verifyInFlight(task.id, long)).toBe(false);
+    expect(stalledFinishedWorkers(long).map((s) => s.task.id)).toEqual([task.id]);
+    expect(await attentionAt(long)).toHaveLength(1);
+
+    await stalledTransitionSweep({ nowMs: long });
+
+    expect(getTask(task.id)!.status).toBe("review");
+    expect(listEvents(60).map((e) => e.kind)).toContain("task.transition_stalled");
+    expect(await attentionAt(long)).toEqual([]);
+  });
+
+  it("leaves a verify that is still within its run window alone", async () => {
     const { stalledFinishedWorkers } = await import("../src/daemon/hooks.js");
     const { logEvent } = await import("../src/db/events.js");
     const { task, worker } = await strandedTask({ verify_cmd: "true" });
     expect(stalledFinishedWorkers(LATER()).length).toBe(1);
-    logEvent("verify.failed", { agentId: worker.id, taskId: task.id });
-    expect(stalledFinishedWorkers(LATER())).toEqual([]);
+    logEvent("verify.started", { agentId: worker.id, taskId: task.id });
+    expect(stalledFinishedWorkers(LATER())).toEqual([]); // run still plausible
   });
 
   it("does not flag a worker that is mid-turn", async () => {
