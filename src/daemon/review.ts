@@ -212,21 +212,20 @@ function submittedByLiveReviewer(taskId: number, agentId: number): boolean {
  *
  * Deliberately conservative in both directions, because being wrong here means
  * calling a PR ready to merge when its verification still fails:
- *  - the durable state must say the rounds are genuinely used up, which is the
- *    same condition exhaustLoop and the cap branch block on;
- *  - AND the most recent recorded blocking cause must be the loop. A cause this
- *    list does not know about simply leaves the task blocked, which is the safe
- *    direction — the verdict is still recorded either way.
+ *  - the cause recorded when the task was blocked must be the loop itself.
+ *    block_cause is written by whichever path blocked the task and is never
+ *    relabelled while it stays blocked, so any other value — including NULL on a
+ *    row that was already blocked before the column existed — leaves the task
+ *    blocked, which is the safe direction. The verdict is still recorded either
+ *    way, so nothing is lost by refusing.
+ *  - AND the durable round count must still say the rounds are used up, the same
+ *    condition exhaustLoop and the cap branch block on. Raising
+ *    review_max_cycles hands the loop rounds back, and then a fresh round —
+ *    not an approve from the round that exhausted the old cap — is what should
+ *    move the task.
  */
 function blockedByReviewLoop(task: Task): boolean {
-  if (task.review_cycles < reviewMaxCycles()) return false;
-  const cause = latestTaskEvent(task.id, [
-    "review.loop_exhausted",
-    "task.blocked",
-    "task.status",
-    "pr.closed",
-  ]);
-  return cause?.kind === "review.loop_exhausted";
+  return task.review_cycles >= reviewMaxCycles() && task.block_cause === "review_loop";
 }
 
 /**
@@ -298,7 +297,7 @@ function startReviewRound(
  *  decision item. Replaces the old hard block-at-2 — a converging loop is
  *  allowed to run up to review_max_cycles rounds first. */
 function exhaustLoop(task: Task, rounds: number): void {
-  updateTask(task.id, { status: "blocked" });
+  updateTask(task.id, { status: "blocked", block_cause: "review_loop" });
   logEvent("review.loop_exhausted", {
     taskId: task.id,
     payload: { rounds, max: reviewMaxCycles() },
@@ -377,7 +376,7 @@ export async function recoverAbandonedReview(reviewer: Agent): Promise<void> {
 /** Every replacement reviewer this task was given also stopped without a
  *  verdict. Nothing automatic is left to try, so block it and say why. */
 function abandonReview(task: Task, spent: number): void {
-  updateTask(task.id, { status: "blocked" });
+  updateTask(task.id, { status: "blocked", block_cause: "reviewer_unrecoverable" });
   logEvent("review.reviewer_unrecoverable", {
     taskId: task.id,
     payload: { replacements_spent: spent, max: MAX_REVIEWER_REPLACEMENTS },
@@ -945,12 +944,45 @@ export async function handleVerdict(
 
   const cycles = task.review_cycles + 1;
 
+  // The task was already blocked when this rejection landed. Record the round
+  // so the history is complete, but leave the block standing — resuming or
+  // requeueing the worker here would silently undo whichever gate blocked it.
+  //
+  // ORDER MATTERS: this must stay ABOVE the cap branch below. A rejection that
+  // lands on an already-blocked task satisfies the cap condition too, and the
+  // cap branch would then log review.loop_exhausted over whatever actually
+  // blocked it — telling the human deciding what to do next that the review loop
+  // is the gate when the real one may be a failing verify_cmd or a closed PR.
+  // The durable block_cause is defended separately (updateTask never relabels a
+  // block that already exists), so the two are independent.
+  if (acceptedWhileBlocked) {
+    updateTask(taskId, {
+      review_verdict: "reject",
+      review_notes: notes,
+      review_cycles: cycles,
+    });
+    notifyEvent(
+      "task_blocked",
+      `task #${taskId} rejected again and stays blocked`,
+      `${task.title}\nThe reviewer rejected round ${cycles} while the task was already blocked, so it was not sent back to a worker. Decide: steer it, requeue it, or close it. Notes: ${notes.slice(0, 200)}`,
+      {
+        priority: "high",
+        tags: "rotating_light",
+        taskId,
+        agentId,
+        once: `task:${taskId}:rejected_while_blocked:${cycles}`,
+      },
+    );
+    return getTask(taskId)!;
+  }
+
   // Cap reached: block for a human decision with the full round history in the
   // event log. This is the ONLY hard stop now — 2 rejections mid-loop no longer
   // halt an actively-converging loop (that was the old block-at-2 behavior).
   if (cycles >= reviewMaxCycles()) {
     updateTask(taskId, {
       status: "blocked",
+      block_cause: "review_loop",
       review_verdict: "reject",
       review_notes: notes,
       review_cycles: cycles,
@@ -970,30 +1002,6 @@ export async function handleVerdict(
         taskId,
         agentId,
         once: `task:${taskId}:review_exhausted:${cycles}`,
-      },
-    );
-    return getTask(taskId)!;
-  }
-
-  // The task was already blocked when this rejection landed. Record the round
-  // so the history is complete, but leave the block standing — resuming or
-  // requeueing the worker here would silently undo whichever gate blocked it.
-  if (acceptedWhileBlocked) {
-    updateTask(taskId, {
-      review_verdict: "reject",
-      review_notes: notes,
-      review_cycles: cycles,
-    });
-    notifyEvent(
-      "task_blocked",
-      `task #${taskId} rejected again and stays blocked`,
-      `${task.title}\nThe reviewer rejected round ${cycles} while the task was already blocked, so it was not sent back to a worker. Decide: steer it, requeue it, or close it. Notes: ${notes.slice(0, 200)}`,
-      {
-        priority: "high",
-        tags: "rotating_light",
-        taskId,
-        agentId,
-        once: `task:${taskId}:rejected_while_blocked:${cycles}`,
       },
     );
     return getTask(taskId)!;

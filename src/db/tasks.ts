@@ -24,6 +24,35 @@ export type DispatchMode = (typeof DISPATCH_MODES)[number];
 export const REVIEW_MODES = ["full", "light"] as const;
 export type ReviewMode = (typeof REVIEW_MODES)[number];
 
+/**
+ * Why a task is in the `blocked` status, recorded by the path that blocked it.
+ *
+ * Consumers that decide whether a block may be LIFTED match on this rather than
+ * inferring the cause from the newest of several event kinds: an inference over
+ * an open-ended event set silently goes wrong the next time someone adds a
+ * blocking path, and one of those decisions (review.blockedByReviewLoop) is a
+ * merge-safety gate. A cause a consumer does not recognise — including NULL —
+ * must mean "do not lift".
+ *
+ *  - verify_failed:          verify_cmd failed its whole nudge budget
+ *  - review_loop:            the review⇄fix loop ran out of rounds
+ *  - reviewer_unrecoverable: every replacement reviewer also died without a verdict
+ *  - pr_closed:              the PR was closed without merging
+ *  - spawn_failed:           the scheduler could not start a worker
+ *  - reported:               blocked from outside the daemon — a worker's
+ *                            report_blocked, or a human/orchestrator PATCH. The
+ *                            reason is in result_summary, not knowable here.
+ */
+export const BLOCK_CAUSES = [
+  "verify_failed",
+  "review_loop",
+  "reviewer_unrecoverable",
+  "pr_closed",
+  "spawn_failed",
+  "reported",
+] as const;
+export type BlockCause = (typeof BLOCK_CAUSES)[number];
+
 export interface Task {
   id: number;
   title: string;
@@ -33,6 +62,7 @@ export interface Task {
   dispatch_mode: DispatchMode;
   parent_task_id: number | null;
   status: TaskStatus;
+  block_cause: BlockCause | null; // why it is blocked; NULL unless status === 'blocked' — see BLOCK_CAUSES
   priority: number;
   worker_provider: AgentProvider;
   model: string | null;
@@ -389,6 +419,36 @@ export function clearTaskTriageAck(id: number): boolean {
   );
 }
 
+/**
+ * The block_cause write implied by a status change, or null for "leave the
+ * column alone". Deliberately derived from the status transition rather than
+ * copied from the caller's field list — that is what makes the invariant
+ * "block_cause is non-NULL exactly while status === 'blocked'" hold for every
+ * blocking path, including ones added later.
+ *
+ * FIRST WRITE WINS while the task stays blocked. A path that blocks an
+ * already-blocked task must not relabel it: a rejection hitting the review
+ * cycle cap re-blocks a task a failing verify_cmd already blocked, and
+ * relabelling that to `review_loop` would make it look like a block a
+ * reviewer's approve is entitled to lift (review.blockedByReviewLoop).
+ *
+ * block_cause is not in UPDATABLE, so it is never bound from `fields` directly
+ * and an API PATCH cannot set it. Passing it without a status is a no-op.
+ */
+function blockCauseWrite(
+  id: number,
+  fields: Partial<Omit<Task, "id" | "created_at" | "updated_at">>,
+): BlockCause | null | undefined {
+  if (fields.status === undefined) return undefined;
+  if (fields.status !== "blocked") return null; // leaving blocked clears the cause
+  if (getTask(id)?.status === "blocked") return undefined; // first write wins
+  const cause = fields.block_cause ?? "reported";
+  if (!BLOCK_CAUSES.includes(cause)) {
+    throw new Error(`invalid block cause: ${String(cause)}`);
+  }
+  return cause;
+}
+
 const UPDATABLE = new Set([
   "title",
   "prompt",
@@ -497,6 +557,13 @@ export function updateTask(
     fields.prompt !== undefined ||
     fields.repo !== undefined;
   const priorAck = invalidatesTriage ? getTask(id)?.triaged_at : undefined;
+  const params: Record<string, unknown> = { id };
+  for (const k of keys) params[k] = (fields as Record<string, unknown>)[k];
+  const cause = blockCauseWrite(id, fields);
+  if (cause !== undefined) {
+    keys.push("block_cause");
+    params.block_cause = cause;
+  }
   const sets = keys.map((k) => `${k} = @${k}`).join(", ");
   getDb()
     .prepare(
@@ -504,7 +571,7 @@ export function updateTask(
               updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
        WHERE id = @id`,
     )
-    .run({ id, ...fields });
+    .run(params);
   // Losing an ack is a delivery-relevant event, not just a column going NULL:
   // the triage delivery path reads it as "this task needs triage again" and the
   // dashboard feed shows the human why the orchestrator was pinged twice.

@@ -156,3 +156,84 @@ describe("api", () => {
   });
 
 });
+
+// block_cause names the gate holding a blocked task. Merge-safety decisions read
+// it (review.blockedByReviewLoop), so the invariant it relies on is enforced
+// here rather than at each of the half-dozen paths that block a task.
+describe("block_cause", () => {
+  async function blockedTask() {
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    updateTask(task.id, { status: "blocked", block_cause: "verify_failed" });
+    return task.id;
+  }
+
+  it("is NULL until a task is blocked, and names the cause once it is", async () => {
+    const { getTask } = await import("../src/db/tasks.js");
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    expect(getTask(task.id)!.block_cause).toBeNull();
+    updateTask(task.id, { status: "blocked", block_cause: "pr_closed" });
+    expect(getTask(task.id)!.block_cause).toBe("pr_closed");
+  });
+
+  it("clears the cause whenever the task leaves the blocked status", async () => {
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const id = await blockedTask();
+    updateTask(id, { status: "queued" });
+    expect(getTask(id)!.block_cause).toBeNull();
+  });
+
+  // The defect this exists for: a rejection at the review cycle cap re-blocks a
+  // task a failing verify_cmd already blocked. Relabelling it would make the
+  // block look like one a reviewer's approve is entitled to lift.
+  it("keeps the original cause when an already-blocked task is blocked again", async () => {
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const id = await blockedTask();
+    updateTask(id, { status: "blocked", block_cause: "review_loop" });
+    expect(getTask(id)!.block_cause).toBe("verify_failed");
+  });
+
+  it("defaults to 'reported' when a blocking path names no cause", async () => {
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    updateTask(task.id, { status: "blocked" });
+    expect(getTask(task.id)!.block_cause).toBe("reported");
+  });
+
+  it("ignores a cause sent without a status change", async () => {
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const id = await blockedTask();
+    updateTask(id, { block_cause: "review_loop", priority: 1 });
+    const t = getTask(id)!;
+    expect(t.block_cause).toBe("verify_failed");
+    expect(t.priority).toBe(1); // the rest of the patch still applied
+  });
+
+  it("rejects an unknown cause", async () => {
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    expect(() =>
+      updateTask(task.id, {
+        status: "blocked",
+        block_cause: "made_up" as "verify_failed",
+      }),
+    ).toThrow(/invalid block cause/);
+  });
+
+  // An API PATCH must not be able to set the cause directly: it is derived from
+  // the status transition, and a caller-supplied value could contradict it.
+  it("is not settable through the task PATCH route", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const app = buildApp();
+    const id = await blockedTask();
+    const res = await app.request(`/api/tasks/${id}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ block_cause: "review_loop" }),
+    });
+    expect(res.status).toBeLessThan(500);
+    expect(getTask(id)!.block_cause).toBe("verify_failed");
+  });
+});

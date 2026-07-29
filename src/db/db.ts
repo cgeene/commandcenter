@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   dispatch_mode  TEXT NOT NULL DEFAULT 'direct',
   parent_task_id INTEGER REFERENCES tasks(id),
   status         TEXT NOT NULL DEFAULT 'queued',
+  block_cause    TEXT,
   priority       INTEGER NOT NULL DEFAULT 2,
   worker_provider TEXT NOT NULL DEFAULT 'claude',
   model          TEXT,
@@ -297,6 +298,15 @@ function migrate(db: Database.Database): void {
   if (!cols.includes("review_head_sha")) {
     db.exec("ALTER TABLE tasks ADD COLUMN review_head_sha TEXT");
     db.exec("ALTER TABLE tasks ADD COLUMN review_result_hash TEXT");
+  }
+  // block_cause: why the task is in the `blocked` status, recorded by whichever
+  // path blocked it instead of being inferred later from event order. NULL on
+  // every task that is not blocked, and on rows that were already blocked when
+  // this column was added — consumers that decide whether a block may be lifted
+  // must treat NULL as "unknown, do not lift" (see review.blockedByReviewLoop).
+  // Written only by updateTask's status handling; see src/db/tasks.ts.
+  if (!cols.includes("block_cause")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN block_cause TEXT");
   }
   if (!cols.includes("pr_url")) {
     db.exec("ALTER TABLE tasks ADD COLUMN pr_url TEXT");
