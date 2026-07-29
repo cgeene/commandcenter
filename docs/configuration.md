@@ -121,8 +121,18 @@ fleet is genuinely too large for the box rather than merely busy.
 
 A larger fleet also makes an individual verification wait longer, so if workers
 appear to sit "finished but not in review" for a while, check the `verify.queued`
-events before treating it as a stall (`stall_minutes` covers agents that stop
-emitting hook events, which a queued verify does not).
+events before treating it as a stall.
+
+`stall_minutes` needs no compensating increase for any of this, and a value
+raised to cover slow verifications can go back to the 15-minute default. The
+stall watchdog only marks an agent stalled while its state is `working`, and the
+`Stop` hook sets the agent to `idle` before it runs `verify_cmd` at all — so a
+verification cannot trip stall detection however long it queues or runs. What
+`stall_minutes` actually detects is an agent that goes silent *mid-work*, which
+does get more likely when the box is thrashing; the queue reduces the thrashing
+the platform itself causes, but not load from anything else on the machine. If
+agents still get marked stalled after this, treat it as real box-wide load rather
+than as a verification artifact.
 
 ### `read_only_extra_allow` — a safety note
 
