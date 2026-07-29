@@ -254,21 +254,31 @@ describe("notifyEvent", () => {
  * Trigger reclassification, end to end through the review loop.       *
  * ------------------------------------------------------------------ */
 
+/** A real git repo whose task branch sits one commit ahead of main, so the
+ *  review loop's HEAD detection works. Built in ONE subprocess: inside a vitest
+ *  worker each fork costs ~120-160ms, and this used to be eight of them. */
 function makeRepo(taskId: number): { repo: string; branch: string; headSha: string } {
   const repo = path.join(tmpDir, `repo-${taskId}`);
   fs.mkdirSync(repo, { recursive: true });
-  const g = (...a: string[]) =>
-    execFileSync("git", ["-C", repo, "-c", "user.email=t@t", "-c", "user.name=t", ...a]);
-  g("init", "-q", "-b", "main");
-  g("commit", "-q", "--allow-empty", "-m", "init");
   const branch = `agent/task-${taskId}`;
-  g("branch", branch);
-  g("checkout", "-q", branch);
-  fs.writeFileSync(path.join(repo, "f.txt"), "work");
-  g("add", "-A");
-  g("commit", "-q", "-m", "work");
-  const headSha = g("rev-parse", branch).toString().trim();
-  g("checkout", "-q", "main");
+  const headSha = execFileSync(
+    "sh",
+    [
+      "-eu",
+      "-c",
+      `g() { git -C "$R" -c user.email=t@t -c user.name=t "$@"; }
+       g init -q -b main
+       g commit -q --allow-empty -m init
+       g checkout -q -b "$B"
+       printf 'work' > "$R/f.txt"
+       g add -A
+       g commit -q -m work
+       SHA=$(g rev-parse "$B")
+       g checkout -q main
+       echo "$SHA"`,
+    ],
+    { encoding: "utf8", env: { ...process.env, R: repo, B: branch } },
+  ).trim();
   return { repo, branch, headSha };
 }
 

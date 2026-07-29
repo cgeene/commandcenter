@@ -63,24 +63,37 @@ function makeRepo(taskId: number): {
 } {
   const repo = path.join(tmpDir, `repo-${taskId}`);
   fs.mkdirSync(repo, { recursive: true });
-  const g = (...a: string[]) =>
-    execFileSync("git", ["-C", repo, "-c", "user.email=t@t", "-c", "user.name=t", ...a]);
-  g("init", "-q", "-b", "main");
-  g("commit", "-q", "--allow-empty", "-m", "init");
   const branch = `agent/task-${taskId}`;
-  g("branch", branch);
+  // One subprocess per step rather than one per git command: inside a vitest
+  // worker each fork costs ~120-160ms, and this helper used to spend nine.
+  const sh = (script: string, n = 0) =>
+    execFileSync(
+      "sh",
+      [
+        "-eu",
+        "-c",
+        `g() { git -C "$R" -c user.email=t@t -c user.name=t "$@"; }\n${script}`,
+      ],
+      { encoding: "utf8", env: { ...process.env, R: repo, B: branch, N: String(n) } },
+    ).trim();
+  sh(`g init -q -b main
+      g commit -q --allow-empty -m init
+      g branch "$B"`);
   let n = 0;
   // Always commit ON the branch, then leave repo HEAD back on the base so the
   // branch stays 1+ commits ahead (merge-base(HEAD, branch) == base).
   const commitMore = (): string => {
     n += 1;
-    g("checkout", "-q", branch);
-    fs.writeFileSync(path.join(repo, `f${n}.txt`), `work ${n}`);
-    g("add", "-A");
-    g("commit", "-q", "-m", `work ${n}`);
-    const sha = g("rev-parse", branch).toString().trim();
-    g("checkout", "-q", "main");
-    return sha;
+    return sh(
+      `g checkout -q "$B"
+       printf 'work %s' "$N" > "$R/f$N.txt"
+       g add -A
+       g commit -q -m "work $N"
+       SHA=$(g rev-parse "$B")
+       g checkout -q main
+       echo "$SHA"`,
+      n,
+    );
   };
   const headSha = commitMore();
   return { repo, branch, headSha, commitMore };

@@ -56,20 +56,35 @@ function makeRepo(name: string): {
 } {
   const repo = path.join(tmpDir, name);
   fs.mkdirSync(repo, { recursive: true });
-  git(repo, "init", "-q", "-b", "main");
-  git(repo, "commit", "-q", "--allow-empty", "-m", "init");
   const branch = `agent/${name}`;
-  git(repo, "branch", branch);
+  // One subprocess per step rather than one per git command: inside a vitest
+  // worker each fork costs ~120-160ms.
+  const sh = (script: string, extra: Record<string, string> = {}) =>
+    execFileSync(
+      "sh",
+      [
+        "-eu",
+        "-c",
+        `g() { git -C "$R" -c user.email=t@t.com -c user.name=t "$@"; }\n${script}`,
+      ],
+      { encoding: "utf8", env: { ...process.env, R: repo, B: branch, ...extra } },
+    ).trim();
+  sh(`g init -q -b main
+      g commit -q --allow-empty -m init
+      g branch "$B"`);
   let n = 0;
   const commitMore = (file?: string): string => {
     n += 1;
-    git(repo, "checkout", "-q", branch);
-    fs.writeFileSync(path.join(repo, file ?? `f${n}.txt`), `work ${n}\n`);
-    git(repo, "add", "-A");
-    git(repo, "commit", "-q", "-m", `work ${n}`);
-    const sha = git(repo, "rev-parse", branch).trim();
-    git(repo, "checkout", "-q", "main");
-    return sha;
+    return sh(
+      `g checkout -q "$B"
+       printf 'work %s\n' "$N" > "$R/$F"
+       g add -A
+       g commit -q -m "work $N"
+       SHA=$(g rev-parse "$B")
+       g checkout -q main
+       echo "$SHA"`,
+      { N: String(n), F: file ?? `f${n}.txt` },
+    );
   };
   return { repo, branch, headSha: commitMore(), commitMore };
 }

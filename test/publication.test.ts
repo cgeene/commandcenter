@@ -16,20 +16,32 @@ function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
+/** Repo with a bare origin and one tracked commit. Built in ONE subprocess:
+ *  inside a vitest worker each fork costs ~120-160ms, and this used to spend
+ *  ten of them per test. */
 function initRepo(): string {
   const repo = path.join(tmpDir, "repo");
-  const remote = path.join(tmpDir, "remote.git");
-  fs.mkdirSync(remote);
-  git(remote, "init", "--bare", "-b", "main");
-  fs.mkdirSync(repo, { recursive: true });
-  execFileSync("git", ["init", "-b", "main", repo]);
-  git(repo, "config", "user.email", "test@example.com");
-  git(repo, "config", "user.name", "Test");
-  git(repo, "remote", "add", "origin", remote);
-  fs.writeFileSync(path.join(repo, "tracked.txt"), "one\n");
-  git(repo, "add", "tracked.txt");
-  git(repo, "commit", "-m", "initial");
-  git(repo, "push", "-u", "origin", "main");
+  execFileSync(
+    "sh",
+    [
+      "-eu",
+      "-c",
+      `mkdir -p "$REMOTE" "$REPO"
+       git -C "$REMOTE" init -q --bare -b main
+       git -C "$REPO" init -q -b main
+       git -C "$REPO" config user.email test@example.com
+       git -C "$REPO" config user.name Test
+       git -C "$REPO" remote add origin "$REMOTE"
+       printf 'one\n' > "$REPO/tracked.txt"
+       git -C "$REPO" add tracked.txt
+       git -C "$REPO" commit -q -m initial
+       git -C "$REPO" push -q -u origin main`,
+    ],
+    {
+      encoding: "utf8",
+      env: { ...process.env, REPO: repo, REMOTE: path.join(tmpDir, "remote.git") },
+    },
+  );
   return repo;
 }
 
