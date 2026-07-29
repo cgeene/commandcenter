@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { listAgents } from "../db/agents.js";
-import { logEvent } from "../db/events.js";
+import { latestTaskEvent, logEvent } from "../db/events.js";
 import { normalizePrState } from "../lib/prstate.js";
 import {
   getTask,
@@ -16,6 +16,7 @@ import { notifyApprovedReady, reviewLoopSweep, reviewMaxCycles } from "./review.
 import { resumeAgent } from "./resume.js";
 import { reviewerActive } from "./reviewerhealth.js";
 import { killAgent } from "./spawn.js";
+import { clearIdleWait } from "./waiting.js";
 import { git, removeWorktree } from "./worktree.js";
 
 /**
@@ -225,6 +226,34 @@ function reapTaskAgents(task: Task, opts?: { rmWorktree?: boolean }): void {
   }
 }
 
+/**
+ * How many sync passes (POLL_MS apart) may defer PR feedback to a worker that
+ * cannot take it before the feedback is folded into review_notes and the task
+ * requeued instead. A menu park does not resolve itself, so the retry has to be
+ * bounded or the feedback is never seen by anybody.
+ */
+const MAX_FEEDBACK_DEFERRALS = 5;
+
+/**
+ * Deferrals already spent on the CURRENT undelivered feedback episode.
+ *
+ * Keyed on `since` (the pr_feedback_at watermark the episode started from),
+ * which is stable precisely because an undelivered defer must not advance the
+ * watermark: a delivery or a requeue moves it, so the next episode starts from
+ * a fresh budget while a retry of this one keeps counting up.
+ */
+function feedbackDeferrals(taskId: number, since: string): number {
+  const last = latestTaskEvent(taskId, ["pr.feedback_deferred"]);
+  if (!last?.payload) return 0;
+  try {
+    const p = JSON.parse(last.payload) as { since?: unknown; attempt?: unknown };
+    if (p.since !== since) return 0;
+    return typeof p.attempt === "number" ? p.attempt : 0;
+  } catch {
+    return 0;
+  }
+}
+
 /** Apply a PR's state to its task. Pure of gh — unit-testable. */
 export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
   const task = getTask(taskId);
@@ -373,6 +402,11 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
   // Deliver BEFORE persisting: once pr_feedback_at advances these comments
   // are never looked at again, so a failed send must leave it untouched.
   if (task.agent_id) {
+    // A worker that merely finished its turn is parked in `waiting_input` too —
+    // that is what EVERY worker looks like between rounds — and resumeAgent
+    // refuses that state for all callers. Correct the state first, but only when
+    // the hooks and the live pane agree nothing is being asked.
+    clearIdleWait(task.agent_id);
     const finishInstruction =
       task.publication_mode === "human"
         ? "Address every point, leave the fixes uncommitted for a new review snapshot, then update your result_summary and stop."
@@ -381,10 +415,36 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
       task.agent_id,
       `New feedback on your PR (${task.pr_url}). ${finishInstruction}\n\n${feedback}`,
     );
-    // Worker is parked on a permission prompt — injected text would answer
-    // the menu, not reach the conversation. The wait is already being
-    // escalated; retry on a later pass once it's unblocked.
-    if (outcome === "waiting_input" || outcome === "delivery_failed") return;
+    // Worker is genuinely parked on a menu (or tmux delivery failed): injected
+    // text would answer the menu, not reach the conversation. Retry on later
+    // passes, but bounded — nothing here changes a menu park, so an unbounded
+    // defer never converges and the feedback is never seen by anybody.
+    if (outcome === "waiting_input" || outcome === "delivery_failed") {
+      const attempt = feedbackDeferrals(taskId, since) + 1;
+      logEvent("pr.feedback_deferred", {
+        taskId,
+        agentId: task.agent_id,
+        payload: {
+          since,
+          attempt,
+          max: MAX_FEEDBACK_DEFERRALS,
+          outcome,
+          comments: fresh.length,
+        },
+      });
+      // Nothing is persisted on this branch, so the watermark stays put and the
+      // next pass retries with the same feedback.
+      if (attempt < MAX_FEEDBACK_DEFERRALS) return;
+      // Out of passes. Retire the worker so its slot is freed and fall through
+      // to the requeue below, which is the only route that gets this feedback
+      // in front of somebody rather than dropping it.
+      killAgent(task.agent_id);
+      logEvent("pr.feedback_delivery_failed", {
+        taskId,
+        agentId: task.agent_id,
+        payload: { attempts: attempt, outcome },
+      });
+    }
     if (outcome === "sent") {
       updateTask(taskId, {
         status: "in_progress",
@@ -399,8 +459,9 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
       logEvent("task.reopened", { taskId, payload: { reason: "pr feedback" } });
       return;
     }
-    // not_live: fall through to requeue. A bounded delivery failure above
-    // deliberately leaves the live worker and task association untouched.
+    // not_live, or an exhausted defer budget: fall through to requeue. A defer
+    // that still has passes left returned above, leaving the live worker and
+    // the task association untouched.
   }
 
   // notes flow into the respawn prompt, same as a reviewer rejection. Append

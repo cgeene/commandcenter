@@ -1,5 +1,5 @@
-import type { Agent } from "../db/agents.js";
-import { latestAgentEvent } from "../db/events.js";
+import { getAgent, updateAgent, type Agent } from "../db/agents.js";
+import { latestAgentEvent, logEvent } from "../db/events.js";
 import { parsePane } from "./pane.js";
 import { capturePane } from "./tmux.js";
 
@@ -91,4 +91,26 @@ export function idleParked(agent: Agent): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Correct an agent whose `waiting_input` is a finished-turn idle park rather
+ * than a real question, so unsolicited text (rejection notes, PR feedback) can
+ * be delivered into its live session instead of costing it its worker.
+ *
+ * resumeAgent refuses any waiting_input agent by design — unsolicited text
+ * typed into a pending permission menu is read as an answer to that menu — and
+ * that guard must stay in place for every caller. What is fixed here is the
+ * overloaded STATE: idleParked requires both the hook history and the pane to
+ * agree that nothing is being asked, and anything ambiguous leaves the state
+ * alone, so a genuine menu still takes whatever undelivered path the caller has.
+ */
+export function clearIdleWait(agentId: number): void {
+  const agent = getAgent(agentId);
+  if (!agent || !idleParked(agent)) return;
+  updateAgent(agentId, { state: "idle" });
+  logEvent("agent.idle_wait_cleared", {
+    agentId,
+    taskId: agent.task_id ?? undefined,
+  });
 }
