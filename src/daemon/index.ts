@@ -12,6 +12,7 @@ import {
 import { getDb } from "../db/db.js";
 import { migrateDocsToFrontmatter } from "../db/docs.js";
 import { logEvent } from "../db/events.js";
+import { markDaemonProcess } from "../process-role.js";
 import { buildApp } from "./api.js";
 import { startCostSync } from "./costsync.js";
 import { startJiraSync } from "./jirasync.js";
@@ -22,6 +23,12 @@ import { startScheduler } from "./scheduler.js";
 import { registerStatic } from "./static.js";
 import { attachTerminal, sweepStaleViewerSessions } from "./termws.js";
 import { initVersion } from "./version.js";
+
+// FIRST, before anything that could page the operator or write to an external
+// system: this is the only process allowed to dispatch outward. Everything else
+// that imports these modules (tests, verification scripts, the MCP server) gets
+// a record-only no-op. See src/process-role.ts.
+markDaemonProcess();
 
 getDb(); // open + migrate up front so failures are loud at startup
 // Bring the on-disk doc store up to the current layout (frontmatter + version

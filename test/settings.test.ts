@@ -516,3 +516,48 @@ describe("ntfy token never leaks", () => {
     }
   });
 });
+
+describe("the effective ntfy URL never leaves the daemon", () => {
+  // A topic URL is publish capability: anything that can read it can page the
+  // operator. Only its presence may cross the boundary.
+  const ENV_URL = "https://ntfy.example/env-only-secret-topic";
+
+  it("GET reports presence, never the resolved URL", async () => {
+    process.env.CC_NTFY_URL = ENV_URL;
+    const { buildApp } = await import("../src/daemon/api.js");
+    const body = await (await buildApp().request("/api/settings")).text();
+
+    expect(body).not.toContain(ENV_URL);
+    const parsed = JSON.parse(body);
+    expect(parsed.notifications.effective.ntfy_url_set).toBe(true);
+    expect(parsed.notifications.effective).not.toHaveProperty("ntfy_url");
+    // No stored override, so the editable field is correctly empty.
+    expect(parsed.notifications.stored.ntfy_url).toBeNull();
+  });
+
+  it("PATCH echoes presence only, and the stored override stays readable", async () => {
+    process.env.CC_NTFY_URL = ENV_URL;
+    const { buildApp } = await import("../src/daemon/api.js");
+    const STORED = "https://ntfy.example/db-topic";
+    const res = await buildApp().request("/api/settings/notifications", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ntfy_url: STORED }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+
+    expect(body).not.toContain(ENV_URL);
+    const parsed = JSON.parse(body);
+    expect(parsed.notifications.effective.ntfy_url_set).toBe(true);
+    expect(parsed.notifications.effective).not.toHaveProperty("ntfy_url");
+    expect(parsed.notifications.stored.ntfy_url).toBe(STORED);
+  });
+
+  it("reports no URL configured when neither the DB nor the env has one", async () => {
+    delete process.env.CC_NTFY_URL;
+    const { buildApp } = await import("../src/daemon/api.js");
+    const parsed = await (await buildApp().request("/api/settings")).json();
+    expect(parsed.notifications.effective.ntfy_url_set).toBe(false);
+  });
+});

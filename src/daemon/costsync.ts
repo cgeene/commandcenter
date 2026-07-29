@@ -3,6 +3,7 @@ import { logEvent } from "../db/events.js";
 import { getOrgCostCache, getQuotaSettings, setOrgCostCache } from "../db/settings.js";
 import type { OrgCostCache } from "../db/settings.js";
 import { cycleWindow } from "../lib/pricing.js";
+import { isDaemonProcess } from "../process-role.js";
 
 /**
  * Org billing dollars from the Anthropic Admin API cost report.
@@ -42,6 +43,12 @@ export function _setCostFetch(fn: Fetcher | null): void {
 }
 
 async function defaultFetchCost(url: string, key: string): Promise<unknown> {
+  // Daemon-only, like every other credentialed outbound call: a test run or a
+  // dist-driving script must inject `_setCostFetch` rather than spend the
+  // organization's admin key.
+  if (!isDaemonProcess()) {
+    throw new Error("cost reporting is daemon-only; inject _setCostFetch instead");
+  }
   const res = await fetch(url, {
     headers: {
       "x-api-key": key,

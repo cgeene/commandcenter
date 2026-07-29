@@ -3006,9 +3006,11 @@ function NotificationsSection({
         label="ntfy topic URL"
         when="immediate"
         hint={
-          effective.ntfy_url
-            ? `In use now: ${effective.ntfy_url}`
-            : "No URL configured — push is disabled."
+          !effective.ntfy_url_set
+            ? "No URL configured — push is disabled."
+            : stored.ntfy_url
+              ? "Push is enabled, using the URL above."
+              : "Push is enabled, using CC_NTFY_URL from the daemon’s environment. Set a URL here to override it."
         }
       >
         <input

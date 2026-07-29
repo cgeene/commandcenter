@@ -1766,7 +1766,11 @@ export function buildApp(): Hono {
         stored: { ntfy_url: notifications.ntfy_url, events: notifications.events },
         ntfy_token_set: Boolean(resolveNtfyToken()),
         effective: {
-          ntfy_url: resolveNtfyUrl() ?? null,
+          // Presence only, like the token: the topic URL IS the credential for
+          // publishing to it, so the resolved value (which may come from the
+          // daemon's own environment) must not be readable over the API. The
+          // stored override above is what the operator typed and stays visible.
+          ntfy_url_set: Boolean(resolveNtfyUrl()),
           events: resolveNotifyEvents(),
         },
       },
@@ -1851,7 +1855,7 @@ export function buildApp(): Hono {
         stored: { ntfy_url: notifications.ntfy_url, events: notifications.events },
         ntfy_token_set: Boolean(resolveNtfyToken()),
         effective: {
-          ntfy_url: resolveNtfyUrl() ?? null,
+          ntfy_url_set: Boolean(resolveNtfyUrl()),
           events: resolveNotifyEvents(),
         },
       },
