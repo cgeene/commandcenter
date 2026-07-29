@@ -554,6 +554,82 @@ describe("deriveAttention — jira_sync", () => {
   });
 });
 
+describe("deriveAttention — reviewer gave up", () => {
+  /** The state abandonReview leaves behind: blocked with the recorded cause,
+   *  plus the event that dates the episode and keys the dismissal. */
+  async function gaveUpTask() {
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const t = createTask({ title: "unreviewable", prompt: "x", repo: "/r" });
+    updateTask(t.id, { status: "blocked", block_cause: "reviewer_unrecoverable" });
+    logEvent("review.reviewer_unrecoverable", { taskId: t.id });
+    return t;
+  }
+
+  const gaveUpItems = async (taskId: number) => {
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    return deriveAttention({ isPrOpen: allOpen }).filter((i) =>
+      i.id.startsWith(`decision:reviewer_gave_up:${taskId}:`),
+    );
+  };
+
+  it("raises the item for a task blocked with that cause", async () => {
+    const t = await gaveUpTask();
+    const items = await gaveUpItems(t.id);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: "decision", task_id: t.id, severity: "orange" });
+    expect(items[0].title).toContain("no reviewer would finish");
+  });
+
+  it("does not raise without the anchor event", async () => {
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const t = createTask({ title: "unreviewable", prompt: "x", repo: "/r" });
+    updateTask(t.id, { status: "blocked", block_cause: "reviewer_unrecoverable" });
+    expect(await gaveUpItems(t.id)).toHaveLength(0);
+  });
+
+  it("clears once the task is no longer blocked", async () => {
+    const { updateTask } = await import("../src/db/tasks.js");
+    const t = await gaveUpTask();
+    updateTask(t.id, { status: "review" }); // human took the review on
+    expect(await gaveUpItems(t.id)).toHaveLength(0);
+  });
+
+  it("does not describe a later block for a different reason as a give-up", async () => {
+    const { updateTask } = await import("../src/db/tasks.js");
+    const t = await gaveUpTask();
+    // Resumed, then blocked again by a failed verify. The give-up event is
+    // still the newest of its kind, but it is no longer why the task is stuck.
+    updateTask(t.id, { status: "queued" });
+    updateTask(t.id, { status: "blocked", block_cause: "verify_failed" });
+    expect(await gaveUpItems(t.id)).toHaveLength(0);
+  });
+
+  it("re-raises with a fresh key after a dismissed episode recurs", async () => {
+    const { dismissAttention } = await import("../src/db/attention.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    const t = await gaveUpTask();
+
+    const [first] = await gaveUpItems(t.id);
+    expect(first).toBeTruthy();
+
+    // Human dismisses it — gone while this episode stands.
+    dismissAttention(first.id);
+    expect(await gaveUpItems(t.id)).toHaveLength(0);
+
+    // Episode 2: the human put it back in review, a fresh set of reviewers
+    // gave up too, and abandonReview blocked it again with a NEW event.
+    updateTask(t.id, { status: "review" });
+    updateTask(t.id, { status: "blocked", block_cause: "reviewer_unrecoverable" });
+    logEvent("review.reviewer_unrecoverable", { taskId: t.id });
+
+    const [second] = await gaveUpItems(t.id);
+    expect(second).toBeTruthy();
+    expect(second.id).not.toBe(first.id);
+  });
+});
+
 describe("deriveAttention — quota", () => {
   const RESETS = "2099-01-01T00:00:00.000Z"; // never elapsed
 
