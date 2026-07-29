@@ -166,6 +166,8 @@ const TEMPLATES: Record<string, Template> = {
       ? `Reaped ${worker(e)} — ${taskRef(e)} approved, awaiting merge; freeing its slot`
       : `Reaped ${worker(e)} — ${taskRef(e)} finished${p.task_status ? ` (${str(p.task_status)})` : ""}, freeing its slot`,
   "agent.vanished": (e) => `${worker(e)} vanished`,
+  "worker.spawn_abandoned": (e) =>
+    `Retired ${worker(e)} — its startup never attached a terminal, freeing its slot`,
   "agent.window_missing": (e) =>
     `${agentRef(e)} window missing once — awaiting confirmation`,
   "agent.recovered": (e) => `${agentRef(e)} recovered while its process was still live`,

@@ -1030,6 +1030,174 @@ describe("watchdog auto-reap", () => {
 
 });
 
+describe("watchdog abandoned-spawn reap", () => {
+  /**
+   * The state a daemon death between createAgent and attachPane leaves: a live
+   * worker row with no window and no pane handle, on a task it has claimed.
+   * `spawning` is where spawnWorker leaves it; the watchdog's own SessionStart
+   * timeout is what moves it to `stalled` (asserted below rather than faked).
+   */
+  async function interruptedSpawn() {
+    const tasks = await import("../src/db/tasks.js");
+    const agents = await import("../src/db/agents.js");
+    const { getDb } = await import("../src/db/db.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const scheduler = await import("../src/daemon/scheduler.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { workerSlots } = await import("../src/daemon/capacity.js");
+    const { killAgent } = await import("../src/daemon/spawn.js");
+    setSchedulerConfig({ reap_after_minutes: 10, max_concurrent: 1 });
+    // Table-driven callers share one database across rows; a row left live by
+    // the previous case would be reaped (or counted) against this one.
+    getDb().prepare("DELETE FROM agents").run();
+    getDb().prepare("DELETE FROM tasks").run();
+    getDb().prepare("DELETE FROM events").run();
+
+    // The grace period is measured from an EVENT the watchdog writes, and
+    // logEvent stamps those from the database clock — so the injected clock has
+    // to be anchored to the real one, offset by minutes, or every age comes out
+    // negative. Same reason test/reviewer-reap.ts drives its reap off Date.now().
+    const base = Date.now();
+    /** How long before the first pass the interrupted spawn started. Anything
+     *  past SESSION_START_TIMEOUT_MS (90s) makes that pass relabel the row. */
+    const spawnedAgo = 5 * 60_000;
+
+    const task = tasks.createTask({ title: "t", prompt: "x", repo: "/r" });
+    const claimed = tasks.claimTask(task.id)!;
+    const agent = agents.createAgent({
+      kind: "worker",
+      provider: "codex",
+      state: "spawning",
+      task_id: task.id,
+    });
+    const spawnedAt = (agentId: number, atMs: number) =>
+      getDb()
+        .prepare("UPDATE agents SET spawned_at = ? WHERE id = ?")
+        .run(new Date(atMs).toISOString(), agentId);
+    spawnedAt(agent.id, base - spawnedAgo);
+
+    // The real teardown: a paneless row has no window and no pane handle, so
+    // killAgent asks tmux nothing at all — no mock needed, and the row really
+    // does end up dead, which is what the capacity assertions depend on.
+    const killed: number[] = [];
+    const deps = (afterMin: number) => ({
+      spawn: () => {},
+      kill: (id: number) => {
+        killed.push(id);
+        killAgent(id);
+      },
+      // cc:@9 is listed as live so that a row given that target is declined by
+      // the reap predicate itself, not by the vanished-window confirmation.
+      windows: () => seen(["cc:@9"]),
+      now: () => new Date(base + afterMin * 60_000),
+    });
+    return {
+      ...tasks,
+      ...agents,
+      ...scheduler,
+      listEvents,
+      workerSlots,
+      task: claimed,
+      agent,
+      killed,
+      deps,
+      base,
+      spawnedAgo,
+      spawnedAt,
+    };
+  }
+
+  it("retires a paneless stalled worker after the grace period and gives the slot back", async () => {
+    const { watchdog, getAgent, getTask, listEvents, workerSlots, task, agent, killed, deps } =
+      await interruptedSpawn();
+
+    // First pass: the SessionStart timeout relabels it, and nothing reaps it.
+    watchdog(deps(0));
+    expect(getAgent(agent.id)?.state).toBe("stalled");
+    expect(killed).toEqual([]);
+    expect(workerSlots().counted.map((w) => w.id)).toEqual([agent.id]);
+
+    // Still inside the 10m reap grace, which runs from the relabelling — not
+    // from spawned_at, which is already 5m old by the first pass.
+    watchdog(deps(9));
+    expect(killed).toEqual([]);
+
+    // Past the grace: retired, task back on the queue, slot released.
+    watchdog(deps(11));
+    expect(killed).toEqual([agent.id]);
+    expect(getAgent(agent.id)?.state).toBe("dead");
+    expect(getTask(task.id)?.status).toBe("queued");
+    expect(getTask(task.id)?.agent_id).toBeNull();
+    // The point of the reap: capacity accounting must agree the slot is free.
+    expect(workerSlots().counted).toEqual([]);
+    const abandoned = listEvents().find((e) => e.kind === "worker.spawn_abandoned");
+    expect(abandoned?.agent_id).toBe(agent.id);
+    expect(abandoned?.task_id).toBe(task.id);
+    // The "did not initialize" signal is not replaced by the reap.
+    expect(listEvents().map((e) => e.kind)).toContain("agent.session_start_missing");
+  });
+
+  it("spends the task's one retry, then fails it instead of retrying forever", async () => {
+    const { watchdog, createAgent, getTask, claimTask, task, deps, base, spawnedAt } =
+      await interruptedSpawn();
+    watchdog(deps(0));
+    watchdog(deps(11));
+    expect(getTask(task.id)?.status).toBe("queued");
+
+    // The replacement spawn is interrupted exactly the same way.
+    claimTask(task.id);
+    const second = createAgent({ kind: "worker", state: "spawning", task_id: task.id });
+    spawnedAt(second.id, base + 11 * 60_000);
+    watchdog(deps(14)); // relabelled
+    watchdog(deps(25)); // past the grace
+    expect(getTask(task.id)?.status).toBe("failed");
+  });
+
+  it("only retires a row that proves nothing is running behind it", async () => {
+    for (const { why, patch, events, reaped } of [
+      {
+        why: "a paneless stalled worker with no session handshake",
+        reaped: true,
+      },
+      {
+        why: "NOT one that still has a tmux window",
+        patch: { tmux_target: "cc:@9" },
+        reaped: false,
+      },
+      {
+        why: "NOT one that recorded a pane pid",
+        patch: { pane_pid: 4242 },
+        reaped: false,
+      },
+      {
+        why: "NOT one whose provider session reported in",
+        events: ["hook.sessionstart"],
+        reaped: false,
+      },
+      {
+        why: "NOT one that is still spawning",
+        patch: { state: "spawning" },
+        reaped: false,
+      },
+      {
+        why: "NOT one that reached a live-session state",
+        patch: { state: "idle" },
+        reaped: false,
+      },
+    ] as const) {
+      const { watchdog, updateAgent, agent, killed, deps } = await interruptedSpawn();
+      const { logEvent } = await import("../src/db/events.js");
+      // Relabel it via the real timeout first, then perturb one input.
+      watchdog(deps(0));
+      if (patch) updateAgent(agent.id, patch);
+      for (const kind of events ?? []) logEvent(kind, { agentId: agent.id });
+
+      watchdog(deps(11));
+      expect(killed, why).toEqual(reaped ? [agent.id] : []);
+    }
+  });
+});
+
 describe("watchdog stall detection (unaffected by idle-in-review suppression)", () => {
   async function setup() {
     const tasks = await import("../src/db/tasks.js");

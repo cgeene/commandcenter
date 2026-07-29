@@ -97,7 +97,8 @@ export const NOTIFY_EVENTS: Record<NotifyEventKey, NotifyEventSpec> = {
     key: "task_failed",
     category: "action",
     label: "Task failed",
-    description: "A task gave up for good — its worker vanished twice.",
+    description:
+      "A task gave up for good — two workers were given it and neither produced anything.",
     default_enabled: true,
   },
   review_exhausted: {
