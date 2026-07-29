@@ -538,6 +538,35 @@ describe("watchdog", () => {
     ]);
   });
 
+  it("closes out a blind spell inherited from a previous process", async () => {
+    // Restarting the daemon is the obvious human response to a blind watchdog,
+    // and the fresh process has no memory of the spell. If recovery were only
+    // derived from module state, the Needs You item would stand forever while
+    // the watchdog was healthy.
+    const { deriveAttention } = await import("../src/daemon/attention.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const { getDb } = await import("../src/db/db.js");
+    const { watchdog, _resetSchedulerState } = await import(
+      "../src/daemon/scheduler.js"
+    );
+
+    logEvent("watchdog.tmux_unavailable");
+    getDb()
+      .prepare("UPDATE events SET ts = ? WHERE kind = 'watchdog.tmux_unavailable'")
+      .run(new Date(Date.now() - 30 * 60_000).toISOString());
+    expect(
+      deriveAttention({ isPrOpen: () => true }).map((item) => item.title),
+    ).toContain("Watchdog blind — tmux cannot be observed");
+
+    _resetSchedulerState(); // the daemon restarts here
+    watchdog({ spawn: () => {}, windows: () => seen([]), now: () => new Date() });
+
+    expect(listEvents(20).map((event) => event.kind)).toContain(
+      "watchdog.tmux_recovered",
+    );
+    expect(deriveAttention({ isPrOpen: () => true })).toHaveLength(0);
+  });
+
   it("reaps the empty window a dead agent leaves behind, once the grace period is up", async () => {
     const { createAgent, updateAgent } = await import("../src/db/agents.js");
     const { listEvents } = await import("../src/db/events.js");

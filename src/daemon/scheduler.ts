@@ -92,6 +92,7 @@ let lastInWindow: boolean | null = null;
 let budgetNotifiedDay: string | null = null;
 let lastScratchPruneDay: string | null = null;
 let tmuxObservationUnavailable: TmuxBlindness | null = null;
+let blindSpellReconciled = false;
 const missingWindowChecks = new Map<number, number>();
 const SESSION_START_TIMEOUT_MS = 90_000;
 const WINDOW_MISSING_CONFIRMATIONS = 2;
@@ -102,6 +103,7 @@ export function _resetSchedulerState(): void {
   budgetNotifiedDay = null;
   lastScratchPruneDay = null;
   tmuxObservationUnavailable = null;
+  blindSpellReconciled = false;
   missingWindowChecks.clear();
 }
 
@@ -112,6 +114,23 @@ const BLINDNESS_EVENT: Record<TmuxBlindness, string> = {
   query_failed: "watchdog.tmux_unavailable",
   implausible_snapshot: "watchdog.tmux_snapshot_implausible",
 };
+
+/**
+ * Whether the record still shows an open blind spell — the newest observation
+ * event of any kind is a blindness one.
+ *
+ * Read from the events table rather than module state because restarting the
+ * daemon is the obvious human response to a blind watchdog, and a fresh
+ * process starts with the in-memory flag clear. Without this, the recovery
+ * event would never be written and the "Watchdog blind" item derived from
+ * those events would stand forever while the watchdog was perfectly healthy.
+ */
+function blindSpellIsOpen(): boolean {
+  const recovered = latestEventTs("watchdog.tmux_recovered") ?? "";
+  return Object.values(BLINDNESS_EVENT).some(
+    (kind) => (latestEventTs(kind) ?? "") > recovered,
+  );
+}
 
 /**
  * Whether a snapshot tmux answered successfully can be believed.
@@ -486,17 +505,6 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
   const recoverReview = deps.recoverReview ?? defaultDeps.recoverReview!;
   const sweepPaneGroup = deps.sweepPaneGroup ?? sweepVanishedPaneGroup;
   const reapWindow = deps.reapWindow ?? defaultDeps.reapWindow!;
-  // A teardown that cannot reach tmux now throws rather than reporting a kill
-  // it did not perform, and one unreapable agent must not stop this pass from
-  // examining the rest. The reap is idempotent, so the next pass retries it.
-  const tryKill = (agentId: number): boolean => {
-    try {
-      kill(agentId);
-      return true;
-    } catch {
-      return false;
-    }
-  };
   const snapshot = deps.windows();
   const nowMs = deps.now().getTime();
 
@@ -529,10 +537,17 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
     goBlind("implausible_snapshot");
     return;
   }
-  if (tmuxObservationUnavailable) {
+  // Close out the spell on the first pass that can be trusted. The stored
+  // check runs once per process: after it, this flag has seen every transition
+  // itself, and a per-tick query would be pure overhead.
+  if (
+    tmuxObservationUnavailable ||
+    (!blindSpellReconciled && blindSpellIsOpen())
+  ) {
     tmuxObservationUnavailable = null;
     logEvent("watchdog.tmux_recovered");
   }
+  blindSpellReconciled = true;
 
   const windowIds = snapshot.live;
   recoverFalseVanishes(deps, windowIds);
@@ -687,7 +702,7 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
       if (task && (terminal || approvedAwaitingMerge)) {
         const last = Date.parse(agent.last_event_at ?? agent.spawned_at);
         if (nowMs - last > cfg.reap_after_minutes * 60_000) {
-          if (!tryKill(agent.id)) continue;
+          kill(agent.id);
           logEvent("agent.reaped", {
             agentId: agent.id,
             taskId: task.id,
@@ -725,7 +740,7 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
         // period runs out.
         if (!submitted && agent.state === "stalled") revive(agent);
         if (nowMs - Date.parse(gaveUpAt) > cfg.reap_after_minutes * 60_000) {
-          if (!tryKill(agent.id)) continue;
+          kill(agent.id);
           if (submitted) {
             logEvent("reviewer.retired", {
               agentId: agent.id,

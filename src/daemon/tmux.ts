@@ -302,9 +302,12 @@ export type WindowSnapshot = TmuxWindows | null;
 // tmux rejects ":" in a session name and window ids are "@<n>", so the last
 // colon on the line always separates the target from the flag — while a session
 // name is free to contain spaces, which is why this splits rather than matching
-// the whole line. A literal TAB would look safer and is not: tmux downgrades it
-// to "_" in -F output whenever the invoking client's locale is not UTF-8, which
-// turns every line into an unparseable one.
+// the whole line. A colon also needs no help from the environment, unlike the
+// TAB this used to use: tmux renders a non-ASCII glyph as "_" for a client
+// whose locale is not UTF-8, so TAB-separated output is only parseable because
+// every call forces localeEnv() (see locale.ts). That holds today and other
+// format readers still rely on it; this is the one query whose misparse costs
+// live agents, so it does not rely on it at all.
 const WINDOW_TARGET_RE = /:@\d+$/;
 
 /**

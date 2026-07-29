@@ -149,6 +149,8 @@ const TEMPLATES: Record<string, Template> = {
   // --- agents ---
   "agent.spawned": (e) => `Spawned ${agentRef(e)}${e.task_id != null ? ` on ${taskRef(e)}` : ""}`,
   "agent.killed": (e) => `Killed ${agentRef(e)}`,
+  "agent.kill_unconfirmed": (e, p) =>
+    `Could not confirm ${agentRef(e)} was stopped — tmux was unreachable${p.pane_handle_retained ? "; kept its pane handle to retry" : ""}`,
   "agent.stalled": (e) => `${worker(e)} stalled on ${taskRef(e)}`,
   "agent.reaped": (e, p) =>
     p.reason === "approved_awaiting_merge"
