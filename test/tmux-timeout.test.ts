@@ -8,9 +8,19 @@ vi.setConfig({ testTimeout: 30_000 });
 let tmpDir: string;
 let originalPath: string | undefined;
 
-// The bound the daemon is put under for these tests. Small, because every
-// "hung" case has to wait it out.
-const TMUX_TIMEOUT_MS = 400;
+// Default bound for these tests. Generous on purpose: the cases that are NOT
+// about hanging drive a real /bin/sh fake through to completion, and a loaded
+// box can take most of a second just to spawn it. A tight default here made
+// "sanitises stale-target send failures" report a timeout instead of the error
+// it was asserting on.
+const TMUX_TIMEOUT_MS = 15_000;
+
+// Bound used only by the deliberately-hung cases, via armHang(). Safe to make
+// this short: in those modes the fake tmux execs `sleep 60` and NEVER returns,
+// so there is no completion to race — the only question is whether the bound
+// fires at all. It is not shorter still because the send_to_worker case needs
+// the hung send to remain outstanding while /healthz is served.
+const HANG_TIMEOUT_MS = 500;
 
 // What a bounded call must beat. The fake tmux below hangs for 60s, so any
 // return comfortably under that proves the timeout fired — while staying wide
@@ -107,6 +117,13 @@ afterEach(async () => {
   await new Promise((resolve) => setImmediate(resolve));
 });
 
+/** Arm a fake-tmux mode that never returns, bounded tightly. */
+async function armHang(mode: string): Promise<void> {
+  process.env.CC_FAKE_TMUX_MODE = mode;
+  const { _setTmuxTimeoutForTest } = await import("../src/daemon/tmux.js");
+  _setTmuxTimeoutForTest(HANG_TIMEOUT_MS);
+}
+
 function calls(): string[] {
   const log = process.env.CC_FAKE_TMUX_LOG!;
   return fs.existsSync(log)
@@ -117,7 +134,7 @@ function calls(): string[] {
 describe("bounded daemon tmux commands", () => {
   it("bounds a hung literal send", async () => {
     const { sendText } = await import("../src/daemon/tmux.js");
-    process.env.CC_FAKE_TMUX_MODE = "hang-literal";
+    await armHang("hang-literal");
     const started = Date.now();
 
     const failure = await sendText("cc:@1", "sensitive message").catch((error) => error);
@@ -133,7 +150,7 @@ describe("bounded daemon tmux commands", () => {
 
   it("bounds Enter delivery after the literal text succeeds", async () => {
     const { sendText } = await import("../src/daemon/tmux.js");
-    process.env.CC_FAKE_TMUX_MODE = "hang-enter";
+    await armHang("hang-enter");
     const started = Date.now();
 
     const failure = await sendText("cc:@1", "message").catch((error) => error);
@@ -162,13 +179,15 @@ describe("bounded daemon tmux commands", () => {
 
   it("bounds synchronous scheduler observation and remains usable afterward", async () => {
     const { listLiveWindowIds } = await import("../src/daemon/tmux.js");
-    process.env.CC_FAKE_TMUX_MODE = "hang-all";
+    await armHang("hang-all");
     const started = Date.now();
 
     expect(listLiveWindowIds()).toBeNull();
 
     expect(Date.now() - started).toBeLessThan(BOUNDED_MS);
     process.env.CC_FAKE_TMUX_MODE = "ok";
+    const { _setTmuxTimeoutForTest } = await import("../src/daemon/tmux.js");
+    _setTmuxTimeoutForTest(TMUX_TIMEOUT_MS);
     expect(listLiveWindowIds()).toEqual(["cc:@1"]);
   });
 
@@ -189,7 +208,7 @@ describe("bounded daemon tmux commands", () => {
       tmux_target: "cc:@1",
     });
     const app = buildApp();
-    process.env.CC_FAKE_TMUX_MODE = "hang-capture";
+    await armHang("hang-capture");
     const started = Date.now();
 
     const peek = await app.request(`/api/agents/${agent.id}/peek`);
@@ -210,7 +229,7 @@ describe("bounded daemon tmux commands", () => {
       tmux_target: "cc:@1",
     });
     const app = buildApp();
-    process.env.CC_FAKE_TMUX_MODE = "hang-all";
+    await armHang("hang-all");
     const started = Date.now();
 
     const hook = await app.request(`/api/hooks/agent/${agent.id}`, {
@@ -238,7 +257,7 @@ describe("bounded daemon tmux commands", () => {
       tmux_target: "cc:@1",
     });
     const app = buildApp();
-    process.env.CC_FAKE_TMUX_MODE = "hang-literal";
+    await armHang("hang-literal");
 
     const send = app.request(`/api/agents/${agent.id}/send`, {
       method: "POST",
@@ -282,7 +301,7 @@ describe("bounded daemon tmux commands", () => {
       tmux_target: "cc:@1",
     });
     const app = buildApp();
-    process.env.CC_FAKE_TMUX_MODE = "hang-all";
+    await armHang("hang-all");
 
     const response = await app.request(`/api/agents/${agent.id}/send`, {
       method: "POST",
