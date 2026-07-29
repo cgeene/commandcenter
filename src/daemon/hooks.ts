@@ -974,40 +974,47 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
  *  sweep can never race the transition it exists to rescue. */
 const TRANSITION_STALL_GRACE_MS = 60_000;
 
-/** Events that mean SOMETHING has moved this task since its worker stopped —
- *  a verify run, a status change, or a message delivered into its session.
- *  `task.transition_stalled` is in the list on purpose: it makes the sweep
- *  fire at most once per Stop. */
-export const TRANSITION_PROGRESS_EVENTS = [
-  "verify.started",
-  ...VERIFY_DONE_EVENTS,
+/**
+ * Events that mean something is ACTUALLY advancing this task: its status moved,
+ * or text was delivered into its worker's session.
+ *
+ * Deliberately excludes the rescue sweep's own bookkeeping
+ * (`task.transition_stalled`, `task.transition_retry_failed`) and the verify
+ * markers. A rescue attempt is not progress — if it leaves the task exactly
+ * where it was, the task is still stranded and must stay visible. An earlier
+ * revision folded those markers in here, which let a rescue mask the very
+ * situation it had just failed to fix.
+ */
+const TRANSITION_ADVANCE_EVENTS = [
   "task.status",
   "task.review",
   "task.blocked",
   "task.reopened",
   "task.requeued",
   "task.autocompleted",
-  "task.transition_stalled",
   "agent.sent",
 ];
 
+export interface StalledFinishedWorker {
+  task: Task;
+  agent: Agent;
+  stop: { id: number; ts: string };
+}
+
 /**
- * Rescue a task nothing can advance: its worker ended a turn with a
- * result_summary, yet the task is still `in_progress` with no verify running
- * and no other event since that Stop. The Stop hook is the only thing that
- * promotes a finished worker to `review`, and it runs inside a single HTTP
- * handler — a daemon restart, a thrown handler, or a lost hook delivery in
- * that window leaves the work finished and the task permanently parked, with
- * nothing but a generic "waiting for input" ping to show for it.
+ * Tasks nothing can advance: the worker ended a turn with a result_summary, the
+ * task is still `in_progress`, no verify_cmd is running, and neither a status
+ * change nor a message into its session has happened since that Stop.
  *
- * Be loud first (event + Needs You item), then re-drive the same transition
- * the Stop hook would have. Re-driving re-runs verify_cmd, which is correct:
- * nothing has verified this result yet.
+ * Derived purely from current state, so it is true exactly while the situation
+ * lasts and false the moment anything fixes it. Both the rescue sweep and the
+ * Needs You queue read it, which is what keeps "the platform is rescuing this"
+ * and "the human should look at this" from ever disagreeing.
  */
-export async function stalledTransitionSweep(
-  opts: { nowMs?: number } = {},
-): Promise<void> {
-  const nowMs = opts.nowMs ?? Date.now();
+export function stalledFinishedWorkers(
+  nowMs = Date.now(),
+): StalledFinishedWorker[] {
+  const stalled: StalledFinishedWorker[] = [];
   for (const task of listTasks("in_progress")) {
     if (!task.result_summary || !task.agent_id) continue;
     const agent = getAgent(task.agent_id);
@@ -1015,36 +1022,87 @@ export async function stalledTransitionSweep(
     const stop = latestAgentEvent(agent.id, ["hook.stop"]);
     if (!stop || nowMs - Date.parse(stop.ts) < TRANSITION_STALL_GRACE_MS) continue;
     if (verifyInFlight(task.id, nowMs)) continue;
-    const acted = latestTaskEventId(task.id, TRANSITION_PROGRESS_EVENTS);
-    if (acted !== undefined && acted > stop.id) continue;
-
-    logEvent("task.transition_stalled", {
-      taskId: task.id,
-      agentId: agent.id,
-      payload: { stopped_at: stop.ts, has_verify_cmd: Boolean(task.verify_cmd) },
-    });
-    notifyEvent(
-      "worker_stalled",
-      `task #${task.id} finished but never entered review`,
-      `${task.title}\na${agent.id} stopped with a result at ${stop.ts} and the task is still in_progress with nothing running. Re-driving the transition now — if it stays in_progress, promote it by hand.`,
-      {
-        priority: "high",
-        tags: "warning",
-        taskId: task.id,
-        agentId: agent.id,
-        once: `task:${task.id}:transition_stalled:${stop.id}`,
-      },
-    );
-    try {
-      await transitionOnStop(task, agent);
-    } catch (err) {
-      logEvent("task.transition_retry_failed", {
-        taskId: task.id,
-        agentId: agent.id,
-        payload: { error: err instanceof Error ? err.message : String(err) },
-      });
-    }
+    const advanced = latestTaskEventId(task.id, TRANSITION_ADVANCE_EVENTS);
+    if (advanced !== undefined && advanced > stop.id) continue;
+    stalled.push({ task, agent, stop: { id: stop.id, ts: stop.ts } });
   }
+  return stalled;
+}
+
+/** One rescue at a time. A re-drive can sit inside a 10-minute verify_cmd,
+ *  which is longer than the poll interval that calls this. */
+let stallSweepInFlight = false;
+
+/**
+ * Rescue every task stalledFinishedWorkers() identifies: be loud (event +
+ * notify; the Needs You item derives from the same state), then re-drive the
+ * transition the Stop hook would have made. The Stop hook is the only thing
+ * that promotes a finished worker to `review`, and it runs inside a single HTTP
+ * handler — a daemon restart, a thrown handler, or a lost hook delivery in that
+ * window leaves the work finished and the task parked forever.
+ *
+ * Re-driving re-runs verify_cmd, which is correct: nothing has verified this
+ * result yet. That also makes this slow, so callers must not hold anything on
+ * it — see prsync.prSyncPass.
+ *
+ * NEVER THROWS. Its callers run other sweeps after it, and an escaping error
+ * would silently skip them.
+ */
+export async function stalledTransitionSweep(
+  opts: { nowMs?: number } = {},
+): Promise<void> {
+  if (stallSweepInFlight) return;
+  stallSweepInFlight = true;
+  try {
+    const nowMs = opts.nowMs ?? Date.now();
+    for (const { task, agent, stop } of stalledFinishedWorkers(nowMs)) {
+      // One rescue attempt per Stop: a re-drive that failed to move the task
+      // will fail again, and the task stays visible without re-running verify
+      // on every poll.
+      const attempted = latestTaskEventId(task.id, [
+        "task.transition_stalled",
+      ]);
+      if (attempted !== undefined && attempted > stop.id) continue;
+
+      logEvent("task.transition_stalled", {
+        taskId: task.id,
+        agentId: agent.id,
+        payload: { stopped_at: stop.ts, has_verify_cmd: Boolean(task.verify_cmd) },
+      });
+      notifyEvent(
+        "worker_stalled",
+        `task #${task.id} finished but never entered review`,
+        `${task.title}\na${agent.id} stopped with a result at ${stop.ts} and the task is still in_progress with nothing running. Re-driving the transition now — if it stays in_progress, promote it by hand.`,
+        {
+          priority: "high",
+          tags: "warning",
+          taskId: task.id,
+          agentId: agent.id,
+          once: `task:${task.id}:transition_stalled:${stop.id}`,
+        },
+      );
+      try {
+        await transitionOnStop(task, agent);
+      } catch (err) {
+        logEvent("task.transition_retry_failed", {
+          taskId: task.id,
+          agentId: agent.id,
+          payload: { error: err instanceof Error ? err.message : String(err) },
+        });
+      }
+    }
+  } catch (err) {
+    logEvent("task.transition_sweep_error", {
+      payload: { error: err instanceof Error ? err.message : String(err) },
+    });
+  } finally {
+    stallSweepInFlight = false;
+  }
+}
+
+/** Test-only: the in-flight latch is module state that outlives a fresh db. */
+export function __clearStallSweepLatchForTests(): void {
+  stallSweepInFlight = false;
 }
 
 function runVerify(

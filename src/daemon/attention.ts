@@ -11,7 +11,7 @@ import {
   latestTaskEvent,
   logEvent,
 } from "../db/events.js";
-import { TRANSITION_PROGRESS_EVENTS } from "./hooks.js";
+import { stalledFinishedWorkers } from "./hooks.js";
 import { JIRA_SYNC_FAIL_THRESHOLD } from "../lib/jira.js";
 import { normalizePrState } from "../lib/prstate.js";
 import { quotaConditions, quotaIsCritical } from "../lib/quotaalert.js";
@@ -220,29 +220,32 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   //     anchored to the event that recorded the stall, and both clear as soon
   //     as anything moves the task — see TRANSITION_PROGRESS_EVENTS. ---------
   //
-  //     Both are gated on a task status first: this runs on every /api/attention
-  //     poll, and an unfiltered per-task event lookup would be two queries per
-  //     task per poll.
+  //     The stranded-worker half reads the SAME state predicate the rescue
+  //     sweep runs on, rather than an event marker: a marker can be buried by
+  //     the sweep's own re-drive, so a rescue that did not work would hide the
+  //     situation it failed to fix.
+  for (const { task: t, agent, stop } of stalledFinishedWorkers(nowMs)) {
+    push({
+      id: `stalled_transition:${t.id}:${stop.id}`, // new Stop -> new episode
+      kind: "stalled_transition",
+      title: `Stuck after finishing — #${t.id} ${t.title}`,
+      context: `The worker wrote a result but the task never left in_progress. ${excerpt(t.result_summary, 140)}`,
+      severity: "orange",
+      urgent: false,
+      task_id: t.id,
+      agent_id: agent.id,
+      pr_url: t.pr_url,
+      created_at: stop.ts,
+    });
+  }
+
+  //     A verdict the task's status refused. Skipped only for done/cancelled,
+  //     where there is no longer anything for a verdict to change; `queued` is
+  //     covered because that is exactly what a rejection's requeue leaves
+  //     behind, and a reviewer submitting into it would otherwise lose its
+  //     round with nothing on the queue to say so.
   for (const t of tasks) {
-    if (t.status !== "in_progress" && t.status !== "blocked") continue;
-    if (t.status === "in_progress" && t.result_summary) {
-      const marker = latestTaskEvent(t.id, TRANSITION_PROGRESS_EVENTS);
-      if (marker?.kind === "task.transition_stalled") {
-        push({
-          id: `stalled_transition:${t.id}:${marker.id}`,
-          kind: "stalled_transition",
-          title: `Stuck after finishing — #${t.id} ${t.title}`,
-          context: `The worker wrote a result but the task never left in_progress. ${excerpt(t.result_summary, 140)}`,
-          severity: "orange",
-          urgent: false,
-          task_id: t.id,
-          agent_id: t.agent_id,
-          pr_url: t.pr_url,
-          created_at: marker.ts,
-        });
-        continue;
-      }
-    }
+    if (t.status === "done" || t.status === "cancelled") continue;
     const held = latestTaskEvent(t.id, [
       "review.verdict_unsubmittable",
       "review.approved",

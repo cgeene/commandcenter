@@ -539,15 +539,18 @@ export async function prSyncPass(): Promise<void> {
   // them. Never throws — see integrationPass.
   await integrationPass();
 
-  // Runs BEFORE the review sweep: it is what puts a stranded finished worker's
-  // task into `review` in the first place, so the sweep below can pick it up in
-  // the same pass instead of a poll interval later.
-  await stalledTransitionSweep();
-
   // Safety net for the auto-review loop: catch a stale approval (post-approval
   // push with no clean worker Stop) or any review-status task the Stop-hook
   // trigger missed. Each call is a no-op when there is nothing new to review.
   await reviewLoopSweep();
+
+  // LAST, and nothing may be sequenced after it: rescuing a stranded worker
+  // re-runs its verify_cmd inline, which can take minutes (VERIFY_TIMEOUT_MS is
+  // 10). Everything above — PR state, integration, the review sweep — must not
+  // wait behind that. A task it rescues is picked up by the next pass's review
+  // sweep, two minutes later at worst. It holds its own in-flight latch, so a
+  // long rescue does not stack across passes, and it never throws.
+  await stalledTransitionSweep();
 }
 
 export function startPrSync(): void {

@@ -46,10 +46,12 @@ beforeEach(async () => {
     __clearAutoNudgeCountsForTests,
     __clearIdleRedelegateForTests,
     __clearBackgroundParkForTests,
+    __clearStallSweepLatchForTests,
   } = await import("../src/daemon/hooks.js");
   __clearAutoNudgeCountsForTests();
   __clearIdleRedelegateForTests();
   __clearBackgroundParkForTests();
+  __clearStallSweepLatchForTests();
 });
 
 afterEach(async () => {
@@ -338,48 +340,108 @@ describe("stalledTransitionSweep", () => {
     expect(stalls.length).toBe(1);
   });
 
-  it("raises a Needs You item while the task is stuck", async () => {
+  /** deriveAttention past the sweep's grace period. */
+  const attentionLater = async () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
-    const { logEvent } = await import("../src/db/events.js");
-    const { task } = await strandedTask();
-    logEvent("task.transition_stalled", { taskId: task.id });
+    return deriveAttention({
+      now: new Date(LATER()),
+      isPrOpen: () => false,
+    }).filter((i) => i.kind === "stalled_transition");
+  };
 
-    const items = deriveAttention({ isPrOpen: () => false });
-    const item = items.find((i) => i.kind === "stalled_transition");
-    expect(item).toBeDefined();
-    expect(item!.task_id).toBe(task.id);
-    expect(item!.title).toContain(`#${task.id}`);
-  });
+  // The Needs You item is derived from the same live state the sweep runs on —
+  // no event marker — so nothing the sweep logs can bury it. These cases set up
+  // only the stranded situation itself and let the real code produce (or clear)
+  // the item.
+  for (const verify_cmd of [undefined, "true"]) {
+    const shape = verify_cmd ? `verify_cmd ${verify_cmd}` : "no verify_cmd";
 
-  it("the Needs You item clears once something moves the task", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    const { logEvent } = await import("../src/db/events.js");
-    const { task } = await strandedTask();
-    logEvent("task.transition_stalled", { taskId: task.id });
-    logEvent("verify.started", { taskId: task.id });
-
-    expect(
-      deriveAttention({ isPrOpen: () => false }).some(
-        (i) => i.kind === "stalled_transition",
-      ),
-    ).toBe(false);
-  });
-
-  it("raises a Needs You item for a verdict the task's status refused", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    const { logEvent } = await import("../src/db/events.js");
-    const { updateTask } = await import("../src/db/tasks.js");
-    const { task } = await reviewTask();
-    updateTask(task.id, { status: "blocked" });
-    logEvent("review.verdict_unsubmittable", {
-      taskId: task.id,
-      payload: { task_status: "blocked" },
+    it(`raises a Needs You item for a stranded worker (${shape}), before any sweep`, async () => {
+      const { task } = await strandedTask({ verify_cmd });
+      const items = await attentionLater();
+      expect(items.length).toBe(1);
+      expect(items[0].task_id).toBe(task.id);
+      expect(items[0].title).toContain(`#${task.id}`);
     });
 
-    const item = deriveAttention({ isPrOpen: () => false }).find(
-      (i) => i.kind === "stalled_transition",
-    );
-    expect(item?.task_id).toBe(task.id);
-    expect(item?.title).toContain("Reviewer verdict blocked");
+    it(`clears the item once the sweep actually moves the task (${shape})`, async () => {
+      const { stalledTransitionSweep } = await import("../src/daemon/hooks.js");
+      const { getTask } = await import("../src/db/tasks.js");
+      const { task } = await strandedTask({ verify_cmd });
+      expect((await attentionLater()).length).toBe(1);
+
+      await stalledTransitionSweep({ nowMs: LATER() });
+
+      // Gone because the task genuinely left in_progress, not because an event
+      // masked it — assert the new status so this cannot pass for that reason.
+      expect(getTask(task.id)!.status).toBe("review");
+      expect(await attentionLater()).toEqual([]);
+    });
+  }
+
+  it("keeps the item up when a rescue ran and the task is still stranded", async () => {
+    // The rescue's own markers, and nothing else. Reached in production when
+    // the re-drive throws (see task.transition_retry_failed) — constructed here
+    // because a re-drive that completes always moves the task. This is the
+    // exact shape that a marker-anchored item got wrong: the sweep buried its
+    // own finding.
+    const { stalledFinishedWorkers } = await import("../src/daemon/hooks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { task } = await strandedTask();
+    logEvent("task.transition_stalled", { taskId: task.id });
+    logEvent("task.transition_retry_failed", { taskId: task.id });
+
+    expect(stalledFinishedWorkers(LATER()).map((s) => s.task.id)).toEqual([task.id]);
+    expect((await attentionLater()).length).toBe(1);
   });
+
+  it("drops the item once the worker is nudged back into work", async () => {
+    const { logEvent } = await import("../src/db/events.js");
+    const { task, worker } = await strandedTask();
+    expect((await attentionLater()).length).toBe(1);
+    // A delivery into the session means something IS advancing it again.
+    logEvent("agent.sent", { agentId: worker.id, taskId: task.id });
+    expect(await attentionLater()).toEqual([]);
+  });
+
+  // `queued` is what a rejection's requeue leaves behind, so it is the status a
+  // late verdict is most likely to land on; `done`/`cancelled` are excluded
+  // because a verdict has nothing left to change there.
+  for (const status of ["blocked", "queued", "in_progress"] as const) {
+    it(`raises a Needs You item for a verdict refused while ${status}`, async () => {
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      const { logEvent } = await import("../src/db/events.js");
+      const { updateTask } = await import("../src/db/tasks.js");
+      const { task } = await reviewTask();
+      updateTask(task.id, { status });
+      logEvent("review.verdict_unsubmittable", {
+        taskId: task.id,
+        payload: { task_status: status },
+      });
+
+      const item = deriveAttention({ isPrOpen: () => false }).find(
+        (i) => i.kind === "stalled_transition",
+      );
+      expect(item?.task_id).toBe(task.id);
+      expect(item?.title).toContain("Reviewer verdict blocked");
+      expect(item?.context).toContain(status);
+    });
+  }
+
+  for (const status of ["done", "cancelled"] as const) {
+    it(`raises no verdict item once the task is ${status}`, async () => {
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      const { logEvent } = await import("../src/db/events.js");
+      const { updateTask } = await import("../src/db/tasks.js");
+      const { task } = await reviewTask();
+      updateTask(task.id, { status });
+      logEvent("review.verdict_unsubmittable", { taskId: task.id });
+
+      expect(
+        deriveAttention({ isPrOpen: () => false }).some(
+          (i) => i.kind === "stalled_transition",
+        ),
+      ).toBe(false);
+    });
+  }
 });
