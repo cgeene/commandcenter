@@ -2,10 +2,14 @@ import type { Agent } from "../db/agents.js";
 import { countAgentEvents, latestAgentEventTs } from "../db/events.js";
 
 /**
- * One definition of "is this reviewer real", shared by everything that keys a
- * decision on a reviewer existing: the cap exemption for its parked worker
+ * One definition of "is this agent real", shared by everything that keys a
+ * decision on an agent existing: the cap exemption for a parked worker
  * (capacity.ts), the double-spawn guards (review.ts, spawn.ts), PR-feedback
  * forwarding (prsync.ts), and the watchdog's reviewer reap (scheduler.ts).
+ *
+ * Reviewers and the main agent get one predicate each because their states mean
+ * different things (see `mainActive`), but both are built on the same evidence
+ * and neither may be replaced by a caller's own reading of a row.
  *
  * `reviewerActive` and `reviewerGaveUpAt` are two readings of the SAME
  * signal — the reviewer's current state — so a reviewer can never be both
@@ -40,6 +44,21 @@ const VERDICT_EVENTS = [
 ];
 
 /**
+ * Did this row's spawn get as far as attaching a pane? `attachPane` records the
+ * target, so a row without one was never given a window and no process runs
+ * behind it.
+ *
+ * This is the one piece of evidence no autonomous pass can supply later: the
+ * watchdog's vanished-agent pass needs a target to find missing, and
+ * deliberately leaves paneless rows to the SessionStart timeout, which only
+ * relabels them `stalled`. So a guard that refuses to spawn a replacement while
+ * such a row is merely live refuses for as long as the row exists.
+ */
+function hasAttachedPane(agent: Agent): boolean {
+  return Boolean(agent.tmux_target);
+}
+
+/**
  * Is this reviewer still going to land a verdict? Being "live" is not enough:
  * `listAgents({live: true})` only means `state != 'dead'`, and both a reviewer
  * that stopped without submitting and a reviewer whose spawn threw before it
@@ -48,8 +67,33 @@ const VERDICT_EVENTS = [
  */
 export function reviewerActive(reviewer: Agent): boolean {
   // No pane: spawn threw between createAgent and attach, so no process exists.
-  if (!reviewer.tmux_target) return false;
+  if (!hasAttachedPane(reviewer)) return false;
   return !STOPPED_STATES.has(reviewer.state);
+}
+
+/**
+ * Is there really an orchestrator behind this main row — the question spawnMain
+ * has to answer before refusing to start one, since only one main may run at a
+ * time.
+ *
+ * Same evidence as `reviewerActive`, but STOPPED_STATES deliberately does NOT
+ * apply: `idle` is the orchestrator's normal resting state between turns, which
+ * is precisely when the rest of the system wants it (orchestration.ts delegates
+ * triage to a `working`/`idle` main, notifqueue delivers only to an `idle` one).
+ * Treating `idle` as stopped here would start a second orchestrator on top of a
+ * healthy one. `stalled` and `waiting_input` are alive too: the window and its
+ * process are still there for a human to attach to, and the error message names
+ * the row so they can kill it.
+ *
+ * That leaves the pane as the whole test. It is the right line to draw because
+ * it splits the rows nothing recovers from the rows something does: a main row
+ * with a stale target is retired by the watchdog's vanished-agent pass (which
+ * is not gated on kind), while a paneless one is invisible to that pass and
+ * would otherwise block every later spawn until a human deleted it by hand.
+ */
+export function mainActive(main: Agent): boolean {
+  if (main.state === "dead") return false;
+  return hasAttachedPane(main);
 }
 
 /**

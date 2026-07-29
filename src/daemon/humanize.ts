@@ -168,6 +168,12 @@ const TEMPLATES: Record<string, Template> = {
   "agent.vanished": (e) => `${worker(e)} vanished`,
   "worker.spawn_abandoned": (e) =>
     `Retired ${worker(e)} — its startup never attached a terminal, freeing its slot`,
+  "main.spawn_abandoned": (e) =>
+    `Retired ${agentRef(e)} — its startup never attached a terminal, so a new main agent could start`,
+  "agent.spawn_failed": (e, p) =>
+    `Could not start ${agentRef(e)}${p.kind === "main" ? " (main agent)" : ""}${
+      str(p.error) ? ` — ${str(p.error)}` : ""
+    }`,
   "agent.window_missing": (e) =>
     `${agentRef(e)} window missing once — awaiting confirmation`,
   "agent.recovered": (e) => `${agentRef(e)} recovered while its process was still live`,

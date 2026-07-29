@@ -51,7 +51,7 @@ import {
   REVIEWER_TOOL_ALLOW,
   WORKER_TOOL_ALLOW,
 } from "./permissions.js";
-import { reviewerActive } from "./reviewerhealth.js";
+import { mainActive, reviewerActive } from "./reviewerhealth.js";
 import { resolveReviewDelta } from "./reviewstate.js";
 import { strictSerialHolder, strictSerialReason } from "./serial.js";
 import { findProviderTranscript } from "./transcript.js";
@@ -1001,50 +1001,92 @@ export function spawnReviewer(
 }
 
 export function spawnMain(model?: string): Agent {
-  const existing = listAgents({ live: true }).find((a) => a.kind === "main");
+  // Only a main with an orchestrator actually behind it may refuse a new one.
+  // Keying this on the row alone made a spawn that threw before attachPane
+  // permanent: the leftover row refused every later spawn, and no pass retires
+  // it, so the orchestrator could not be restarted without deleting the row by
+  // hand — with nothing being triaged, dispatched or merged meanwhile.
+  const mains = listAgents({ live: true }).filter((a) => a.kind === "main");
+  const existing = mains.find(mainActive);
   if (existing) {
     throw new Error(
       `main agent a${existing.id} already live (${existing.state}) — attach or kill it first`,
     );
   }
+  // Everything left is paneless by construction, so there is no window to kill
+  // and no pane_pid to reap. Retire the rows rather than just stepping over
+  // them: the rest of the system reads "the main agent" as the one live row of
+  // that kind (attention.ts, the dashboard, `cc upgrade --main`), and a second
+  // one lingering would keep answering for the orchestrator this call starts.
+  for (const stale of mains) {
+    updateAgent(stale.id, { state: "dead" });
+    logEvent("main.spawn_abandoned", {
+      agentId: stale.id,
+      payload: { state: stale.state },
+    });
+  }
 
-  const resolvedModel = model ?? resolveMainModel();
-  const agent = createAgent({
-    kind: "main",
-    provider: "claude",
-    model: resolvedModel,
-    state: "spawning",
-  });
+  let spawnedAgent: Agent | undefined;
+  let target: string | undefined;
+  try {
+    const resolvedModel = model ?? resolveMainModel();
+    const agent = createAgent({
+      kind: "main",
+      provider: "claude",
+      model: resolvedModel,
+      state: "spawning",
+    });
+    spawnedAgent = agent;
 
-  const settingsFile = writeSettingsFile("main", agent.id, {
-    deny: [...DANGEROUS_BASH_DENY],
-  });
-  const mcpFile = writeMcpConfigFile("main", {
-    CC_ROLE: "main",
-    CC_AGENT_ID: String(agent.id),
-  });
-  updateAgent(agent.id, { runtime_config_path: settingsFile });
+    const settingsFile = writeSettingsFile("main", agent.id, {
+      deny: [...DANGEROUS_BASH_DENY],
+    });
+    const mcpFile = writeMcpConfigFile("main", {
+      CC_ROLE: "main",
+      CC_AGENT_ID: String(agent.id),
+    });
+    updateAgent(agent.id, { runtime_config_path: settingsFile });
 
-  fs.mkdirSync(promptsDir(), { recursive: true });
-  const promptFile = path.join(promptsDir(), "main.md");
-  fs.writeFileSync(promptFile, ORCHESTRATOR_PROMPT);
+    fs.mkdirSync(promptsDir(), { recursive: true });
+    const promptFile = path.join(promptsDir(), "main.md");
+    fs.writeFileSync(promptFile, ORCHESTRATOR_PROMPT);
 
-  const target = newWindow(
-    "main",
-    resolveMainWorkspaceDir(),
-    isolateAgentTmux(
-      agent.id,
-      buildClaudeCmd({ model: resolvedModel, settingsFile, mcpFile, promptFile }),
-    ),
-  );
-  // Do not report the orchestrator as working until its SessionStart hook
-  // arrives. The provider may first require a one-time workspace-trust choice.
-  attachPane(agent.id, target);
-  logEvent("agent.spawned", {
-    agentId: agent.id,
-    payload: { target, model: resolvedModel, kind: "main" },
-  });
-  return getAgent(agent.id)!;
+    target = newWindow(
+      "main",
+      resolveMainWorkspaceDir(),
+      isolateAgentTmux(
+        agent.id,
+        buildClaudeCmd({ model: resolvedModel, settingsFile, mcpFile, promptFile }),
+      ),
+    );
+    // Do not report the orchestrator as working until its SessionStart hook
+    // arrives. The provider may first require a one-time workspace-trust choice.
+    attachPane(agent.id, target);
+    logEvent("agent.spawned", {
+      agentId: agent.id,
+      payload: { target, model: resolvedModel, kind: "main" },
+    });
+    return getAgent(agent.id)!;
+  } catch (error) {
+    // Same unwind as spawnWorker's: leave nothing live that a later spawnMain
+    // would have to reason about. There is no task to roll back for main.
+    if (target && windowExists(target, { whenUnobservable: "present" })) {
+      try {
+        killWindow(target);
+      } catch {
+        // Best effort: preserve the original spawn error for the caller.
+      }
+    }
+    if (spawnedAgent) updateAgent(spawnedAgent.id, { state: "dead" });
+    logEvent("agent.spawn_failed", {
+      agentId: spawnedAgent?.id,
+      payload: {
+        kind: "main",
+        error: error instanceof Error ? error.message : String(error),
+      },
+    });
+    throw error;
+  }
 }
 
 /**
