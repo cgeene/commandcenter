@@ -79,7 +79,13 @@ vi.mock("../src/daemon/spawn.js", () => ({
 
 let tmpDir: string;
 let fetchMock: ReturnType<typeof vi.fn>;
+let notifyModule: typeof import("../src/daemon/notify.js");
 const realFetch = globalThis.fetch;
+
+/** Every push this process produced, in order. Only the daemon dispatches for
+ *  real (src/process-role.ts), so a test reads the recorded intents; fetchMock
+ *  stays installed as the tripwire that proves nothing reached the wire. */
+const pushes = () => notifyModule.recordedPushes();
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-rework-dispatch-"));
@@ -87,6 +93,8 @@ beforeEach(async () => {
   process.env.CC_NTFY_URL = "https://ntfy.test/cc";
   fetchMock = vi.fn(async () => new Response("ok"));
   globalThis.fetch = fetchMock as unknown as typeof fetch;
+  notifyModule = await import("../src/daemon/notify.js");
+  notifyModule.clearRecordedPushes();
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   sendText.mockReset();
@@ -112,6 +120,9 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  // No test here may put a request on the wire. If this fires, the daemon-only
+  // dispatch guard has been lost and a test run can page a phone.
+  expect(fetchMock).not.toHaveBeenCalled();
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   globalThis.fetch = realFetch;
@@ -399,10 +410,9 @@ describe("a rejection that requeues never goes silent", () => {
     // event is off by default and the operator may have them all off), and the
     // push — enabled above — fires once, on the attempt that exhausts the budget.
     expect((await attentionItems(now)).map((i) => i.task_id)).toEqual([task.id]);
-    const pushed = fetchMock.mock.calls.map(
-      (call) => (call[1] as { headers: Record<string, string> }).headers.Title,
-    );
-    expect(pushed.filter((t) => t.includes("nobody fixing it"))).toHaveLength(1);
+    expect(
+      pushes().filter((p) => p.title.includes("nobody fixing it")),
+    ).toHaveLength(1);
   });
 
   // Post-#86 the ordinary rejection resolves IN PLACE, so a task can carry a
