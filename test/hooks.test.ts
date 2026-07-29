@@ -569,6 +569,146 @@ describe("idle-prompt suppression for finished workers in review", () => {
   });
 });
 
+/**
+ * The catch-up delegator, which reaches a wait the delivery queue never sees.
+ *
+ * It fires on the orchestrator's SessionStart AND on every idle_prompt — i.e.
+ * roughly a minute after every turn it finishes — and it delivers straight
+ * through deliverToMainIfClear, so notifqueue's flush-time re-validation cannot
+ * screen it. A worker that idled mid-verify and then had its task sent to review
+ * matched its filter and got re-delegated to an orchestrator that could do
+ * nothing about it, while a live reviewer worked that very task.
+ */
+describe("catch-up delegation for a wait whose task moved out of reach", () => {
+  async function liveIdleMain() {
+    const { createAgent } = await import("../src/db/agents.js");
+    return createAgent({ kind: "main", state: "idle", tmux_target: "cc:@2" });
+  }
+
+  const IDLE_PROMPT = {
+    hook_event_name: "Notification" as const,
+    notification_type: "idle_prompt",
+    message: "Claude is waiting for your input",
+  };
+
+  /** A live agent parked in waiting_input on a task, with a recorded wait hook
+   *  and no delegation yet — exactly what the catch-up filter looks for. */
+  async function parkedWait(
+    status: "in_progress" | "blocked" | "review" | "done" | "cancelled",
+    kind: "worker" | "reviewer" = "worker",
+  ) {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const agent = createAgent({
+      kind,
+      state: "waiting_input",
+      task_id: task.id,
+      tmux_target: "cc:@1",
+    });
+    updateTask(task.id, { status, agent_id: agent.id });
+    logEvent("hook.notification", { agentId: agent.id });
+    return { task, agent };
+  }
+
+  for (const status of ["review", "done", "cancelled"] as const) {
+    it(`does not delegate a worker wait while its task is ${status}`, async () => {
+      const { handleHookEvent } = await import("../src/daemon/hooks.js");
+      const { listEvents } = await import("../src/db/events.js");
+      paneByTarget.set("cc:@2", PROMPT_BOX); // main prompt clear → WOULD deliver
+      const main = await liveIdleMain();
+      await parkedWait(status);
+
+      await handleHookEvent(main.id, IDLE_PROMPT);
+
+      expect(listEvents(40).map((e) => e.kind)).not.toContain("waiting.delegated");
+      expect(sendText).not.toHaveBeenCalled();
+    });
+  }
+
+  for (const status of ["in_progress", "blocked"] as const) {
+    it(`still delegates a worker wait while its task is ${status}`, async () => {
+      const { handleHookEvent } = await import("../src/daemon/hooks.js");
+      const { listEvents } = await import("../src/db/events.js");
+      paneByTarget.set("cc:@2", PROMPT_BOX);
+      const main = await liveIdleMain();
+      const { agent } = await parkedWait(status);
+
+      await handleHookEvent(main.id, IDLE_PROMPT);
+
+      const delegated = listEvents(40).filter((e) => e.kind === "waiting.delegated");
+      expect(delegated).toHaveLength(1);
+      expect(delegated[0].agent_id).toBe(agent.id);
+      expect(sendText).toHaveBeenCalled();
+    });
+  }
+
+  it("still delegates a REVIEWER's wait on a task that is in review", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    paneByTarget.set("cc:@2", PROMPT_BOX);
+    const main = await liveIdleMain();
+    const { agent } = await parkedWait("review", "reviewer");
+
+    await handleHookEvent(main.id, IDLE_PROMPT);
+
+    const delegated = listEvents(40).filter((e) => e.kind === "waiting.delegated");
+    expect(delegated).toHaveLength(1);
+    expect(delegated[0].agent_id).toBe(agent.id);
+  });
+
+  it("also screens the wait on the orchestrator's SessionStart", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    paneByTarget.set("cc:@2", PROMPT_BOX);
+    const main = await liveIdleMain();
+    await parkedWait("review");
+
+    await handleHookEvent(main.id, {
+      hook_event_name: "SessionStart",
+      session_id: "s-main",
+    });
+
+    expect(listEvents(40).map((e) => e.kind)).not.toContain("waiting.delegated");
+    expect(sendText).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The two halves together, which is where the regression hid: expiring the
+   * queued ping is what REMOVES the waiting.delegated that used to exclude this
+   * agent from the catch-up filter, so suppressing only the queue would have made
+   * this path strictly more reachable than before.
+   */
+  it("expires the queued ping WITHOUT the catch-up delegator re-sending it", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { queueDelivery } = await import("../src/daemon/notifqueue.js");
+    paneByTarget.set("cc:@2", PROMPT_BOX);
+    const main = await liveIdleMain();
+    // Queued while the task was still in_progress — the verify window.
+    const { task, agent } = await parkedWait("in_progress");
+    queueDelivery({
+      mainId: main.id,
+      workerId: agent.id,
+      taskId: task.id,
+      message: "which region?",
+      origin: "worker_waiting",
+      reason: "main_working",
+    });
+    // The verify passes and a reviewer takes over.
+    updateTask(task.id, { status: "review" });
+
+    await handleHookEvent(main.id, IDLE_PROMPT);
+
+    const kinds = listEvents(40).map((e) => e.kind);
+    expect(kinds).toContain("delivery.expired");
+    expect(kinds).not.toContain("waiting.delegated");
+    expect(sendText).not.toHaveBeenCalled();
+  });
+});
+
 describe("transient API error auto-nudge", () => {
   it("Stop with no result_summary and a transient-error pane sends a silent continue, not an escalation", async () => {
     const { handleHookEvent } = await import("../src/daemon/hooks.js");

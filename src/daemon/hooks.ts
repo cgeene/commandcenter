@@ -27,7 +27,7 @@ import {
 } from "./transcript.js";
 import { recordTokenSample } from "../db/tokens.js";
 import { capturePane, windowExists } from "./tmux.js";
-import { WAIT_HOOK_EVENTS } from "./waiting.js";
+import { WAIT_HOOK_EVENTS, waitIsMoot } from "./waiting.js";
 import { codexPermissionDecision } from "../codex-policy.js";
 import { delegatePendingTaskToMain } from "./orchestration.js";
 import { runVerifyCommand, VERIFY_TIMEOUT_MS } from "./verifyenv.js";
@@ -67,12 +67,6 @@ export function resetAutoNudgeCount(agentId: number): void {
 export function __clearAutoNudgeCountsForTests(): void {
   autoNudgeCounts.clear();
 }
-
-/** Task statuses in which a finished worker's idle-prompt ping is pure noise:
- *  "review" is handled by PR #36's automatic review⇄fix loop (reject
- *  auto-resumes, approve→merge auto-completes+reaps), and a done/cancelled task
- *  has nothing left to do — its worker is only awaiting the reaper. */
-const IDLE_SUPPRESS_STATUSES: readonly string[] = ["review", "done", "cancelled"];
 
 /** True once the worker's latest turn-boundary lifecycle event is its Stop
  *  hook — i.e. it finished the turn and is not blocked mid-work on a
@@ -363,11 +357,11 @@ function delegationPrompt(agent: Agent): string {
 /**
  * Startup / idle catch-up delegator: hand a worker wait to a main that has just
  * become available (working or idle) — it runs right after the orchestrator
- * clears its own startup/idle screen, catching up waits that accrued while it
- * was down. Unlike the real-time worker-wait path it does not queue, but it
- * shares the SAME prompt-clear gate (deliverToMainIfClear) so a human draft in
- * the just-ready main's composer is never clobbered; `allowWorking` keeps the
- * original "deliver to a working|idle main" reach.
+ * clears its own startup screen and after each turn it finishes, catching up
+ * waits it was never told about. Unlike the real-time worker-wait path it does
+ * not queue, but it shares the SAME prompt-clear gate (deliverToMainIfClear) so
+ * a human draft in the just-ready main's composer is never clobbered;
+ * `allowWorking` keeps the original "deliver to a working|idle main" reach.
  */
 async function delegateToMain(
   waiting: Agent,
@@ -397,13 +391,23 @@ async function delegateToMain(
   return true;
 }
 
-/** Once the orchestrator clears its own startup trust screen, hand it the
- * oldest outstanding worker/reviewer wait that occurred while it was down. */
+/** Hand the orchestrator the oldest outstanding worker/reviewer wait it has not
+ * been told about — after it clears its startup trust screen, and again on every
+ * idle_prompt once it finishes a turn. */
 async function delegateExistingWait(main: Agent): Promise<boolean> {
   const candidates = listAgents({ live: true }).filter((candidate) => {
     if (candidate.kind === "main" || candidate.state !== "waiting_input") {
       return false;
     }
+    // This path bypasses the delivery queue entirely, so notifqueue's
+    // flush-time re-validation cannot cover it — the status check has to be
+    // repeated here. It is emphatically NOT redundant with that one: the
+    // idle_prompt caller runs flushMainQueue immediately before this, and a
+    // ping EXPIRED there logs only delivery.expired, never waiting.delegated.
+    // So expiring a ping leaves the wait looking permanently un-delegated,
+    // which makes the recency test below match forever.
+    const task = candidate.task_id ? getTask(candidate.task_id) : undefined;
+    if (waitIsMoot(candidate, task)) return false;
     const started = latestAgentEvent(candidate.id, [...WAIT_HOOK_EVENTS]);
     const delegated = latestAgentEvent(candidate.id, ["waiting.delegated"]);
     return Boolean(started && (!delegated || delegated.id < started.id));
@@ -602,7 +606,7 @@ export async function handleHookEvent(
       // reviewers must keep. Reviewers fall through to the normal wait path.
       if (agent.kind === "worker" && isIdlePrompt && stopFiredForLatestTurn(agentId)) {
         const task = agent.task_id ? getTask(agent.task_id) : undefined;
-        if (task && IDLE_SUPPRESS_STATUSES.includes(task.status)) {
+        if (task && waitIsMoot(agent, task)) {
           updateAgent(agentId, { state: "idle" });
           logEvent("waiting.suppressed_in_review", {
             agentId,

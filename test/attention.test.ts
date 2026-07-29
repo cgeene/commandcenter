@@ -252,6 +252,93 @@ describe("deriveAttention — kinds", () => {
     expect(items[0].kind).toBe("escalation");
   });
 
+  /**
+   * Both wait producers are anchored on EVENTS, so neither notices a task moving
+   * on underneath them: the wait hook and the escalation stay the newest of their
+   * kind forever. A worker that idled mid-verify and then had its task sent to
+   * review therefore kept generating both items — while a live reviewer was
+   * working that very task.
+   */
+  describe("a wait whose task moved out of the worker's reach", () => {
+    async function waitingWorkerOn(
+      status: "in_progress" | "blocked" | "review" | "done" | "cancelled",
+      kind: "worker" | "reviewer" = "worker",
+      opts: { escalate?: boolean } = {},
+    ) {
+      const { createAgent } = await import("../src/db/agents.js");
+      const { createTask, updateTask } = await import("../src/db/tasks.js");
+      const { logEvent } = await import("../src/db/events.js");
+      const { getDb } = await import("../src/db/db.js");
+      const t = createTask({ title: "ship it", prompt: "x", repo: "/r" });
+      const a = createAgent({ kind, state: "waiting_input", task_id: t.id });
+      updateTask(t.id, { status, agent_id: a.id });
+      logEvent("hook.notification", { agentId: a.id });
+      // Older than attention_stale_minutes (10m default) so stale_waiting is due.
+      getDb()
+        .prepare("UPDATE events SET ts = ? WHERE kind = 'hook.notification'")
+        .run(new Date(Date.now() - 15 * 60_000).toISOString());
+      if (opts.escalate) logEvent("waiting.escalated", { agentId: a.id });
+      return { task: t, agent: a };
+    }
+
+    for (const status of ["review", "done", "cancelled"] as const) {
+      it(`produces no escalation item while the task is ${status}`, async () => {
+        const { deriveAttention } = await import("../src/daemon/attention.js");
+        const { agent } = await waitingWorkerOn(status, "worker", {
+          escalate: true,
+        });
+        const items = deriveAttention({ isPrOpen: allOpen });
+        expect(items.filter((i) => i.agent_id === agent.id)).toEqual([]);
+        expect(items.map((i) => i.kind)).not.toContain("escalation");
+      });
+
+      it(`produces no stale_waiting item while the task is ${status}`, async () => {
+        const { deriveAttention } = await import("../src/daemon/attention.js");
+        const { agent } = await waitingWorkerOn(status);
+        const items = deriveAttention({ isPrOpen: allOpen });
+        expect(items.filter((i) => i.agent_id === agent.id)).toEqual([]);
+        expect(items.map((i) => i.kind)).not.toContain("stale_waiting");
+      });
+    }
+
+    for (const status of ["in_progress", "blocked"] as const) {
+      it(`still escalates a worker waiting on a ${status} task`, async () => {
+        const { deriveAttention } = await import("../src/daemon/attention.js");
+        const { agent } = await waitingWorkerOn(status, "worker", {
+          escalate: true,
+        });
+        const items = deriveAttention({ isPrOpen: allOpen }).filter(
+          (i) => i.agent_id === agent.id,
+        );
+        expect(items).toHaveLength(1);
+        expect(items[0].kind).toBe("escalation");
+      });
+
+      it(`still flags a stale wait on a ${status} task`, async () => {
+        const { deriveAttention } = await import("../src/daemon/attention.js");
+        const { agent } = await waitingWorkerOn(status);
+        const items = deriveAttention({ isPrOpen: allOpen }).filter(
+          (i) => i.agent_id === agent.id,
+        );
+        expect(items).toHaveLength(1);
+        expect(items[0].kind).toBe("stale_waiting");
+      });
+    }
+
+    // A reviewer's task is "review" by definition, so a status-only test would
+    // silence every reviewer wait — and an unanswered reviewer is a task stuck
+    // in review with no verdict coming.
+    it("still flags a REVIEWER waiting on a task that is in review", async () => {
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      const { agent } = await waitingWorkerOn("review", "reviewer");
+      const items = deriveAttention({ isPrOpen: allOpen }).filter(
+        (i) => i.agent_id === agent.id,
+      );
+      expect(items).toHaveLength(1);
+      expect(items[0].kind).toBe("stale_waiting");
+    });
+  });
+
   it("ignores the main agent's own waiting_input", async () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     const { createAgent } = await import("../src/db/agents.js");

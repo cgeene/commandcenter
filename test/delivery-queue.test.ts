@@ -325,6 +325,141 @@ describe("staleness — a queued delivery is re-validated before it is sent late
   });
 });
 
+/**
+ * A worker's wait outliving its own task.
+ *
+ * A worker that idles while its inline verify is still running is correctly
+ * `waiting_input` — nothing has gone wrong — so the hook that first sees the
+ * wait cannot suppress it. If the verify then passes, the task moves to review
+ * and a reviewer takes over, but the queued ping still describes a worker that
+ * needs rescuing. Re-validating only the AGENT let that ping land minutes later
+ * and send the orchestrator after a worker whose work was already under review.
+ */
+describe("staleness — a queued worker-wait ping outlives its task", () => {
+  /** A queued worker-wait ping, enqueued while the task was still in_progress
+   *  (the state the verify window really leaves behind), then moved on. */
+  async function queuedWait(
+    mainId: number,
+    moveTo: "in_progress" | "blocked" | "review" | "done" | "cancelled",
+    kind: "worker" | "reviewer" = "worker",
+  ) {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "ship it", prompt: "do the work", repo });
+    const agent = createAgent({
+      kind,
+      state: "waiting_input",
+      task_id: task.id,
+      tmux_target: "cc:@w1",
+    });
+    updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+
+    const { queueDelivery } = await import("../src/daemon/notifqueue.js");
+    queueDelivery({
+      mainId,
+      workerId: agent.id,
+      taskId: task.id,
+      message: "which region?",
+      origin: "worker_waiting",
+      reason: "main_working",
+    });
+
+    updateTask(task.id, { status: moveTo });
+    return { task, agent };
+  }
+
+  async function expiredReasons() {
+    const { listEvents } = await import("../src/db/events.js");
+    return listEvents(40)
+      .filter((e) => e.kind === "delivery.expired")
+      .map((e) => JSON.parse(e.payload!) as { origin: string; reason: string })
+      .map(({ origin, reason }) => ({ origin, reason }));
+  }
+
+  for (const status of ["review", "done", "cancelled"] as const) {
+    it(`expires the ping when the task moved to ${status} before the flush`, async () => {
+      const { main } = await setup("working");
+      const { agent } = await queuedWait(main.id, status);
+
+      panes.set(MAIN, CLEAR_PROMPT);
+      const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
+      expect(await flushMainQueue(main.id, { force: true })).toBe("empty");
+      expect(sendText).not.toHaveBeenCalled();
+
+      expect(await expiredReasons()).toEqual([
+        { origin: "worker_waiting", reason: `task_${status}` },
+      ]);
+
+      // Dropped for the TASK, not by pretending the wait ended: the agent row
+      // still says waiting_input, which is what the pane actually shows.
+      const { getAgent } = await import("../src/db/agents.js");
+      expect(getAgent(agent.id)?.state).toBe("waiting_input");
+    });
+  }
+
+  for (const status of ["in_progress", "blocked"] as const) {
+    it(`still delivers the ping while the task is ${status}`, async () => {
+      const { main } = await setup("working");
+      await queuedWait(main.id, status);
+
+      panes.set(MAIN, CLEAR_PROMPT);
+      const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
+      expect(await flushMainQueue(main.id, { force: true })).toBe("flushed");
+      expect(sendText).toHaveBeenCalledOnce();
+      expect(String(sendText.mock.calls[0][1])).toContain("which region?");
+      expect(await expiredReasons()).toEqual([]);
+    });
+  }
+
+  /**
+   * The status test alone would be wrong. A reviewer's task is "review" by
+   * definition, so keying on status without the agent's kind would silence every
+   * reviewer that stops to ask something — and a reviewer nobody answers is a
+   * task stuck in review with no verdict coming.
+   */
+  it("still delivers a REVIEWER's wait on a task that is in review", async () => {
+    const { main } = await setup("working");
+    await queuedWait(main.id, "review", "reviewer");
+
+    panes.set(MAIN, CLEAR_PROMPT);
+    const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
+    expect(await flushMainQueue(main.id, { force: true })).toBe("flushed");
+    expect(sendText).toHaveBeenCalledOnce();
+    expect(await expiredReasons()).toEqual([]);
+  });
+
+  /**
+   * Expiring a ping must stay silent. Outside the daemon a push is recorded
+   * rather than sent (see notify.ts), so `recordedPushes` — not a fetch spy — is
+   * what proves it: a spy would pass even if the push had fired.
+   */
+  it("expiring for the task pushes nothing to the human", async () => {
+    const { main } = await setup("working");
+    const { setNotificationSettings } = await import("../src/db/settings.js");
+    const { clearRecordedPushes, recordedPushes } = await import(
+      "../src/daemon/notify.js"
+    );
+    // Channel configured and the relevant events explicitly ON, so "nothing
+    // pushed" is a real result rather than an artifact of a disabled toggle.
+    setNotificationSettings({
+      ntfy_url: "https://ntfy.test/cc",
+      events: { escalation: true, worker_stalled: true },
+    });
+    clearRecordedPushes();
+    await queuedWait(main.id, "review");
+
+    panes.set(MAIN, CLEAR_PROMPT);
+    const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
+    expect(await flushMainQueue(main.id, { force: true })).toBe("empty");
+
+    const { listEvents } = await import("../src/db/events.js");
+    const kinds = listEvents(40).map((e) => e.kind);
+    expect(kinds).toContain("delivery.expired");
+    expect(kinds).not.toContain("notify.pushed");
+    expect(recordedPushes()).toHaveLength(0);
+  });
+});
+
 describe("POST /api/tasks/:id/delegate response shape", () => {
   it("202s a queued ping rather than implying instant delivery — or failure", async () => {
     const { task } = await setup("working");

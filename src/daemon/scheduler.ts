@@ -33,7 +33,7 @@ import {
   type LiveWindowSnapshot,
 } from "./tmux.js";
 import { versionInfo } from "./version.js";
-import { WAIT_HOOK_EVENTS } from "./waiting.js";
+import { WAIT_HOOK_EVENTS, waitIsMoot } from "./waiting.js";
 import { pruneScratchWorkspaces } from "./workspaces.js";
 import { delegatePendingTaskToLiveMain } from "./orchestration.js";
 import { dispatchableTasks } from "./serial.js";
@@ -638,7 +638,16 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
     // waiting_input was delegated to the main agent (hooks.ts); if nobody
     // rescued the worker within escalate_minutes, page the human — once per
     // wait episode (a fresh provider wait hook starts a new episode).
-    if (agent.kind !== "main" && agent.state === "waiting_input") {
+    //
+    // The escalation deadline can fall AFTER the task left the worker's reach
+    // (it idled mid-verify, the verify passed, a reviewer took over), and the
+    // wait hook that starts the clock cannot know that — so re-check the task
+    // here rather than escalating a wait nobody can answer.
+    if (
+      agent.kind !== "main" &&
+      agent.state === "waiting_input" &&
+      !waitIsMoot(agent, agent.task_id ? getTask(agent.task_id) : undefined)
+    ) {
       const waitStart = latestAgentEventTs(agent.id, [...WAIT_HOOK_EVENTS]);
       if (
         waitStart &&

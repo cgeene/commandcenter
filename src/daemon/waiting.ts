@@ -1,5 +1,6 @@
 import { getAgent, updateAgent, type Agent } from "../db/agents.js";
 import { latestAgentEvent, logEvent } from "../db/events.js";
+import type { Task } from "../db/tasks.js";
 import { parsePane } from "./pane.js";
 import { capturePane } from "./tmux.js";
 
@@ -12,6 +13,42 @@ export const WAIT_HOOK_EVENTS = [
   // watchdog records the beginning of that wait itself.
   "agent.startup_permission",
 ] as const;
+
+/**
+ * Task statuses in which a WORKER's waiting-for-input ping is moot: "review" is
+ * driven by the automatic review⇄fix loop (a rejection resumes or restarts the
+ * worker, an approval completes and reaps it), and a done/cancelled task has
+ * nothing left to do — its worker is only awaiting the reaper.
+ *
+ * `blocked` is absent on purpose: that status is a request for attention, not a
+ * reason to withhold it. So is `in_progress` — a worker asking a real question
+ * mid-work is the entire point of the mechanism.
+ *
+ * Read only through waitIsMoot, so the status policy and the kind scoping below
+ * can never be applied one without the other.
+ */
+const IDLE_SUPPRESS_STATUSES: readonly string[] = ["review", "done", "cancelled"];
+
+/**
+ * True when nobody can usefully act on this agent's `waiting_input`, because its
+ * task has moved past the point where an answer to the worker would change
+ * anything.
+ *
+ * Every path that turns a wait into a ping has to ask this, not just the hook
+ * that first sees the wait: a task can move into review while a ping already
+ * sits in the delivery queue, and an escalation derived from an old wait event
+ * outlives the transition entirely.
+ *
+ * Scoped to `kind === "worker"` deliberately. A REVIEWER's task is "review" by
+ * definition, so a status test alone would silence every reviewer wait —
+ * including the idle → waiting_input → page path that is the only thing standing
+ * between a reviewer that stops without a verdict and a task stuck in review.
+ */
+export function waitIsMoot(agent: Agent, task: Task | undefined): boolean {
+  if (agent.kind !== "worker") return false;
+  if (!task) return false;
+  return IDLE_SUPPRESS_STATUSES.includes(task.status);
+}
 
 const PANE_TAIL_LINES = 60;
 

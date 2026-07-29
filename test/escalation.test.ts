@@ -155,4 +155,76 @@ describe("watchdog escalation", () => {
     const escalations = listEvents(30).filter((e) => e.kind === "waiting.escalated");
     expect(escalations.length).toBe(2);
   });
+
+  /**
+   * The escalation deadline can fall after the task stopped being the worker's to
+   * act on: a worker that idles while its inline verify is still running is
+   * correctly waiting_input, and if that verify passes the task goes to review
+   * with a reviewer on it. The wait hook that started the clock cannot know that,
+   * so the watchdog re-reads the task instead of paging about an answer nobody
+   * needs.
+   */
+  describe("a wait whose task moved out of the worker's reach", () => {
+    async function overdueWait(
+      status: "in_progress" | "blocked" | "review" | "done" | "cancelled",
+      kind: "worker" | "reviewer" = "worker",
+    ) {
+      const { createAgent } = await import("../src/db/agents.js");
+      const { createTask, updateTask } = await import("../src/db/tasks.js");
+      const { logEvent } = await import("../src/db/events.js");
+      const task = createTask({ title: "ship it", prompt: "x", repo: "/r" });
+      const agent = createAgent({ kind, state: "waiting_input", task_id: task.id });
+      updateTask(task.id, { status, agent_id: agent.id });
+      logEvent("hook.notification", { agentId: agent.id });
+      await backdateLatest("hook.notification", 10); // default escalate_minutes = 5
+      return { task, agent };
+    }
+
+    async function escalationsFor(agentId: number) {
+      const { listEvents } = await import("../src/db/events.js");
+      return listEvents(30).filter(
+        (e) => e.kind === "waiting.escalated" && e.agent_id === agentId,
+      );
+    }
+
+    for (const status of ["review", "done", "cancelled"] as const) {
+      it(`does not escalate or push while the task is ${status}`, async () => {
+        const { setNotificationSettings } = await import("../src/db/settings.js");
+        const { recordedPushes } = await import("../src/daemon/notify.js");
+        // Channel configured and the event explicitly ON, so a silent result is
+        // the guard working rather than a disabled toggle. Outside the daemon a
+        // push is recorded rather than sent, so recordedPushes is the real proof.
+        setNotificationSettings({
+          ntfy_url: "https://ntfy.test/cc",
+          events: { escalation: true },
+        });
+        const { watchdog } = await import("../src/daemon/scheduler.js");
+        const { agent } = await overdueWait(status);
+
+        watchdog(noopDeps);
+        expect(await escalationsFor(agent.id)).toEqual([]);
+        expect(recordedPushes()).toHaveLength(0);
+      });
+    }
+
+    for (const status of ["in_progress", "blocked"] as const) {
+      it(`still escalates a worker waiting on a ${status} task`, async () => {
+        const { watchdog } = await import("../src/daemon/scheduler.js");
+        const { agent } = await overdueWait(status);
+
+        watchdog(noopDeps);
+        expect(await escalationsFor(agent.id)).toHaveLength(1);
+      });
+    }
+
+    // A reviewer's task is "review" by definition, so keying on status alone
+    // would silence every reviewer wait and leave the task stuck with no verdict.
+    it("still escalates a REVIEWER waiting on a task that is in review", async () => {
+      const { watchdog } = await import("../src/daemon/scheduler.js");
+      const { agent } = await overdueWait("review", "reviewer");
+
+      watchdog(noopDeps);
+      expect(await escalationsFor(agent.id)).toHaveLength(1);
+    });
+  });
 });
