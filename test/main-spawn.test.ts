@@ -96,8 +96,10 @@ describe("main orchestrator spawn", () => {
       "../src/db/agents.js"
     );
     const { listEvents } = await import("../src/db/events.js");
-    // What a spawn interrupted between createAgent and attachPane leaves behind.
-    const leaked = createAgent({ kind: "main", state: "spawning" });
+    // What a spawn interrupted between createAgent and attachPane leaves behind,
+    // after the watchdog's SessionStart timeout has relabelled it. No pane, and
+    // no handshake ever arrived, so no session answered for it.
+    const leaked = createAgent({ kind: "main", state: "stalled" });
 
     const main = spawnMain();
 
@@ -110,6 +112,51 @@ describe("main orchestrator spawn", () => {
     expect(listEvents(10).map((event) => event.kind)).toContain(
       "main.spawn_abandoned",
     );
+  });
+
+  it("refuses to spawn over a paneless main whose provider session came up", async () => {
+    // The one statement between newWindow returning and attachPane storing the
+    // target: a daemon death there leaves a real orchestrator window that no row
+    // claims, and its provider still handshakes (handleHookEvent resolves the
+    // row by agent id, never by target). Retiring that row would hand the queue
+    // to a second orchestrator and blind the platform to the first.
+    const { spawnMain } = await import("../src/daemon/spawn.js");
+    const { createAgent, getAgent, listAgents } = await import(
+      "../src/db/agents.js"
+    );
+    const { logEvent } = await import("../src/db/events.js");
+    const started = createAgent({ kind: "main", state: "spawning" });
+    logEvent("hook.sessionstart", { agentId: started.id });
+
+    expect(() => spawnMain()).toThrow(/never recorded a pane/);
+
+    expect(getAgent(started.id)?.state).toBe("spawning");
+    expect(listAgents({ live: true }).filter((a) => a.kind === "main")).toEqual([
+      expect.objectContaining({ id: started.id }),
+    ]);
+    expect(newWindow).not.toHaveBeenCalled();
+  });
+
+  it("refuses while another spawnMain may still be in flight", async () => {
+    // spawnMain runs in the daemon and in `cc upgrade --main`, so one process can
+    // see the other between createAgent and attachPane.
+    const { spawnMain } = await import("../src/daemon/spawn.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const inFlight = createAgent({ kind: "main", state: "spawning" });
+
+    expect(() => spawnMain()).toThrow(/may still be in flight/);
+    expect(getAgent(inFlight.id)?.state).toBe("spawning");
+
+    // The refusal is time-bounded: once no spawn could still be running, the
+    // row is retired and a replacement starts.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.parse(inFlight.spawned_at) + 61_000);
+      expect(spawnMain().tmux_target).toBe("cc:@7");
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(getAgent(inFlight.id)?.state).toBe("dead");
   });
 
   it("still refuses to start a second main while one holds a pane, even idle", async () => {

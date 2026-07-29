@@ -8,6 +8,7 @@ import {
   codexProfile,
   dataDir,
   promptsDir,
+  tmuxSession,
 } from "../config.js";
 import {
   resolveMainModel,
@@ -51,7 +52,11 @@ import {
   REVIEWER_TOOL_ALLOW,
   WORKER_TOOL_ALLOW,
 } from "./permissions.js";
-import { mainActive, reviewerActive } from "./reviewerhealth.js";
+import {
+  mainActive,
+  mainSessionStarted,
+  reviewerActive,
+} from "./reviewerhealth.js";
 import { resolveReviewDelta } from "./reviewstate.js";
 import { strictSerialHolder, strictSerialReason } from "./serial.js";
 import { findProviderTranscript } from "./transcript.js";
@@ -1000,6 +1005,24 @@ export function spawnReviewer(
   return { agent: getAgent(agent.id)!, task: getTask(taskId)! };
 }
 
+/**
+ * Why spawnMain is refusing, in terms of what the human has to go and do. A
+ * paneless row cannot be attached or killed by target, so "attach or kill it"
+ * would be unfollowable advice: say instead that its window has to be found by
+ * name, or that the spawn may simply still be running.
+ */
+function mainAlreadyLiveMessage(existing: Agent): string {
+  if (existing.tmux_target) {
+    return `main agent a${existing.id} already live (${existing.state}) in ${existing.tmux_target} — attach or kill it first`;
+  }
+  // Evidence before state: a row that handshook has a session whatever its state
+  // says, and that is the case the human cannot work out for themselves.
+  if (mainSessionStarted(existing)) {
+    return `main agent a${existing.id} is live (${existing.state}) and its session started, but its spawn never recorded a pane — find the window named "main" in the ${tmuxSession()} tmux session and close it, then kill a${existing.id}, before starting another`;
+  }
+  return `a main agent spawn (a${existing.id}, started ${existing.spawned_at}) may still be in flight — retry in a moment, or kill a${existing.id} if no spawn is running`;
+}
+
 export function spawnMain(model?: string): Agent {
   // Only a main with an orchestrator actually behind it may refuse a new one.
   // Keying this on the row alone made a spawn that threw before attachPane
@@ -1007,17 +1030,27 @@ export function spawnMain(model?: string): Agent {
   // it, so the orchestrator could not be restarted without deleting the row by
   // hand — with nothing being triaged, dispatched or merged meanwhile.
   const mains = listAgents({ live: true }).filter((a) => a.kind === "main");
-  const existing = mains.find(mainActive);
-  if (existing) {
-    throw new Error(
-      `main agent a${existing.id} already live (${existing.state}) — attach or kill it first`,
-    );
-  }
-  // Everything left is paneless by construction, so there is no window to kill
-  // and no pane_pid to reap. Retire the rows rather than just stepping over
-  // them: the rest of the system reads "the main agent" as the one live row of
-  // that kind (attention.ts, the dashboard, `cc upgrade --main`), and a second
-  // one lingering would keep answering for the orchestrator this call starts.
+  const existing = mains.find((a) => mainActive(a));
+  if (existing) throw new Error(mainAlreadyLiveMessage(existing));
+  // Everything left has no pane, no SessionStart handshake, and is too old to be
+  // a spawn in flight, so no session ever answered for it and there is no
+  // pane_pid to reap (attachPane records target and pid together).
+  //
+  // A tmux window CAN outlive such a row — a daemon killed between newWindow
+  // returning and attachPane leaves one nothing claims — and no target was
+  // recorded, so it cannot be found from here. What makes retiring safe is that
+  // mainActive keeps the version of that case which MATTERS out of this loop: a
+  // provider that came up logs hook.sessionstart against the row and so reads
+  // active. The residual is a window whose provider never handshook — it died,
+  // or it is parked on a one-time trust prompt, having not yet been given the
+  // orchestrator prompt. That is the same sliver the worker reap accepts, and it
+  // is worth accepting for the same reason: the alternative is a permanent
+  // wedge.
+  //
+  // Retire the rows rather than just stepping over them: the rest of the system
+  // reads "the main agent" as the one live row of that kind (attention.ts, the
+  // dashboard, `cc upgrade --main`), and a second one lingering would keep
+  // answering for the orchestrator this call starts.
   for (const stale of mains) {
     updateAgent(stale.id, { state: "dead" });
     logEvent("main.spawn_abandoned", {

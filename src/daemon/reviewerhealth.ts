@@ -72,9 +72,21 @@ export function reviewerActive(reviewer: Agent): boolean {
 }
 
 /**
+ * How long a paneless `spawning` main row is treated as a spawn that might
+ * still be running. spawnMain is called from two processes — the daemon's API
+ * and `cc upgrade --main` — so one can observe the other partway through, and
+ * spawning over an in-flight spawn produces exactly the two concurrent
+ * orchestrators this predicate exists to prevent. A real spawn crosses the
+ * window in well under a second; the margin is for a loaded box. It stays under
+ * the watchdog's 90s SessionStart timeout, so a row that never came up becomes
+ * retirable either by aging out here or by being relabelled `stalled`.
+ */
+const MAIN_SPAWN_IN_FLIGHT_MS = 60_000;
+
+/**
  * Is there really an orchestrator behind this main row — the question spawnMain
  * has to answer before refusing to start one, since only one main may run at a
- * time.
+ * time, and before retiring a row it judges empty.
  *
  * Same evidence as `reviewerActive`, but STOPPED_STATES deliberately does NOT
  * apply: `idle` is the orchestrator's normal resting state between turns, which
@@ -82,18 +94,44 @@ export function reviewerActive(reviewer: Agent): boolean {
  * triage to a `working`/`idle` main, notifqueue delivers only to an `idle` one).
  * Treating `idle` as stopped here would start a second orchestrator on top of a
  * healthy one. `stalled` and `waiting_input` are alive too: the window and its
- * process are still there for a human to attach to, and the error message names
- * the row so they can kill it.
+ * process are still there for a human to attach to.
  *
- * That leaves the pane as the whole test. It is the right line to draw because
- * it splits the rows nothing recovers from the rows something does: a main row
- * with a stale target is retired by the watchdog's vanished-agent pass (which
- * is not gated on kind), while a paneless one is invisible to that pass and
- * would otherwise block every later spawn until a human deleted it by hand.
+ * A pane is the ordinary evidence, and the right line to draw because it splits
+ * the rows nothing recovers from the rows something does: a main row with a
+ * stale target is retired by the watchdog's vanished-agent pass (which is not
+ * gated on kind), while a paneless one is invisible to that pass and would
+ * otherwise block every later spawn until a human deleted it by hand.
+ *
+ * But paneless is NOT the same as empty, so two further readings can each keep
+ * such a row active — the same two `abandonedSpawnAt` applies to workers:
+ *
+ *  - a `hook.sessionstart` in its history. A daemon killed in the one statement
+ *    between `newWindow` returning and `attachPane` storing the target leaves a
+ *    real window no row claims, and its provider handshakes normally anyway:
+ *    handleHookEvent resolves the row by agent id and never consults
+ *    tmux_target. That session was handed ORCHESTRATOR_PROMPT and is triaging,
+ *    so it must be neither retired nor spawned over;
+ *  - `spawning` within MAIN_SPAWN_IN_FLIGHT_MS: a spawn that may simply not have
+ *    reached attachPane yet.
+ *
+ * What is left — no pane, no handshake, too old to be in flight — is a row no
+ * session ever answered for, and the only kind spawnMain retires.
  */
-export function mainActive(main: Agent): boolean {
+export function mainActive(main: Agent, nowMs = Date.now()): boolean {
   if (main.state === "dead") return false;
-  return hasAttachedPane(main);
+  if (hasAttachedPane(main)) return true;
+  if (mainSessionStarted(main)) return true;
+  return (
+    main.state === "spawning" &&
+    nowMs - Date.parse(main.spawned_at) < MAIN_SPAWN_IN_FLIGHT_MS
+  );
+}
+
+/** Did a provider session ever answer for this row? True of a paneless row only
+ *  in the daemon-died-mid-spawn case, where it means a running orchestrator sits
+ *  in a window no target points at — which is what the human must be told. */
+export function mainSessionStarted(main: Agent): boolean {
+  return countAgentEvents(main.id, ["hook.sessionstart"]) > 0;
 }
 
 /**
