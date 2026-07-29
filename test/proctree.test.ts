@@ -1,5 +1,14 @@
 import { spawn } from "node:child_process";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  DETACHED_KEEPALIVE_SOURCE,
+  groupMembers,
+  killTrackedGroups,
+  spawnKeepaliveGroup,
+  trackGroupsOf,
+  trackKeepaliveGroupUnder,
+  trackProcessGroup,
+} from "./fixtures/procgroups.js";
 import {
   collectProcessTree,
   escalateSurvivors,
@@ -18,6 +27,13 @@ import {
 // Real processes plus fixed settling delays: the 5s default is not survivable
 // under full-suite parallel load.
 vi.setConfig({ testTimeout: 30_000 });
+
+// The real-process fixtures below create genuine strays. Reap them as a GROUP,
+// and from a hook rather than inline, so a failure or a timeout above cannot
+// leave a backgrounded loop running at pid 1.
+afterEach(() => {
+  killTrackedGroups();
+});
 
 function row(
   pid: number,
@@ -204,27 +220,30 @@ describe("terminatePaneTree (real processes)", () => {
   };
 
   it("kills the pane process and its detached descendants", async () => {
-    const pane = spawn(
-      process.execPath,
-      [
-        "-e",
-        `require('node:child_process').spawn('/bin/sh',['-c','(while :; do sleep 1; done) & sleep 600'],{detached:true,stdio:'ignore'});setTimeout(()=>{},600000)`,
-      ],
-      { stdio: "ignore" },
-    );
+    const pane = spawn(process.execPath, ["-e", DETACHED_KEEPALIVE_SOURCE], {
+      stdio: "ignore",
+    });
     pane.unref();
     const panePid = pane.pid!;
 
     // The detached child is in its own session and process group with no tty,
-    // so nothing but the parent link connects it to the pane.
-    const strays = await waitFor(() => {
-      const found = descendants(panePid);
-      return found.length > 0 ? found : undefined;
-    }, "the pane's detached descendants to appear");
+    // so nothing but the parent link connects it to the pane. Waiting for the
+    // whole group is what lets terminatePaneTree's own snapshot see all of it.
+    const leakedGroup = await waitFor(
+      () => trackKeepaliveGroupUnder(panePid),
+      "the pane's detached keepalive group to be forked",
+    );
+    const strays = descendants(panePid);
 
     const killed = terminatePaneTree({ pid: panePid, tty: "" });
     expect(killed).toContain(panePid);
     expect(await waitForExit([panePid, ...strays])).toEqual([]);
+    // The loop is absent from `strays` whenever that snapshot caught the leader
+    // before the fork, so the group is what proves nothing was stranded.
+    await waitFor(
+      () => (groupMembers(leakedGroup).length === 0 ? true : undefined),
+      "the detached process group to be fully reaped",
+    );
   });
 
   it("SIGKILLs a descendant that ignores SIGTERM", async () => {
@@ -241,6 +260,7 @@ describe("terminatePaneTree (real processes)", () => {
       () => paneTreeOnce(pane.pid!),
       "the SIGTERM-ignoring child to appear under the pane",
     );
+    trackGroupsOf(tree.map((p) => p.pid));
 
     terminatePaneTree({ pid: pane.pid!, tty: "" });
     await new Promise((r) => setTimeout(r, 400));
@@ -267,10 +287,11 @@ describe("terminatePaneTree (real processes)", () => {
       { stdio: "ignore" },
     );
     pane.unref();
-    await waitFor(
+    const tree = await waitFor(
       () => paneTreeOnce(pane.pid!),
       "the SIGTERM-ignoring child to appear under the pane",
     );
+    trackGroupsOf(tree.map((p) => p.pid));
 
     // A long grace so the timer cannot fire on its own during the test.
     process.env.CC_REAP_GRACE_MS = "600000";
@@ -294,11 +315,7 @@ describe("sweepVanishedPaneGroup (real processes)", () => {
     // `setsid`-equivalent: a detached child leads its own group, and its own
     // children stay in it. That group id is what an agent's recorded pane_pid
     // stands in for once the pane shell itself is gone.
-    const leader = spawn("/bin/sh", ["-c", "(while :; do sleep 1; done) & sleep 600"], {
-      detached: true,
-      stdio: "ignore",
-    });
-    leader.unref();
+    const leader = spawnKeepaliveGroup();
     const pgid = leader.pid!;
     // The shell has to fork its background subshell INTO the group before the
     // leader is killed; killing first leaves nothing to sweep.
@@ -332,6 +349,7 @@ describe("sweepVanishedPaneGroup (real processes)", () => {
       stdio: "ignore",
     });
     leader.unref();
+    trackProcessGroup(leader.pid!);
     // The leader must actually be visible as its own group leader, or this
     // would exercise the "clean" branch instead of the "declined" one.
     await waitFor(
