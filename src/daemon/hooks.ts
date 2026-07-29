@@ -1104,7 +1104,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
       },
     });
   } else {
-    updateTask(task.id, { status: "blocked" });
+    updateTask(task.id, { status: "blocked", block_cause: "verify_failed" });
     logEvent("task.blocked", {
       taskId: task.id,
       agentId: agent.id,

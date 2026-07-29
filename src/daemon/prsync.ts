@@ -321,6 +321,7 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
     reapTaskAgents(task);
     updateTask(taskId, {
       status: "blocked",
+      block_cause: "pr_closed",
       review_notes: `PR closed without merging: ${task.pr_url}`,
     });
     logEvent("pr.closed", { taskId, payload: { pr_url: task.pr_url } });
