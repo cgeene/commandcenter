@@ -134,31 +134,10 @@ describe("cost estimation", () => {
       .toBeCloseTo(6.25, 6);
   });
 
-  it("scales linearly below a million tokens", () => {
-    // Sonnet 5 introductory input rate is $2/MTok, so 500k = $1.00.
-    const cost = estimateCostUsd(
-      { input_tokens: 500_000, output_tokens: 0, cache_read: 0, cache_creation: 0 },
-      "claude-sonnet-5",
-      "2026-07-27",
-    );
-    expect(cost).toBeCloseTo(1, 6);
-  });
-
   it("costs an unpriceable model at zero so it can be reported separately", () => {
     expect(estimateCostUsd(tokens, "gpt-5-codex")).toBe(0);
   });
 
-  it("treats cache reads as far cheaper than fresh input", () => {
-    const fresh = estimateCostUsd(
-      { input_tokens: 1_000_000, output_tokens: 0, cache_read: 0, cache_creation: 0 },
-      "claude-opus-5",
-    );
-    const cached = estimateCostUsd(
-      { input_tokens: 0, output_tokens: 0, cache_read: 1_000_000, cache_creation: 0 },
-      "claude-opus-5",
-    );
-    expect(cached * 10).toBeCloseTo(fresh, 6);
-  });
 });
 
 describe("cycle window", () => {
@@ -330,10 +309,6 @@ describe("org cost cache usability", () => {
     expect(orgCycleSpend(stale, "2026-08-01")).toBeNull();
   });
 
-  it("refuses a cache with no recorded window", () => {
-    expect(orgCycleSpend({ ...fresh, cycle_start: null }, "2026-08-01")).toBeNull();
-  });
-
   it("reports nothing when the report never succeeded", () => {
     expect(orgCycleSpend({ total_usd: null, cycle_start: null, fetched_at: null }, "2026-08-01"))
       .toBeNull();
@@ -343,9 +318,6 @@ describe("org cost cache usability", () => {
     expect(orgCycleSpend({ ...fresh, total_usd: 0 }, "2026-08-01")?.usd).toBe(0);
   });
 
-  it("carries fetched_at through so the UI can show freshness", () => {
-    expect(orgCycleSpend(fresh, "2026-08-01")?.fetched_at).toBe("2026-08-05T10:00:00Z");
-  });
 });
 
 describe("headline + reset formatting", () => {

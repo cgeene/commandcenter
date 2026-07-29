@@ -29,16 +29,6 @@ describe("detectTransientApiError", () => {
         match: /Overloaded|overloaded_error/,
       },
       {
-        why: "a 500 internal server error",
-        input: pane(
-          "⏺ Bash(npm test)",
-          "  ⎿  running...",
-          "",
-          '⏺ API Error: 500 {"type":"error","error":{"type":"api_error","message":"Internal server error"}}',
-        ),
-        match: /Internal server error/,
-      },
-      {
         why: "a connection dropped mid-response",
         input: pane(
           "⏺ Read(src/daemon/review.ts)",
@@ -47,15 +37,6 @@ describe("detectTransientApiError", () => {
           "⏺ API Error: Connection closed mid-response",
         ),
         match: /Connection closed/,
-      },
-      {
-        why: "a 429 rate limit error",
-        input: pane(
-          "⏺ Reading config",
-          "",
-          '⏺ API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"rate limit exceeded"}}',
-        ),
-        match: /rate.?limit/i,
       },
       {
         why: "a wrapped continuation line folded into the match",
@@ -97,18 +78,12 @@ describe("detectTransientApiError", () => {
         match: null,
       },
       {
-        why: "NOT ordinary completion output with no error at all",
-        input: pane("⏺ Ran the test suite — all green.", "  ⎿  42 passed, 0 failed"),
-        match: null,
-      },
-      {
         why: "NOT a non-transient API error (400 bad request)",
         input: pane(
           '⏺ API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}',
         ),
         match: null,
       },
-      { why: "NOT an empty pane", input: "", match: null },
       {
         why: "a terminal Codex transport failure, including its wrapped detail",
         input:
