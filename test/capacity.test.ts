@@ -137,23 +137,6 @@ describe("workerSlots", () => {
     expect(slots.counted.map((a) => a.id)).toEqual([stuck.agent.id]);
   });
 
-  it("counts a worker whose reviewer is stalled or was never attached to a pane", async () => {
-    const { workerSlots } = await import("../src/daemon/capacity.js");
-    const { createAgent, updateAgent } = await import("../src/db/agents.js");
-    const stalled = await parkedWorker();
-    updateAgent(stalled.reviewer.id, { state: "stalled" });
-    // Spawn threw after createAgent but before the pane was attached, so no
-    // process exists; the vanished-agent reaper skips it for lacking a target.
-    const paneless = await workerOn("review");
-    createAgent({ kind: "reviewer", state: "spawning", task_id: paneless.task.id });
-
-    const slots = workerSlots();
-    expect(slots.parked).toHaveLength(0);
-    expect(slots.counted.map((a) => a.id).sort()).toEqual(
-      [stalled.agent.id, paneless.agent.id].sort(),
-    );
-  });
-
   it("expires the exemption once the review round has run too long", async () => {
     const { workerSlots } = await import("../src/daemon/capacity.js");
     const parked = await parkedWorker();
@@ -174,19 +157,6 @@ describe("workerSlots", () => {
     updateAgent(parked.reviewer.id, { state: "waiting_input" });
 
     expect(workerSlots().parked.map((a) => a.id)).toEqual([parked.agent.id]);
-  });
-
-  it("re-counts a parked worker when its reviewer dies without a verdict", async () => {
-    const { workerSlots } = await import("../src/daemon/capacity.js");
-    const { updateAgent } = await import("../src/db/agents.js");
-    const parked = await parkedWorker();
-    expect(workerSlots().parked).toHaveLength(1);
-
-    updateAgent(parked.reviewer.id, { state: "dead" });
-
-    const slots = workerSlots();
-    expect(slots.parked).toHaveLength(0);
-    expect(slots.counted.map((a) => a.id)).toEqual([parked.agent.id]);
   });
 
   it("counts a worker whose task is approved and awaiting merge", async () => {

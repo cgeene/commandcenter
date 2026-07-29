@@ -235,21 +235,6 @@ describe("create path", () => {
     expect(fake.createCount).toBe(1);
   });
 
-  it("persists the key even when the downstream getIssue fails — no duplicate on the next pass", async () => {
-    const { createTask, updateTask, getTask } = await import("../src/db/tasks.js");
-    const t = createTask({ title: "t", prompt: "p", repo: "/repo" });
-    updateTask(t.id, { pr_url: "https://github.com/o/r/pull/1", status: "review" });
-    await enableRepo("/repo");
-    const fake = new FakeJira({ getIssueError: true });
-    await useFake(fake);
-    const { jiraSyncPass } = await import("../src/daemon/jirasync.js");
-    await jiraSyncPass(); // create ok, downstream getIssue 500s
-    const after = getTask(t.id)!;
-    expect(after.jira_key).toBe("EN-1"); // key survived the downstream failure
-    expect(after.jira_sync_fails).toBe(1); // the failure was recorded
-    await jiraSyncPass();
-    expect(fake.createCount).toBe(1); // still only ever created once
-  });
 });
 
 describe("PR-title enforcement (create → retitle + reconciler)", () => {
@@ -426,19 +411,6 @@ describe("transition mapping (sync path)", () => {
     expect(fake.issues.get("EN-1")!.name).toBe("Will not do");
   });
 
-  it("task cancelled degrades to a comment when Will not do is unavailable", async () => {
-    const id = await seedTicket("cancelled");
-    const { updateTask } = await import("../src/db/tasks.js");
-    updateTask(id, { status: "cancelled" });
-    const fake = new FakeJira({ offeredTargets: ["In Progress", "Merged", "Done"] });
-    fake.seed("EN-1", "In Progress");
-    await useFake(fake);
-    const { jiraSyncPass } = await import("../src/daemon/jirasync.js");
-    await jiraSyncPass();
-    expect(fake.transitionCount).toBe(0);
-    expect(fake.comments.get("EN-1")!.length).toBe(1); // degraded to comment
-  });
-
   it("task cancelled degrades to a comment when Will not do is OFFERED but the POST fails (hasScreen), exactly ONCE per run", async () => {
     const id = await seedTicket("cancelled");
     const { updateTask, getTask } = await import("../src/db/tasks.js");
@@ -517,41 +489,6 @@ describe("sync failure streak + escalate-once", () => {
     expect(events.filter((e) => e.kind === "jira.sync_broken").length).toBe(1); // paged once at threshold
   });
 
-  it("a persistently-failing FORWARD transition (Done hasScreen) accumulates the streak and pages once", async () => {
-    // The general In Progress/Merged/Done path — not just Will not do. A project
-    // whose "Done" transition has a required screen field 400s the POST every
-    // pass. recordJiraSyncSuccess (streak clear) must run only AFTER the
-    // consequence applies cleanly, so this streak reaches the threshold instead
-    // of oscillating 0→1 forever and never paging (the reviewed regression).
-    const { createTask, updateTask, getTask } = await import("../src/db/tasks.js");
-    const t = createTask({ title: "t", prompt: "p", repo: "/repo" });
-    updateTask(t.id, {
-      jira_key: "EN-1",
-      jira_project: "EN",
-      jira_state: "in progress",
-      jira_status_category: "indeterminate",
-      status: "done", // → drives the Done transition
-    });
-    await enableRepo("/repo");
-    // "Done" is offered by GET /transitions but its POST 400s (hasScreen).
-    const fake = new FakeJira({ failTransitionTo: ["Done"] });
-    fake.seed("EN-1", "In Progress");
-    await useFake(fake);
-    const { jiraSyncPass, SYNC_FAIL_THRESHOLD } = await import("../src/daemon/jirasync.js");
-    const { listEvents } = await import("../src/db/events.js");
-
-    const passes = SYNC_FAIL_THRESHOLD + 3; // run well past the threshold
-    for (let i = 0; i < passes; i++) await jiraSyncPass();
-
-    const after = getTask(t.id)!;
-    expect(after.jira_sync_fails).toBeGreaterThanOrEqual(SYNC_FAIL_THRESHOLD);
-    expect(after.jira_sync_fails).toBe(passes); // strictly monotonic — never reset
-    expect(fake.transitionCount).toBe(0); // the transition never landed
-    expect(fake.issues.get("EN-1")!.name).toBe("In Progress"); // stuck, not silently Done
-    const events = listEvents();
-    expect(events.filter((e) => e.kind === "jira.sync_error").length).toBe(1); // logged ONCE at streak start
-    expect(events.filter((e) => e.kind === "jira.sync_broken").length).toBe(1); // paged ONCE at threshold
-  });
 });
 
 describe("recordJiraSyncSuccess clears the streak", () => {

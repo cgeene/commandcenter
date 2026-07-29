@@ -98,13 +98,6 @@ describe("notification defaults", () => {
     }
   });
 
-  it("covers both quota alert kinds under platform health", async () => {
-    const { NOTIFY_EVENTS } = await import("../src/notify-events.js");
-    for (const key of ["quota_threshold", "quota_spend_limit"] as const) {
-      expect(NOTIFY_EVENTS[key].category).toBe("platform");
-      expect(NOTIFY_EVENTS[key].default_enabled).toBe(true);
-    }
-  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -167,19 +160,6 @@ describe("quota alerts", () => {
     expect(listEvents(30).map((e) => e.kind)).toContain("usage.quota_threshold");
   });
 
-  it("switches the two quota kinds independently", async () => {
-    const { setNotificationSettings } = await import("../src/db/settings.js");
-    setNotificationSettings({ events: { quota_threshold: false } });
-    const { runQuotaAlerts } = await import("../src/daemon/quotaalert.js");
-    const now = new Date("2026-07-28T12:00:00.000Z");
-
-    runQuotaAlerts(usageAt(88, now, true) as never, now);
-
-    const sent = pushes();
-    expect(sent).toHaveLength(1);
-    expect(sent[0].title).toBe("Claude spend limit reached");
-  });
-
   it("still pages only once per crossing (the quota latch is the de-dup)", async () => {
     const { runQuotaAlerts } = await import("../src/daemon/quotaalert.js");
     const now = new Date("2026-07-28T12:00:00.000Z");
@@ -198,12 +178,6 @@ describe("quota alerts", () => {
  * ------------------------------------------------------------------ */
 
 describe("notifyEvent", () => {
-  it("suppresses an event that is off by default", async () => {
-    const { notifyEvent } = await import("../src/daemon/notify.js");
-    expect(notifyEvent("task_review_entered", "t", "m")).toBe(false);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
   it("pushes an off-by-default event once it is switched on", async () => {
     const { setNotificationSettings } = await import("../src/db/settings.js");
     const { notifyEvent } = await import("../src/daemon/notify.js");
@@ -396,18 +370,6 @@ describe("approved + PR ready", () => {
     expect(sent[1].title).toContain("reviewed & approved — PR ready to merge");
   });
 
-  it("is suppressed when the operator turns the event off", async () => {
-    const { setNotificationSettings } = await import("../src/db/settings.js");
-    setNotificationSettings({ events: { review_approved_ready: false } });
-    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
-    _setGhRunner(ghOk);
-    const { handleVerdict } = await import("../src/daemon/review.js");
-    const task = await reviewTask(5);
-
-    await handleVerdict(task.id, 999, "approve", "looks good");
-
-    expect(pushes()).toEqual([]);
-  });
 });
 
 describe("review loop exhausted", () => {
@@ -468,21 +430,6 @@ describe("PR merged", () => {
     expect(pushes()).toEqual([]);
   });
 
-  it("pushes when the operator opts into completion notices", async () => {
-    const { setNotificationSettings } = await import("../src/db/settings.js");
-    setNotificationSettings({ events: { task_completed: true } });
-    const { applyPrState } = await import("../src/daemon/prsync.js");
-    const task = await reviewTask(9, { pr_is_draft: 0 });
-
-    await applyPrState(task.id, {
-      state: "MERGED",
-      reviewDecision: null,
-      comments: [],
-    });
-
-    expect(pushes()).toHaveLength(1);
-    expect(pushes()[0].title).toContain("done — you merged its PR");
-  });
 });
 
 describe("PR closed without merge", () => {

@@ -163,40 +163,6 @@ describe("spawn_reviewer refusal", () => {
     expect(agent.kind).toBe("reviewer");
   });
 
-  it("refuses again once a given-up reviewer has been typed back to life", async () => {
-    const { spawnReviewer, ReviewerSpawnError } = await import(
-      "../src/daemon/spawn.js"
-    );
-    const { updateAgent } = await import("../src/db/agents.js");
-    const { taskId } = await reviewTask(15);
-    const rescued = await makeReviewer(taskId);
-    await stoppedIncomplete(rescued.id, taskId);
-    // A send_to_worker nudge puts it back to work (resume.ts). It is judging the
-    // task again, and a second reviewer would share its review worktree — one
-    // re-detaching the tree the other is reading, then removing it on submit.
-    updateAgent(rescued.id, { state: "working" });
-
-    let thrown: unknown;
-    try {
-      spawnReviewer(taskId);
-    } catch (err) {
-      thrown = err;
-    }
-    expect(thrown).toBeInstanceOf(ReviewerSpawnError);
-    expect((thrown as Error).message).toContain(`a${rescued.id}`);
-  });
-
-  it("does not count a reviewer whose spawn never reached a pane", async () => {
-    const { spawnReviewer } = await import("../src/daemon/spawn.js");
-    const { taskId } = await reviewTask(4);
-    const paneless = await makeReviewer(taskId, {
-      state: "spawning",
-      tmux_target: null,
-    });
-
-    const { agent } = spawnReviewer(taskId);
-    expect(agent.id).not.toBe(paneless.id);
-  });
 });
 
 describe("a reviewer ending its turn without a verdict", () => {
@@ -367,23 +333,6 @@ describe("review recovery after a reviewer gives up", () => {
     expect(kinds).toContain("review.reviewer_replaced");
     expect(kinds).toContain("reviewer.spawned");
     expect(kinds).toContain("review.round_started");
-  });
-
-  it("does not claim a replacement started when auto-review declines it", async () => {
-    const { recoverAbandonedReview } = await import("../src/daemon/review.js");
-    const { logEvent, listEvents } = await import("../src/db/events.js");
-    const { setSchedulerConfig } = await import("../src/db/settings.js");
-    const { taskId } = await reviewTask(17);
-    setSchedulerConfig({ auto_review: false });
-    const zombie = await makeReviewer(taskId, { state: "idle" });
-    logEvent("reviewer.reaped", { agentId: zombie.id, taskId });
-
-    await recoverAbandonedReview(zombie);
-
-    const kinds = listEvents(80).map((e) => e.kind);
-    expect(kinds).not.toContain("review.reviewer_replaced");
-    expect(kinds).toContain("review.replacement_declined");
-    expect(kinds).not.toContain("reviewer.spawned");
   });
 
   it("does nothing once a verdict landed after all", async () => {

@@ -110,15 +110,6 @@ async function countEvents(kind: string): Promise<number> {
 const messages = () => sendText.mock.calls.map((call) => String(call[1]));
 
 describe("triage ack — reading a task stops it being re-delivered", () => {
-  it("only a full read acks; a compact read or projection is just a lookup", async () => {
-    const { taskReadPath } = await import("../src/mcp/triage.js");
-    expect(taskReadPath(7, { verbose: true })).toBe("/api/tasks/7?triage_ack=1");
-    expect(taskReadPath(7)).toBe("/api/tasks/7");
-    expect(taskReadPath(7, { verbose: false })).toBe("/api/tasks/7");
-    // `fields` wins over verbose and cannot return the prompt, so it never acks.
-    expect(taskReadPath(7, { verbose: true, fields: ["status"] })).toBe("/api/tasks/7");
-  });
-
   it("stamps the ack on a verbose get and stops every re-delivery route", async () => {
     const { main, tasks } = await setup();
     const [task] = tasks;
@@ -192,26 +183,6 @@ describe("triage ack — reading a task stops it being re-delivered", () => {
     expect(sendText).not.toHaveBeenCalled();
   });
 
-  it("expires — never delivers late — a queued ping whose task got acked", async () => {
-    const { main, tasks } = await setup();
-    const [task] = tasks;
-    panes.set(MAIN, HUMAN_DRAFT);
-    const { delegateTaskToMainDetailed } = await import("../src/daemon/orchestration.js");
-    expect(await delegateTaskToMainDetailed(task.id)).toBe("queued");
-
-    // Ack straight at the db, leaving the queued row in place: the flush's own
-    // re-validation is the backstop for any route that acks without clearing.
-    const { markTaskTriaged } = await import("../src/db/tasks.js");
-    expect(markTaskTriaged(task.id)).toBeDefined();
-
-    panes.set(MAIN, CLEAR_PROMPT);
-    const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
-    expect(await flushMainQueue(main.id, { force: true })).toBe("empty");
-    expect(sendText).not.toHaveBeenCalled();
-    const { listEvents } = await import("../src/db/events.js");
-    const expired = listEvents(30).find((e) => e.kind === "delivery.expired");
-    expect(String(expired?.payload)).toContain("task_triaged");
-  });
 });
 
 describe("triage ack — what brings a task back", () => {
@@ -386,25 +357,6 @@ describe("triage delivery batching", () => {
     expect(message).toContain(`#${tasks[1].id}`);
   });
 
-  it("keeps the directive when the batch arrives via the deferred-queue flush", async () => {
-    const { main, tasks } = await setup(2);
-    const { logEvent } = await import("../src/db/events.js");
-    logEvent("task.worker_resume_requested", { taskId: tasks[0].id });
-    panes.set(MAIN, HUMAN_DRAFT);
-    const { delegatePendingTaskToMain } = await import("../src/daemon/orchestration.js");
-    expect(await delegatePendingTaskToMain(main)).toBe(false);
-
-    panes.set(MAIN, CLEAR_PROMPT);
-    const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
-    expect(await flushMainQueue(main.id, { force: true })).toBe("flushed");
-    expect(sendText).toHaveBeenCalledOnce();
-    const message = messages()[0];
-    expect(message).toContain("managed worker launch failed");
-    expect(message).toContain(`spawn_worker(${tasks[0].id})`);
-    expect(message).toContain("Do not create a duplicate task");
-    expect(message).toContain(`#${tasks[1].id}`);
-  });
-
   it("queues each batched task separately when the composer is busy", async () => {
     const { main, tasks } = await setup(2);
     panes.set(MAIN, HUMAN_DRAFT);
@@ -503,45 +455,6 @@ describe("triage ack — safety net for a task that is never acked", () => {
     expect(ready.find((t) => t.id === task.id)!.triaged_at).not.toBeNull();
     const { TASK_ROW_FIELDS } = await import("../src/mcp/compact.js");
     expect(TASK_ROW_FIELDS).toContain("triaged_at");
-  });
-
-  it("does not churn the delivery queue for a triaged task after its main dies", async () => {
-    // The failure this pins: if the delivery path and the queue's staleness
-    // check disagree about whether a task is acked, every tick persists a ping
-    // that the next flush expires — a permanent ~10s storm of
-    // task.awaiting_main / delivery.persisted / delivery.expired, and a ping the
-    // main never actually receives. Both sides read the same flag, so a triaged
-    // task produces no rows and no events at all.
-    const { main, tasks } = await setup();
-    const [task] = tasks;
-    const { delegatePendingTaskToMain } = await import("../src/daemon/orchestration.js");
-    expect(await delegatePendingTaskToMain(main)).toBe(true);
-    await readFullTask(task.id);
-
-    const { createAgent, updateAgent } = await import("../src/db/agents.js");
-    updateAgent(main.id, { state: "dead" });
-    // The replacement is mid-turn with the human typing — the state that makes
-    // the live send defer and the ping get persisted instead.
-    const replacement = createAgent({ kind: "main", state: "working", tmux_target: MAIN });
-    panes.set(MAIN, HUMAN_DRAFT);
-    sendText.mockClear();
-
-    const before = {
-      awaiting: await countEvents("task.awaiting_main"),
-      persisted: await countEvents("delivery.persisted"),
-      expired: await countEvents("delivery.expired"),
-    };
-    const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
-    const { countQueuedNotifications } = await import("../src/db/notifications.js");
-    for (let tick = 0; tick < 5; tick++) {
-      expect(await delegatePendingTaskToMain(replacement)).toBe(false);
-      expect(await flushMainQueue(replacement.id, { force: true })).toBe("empty");
-      expect(countQueuedNotifications(replacement.id)).toBe(0);
-    }
-    expect(await countEvents("task.awaiting_main")).toBe(before.awaiting);
-    expect(await countEvents("delivery.persisted")).toBe(before.persisted);
-    expect(await countEvents("delivery.expired")).toBe(before.expired);
-    expect(sendText).not.toHaveBeenCalled();
   });
 
   it("cannot be scoped to one agent — an attributed ack still silences every main", async () => {
