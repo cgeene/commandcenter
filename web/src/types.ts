@@ -339,8 +339,9 @@ export interface UsagePayload {
 
 /** Runtime settings surfaced by the Settings tab (GET /api/settings).
  *  `stored` holds explicit overrides (null = unset → env/default fallback);
- *  `effective` is the resolved value actually in use. The ntfy token is a
- *  secret — only its presence (`ntfy_token_set`) ever crosses the boundary. */
+ *  `effective` is the resolved value actually in use. Both ntfy credentials are
+ *  secrets — a topic URL is publish capability — so only their presence
+ *  (`ntfy_token_set`, `effective.ntfy_url_set`) crosses the boundary. */
 export interface AppSettings {
   agents: {
     stored: {
@@ -373,7 +374,7 @@ export interface AppSettings {
      *  follows the built-in default from `notify_event_choices`. */
     stored: { ntfy_url: string | null; events: Record<string, boolean> };
     ntfy_token_set: boolean;
-    effective: { ntfy_url: string | null; events: Record<string, boolean> };
+    effective: { ntfy_url_set: boolean; events: Record<string, boolean> };
   };
   quota: {
     stored: {
