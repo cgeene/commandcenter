@@ -261,6 +261,7 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
       // block it so the scheduler doesn't hot-loop on a broken task
       updateTask(task.id, {
         status: "blocked",
+        block_cause: "spawn_failed",
         result_summary: `scheduler spawn failed: ${msg}`,
       });
       notifyEvent(
