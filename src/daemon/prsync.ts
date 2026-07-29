@@ -14,6 +14,7 @@ import { stalledTransitionSweep } from "./hooks.js";
 import { notifyEvent } from "./notify.js";
 import { notifyApprovedReady, reviewLoopSweep, reviewMaxCycles } from "./review.js";
 import { resumeAgent } from "./resume.js";
+import { reviewerActive } from "./reviewerhealth.js";
 import { killAgent } from "./spawn.js";
 import { git, removeWorktree } from "./worktree.js";
 
@@ -351,9 +352,11 @@ export async function applyPrState(taskId: number, pr: PrState): Promise<void> {
 
   // A live adversarial reviewer is judging this exact state — moving the
   // task out of review now would void its verdict mid-flight. The feedback
-  // keeps: nothing below is persisted, so the next pass retries.
+  // keeps: nothing below is persisted, so the next pass retries. A reviewer
+  // that has stopped without submitting is NOT judging anything, and deferring
+  // to it would hold the feedback until the watchdog reaps it.
   const reviewing = listAgents({ live: true }).some(
-    (a) => a.kind === "reviewer" && a.task_id === taskId,
+    (a) => a.kind === "reviewer" && a.task_id === taskId && reviewerActive(a),
   );
   if (reviewing) return;
 

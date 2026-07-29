@@ -101,10 +101,14 @@ const TEMPLATES: Record<string, Template> = {
     `Skipped auto-review of ${taskRef(e)} — daily spawn budget spent`,
   "reviewer.reaped": (e, p) =>
     `Reaped reviewer ${agentRef(e)} on ${taskRef(e)} — ${p.state === "stalled" ? "went silent" : "stopped"} without a verdict`,
-  "review.reviewer_replacing": (e, p) =>
-    `Starting a replacement reviewer for ${taskRef(e)} (attempt ${p.attempt} of ${p.max})`,
+  "reviewer.retired": (e) =>
+    `Retired reviewer ${agentRef(e)} on ${taskRef(e)} — its verdict had already landed`,
+  "review.reviewer_replaced": (e, p) =>
+    `Started a replacement reviewer for ${taskRef(e)} (attempt ${p.attempt} of ${p.max})`,
+  "review.replacement_declined": (e, p) =>
+    `No replacement reviewer started for ${taskRef(e)} (attempt ${p.attempt} of ${p.max}) — auto-review declined the round; see the reason above`,
   "review.reviewer_unrecoverable": (e, p) =>
-    `${taskRef(e)} blocked — ${p.reviewers_gave_up} reviewers stopped without a verdict; no more will be spawned`,
+    `${taskRef(e)} blocked — its reviewer was replaced ${p.replacements_spent} time(s) and each one also stopped without a verdict; no more will be spawned`,
 
   // --- verify ---
   "verify.passed": (e) => `${taskRef(e)} passed verification`,

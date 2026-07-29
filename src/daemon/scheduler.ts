@@ -13,7 +13,10 @@ import { createTask, getTask, listTasks, updateTask } from "../db/tasks.js";
 import { workerSlots } from "./capacity.js";
 import { tryAutoNudge } from "./hooks.js";
 import { recoverAbandonedReview } from "./review.js";
-import { reviewerGaveUpAt } from "./reviewerhealth.js";
+import {
+  reviewerGaveUpAt,
+  reviewerSubmittedVerdict,
+} from "./reviewerhealth.js";
 import { flushMainQueue } from "./notifqueue.js";
 import { notifyEvent } from "./notify.js";
 import { parsePane, type PendingPermission } from "./pane.js";
@@ -587,15 +590,28 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
     if (agent.kind === "reviewer") {
       const gaveUpAt = reviewerGaveUpAt(agent);
       if (gaveUpAt) {
-        // A silent reviewer may only be sleeping off a transient API error,
-        // which one keystroke fixes versus a full-price re-review. Nudge first;
-        // the nudge caps itself and puts a revived reviewer back to `working`,
-        // which clears gaveUpAt before the grace period runs out.
-        if (agent.state === "stalled") revive(agent);
+        // A reviewer can also stop like this AFTER submitting, when its session
+        // dies before the Stop hook that would have killed it. It owes nothing,
+        // so it is retired rather than replaced — and must not be recorded as a
+        // give-up, which would spend one of the task's replacement attempts on
+        // a round that actually completed.
+        const submitted = reviewerSubmittedVerdict(agent);
+        // A silent reviewer that still owes a verdict may only be sleeping off
+        // a transient API error, which one keystroke fixes versus a full-price
+        // re-review. Nudge first; the nudge caps itself and puts a revived
+        // reviewer back to `working`, which clears gaveUpAt before the grace
+        // period runs out.
+        if (!submitted && agent.state === "stalled") revive(agent);
         if (nowMs - Date.parse(gaveUpAt) > cfg.reap_after_minutes * 60_000) {
           kill(agent.id);
-          // Logged before the recovery reads it back: the replacement cap
-          // counts these.
+          if (submitted) {
+            logEvent("reviewer.retired", {
+              agentId: agent.id,
+              taskId: agent.task_id ?? undefined,
+              payload: { state: agent.state, reason: "verdict_already_submitted" },
+            });
+            continue;
+          }
           logEvent("reviewer.reaped", {
             agentId: agent.id,
             taskId: agent.task_id ?? undefined,

@@ -163,6 +163,29 @@ describe("spawn_reviewer refusal", () => {
     expect(agent.kind).toBe("reviewer");
   });
 
+  it("refuses again once a given-up reviewer has been typed back to life", async () => {
+    const { spawnReviewer, ReviewerSpawnError } = await import(
+      "../src/daemon/spawn.js"
+    );
+    const { updateAgent } = await import("../src/db/agents.js");
+    const { taskId } = await reviewTask(15);
+    const rescued = await makeReviewer(taskId);
+    await stoppedIncomplete(rescued.id, taskId);
+    // A send_to_worker nudge puts it back to work (resume.ts). It is judging the
+    // task again, and a second reviewer would share its review worktree — one
+    // re-detaching the tree the other is reading, then removing it on submit.
+    updateAgent(rescued.id, { state: "working" });
+
+    let thrown: unknown;
+    try {
+      spawnReviewer(taskId);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(ReviewerSpawnError);
+    expect((thrown as Error).message).toContain(`a${rescued.id}`);
+  });
+
   it("does not count a reviewer whose spawn never reached a pane", async () => {
     const { spawnReviewer } = await import("../src/daemon/spawn.js");
     const { taskId } = await reviewTask(4);
@@ -247,6 +270,34 @@ describe("watchdog reviewer reap", () => {
     expect(late.recovered).toEqual([]);
   });
 
+  it("retires a reviewer that submitted and then died, without calling it a give-up", async () => {
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    const { logEvent, listEvents, countTaskEvents } = await import(
+      "../src/db/events.js"
+    );
+    const { updateAgent } = await import("../src/db/agents.js");
+    const { taskId } = await reviewTask(16);
+    const done = await makeReviewer(taskId, { state: "working" });
+    // It delivered a verdict, then its session died before the Stop hook that
+    // would have killed it — so the stall detector flags it like any silence.
+    logEvent("review.approved", { agentId: done.id, taskId });
+    updateAgent(done.id, { state: "stalled" });
+    logEvent("agent.stalled", { agentId: done.id, taskId });
+
+    const late = watchdogDeps({
+      now: () => new Date(Date.now() + 11 * 60_000),
+    });
+    watchdog(late.deps);
+
+    expect(late.killed).toEqual([done.id]);
+    // Never nudged: it owes nothing.
+    expect(late.revived).toEqual([]);
+    // No replacement, and — critically — nothing that spends a cap attempt.
+    expect(late.recovered).toEqual([]);
+    expect(countTaskEvents(taskId, "reviewer.reaped")).toBe(0);
+    expect(listEvents(50).map((e) => e.kind)).toContain("reviewer.retired");
+  });
+
   it("leaves a reviewer that was typed back to life alone", async () => {
     const { watchdog } = await import("../src/daemon/scheduler.js");
     const { updateAgent } = await import("../src/db/agents.js");
@@ -313,9 +364,26 @@ describe("review recovery after a reviewer gives up", () => {
     await recoverAbandonedReview(zombie);
 
     const kinds = listEvents(80).map((e) => e.kind);
-    expect(kinds).toContain("review.reviewer_replacing");
+    expect(kinds).toContain("review.reviewer_replaced");
     expect(kinds).toContain("reviewer.spawned");
     expect(kinds).toContain("review.round_started");
+  });
+
+  it("does not claim a replacement started when auto-review declines it", async () => {
+    const { recoverAbandonedReview } = await import("../src/daemon/review.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { taskId } = await reviewTask(17);
+    setSchedulerConfig({ auto_review: false });
+    const zombie = await makeReviewer(taskId, { state: "idle" });
+    logEvent("reviewer.reaped", { agentId: zombie.id, taskId });
+
+    await recoverAbandonedReview(zombie);
+
+    const kinds = listEvents(80).map((e) => e.kind);
+    expect(kinds).not.toContain("review.reviewer_replaced");
+    expect(kinds).toContain("review.replacement_declined");
+    expect(kinds).not.toContain("reviewer.spawned");
   });
 
   it("does nothing once a verdict landed after all", async () => {
@@ -330,7 +398,7 @@ describe("review recovery after a reviewer gives up", () => {
     await recoverAbandonedReview(zombie);
 
     const kinds = listEvents(80).map((e) => e.kind);
-    expect(kinds).not.toContain("review.reviewer_replacing");
+    expect(kinds).not.toContain("review.reviewer_replaced");
     expect(kinds).not.toContain("reviewer.spawned");
   });
 
@@ -340,10 +408,10 @@ describe("review recovery after a reviewer gives up", () => {
     const { getTask } = await import("../src/db/tasks.js");
     const { taskId } = await reviewTask(11);
     const zombie = await makeReviewer(taskId, { state: "idle" });
-    // Three reviewers have now given up on this task: two replacements were
-    // already spent, so this one must not spawn a third.
-    for (let i = 0; i < 3; i++) {
-      logEvent("reviewer.reaped", { agentId: zombie.id, taskId });
+    // Both replacement rounds this task is allowed have already been spawned
+    // and both of those reviewers also gave up, so there is no third.
+    for (let i = 0; i < 2; i++) {
+      logEvent("review.reviewer_replaced", { agentId: zombie.id, taskId });
     }
 
     await recoverAbandonedReview(zombie);
@@ -360,8 +428,8 @@ describe("review recovery after a reviewer gives up", () => {
     const { computeAttention } = await import("../src/daemon/attention.js");
     const { taskId } = await reviewTask(12);
     const zombie = await makeReviewer(taskId, { state: "idle" });
-    for (let i = 0; i < 3; i++) {
-      logEvent("reviewer.reaped", { agentId: zombie.id, taskId });
+    for (let i = 0; i < 2; i++) {
+      logEvent("review.reviewer_replaced", { agentId: zombie.id, taskId });
     }
 
     await recoverAbandonedReview(zombie);
