@@ -351,7 +351,7 @@ describe("sweepVanishedPaneGroup (real processes)", () => {
     leader.unref();
     trackProcessGroup(leader.pid!);
     // The leader must actually be visible as its own group leader, or this
-    // would exercise the "clean" branch instead of the "declined" one.
+    // would exercise the "unreachable" branch instead of the "declined" one.
     await waitFor(
       () =>
         snapshotProcesses().some((p) => p.pid === leader.pid && p.pgid === leader.pid)
@@ -360,8 +360,9 @@ describe("sweepVanishedPaneGroup (real processes)", () => {
       "the live group leader to appear in the process table",
     );
 
-    // "declined", not "clean": callers must keep pane_pid on this path, or a
-    // false vanish would disarm the sweep for the agent's real death.
+    // "declined", not "unreachable": this handle is not spent — a later sweep
+    // can do better — so callers must keep pane_pid, or a false vanish would
+    // disarm the sweep for the agent's real death.
     expect(sweepVanishedPaneGroup(leader.pid!, 3600)).toEqual({
       outcome: "declined",
       killed: [],
@@ -374,10 +375,63 @@ describe("sweepVanishedPaneGroup (real processes)", () => {
   it("rejects nonsense pids", () => {
     for (const pid of [1, 0, -5]) {
       expect(sweepVanishedPaneGroup(pid, 3600)).toEqual({
-        outcome: "clean",
+        outcome: "unreachable",
         killed: [],
       });
     }
+  });
+
+  // The gap this outcome exists to name. There is no fix here to test — the
+  // strays really are unreachable from the recorded pane pid — so what is
+  // pinned is the HONESTY of the report: an empty group must not be reported as
+  // a clean reap, because the callers clear pane_pid on the strength of it and
+  // would otherwise be recording a teardown that never happened.
+  it("reports unreachable, not clean, when a detached tree outlived the pane", async () => {
+    // `detached` makes the pane its own session and group leader, so its pid
+    // doubles as its pgid — the same shape tmux gives a real pane shell, and
+    // the shape sweepVanishedPaneGroup assumes when it treats pane_pid as a
+    // group id.
+    const pane = spawn(process.execPath, ["-e", DETACHED_KEEPALIVE_SOURCE], {
+      detached: true,
+      stdio: "ignore",
+    });
+    pane.unref();
+    const panePid = pane.pid!;
+    trackProcessGroup(panePid);
+    await waitFor(
+      () =>
+        snapshotProcesses().some((p) => p.pid === panePid && p.pgid === panePid)
+          ? true
+          : undefined,
+      "the pane to lead its own process group",
+    );
+    const leakedGroup = await waitFor(
+      () => trackKeepaliveGroupUnder(panePid),
+      "the pane's detached keepalive group to be forked",
+    );
+    expect(leakedGroup).not.toBe(panePid);
+
+    // Kill ONLY the pane, with no teardown first: what a crash, an OOM or a
+    // daemon restart does. Awaiting `exit` lets node reap it, so the sweep sees
+    // a genuinely absent pane rather than a zombie.
+    const reaped = new Promise<void>((resolve) => pane.once("exit", () => resolve()));
+    process.kill(panePid, "SIGKILL");
+    await reaped;
+    expect(groupMembers(leakedGroup).length).toBeGreaterThan(0);
+
+    expect(sweepVanishedPaneGroup(panePid, 3600)).toEqual({
+      outcome: "unreachable",
+      killed: [],
+    });
+    // Still running, and still unreachable through pane_pid: the detached child
+    // left both the pane's process group and its session, so the sweep has
+    // nothing left to follow. Only the group kill in `afterEach` reaches them.
+    //
+    // Occupancy of the group, plus its leader, rather than the pids a snapshot
+    // happened to hold: the loop's `sleep 1` exits and is re-forked every
+    // second, so any assertion that a member pid is still alive is a race.
+    expect(groupMembers(leakedGroup).length).toBeGreaterThan(0);
+    expect(alive(leakedGroup)).toBe(true);
   });
 });
 

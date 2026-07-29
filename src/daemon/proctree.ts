@@ -289,30 +289,6 @@ export function terminatePaneTree(pane: PaneProcess): number[] {
 }
 
 /**
- * Last-resort cleanup for a pane whose process is already gone — a crashed
- * window, a pane corpse behind `remain-on-exit`, or a watchdog reap that
- * arrives after the fact. The parent chain and the tty are both unusable by
- * then; the pane's process group id is the only handle left, and it does
- * survive reparenting to pid 1.
- *
- * `panePid` doubles as that pgid because tmux makes each pane shell a session
- * and group leader. Pids get reused, so a candidate is only accepted if it
- * started no earlier than the pane did — `paneAgeSec` is how long ago the agent
- * was spawned.
- *
- * Reach, measured rather than assumed:
- *  - a leftover still in the pane's process group IS found. In practice that
- *    means one that ignores SIGHUP (`nohup`, or a handler), because the pty
- *    hangup already kills the rest of the group when the pane dies.
- *  - a leftover that called setsid() (a `detached` child, and anything under
- *    it) is NOT found: it left both the process group and the session, and
- *    once its parent is gone nothing on the system still links it to the pane.
- *    macOS offers no way back — `ps -E` will not read another process's
- *    environment, so an inherited marker cannot be matched either. Those are
- *    only reachable while the pane is alive, via terminatePaneTree, which is
- *    why every deliberate reap tears the tree down before the window goes.
- */
-/**
  * Members of `panePid`'s process group that plausibly belong to that pane.
  *
  * Pids are reused, so a pid that once identified a pane can later name an
@@ -335,13 +311,19 @@ export function vanishedPaneSeeds(
 }
 
 export type PaneSweepOutcome =
-  /** Found leftovers and signalled them. */
+  /** Found leftovers in the recorded group and signalled them, along with
+   *  everything reachable from them. The handle has been acted on and is spent. */
   | "swept"
-  /** Looked properly and there was nothing left to kill. */
-  | "clean"
+  /** The recorded group held nothing this sweep was allowed to kill, and
+   *  nothing further can be learned from this handle — see
+   *  `sweepVanishedPaneGroup` for why this is NOT the same as "the pane left
+   *  nothing running". The handle is spent either way: a later sweep of the
+   *  same pid can only reach the same empty group, so callers should clear it,
+   *  but they must not report the pane as confirmed stopped. */
+  | "unreachable"
   /** Could not look, or the pane is demonstrably still alive. Nothing was
    *  done and the caller must KEEP the recorded pane pid — it is still the
-   *  only handle on this pane. */
+   *  only handle on this pane, and a later sweep can do better. */
   | "declined";
 
 export interface PaneSweepResult {
@@ -350,17 +332,52 @@ export interface PaneSweepResult {
   killed: number[];
 }
 
+/**
+ * Last-resort cleanup for a pane whose process is already gone — a crashed
+ * window, a pane corpse behind `remain-on-exit`, or a watchdog reap that
+ * arrives after the fact. The parent chain and the tty are both unusable by
+ * then; the pane's process group id is the only handle left, and it does
+ * survive reparenting to pid 1.
+ *
+ * `panePid` doubles as that pgid because tmux makes each pane shell a session
+ * and group leader. Pids get reused, so a candidate is only accepted if it
+ * started no earlier than the pane did — `paneAgeSec` is how long ago the agent
+ * was spawned.
+ *
+ * Reach, measured rather than assumed:
+ *  - a leftover still in the pane's process group IS found. In practice that
+ *    means one that ignores SIGHUP (`nohup`, or a handler), because the pty
+ *    hangup already kills the rest of the group when the pane dies.
+ *  - a leftover that called setsid() (a `detached` child, and anything under
+ *    it) is NOT found: it left both the process group and the session, and
+ *    once its parent is gone nothing on the system still links it to the pane.
+ *    macOS offers no way back — `ps -E` will not read another process's
+ *    environment, so an inherited marker cannot be matched either. Those are
+ *    only reachable while the pane is alive, via terminatePaneTree, which is
+ *    why every deliberate reap tears the tree down before the window goes.
+ *
+ * So an empty result is NOT evidence of an empty pane, and this function must
+ * never claim it is. Once the pane shell is gone there is no observation left
+ * that distinguishes "the pane really left nothing behind" from "the pane left
+ * a setsid'd tree that this handle cannot see" — measured: killing only the
+ * pane of a shell whose `detached` child had backgrounded a keepalive loop left
+ * four processes alive in the child's own group, and this sweep found none of
+ * them. That is why the empty case reports "unreachable" rather than a clean
+ * bill of health: callers may drop the spent handle, but a reap they could not
+ * see must not be logged as a reap they performed.
+ */
 export function sweepVanishedPaneGroup(
   panePid: number,
   paneAgeSec: number,
 ): PaneSweepResult {
-  // Not a usable handle in the first place — nothing to do and nothing to keep.
+  // Not a usable handle in the first place — nothing to chase it with, so
+  // nothing to keep and nothing that could have been confirmed.
   if (!Number.isInteger(panePid) || panePid <= 1) {
-    return { outcome: "clean", killed: [] };
+    return { outcome: "unreachable", killed: [] };
   }
   const procs = snapshotProcesses();
-  // No snapshot means no observation. Saying "clean" here would throw away the
-  // handle on the strength of a failed `ps`.
+  // No snapshot means no observation at all. Unlike the empty-group case below
+  // this one is retryable, so the handle is worth keeping.
   if (procs.length === 0) return { outcome: "declined", killed: [] };
 
   const paneRow = procs.find((p) => p.pid === panePid);
@@ -372,7 +389,7 @@ export function sweepVanishedPaneGroup(
 
   const protectedPids = selfAncestry(procs);
   const seeds = vanishedPaneSeeds(panePid, paneAgeSec, procs, protectedPids);
-  if (seeds.length === 0) return { outcome: "clean", killed: [] };
+  if (seeds.length === 0) return { outcome: "unreachable", killed: [] };
 
   const tree = collectProcessTree(seeds, procs, protectedPids);
   for (const p of tree) signal(p.pid, "SIGTERM");

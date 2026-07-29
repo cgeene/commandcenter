@@ -128,7 +128,7 @@ describe("killAgent process teardown", () => {
     expect(getAgent(worker.id)?.pane_pid).toBe(9182);
   });
 
-  it("releases the pane pid when the sweep looked and found nothing", async () => {
+  it("releases the pane pid once the sweep reports the handle is spent", async () => {
     const { killAgent } = await import("../src/daemon/spawn.js");
     const { createAgent, updateAgent, getAgent } = await import("../src/db/agents.js");
     const worker = createAgent({
@@ -138,7 +138,7 @@ describe("killAgent process teardown", () => {
     });
     updateAgent(worker.id, { pane_pid: 9182 });
     windowExists.mockReturnValue(false);
-    sweepVanishedPaneGroup.mockReturnValue({ outcome: "clean", killed: [] });
+    sweepVanishedPaneGroup.mockReturnValue({ outcome: "unreachable", killed: [] });
 
     killAgent(worker.id);
 

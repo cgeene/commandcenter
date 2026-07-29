@@ -262,7 +262,7 @@ describe("watchdog", () => {
       now: () => new Date(),
       sweepPaneGroup: (panePid: number) => {
         swept.push(panePid);
-        return { outcome: "clean" as const, killed: [] };
+        return { outcome: "unreachable" as const, killed: [] };
       },
     };
     watchdog(missing);
