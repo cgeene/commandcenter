@@ -653,42 +653,38 @@ describe("tasksNeedingPrReconcile (task #97 candidate selection)", () => {
 });
 
 describe("computeCheckRollup", () => {
-  it("empty rollup -> none", async () => {
+  // A pure function over check lists: one table, since every case was the same
+  // call with a different array. Both gh shapes appear (the checks-API
+  // status/conclusion pair and the legacy commit-status `state`), and precedence
+  // matters: any failure outranks pending, which outranks success.
+  it("rolls a check list up to one verdict", async () => {
     const { computeCheckRollup } = await import("../src/daemon/prsync.js");
-    expect(computeCheckRollup([])).toBe("none");
-  });
-
-  it("all successful checks -> pass", async () => {
-    const { computeCheckRollup } = await import("../src/daemon/prsync.js");
-    expect(
-      computeCheckRollup([
-        { status: "COMPLETED", conclusion: "SUCCESS" },
-        { state: "SUCCESS" },
-      ]),
-    ).toBe("pass");
-  });
-
-  it("any failure wins over pending/success", async () => {
-    const { computeCheckRollup } = await import("../src/daemon/prsync.js");
-    expect(
-      computeCheckRollup([
-        { status: "COMPLETED", conclusion: "SUCCESS" },
-        { status: "IN_PROGRESS" },
-        { status: "COMPLETED", conclusion: "FAILURE" },
-      ]),
-    ).toBe("fail");
-    expect(computeCheckRollup([{ state: "ERROR" }])).toBe("fail");
-  });
-
-  it("an incomplete check with no failures -> pending", async () => {
-    const { computeCheckRollup } = await import("../src/daemon/prsync.js");
-    expect(
-      computeCheckRollup([
-        { status: "COMPLETED", conclusion: "SUCCESS" },
-        { status: "QUEUED" },
-      ]),
-    ).toBe("pending");
-    expect(computeCheckRollup([{ state: "PENDING" }])).toBe("pending");
+    for (const { why, checks, rollup } of [
+      { why: "no checks at all", checks: [], rollup: "none" },
+      {
+        why: "all successful, in both gh shapes",
+        checks: [{ status: "COMPLETED", conclusion: "SUCCESS" }, { state: "SUCCESS" }],
+        rollup: "pass",
+      },
+      {
+        why: "a failure alongside pending and success",
+        checks: [
+          { status: "COMPLETED", conclusion: "SUCCESS" },
+          { status: "IN_PROGRESS" },
+          { status: "COMPLETED", conclusion: "FAILURE" },
+        ],
+        rollup: "fail",
+      },
+      { why: "a legacy ERROR state", checks: [{ state: "ERROR" }], rollup: "fail" },
+      {
+        why: "an incomplete check with no failures",
+        checks: [{ status: "COMPLETED", conclusion: "SUCCESS" }, { status: "QUEUED" }],
+        rollup: "pending",
+      },
+      { why: "a legacy PENDING state", checks: [{ state: "PENDING" }], rollup: "pending" },
+    ] as const) {
+      expect(computeCheckRollup([...checks]), why).toBe(rollup);
+    }
   });
 });
 

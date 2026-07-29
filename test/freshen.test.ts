@@ -459,70 +459,73 @@ describe("freshenPass — real git", () => {
     ]);
   });
 
-  it("pushes nothing and respawns the worker with the standard conflict brief", async () => {
+  // Both no-push outcomes in ONE pass. They were two tests paying for two
+  // fixtures and two real merges to prove the same rule -- freshening pushes
+  // NOTHING unless the merge is clean AND verification passes -- and running
+  // them together additionally proves one task's failure does not contaminate
+  // the other's handling, which is what a pass actually does in production.
+  // The default freshen_per_pass_limit is 2, so both are processed.
+  it("pushes nothing and respawns the worker, for a conflict and for a failed verify", async () => {
     const { freshenPass } = await import("../src/daemon/freshen.js");
     const { getTask } = await import("../src/db/tasks.js");
-    const { task, branch, tip } = await setupAgentTask({
+    // main moves shared.txt, which conflicts with the first branch and merges
+    // cleanly into the second (whose own change is feature.txt).
+    const conflicted = await setupAgentTask({
       file: "shared.txt",
       contents: "branch side\n",
+    });
+    const verifyFailed = await setupAgentTask({
+      file: "feature.txt",
+      contents: "feature\n",
+      verifyCmd: "echo boom >&2; exit 1",
     });
     advanceMain("shared.txt", "main side\n");
 
     const spawned: number[] = [];
     await freshenPass({ spawn: (id) => spawned.push(id) });
 
-    expect(git(repoDir, "rev-parse", `origin/${branch}`)).toBe(tip); // nothing pushed
-    expect(spawned).toEqual([task.id]);
+    // Neither branch moved on origin, and both workers were handed back the work.
+    for (const { branch, tip } of [conflicted, verifyFailed]) {
+      expect(git(repoDir, "rev-parse", `origin/${branch}`), branch).toBe(tip);
+    }
+    expect([...spawned].sort()).toEqual(
+      [conflicted.task.id, verifyFailed.task.id].sort(),
+    );
+    expect(await eventKinds()).not.toContain("pr.freshened");
 
-    const fresh = getTask(task.id)!;
-    expect(fresh.status).toBe("queued"); // requeued so the worker can be spawned
-    expect(fresh.agent_id).toBeNull();
-    // The standardized brief, appended to the prompt so it reaches both a fresh
-    // and a resumed session.
-    expect(fresh.prompt).toContain("do the thing");
-    expect(fresh.prompt).toContain("Integration fix round 1");
-    expect(fresh.prompt).toContain("ALREADY COMPLETE");
-    expect(fresh.prompt).toContain("git merge origin/main");
-    expect(fresh.prompt).toContain("never a rebase");
-    expect(fresh.prompt).toContain("keeping BOTH sides' intent");
-    expect(fresh.prompt).toContain("`shared.txt`");
-    expect(fresh.prompt).toContain(`git push origin ${branch}`);
-    expect(fresh.prompt).toContain("added shared.txt"); // its own result summary
-
+    // The conflict side: requeued, with the standardized brief appended to the
+    // prompt so it reaches both a fresh and a resumed session.
+    const c = getTask(conflicted.task.id)!;
+    expect(c.status).toBe("queued"); // requeued so the worker can be spawned
+    expect(c.agent_id).toBeNull();
+    expect(c.prompt).toContain("do the thing");
+    expect(c.prompt).toContain("Integration fix round 1");
+    expect(c.prompt).toContain("ALREADY COMPLETE");
+    expect(c.prompt).toContain("git merge origin/main");
+    expect(c.prompt).toContain("never a rebase");
+    expect(c.prompt).toContain("keeping BOTH sides' intent");
+    expect(c.prompt).toContain("`shared.txt`");
+    expect(c.prompt).toContain(`git push origin ${conflicted.branch}`);
+    expect(c.prompt).toContain("added shared.txt"); // its own result summary
     expect(await eventPayload("pr.freshen_conflict")).toMatchObject({
       conflicts: ["shared.txt"],
       respawned: true,
     });
-    // The throwaway merge tree never survives a failed attempt.
+
+    // The verify side: a different brief, carrying the failure output.
+    const v = getTask(verifyFailed.task.id)!;
+    expect(v.prompt).toContain("verification FAILED");
+    expect(v.prompt).toContain("boom");
+    expect(await eventPayload("pr.freshen_verify_failed")).toMatchObject({
+      respawned: true,
+    });
+
+    // The throwaway merge tree never survives a failed attempt, either kind.
     expect(
       fs
         .readdirSync(path.join(tmpDir, "data", "worktrees"))
         .filter((d) => d.endsWith("-freshen")),
     ).toEqual([]);
-  });
-
-  it("does not push when the merged tree fails the task's verify command", async () => {
-    const { freshenPass } = await import("../src/daemon/freshen.js");
-    const { getTask } = await import("../src/db/tasks.js");
-    const { task, branch, tip } = await setupAgentTask({
-      file: "feature.txt",
-      contents: "feature\n",
-      verifyCmd: "echo boom >&2; exit 1",
-    });
-    advanceMain("other.txt", "other\n");
-
-    const spawned: number[] = [];
-    await freshenPass({ spawn: (id) => spawned.push(id) });
-
-    expect(git(repoDir, "rev-parse", `origin/${branch}`)).toBe(tip); // nothing pushed
-    expect(spawned).toEqual([task.id]);
-    const fresh = getTask(task.id)!;
-    expect(fresh.prompt).toContain("verification FAILED");
-    expect(fresh.prompt).toContain("boom");
-    expect(await eventPayload("pr.freshen_verify_failed")).toMatchObject({
-      respawned: true,
-    });
-    expect(await eventKinds()).not.toContain("pr.freshened");
   });
 
   it("throws the merge away when the task moves on while verification runs", async () => {
