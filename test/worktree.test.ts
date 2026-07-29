@@ -29,7 +29,7 @@ function sh(script: string, env: Record<string, string> = {}): string {
  *  commits with a fixed identity, `mkrepo <name>` inits a standalone repo under
  *  $TMP, `clone <name>` clones $TMP/remote.git to $TMP/<name>. */
 const SH_HELPERS = `
-  gc() { git -C "$1" -c user.email=t@t.com -c user.name=t commit -q "\${@:2}"; }
+  gc() { d="$1"; shift; git -C "$d" -c user.email=t@t.com -c user.name=t commit -q "$@"; }
   mkrepo() { mkdir -p "$TMP/$1"; git -C "$TMP/$1" init -q -b main; }
   clone() { git -C "$TMP" clone --quiet "$TMP/remote.git" "$TMP/$1"; }
 `;
@@ -295,16 +295,23 @@ describe("createReviewWorktree", () => {
     const firstDir = createReviewWorktree(repoA, 11, taskBranch, true);
     const firstTip = worktreeGit(firstDir, "rev-parse", "HEAD").trim();
 
-    // Second review cycle: the worker pushed more commits since.
+    // Second review cycle: the worker pushed more commits since. repo-a's LOCAL
+    // ref is then rewound to the first tip, so origin holds v2 while the local
+    // branch still points at v1. Without that the local and remote refs agree
+    // and this test would pass whether the reuse path resolved origin/<branch>
+    // or the stale local ref — which is the only thing it exists to catch.
     const secondPush = sh(`${SH_HELPERS}
         printf 'v2\n' > "$TMP/repo-a/work.txt"
         git -C "$TMP/repo-a" add -A; gc "$TMP/repo-a" -m 'feat: v2'
         git -C "$TMP/repo-a" push -q origin "$BRANCH"
-        git -C "$TMP/remote.git" rev-parse "$BRANCH"`, { BRANCH: taskBranch });
+        NEW=$(git -C "$TMP/remote.git" rev-parse "$BRANCH")
+        git -C "$TMP/repo-a" update-ref "refs/heads/$BRANCH" "$FIRST"
+        echo "$NEW"`, { BRANCH: taskBranch, FIRST: firstTip });
+    expect(git(repoA, "rev-parse", taskBranch)).toBe(firstTip); // local really is stale
+    expect(secondPush).not.toBe(firstTip);
 
     const secondDir = createReviewWorktree(repoA, 11, taskBranch, true);
     expect(secondDir).toBe(firstDir); // same worktree reused...
-    expect(secondPush).not.toBe(firstTip);
     // ...re-detached onto what origin holds now, not left on the first tip.
     expect(worktreeGit(secondDir, "rev-parse", "HEAD").trim()).toBe(secondPush);
   });

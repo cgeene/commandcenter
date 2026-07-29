@@ -15,12 +15,16 @@ let originalPath: string | undefined;
 // it was asserting on.
 const TMUX_TIMEOUT_MS = 15_000;
 
-// Bound used only by the deliberately-hung cases, via armHang(). Safe to make
-// this short: in those modes the fake tmux execs `sleep 60` and NEVER returns,
-// so there is no completion to race — the only question is whether the bound
-// fires at all. It is not shorter still because the send_to_worker case needs
-// the hung send to remain outstanding while /healthz is served.
+// Bound used by the deliberately-hung cases, via armHang(). Safe to make this
+// short: in those modes the fake tmux execs `sleep 60` and NEVER returns, so
+// there is no completion to race — the only question is whether the bound fires
+// at all, and the elapsed assertions use the wide BOUNDED_MS ceiling below.
 const HANG_TIMEOUT_MS = 500;
+
+// The one case that is NOT just "did the bound fire": the /healthz ordering test
+// needs the hung send to still be outstanding while health is served, so it pays
+// a wider bound to buy that margin. This is the whole cost of the case.
+const HEALTH_RACE_HANG_MS = 3_000;
 
 // What a bounded call must beat. The fake tmux below hangs for 60s, so any
 // return comfortably under that proves the timeout fired — while staying wide
@@ -118,10 +122,10 @@ afterEach(async () => {
 });
 
 /** Arm a fake-tmux mode that never returns, bounded tightly. */
-async function armHang(mode: string): Promise<void> {
+async function armHang(mode: string, boundMs = HANG_TIMEOUT_MS): Promise<void> {
   process.env.CC_FAKE_TMUX_MODE = mode;
   const { _setTmuxTimeoutForTest } = await import("../src/daemon/tmux.js");
-  _setTmuxTimeoutForTest(HANG_TIMEOUT_MS);
+  _setTmuxTimeoutForTest(boundMs);
 }
 
 function calls(): string[] {
@@ -257,7 +261,13 @@ describe("bounded daemon tmux commands", () => {
       tmux_target: "cc:@1",
     });
     const app = buildApp();
-    await armHang("hang-literal");
+    // A WIDE bound for this case specifically. The assertion below is an
+    // ordering one, and how long /healthz takes to be served is the thing under
+    // test — so the hung send has to stay outstanding for far longer than a
+    // loaded box could plausibly take to answer one in-process request. At the
+    // 500ms armHang() default /healthz would have had ~450ms to win, which is
+    // tighter than the 1500ms the previous version of this test allowed.
+    await armHang("hang-literal", HEALTH_RACE_HANG_MS);
 
     const send = app.request(`/api/agents/${agent.id}/send`, {
       method: "POST",
