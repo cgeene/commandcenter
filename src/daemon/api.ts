@@ -129,12 +129,7 @@ import {
   TaskResumeLaunchError,
   TaskResumeValidationError,
 } from "./taskresume.js";
-import {
-  capturePane,
-  clearInputLine,
-  tmuxFailureCode,
-  windowExists,
-} from "./tmux.js";
+import { capturePane, clearInputLine, tmuxFailureCode } from "./tmux.js";
 import { parsePane } from "./pane.js";
 import { AGENT_PROVIDERS } from "../providers.js";
 import { PUBLICATION_MODES } from "../publication.js";

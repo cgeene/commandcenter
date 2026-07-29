@@ -43,7 +43,8 @@ vi.mock("../src/daemon/tmux.js", () => ({
     opts?.escapes ? paneContent : stripSgr(paneContent),
   killWindow: () => [],
   paneProcess: () => null,
-  listLiveWindowIds: () => [],
+  listWindows: () => ({ live: [], dead: [], server: "running" }),
+  probeWindow: () => "absent" as const,
 }));
 
 /**
@@ -270,7 +271,7 @@ describe("a rejection that requeues never goes silent", () => {
 
   const deps = (nowMs: number) => ({
     spawn: (id: number) => spawnWorker(id),
-    windowIds: () => [] as string[],
+    windows: () => ({ live: [] as string[], dead: [], server: "running" }),
     now: () => new Date(nowMs),
   });
 

@@ -24,7 +24,8 @@ vi.mock("../src/daemon/tmux.js", () => ({
   newWindow: () => "cc:1",
   killWindow: () => {},
   paneProcess: () => null,
-  listLiveWindowIds: () => [],
+  listWindows: () => ({ live: [], dead: [], server: "running" }),
+  probeWindow: () => "absent" as const,
 }));
 
 let tmpDir: string;
