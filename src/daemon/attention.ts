@@ -11,6 +11,7 @@ import {
   latestTaskEvent,
   logEvent,
 } from "../db/events.js";
+import { stalledFinishedWorkers } from "./hooks.js";
 import { JIRA_SYNC_FAIL_THRESHOLD } from "../lib/jira.js";
 import { normalizePrState } from "../lib/prstate.js";
 import { quotaConditions, quotaIsCritical } from "../lib/quotaalert.js";
@@ -37,6 +38,7 @@ export type AttentionKind =
   | "merge_pr"
   | "merge_and_apply"
   | "decision"
+  | "stalled_transition"
   | "escalation"
   | "stale_waiting"
   | "scheduler_stalled"
@@ -208,6 +210,62 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
       agent_id: t.agent_id,
       pr_url: t.pr_url,
       created_at: t.updated_at,
+    });
+  }
+
+  // --- stalled_transition: the lifecycle itself is stuck. Two shapes, both of
+  //     which used to surface only as a generic idle ping: a worker that
+  //     finished with a result the platform never promoted out of in_progress,
+  //     and a reviewer holding a verdict the task's status refuses.
+  //
+  //     They are anchored differently on purpose. The stranded-worker half
+  //     calls stalledFinishedWorkers() — the same live-state predicate the
+  //     rescue sweep runs on — instead of keying off an event: an event marker
+  //     gets buried by the sweep's own re-drive, so a rescue that did NOT work
+  //     would hide the situation it had just failed to fix. The held-verdict
+  //     half has no equivalent standing state, so it does key off its event,
+  //     and clears when a later review or status event supersedes it.
+  for (const { task: t, agent, stop } of stalledFinishedWorkers(nowMs)) {
+    push({
+      id: `stalled_transition:${t.id}:${stop.id}`, // new Stop -> new episode
+      kind: "stalled_transition",
+      title: `Stuck after finishing — #${t.id} ${t.title}`,
+      context: `The worker wrote a result but the task never left in_progress. ${excerpt(t.result_summary, 140)}`,
+      severity: "orange",
+      urgent: false,
+      task_id: t.id,
+      agent_id: agent.id,
+      pr_url: t.pr_url,
+      created_at: stop.ts,
+    });
+  }
+
+  //     A verdict the task's status refused. Skipped only for done/cancelled,
+  //     where there is no longer anything for a verdict to change; `queued` is
+  //     covered because that is exactly what a rejection's requeue leaves
+  //     behind, and a reviewer submitting into it would otherwise lose its
+  //     round with nothing on the queue to say so.
+  for (const t of tasks) {
+    if (t.status === "done" || t.status === "cancelled") continue;
+    const held = latestTaskEvent(t.id, [
+      "review.verdict_unsubmittable",
+      "review.approved",
+      "review.rejected",
+      "review.verdict_accepted_while_blocked",
+      "task.status",
+    ]);
+    if (held?.kind !== "review.verdict_unsubmittable") continue;
+    push({
+      id: `stalled_transition:verdict:${t.id}:${held.id}`,
+      kind: "stalled_transition",
+      title: `Reviewer verdict blocked — #${t.id} ${t.title}`,
+      context: `A reviewer finished but could not record its verdict: the task is ${t.status}, not review. Move it back to review and have the reviewer re-submit.`,
+      severity: "orange",
+      urgent: false,
+      task_id: t.id,
+      agent_id: held.agent_id,
+      pr_url: t.pr_url,
+      created_at: held.ts,
     });
   }
 

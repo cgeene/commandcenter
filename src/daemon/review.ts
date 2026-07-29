@@ -1,5 +1,10 @@
-import { listAgents } from "../db/agents.js";
-import { countEventsToday, latestTaskEventId, logEvent } from "../db/events.js";
+import { listAgents, type Agent } from "../db/agents.js";
+import {
+  countEventsToday,
+  latestTaskEvent,
+  latestTaskEventId,
+  logEvent,
+} from "../db/events.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { getTask, listTasks, updateTask, type Task } from "../db/tasks.js";
 import { noteReworkOverCap } from "./capacity.js";
@@ -57,6 +62,17 @@ export function approvedReadyLatchKey(
  */
 export function notifyApprovedReady(task: Task): void {
   if (task.review_verdict !== "approve") return;
+  // An approve verdict is not by itself permission to merge — the task's status
+  // is. A blocked task is held by a gate the reviewer did not evaluate (a
+  // verify_cmd that keeps failing, a PR closed without merging, a worker's
+  // report_blocked), and this is the ONE push that means "act now", so it must
+  // never fire for one. Enforced here rather than at the call sites because
+  // prsync re-derives it from standing state on every poll, so any task
+  // carrying an approve verdict is a candidate regardless of how it got there.
+  //
+  // Returning before notifyEvent also leaves the once-latch unclaimed, so the
+  // push still lands the moment the block is genuinely cleared.
+  if (task.status !== "review" && task.status !== "done") return;
   const awaitingHuman =
     task.publication_mode === "human" &&
     task.workspace_kind === "repo" &&
@@ -152,11 +168,68 @@ function noPrSkipAlreadyLogged(taskId: number): boolean {
   return !entered || skipped > entered;
 }
 
-/** Is there a live reviewer already judging this task? */
-function reviewerLive(taskId: number): boolean {
-  return listAgents({ live: true }).some(
+/** Every live reviewer assigned to this task. The single source of truth for
+ *  "someone is judging this right now" — both the double-spawn guard and the
+ *  verdict-acceptance check below read it, so they can never disagree. */
+function liveReviewers(taskId: number): Agent[] {
+  return listAgents({ live: true }).filter(
     (a) => a.kind === "reviewer" && a.task_id === taskId,
   );
+}
+
+/** Is there a live reviewer already judging this task? */
+function reviewerLive(taskId: number): boolean {
+  return liveReviewers(taskId).length > 0;
+}
+
+/** Did this exact verdict come from a reviewer the platform still has running
+ *  on this task? Work it commissioned and has not retired is never discarded
+ *  for a status change that happened underneath it. */
+function submittedByLiveReviewer(taskId: number, agentId: number): boolean {
+  return liveReviewers(taskId).some((a) => a.id === agentId);
+}
+
+/**
+ * Is the review loop's own round cap the thing holding this blocked task — as
+ * opposed to a mechanical gate (a verify_cmd that keeps failing, a PR closed
+ * without merging, a worker's report_blocked)? Only the cap is a gate a
+ * reviewer's approve is entitled to lift; the rest are conditions no amount of
+ * reading the diff satisfies.
+ *
+ * Deliberately conservative in both directions, because being wrong here means
+ * calling a PR ready to merge when its verification still fails:
+ *  - the durable state must say the rounds are genuinely used up, which is the
+ *    same condition exhaustLoop and the cap branch block on;
+ *  - AND the most recent recorded blocking cause must be the loop. A cause this
+ *    list does not know about simply leaves the task blocked, which is the safe
+ *    direction — the verdict is still recorded either way.
+ */
+function blockedByReviewLoop(task: Task): boolean {
+  if (task.review_cycles < reviewMaxCycles()) return false;
+  const cause = latestTaskEvent(task.id, [
+    "review.loop_exhausted",
+    "task.blocked",
+    "task.status",
+    "pr.closed",
+  ]);
+  return cause?.kind === "review.loop_exhausted";
+}
+
+/**
+ * A verdict (or other review action) could not be applied because the task is
+ * not in a state that accepts it. Surfaced to the caller as a 409 carrying the
+ * real status — an opaque 500 costs a reviewer several blind retries and tells
+ * neither it nor the orchestrator what to fix.
+ */
+export class ReviewStateError extends Error {
+  constructor(
+    message: string,
+    readonly taskStatus: string | null,
+    readonly expectedStatus = "review",
+  ) {
+    super(message);
+    this.name = "ReviewStateError";
+  }
 }
 
 /**
@@ -421,10 +494,59 @@ export async function handleVerdict(
   notes: string,
 ): Promise<Task> {
   const task = getTask(taskId);
-  if (!task) throw new Error(`task ${taskId} not found`);
-  if (task.status !== "review") {
-    throw new Error(`task ${taskId} is ${task.status}, not review`);
+  if (!task) {
+    throw new ReviewStateError(`task ${taskId} not found`, null);
   }
+
+  // A reviewer can spend many minutes on a round, and the task can be
+  // auto-blocked underneath it in that window (the rejection-cycle cap, or a
+  // verify_cmd that failed once too often). Throwing that verdict away wastes a
+  // completed review and strands the task, so a LIVE reviewer's verdict is
+  // still accepted while the task sits blocked, and the status is re-derived
+  // from the verdict below: approve returns it to `review`, reject leaves the
+  // human's block in place.
+  const acceptedWhileBlocked =
+    task.status === "blocked" && submittedByLiveReviewer(taskId, agentId);
+  if (task.status !== "review" && !acceptedWhileBlocked) {
+    logEvent("review.verdict_unsubmittable", {
+      taskId,
+      agentId,
+      payload: { task_status: task.status, attempted_verdict: verdict },
+    });
+    notifyEvent(
+      "worker_stalled",
+      `task #${taskId} — a reviewer's verdict could not be recorded`,
+      `${task.title}\nReviewer a${agentId} reached "${verdict}" but the task is ${task.status}, not review, so the verdict is being held, not applied. Move the task back to review and tell the reviewer to re-submit, or its work is lost.`,
+      {
+        priority: "high",
+        tags: "warning",
+        taskId,
+        agentId,
+        once: `task:${taskId}:verdict_unsubmittable:${task.status}:a${agentId}`,
+      },
+    );
+    throw new ReviewStateError(
+      `task ${taskId} is ${task.status}, not review — a verdict cannot be recorded until it is moved back to review`,
+      task.status,
+    );
+  }
+  // Which gate is holding the task decides whether a verdict may lift it. The
+  // review loop's own cap is the reviewer's to clear — that is the case this
+  // exists for. Every other cause is not: a task blocked because its verify_cmd
+  // keeps failing has an unmet MECHANICAL gate that no amount of reading the
+  // diff satisfies, and restoring it to `review` would let the approve path
+  // mark the PR ready and push "ready to merge" for a branch whose tests fail.
+  const restorable = acceptedWhileBlocked && blockedByReviewLoop(task);
+  if (acceptedWhileBlocked) {
+    logEvent("review.verdict_accepted_while_blocked", {
+      taskId,
+      agentId,
+      payload: { verdict, restorable },
+    });
+  }
+  // Restores the reviewable status the cap took away. Approve edges only — a
+  // rejection leaves the block standing.
+  const restoreStatus = restorable ? { status: "review" as const } : {};
 
   if (
     verdict === "approve" &&
@@ -466,12 +588,49 @@ export async function handleVerdict(
         ? task.review_snapshot_tree ?? task.review_head_sha
         : branchHeadSha(task) ?? task.review_head_sha;
 
+    // Blocked for a gate this approve does not clear (a failing verify_cmd, a
+    // worker's report_blocked). Keep the verdict — losing a finished review is
+    // the whole point of accepting it here — but change nothing else: the task
+    // stays blocked, the PR stays a draft, and no "ready to merge" is pushed.
+    // Marking that PR ready would hand a human an act-now signal for a branch
+    // whose verification still fails.
+    if (acceptedWhileBlocked && !restorable) {
+      // review_head_sha is deliberately NOT advanced. It is the SHA an
+      // actionable approval covers: moving it here would both mint a fresh
+      // approved-ready latch key for a task that must not be announced as
+      // mergeable, and make maybeAutoReview treat this approval as current if
+      // the block is later lifted, skipping the re-review that should happen.
+      updateTask(taskId, {
+        review_verdict: "approve",
+        review_notes: notes,
+      });
+      logEvent("review.approved_block_kept", {
+        taskId,
+        agentId,
+        payload: { verdict_sha: approvedSha, pr_is_draft: task.pr_is_draft },
+      });
+      notifyEvent(
+        "task_blocked",
+        `task #${taskId} approved, but it stays blocked`,
+        `${task.title}\nThe reviewer approved the work, but the task is blocked by something the review does not clear — check why it was blocked (a failing verify command, a closed PR, or a worker that reported blocked). The verdict is recorded and nothing has been announced as ready to merge. Clear the block and it can go ready.`,
+        {
+          priority: "high",
+          tags: "rotating_light",
+          taskId,
+          agentId,
+          once: `task:${taskId}:approved_block_kept:${approvedSha ?? "nosha"}`,
+        },
+      );
+      return getTask(taskId)!;
+    }
+
     if (
       task.publication_mode === "human" &&
       task.workspace_kind === "repo" &&
       task.publication_state !== "published"
     ) {
       updateTask(taskId, {
+        ...restoreStatus,
         review_verdict: "approve",
         review_notes: notes,
         review_head_sha: approvedSha,
@@ -513,6 +672,7 @@ export async function handleVerdict(
       return getTask(taskId)!;
     }
     updateTask(taskId, {
+      ...restoreStatus,
       review_verdict: "approve",
       review_notes: notes,
       review_head_sha: approvedSha,
@@ -615,6 +775,30 @@ export async function handleVerdict(
         taskId,
         agentId,
         once: `task:${taskId}:review_exhausted:${cycles}`,
+      },
+    );
+    return getTask(taskId)!;
+  }
+
+  // The task was already blocked when this rejection landed. Record the round
+  // so the history is complete, but leave the block standing — resuming or
+  // requeueing the worker here would silently undo whichever gate blocked it.
+  if (acceptedWhileBlocked) {
+    updateTask(taskId, {
+      review_verdict: "reject",
+      review_notes: notes,
+      review_cycles: cycles,
+    });
+    notifyEvent(
+      "task_blocked",
+      `task #${taskId} rejected again and stays blocked`,
+      `${task.title}\nThe reviewer rejected round ${cycles} while the task was already blocked, so it was not sent back to a worker. Decide: steer it, requeue it, or close it. Notes: ${notes.slice(0, 200)}`,
+      {
+        priority: "high",
+        tags: "rotating_light",
+        taskId,
+        agentId,
+        once: `task:${taskId}:rejected_while_blocked:${cycles}`,
       },
     );
     return getTask(taskId)!;

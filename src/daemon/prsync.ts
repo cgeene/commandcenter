@@ -10,6 +10,7 @@ import {
   type Task,
 } from "../db/tasks.js";
 import { integrationPass } from "./freshen.js";
+import { stalledTransitionSweep } from "./hooks.js";
 import { notifyEvent } from "./notify.js";
 import { notifyApprovedReady, reviewLoopSweep, reviewMaxCycles } from "./review.js";
 import { resumeAgent } from "./resume.js";
@@ -542,6 +543,14 @@ export async function prSyncPass(): Promise<void> {
   // push with no clean worker Stop) or any review-status task the Stop-hook
   // trigger missed. Each call is a no-op when there is nothing new to review.
   await reviewLoopSweep();
+
+  // LAST, and nothing may be sequenced after it: rescuing a stranded worker
+  // re-runs its verify_cmd inline, which can take minutes (VERIFY_TIMEOUT_MS is
+  // 10). Everything above — PR state, integration, the review sweep — must not
+  // wait behind that. A task it rescues is picked up by the next pass's review
+  // sweep, two minutes later at worst. It holds its own in-flight latch, so a
+  // long rescue does not stack across passes, and it never throws.
+  await stalledTransitionSweep();
 }
 
 export function startPrSync(): void {

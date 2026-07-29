@@ -171,6 +171,253 @@ describe("handleVerdict", () => {
     );
   });
 
+  // --- a verdict reached while the task was auto-blocked underneath it ------
+  // The reviewer spends minutes on a round; the cycle cap or a repeatedly
+  // failing verify_cmd can block the task in that window. Discarding a
+  // completed review because of it wastes the whole round.
+
+  /** A blocked task with the reviewer that is still judging it alive. `cause`
+   *  picks which gate blocked it: the review loop's own cap (which an approve
+   *  may lift) or a repeatedly-failing verify_cmd (which it may not). */
+  async function setupBlockedWithLiveReviewer(
+    fields: Parameters<typeof setupReviewTask>[0] & {
+      cause?: "cap" | "verify";
+    } = {},
+  ) {
+    const { createAgent } = await import("../src/db/agents.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    // Rounds genuinely used up: half of what makes a cap block restorable.
+    setSchedulerConfig({ review_max_cycles: 2 });
+    const { task, worker } = await setupReviewTask({
+      review_cycles: 2,
+      ...fields,
+    });
+    const reviewer = createAgent({
+      kind: "reviewer",
+      state: "working",
+      task_id: task.id,
+    });
+    updateTask(task.id, { status: "blocked" });
+    logEvent(
+      (fields.cause ?? "cap") === "verify" ? "task.blocked" : "review.loop_exhausted",
+      { taskId: task.id },
+    );
+    return { task, worker, reviewer };
+  }
+
+  it("a live reviewer's approve is accepted while the task sits blocked", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, reviewer } = await setupBlockedWithLiveReviewer({
+      review_cycles: 2,
+    });
+    await handleVerdict(task.id, reviewer.id, "approve", "verified end to end");
+    const t = getTask(task.id)!;
+    expect(t.review_verdict).toBe("approve");
+    expect(t.review_notes).toContain("verified end to end");
+    // status re-derived from the verdict: back to review for the merge gate
+    expect(t.status).toBe("review");
+    const kinds = listEvents(20).map((e) => e.kind);
+    expect(kinds).toContain("review.approved");
+    expect(kinds).toContain("review.verdict_accepted_while_blocked");
+  });
+
+  it("an approve accepted while blocked completes a doc-only task", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { task, reviewer } = await setupBlockedWithLiveReviewer({
+      open_pr: false,
+    });
+    await handleVerdict(task.id, reviewer.id, "approve", "doc is accurate");
+    expect(getTask(task.id)?.status).toBe("done");
+  });
+
+  it("a reject accepted while blocked is recorded but leaves the block standing", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    const { task, reviewer } = await setupBlockedWithLiveReviewer({
+      review_cycles: 1,
+    });
+    setSchedulerConfig({ review_max_cycles: 6 }); // still below the cap
+    await handleVerdict(task.id, reviewer.id, "reject", "the fix is incomplete");
+    const t = getTask(task.id)!;
+    // NOT resurrected into in_progress/queued — whatever blocked it still holds
+    expect(t.status).toBe("blocked");
+    expect(t.review_verdict).toBe("reject");
+    expect(t.review_notes).toContain("incomplete");
+    expect(t.review_cycles).toBe(2);
+  });
+
+  it("an approve does NOT restore a task whose rounds are not actually used up", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    // A stale review.loop_exhausted from an earlier episode must not be enough
+    // on its own — the durable round count has to agree.
+    const { task, reviewer } = await setupBlockedWithLiveReviewer();
+    setSchedulerConfig({ review_max_cycles: 6 });
+    await handleVerdict(task.id, reviewer.id, "approve", "looks fine");
+    expect(getTask(task.id)!.status).toBe("blocked");
+    expect(getTask(task.id)!.review_verdict).toBe("approve"); // still recorded
+  });
+
+  // Merge safety: an approve says the DIFF is good. It says nothing about a
+  // verify_cmd that keeps failing, so it must not lift that block, must not
+  // take the PR out of draft, and must not push "ready to merge".
+  it("an approve does NOT clear a verify-caused block or ready the PR", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
+    const gh = vi.fn(() => "");
+    _setGhRunner(gh); // any gh call at all would be a failure here
+    const { task, reviewer } = await setupBlockedWithLiveReviewer({
+      cause: "verify",
+    });
+    await handleVerdict(task.id, reviewer.id, "approve", "the diff itself is fine");
+
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("blocked"); // the mechanical gate still holds
+    expect(t.review_verdict).toBe("approve"); // but the round is NOT lost
+    expect(t.review_notes).toContain("diff itself is fine");
+    expect(t.pr_is_draft).not.toBe(0); // never flipped to ready
+    expect(gh).not.toHaveBeenCalled();
+    const kinds = listEvents(30).map((e) => e.kind);
+    expect(kinds).toContain("review.approved_block_kept");
+    expect(kinds).not.toContain("pr.marked_ready");
+    const pushes = listEvents(30).filter((e) => e.kind === "notify.pushed");
+    expect(pushes.map((e) => e.payload ?? "").join()).not.toContain(
+      "review_approved_ready",
+    );
+  });
+
+  // The dangerous shape: the PR is ALREADY out of draft from an earlier
+  // approve, so nothing about draft state protects us. prsync re-derives the
+  // ready-to-merge push from standing state on every poll, so an approve
+  // verdict on a blocked task would otherwise announce a branch whose
+  // verification still fails as mergeable.
+  it("an approve on a verify-blocked task with a READY PR never announces it mergeable", async () => {
+    const { handleVerdict, notifyApprovedReady } = await import(
+      "../src/daemon/review.js"
+    );
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, reviewer } = await setupBlockedWithLiveReviewer({
+      cause: "verify",
+    });
+    updateTask(task.id, { pr_is_draft: 0 }); // left ready by an earlier round
+    const shaBefore = getTask(task.id)!.review_head_sha;
+
+    await handleVerdict(task.id, reviewer.id, "approve", "diff is fine");
+
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("blocked");
+    expect(t.review_verdict).toBe("approve"); // verdict kept
+    // The approval covers no announceable SHA: advancing it would mint a fresh
+    // latch key and make the stale approval look current after an unblock.
+    expect(t.review_head_sha).toBe(shaBefore);
+    // The standing-state push prsync makes every poll must stay silent.
+    notifyApprovedReady(t);
+    const pushed = listEvents(40)
+      .filter((e) => e.kind === "notify.pushed")
+      .map((e) => e.payload ?? "")
+      .join();
+    expect(pushed).not.toContain("review_approved_ready");
+  });
+
+  it("suppressing the ready push leaves the latch free for when the block clears", async () => {
+    const { notifyApprovedReady, approvedReadyLatchKey } = await import(
+      "../src/daemon/review.js"
+    );
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { setNotificationSettings } = await import("../src/db/settings.js");
+    const { notifyLatched } = await import("../src/db/notifylatch.js");
+    // A push has to actually be dispatchable, or "the latch stayed free" would
+    // hold for the wrong reason. Nothing leaves the process.
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("ok")));
+    try {
+      setNotificationSettings({ ntfy_url: "http://127.0.0.1:9/sink" });
+      const { task } = await setupReviewTask();
+      updateTask(task.id, {
+        status: "blocked",
+        review_verdict: "approve",
+        review_head_sha: "abc123",
+        pr_is_draft: 0,
+      });
+      const key = approvedReadyLatchKey(task.id, "abc123");
+
+      notifyApprovedReady(getTask(task.id)!); // suppressed: task is blocked
+      expect(notifyLatched(key)).toBe(false);
+
+      // Block cleared by a human — the same standing state must now push,
+      // which it can only do if the suppression never consumed the latch.
+      updateTask(task.id, { status: "review" });
+      notifyApprovedReady(getTask(task.id)!);
+      expect(notifyLatched(key)).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("an approve does NOT auto-complete a doc-only task blocked for verification", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { task, reviewer } = await setupBlockedWithLiveReviewer({
+      open_pr: false,
+      cause: "verify",
+    });
+    await handleVerdict(task.id, reviewer.id, "approve", "doc reads fine");
+    expect(getTask(task.id)!.status).toBe("blocked"); // NOT done
+    expect(getTask(task.id)!.review_verdict).toBe("approve");
+  });
+
+  it("a task re-blocked by the cap after a verify block is restorable again", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { task, reviewer } = await setupBlockedWithLiveReviewer({
+      cause: "verify",
+    });
+    // Verification was fixed and the loop later exhausted its rounds — the
+    // most recent gate is the cap, which an approve may lift.
+    logEvent("review.loop_exhausted", { taskId: task.id });
+    await handleVerdict(task.id, reviewer.id, "approve", "all good now");
+    expect(getTask(task.id)!.status).toBe("review");
+  });
+
+  it("a dead reviewer's verdict on a blocked task is still refused, loudly", async () => {
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { updateAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, reviewer } = await setupBlockedWithLiveReviewer();
+    updateAgent(reviewer.id, { state: "dead" });
+    await expect(
+      handleVerdict(task.id, reviewer.id, "approve", "n"),
+    ).rejects.toThrow(/blocked/);
+    expect(listEvents(20).map((e) => e.kind)).toContain(
+      "review.verdict_unsubmittable",
+    );
+  });
+
+  it("a refused verdict names the real status instead of failing opaquely", async () => {
+    const { handleVerdict, ReviewStateError } = await import(
+      "../src/daemon/review.js"
+    );
+    const { updateTask } = await import("../src/db/tasks.js");
+    const { task } = await setupReviewTask();
+    updateTask(task.id, { status: "cancelled" });
+    const err = await handleVerdict(task.id, 99, "approve", "n").catch((e) => e);
+    expect(err).toBeInstanceOf(ReviewStateError);
+    expect(err.taskStatus).toBe("cancelled");
+    expect(err.expectedStatus).toBe("review");
+    expect(err.message).toMatch(/cancelled/);
+    expect(err.message).toMatch(/review/);
+  });
+
   it("rejected notes land in the respawned worker's prompt", async () => {
     const { handleVerdict } = await import("../src/daemon/review.js");
     const { getTask } = await import("../src/db/tasks.js");

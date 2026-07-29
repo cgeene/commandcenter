@@ -174,6 +174,7 @@ export type AttentionKind =
   | "merge_pr"
   | "merge_and_apply"
   | "decision"
+  | "stalled_transition"
   | "escalation"
   | "stale_waiting"
   | "scheduler_stalled"
