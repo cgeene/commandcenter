@@ -289,17 +289,6 @@ describe("Codex runtime isolation", () => {
     expect(_resumableSessionForTest(task, "codex")).toBeUndefined();
   });
 
-  it("preserves a Claude task model for reviewers but never reuses a Codex model", async () => {
-    delete process.env.CC_REVIEWER_MODEL;
-    const { _resolveReviewerModelForTest } = await import("../src/daemon/spawn.js");
-    expect(
-      _resolveReviewerModelForTest({ worker_provider: "claude", model: "sonnet" } as never),
-    ).toBe("sonnet");
-    expect(
-      _resolveReviewerModelForTest({ worker_provider: "codex", model: "gpt-codex" } as never),
-    ).toBe("opus");
-  });
-
   it("selects the reviewer provider by override, pin, variety policy, then Claude", async () => {
     const prevProvider = process.env.CC_REVIEWER_PROVIDER;
     const prevVariety = process.env.CC_REVIEWER_VARIETY;

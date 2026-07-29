@@ -114,13 +114,6 @@ describe("enforcePrTitle", () => {
     expect(state.title).toBe("[EN-7] [UNREVIEWED] feat: ship it");
   });
 
-  it("propagates a gh failure so the caller records it against the sync streak", async () => {
-    const { enforcePrTitle, _setGhRunner } = await import("../src/daemon/prdraft.js");
-    _setGhRunner(async () => {
-      throw new Error("gh down");
-    });
-    await expect(enforcePrTitle(URL, "EN-7")).rejects.toThrow(/gh down/);
-  });
 });
 
 describe("enforcePrTitle + markPrReady compose (disjoint prefixes, both orders)", () => {

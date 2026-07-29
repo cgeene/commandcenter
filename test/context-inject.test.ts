@@ -13,15 +13,40 @@ function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
-/** A real git working tree to stand in for a worker's worktree. */
+/** A real git working tree to stand in for a worker's worktree. Real git is
+ *  required (context.ts resolves `--git-path info/exclude`), but the setup runs
+ *  as one batched `sh -c`: inside a vitest worker each subprocess fork costs
+ *  ~120-160ms, so five spawns per test was the bulk of this file's runtime. */
 function initWorkingTree(name: string): string {
   const dir = path.join(tmpDir, name);
   fs.mkdirSync(dir, { recursive: true });
-  git(dir, "init", "-b", "main");
-  fs.writeFileSync(path.join(dir, "README.md"), "x\n");
-  git(dir, "add", "-A");
-  git(dir, "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-m", "init");
+  execFileSync(
+    "sh",
+    [
+      "-eu",
+      "-c",
+      `git -C "$D" init -q -b main
+       printf 'x\n' > "$D/README.md"
+       git -C "$D" add -A
+       git -C "$D" -c user.email=t@t.com -c user.name=t commit -q -m init`,
+    ],
+    { encoding: "utf8", env: { ...process.env, D: dir } },
+  );
   return dir;
+}
+
+/** Commit whatever is currently in `dir` (a repo's own committed file). */
+function commitAll(dir: string, message: string): void {
+  execFileSync(
+    "sh",
+    [
+      "-eu",
+      "-c",
+      `git -C "$D" add -A
+       git -C "$D" -c user.email=t@t.com -c user.name=t commit -q -m "$M"`,
+    ],
+    { encoding: "utf8", env: { ...process.env, D: dir, M: message } },
+  );
 }
 
 function write(p: string, contents: string): void {
@@ -104,8 +129,7 @@ describe("injectWorkspaceContext", () => {
     const wt = initWorkingTree("svc-wt");
     const repoClaude = path.join(wt, "CLAUDE.md");
     fs.writeFileSync(repoClaude, "REPO OWN CONTENT\n");
-    git(wt, "add", "-A");
-    git(wt, "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-m", "add claude");
+    commitAll(wt, "add claude");
 
     const { injectWorkspaceContext } = await import("../src/daemon/context.js");
     injectWorkspaceContext(repo, wt, 1, "claude", { home });
@@ -121,8 +145,7 @@ describe("injectWorkspaceContext", () => {
     const wt = initWorkingTree("svc-wt");
     const repoDotClaude = path.join(wt, ".claude", "CLAUDE.md");
     write(repoDotClaude, "REPO DOTCLAUDE CONTENT\n");
-    git(wt, "add", "-A");
-    git(wt, "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-m", "add dotclaude");
+    commitAll(wt, "add dotclaude");
 
     const { injectWorkspaceContext, INJECT_MARKER } = await import(
       "../src/daemon/context.js"
@@ -259,8 +282,7 @@ describe("injectWorkspaceContext — Codex (AGENTS.md) provider path", () => {
     const wt = initWorkingTree("svc-wt");
     const repoAgents = path.join(wt, "AGENTS.md");
     fs.writeFileSync(repoAgents, "REPO OWN AGENTS\n");
-    git(wt, "add", "-A");
-    git(wt, "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-m", "add agents");
+    commitAll(wt, "add agents");
 
     const { injectWorkspaceContext } = await import("../src/daemon/context.js");
     injectWorkspaceContext(repo, wt, 1, "codex", { home });

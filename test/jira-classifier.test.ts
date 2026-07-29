@@ -35,27 +35,24 @@ const input = {
 };
 
 describe("parseClassifierOutput", () => {
-  it("extracts a well-formed JSON object", () => {
-    expect(parseClassifierOutput('{"project":"EN","issue_type":"Bug"}')).toEqual({
-      project: "EN",
-      issue_type: "Bug",
-    });
-  });
-
-  it("extracts JSON embedded in surrounding prose", () => {
-    const raw = 'Here is my choice:\n{"project": "UN", "issue_type": "Story"}\nThanks!';
-    expect(parseClassifierOutput(raw)).toEqual({ project: "UN", issue_type: "Story" });
-  });
-
-  it("returns null on invalid JSON", () => {
-    expect(parseClassifierOutput("not json at all")).toBeNull();
-    expect(parseClassifierOutput('{"project": "EN", }')).toBeNull();
-  });
-
-  it("returns null when required fields are missing or non-string", () => {
-    expect(parseClassifierOutput('{"project":"EN"}')).toBeNull();
-    expect(parseClassifierOutput('{"project":1,"issue_type":"Task"}')).toBeNull();
-    expect(parseClassifierOutput('{"project":"","issue_type":"Task"}')).toBeNull();
+  // A pure parser: one row per input shape. It must never hand a half-formed
+  // proposal downstream, so every rejection case is kept.
+  it("extracts a complete proposal, or nothing", () => {
+    for (const { why, raw, out } of [
+      { why: "a well-formed JSON object", raw: '{"project":"EN","issue_type":"Bug"}', out: { project: "EN", issue_type: "Bug" } },
+      {
+        why: "JSON embedded in surrounding prose",
+        raw: 'Here is my choice:\n{"project": "UN", "issue_type": "Story"}\nThanks!',
+        out: { project: "UN", issue_type: "Story" },
+      },
+      { why: "not JSON at all", raw: "not json at all", out: null },
+      { why: "malformed JSON", raw: '{"project": "EN", }', out: null },
+      { why: "a missing required field", raw: '{"project":"EN"}', out: null },
+      { why: "a non-string field", raw: '{"project":1,"issue_type":"Task"}', out: null },
+      { why: "an empty-string field", raw: '{"project":"","issue_type":"Task"}', out: null },
+    ] as const) {
+      expect(parseClassifierOutput(raw), why).toEqual(out);
+    }
   });
 });
 

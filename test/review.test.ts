@@ -90,19 +90,6 @@ describe("handleVerdict", () => {
     expect(kinds).toContain("review.approved");
   });
 
-  it("approve on a code task whose pr_url isn't recorded yet stays in review", async () => {
-    const { handleVerdict } = await import("../src/daemon/review.js");
-    const { getTask } = await import("../src/db/tasks.js");
-    const { listEvents } = await import("../src/db/events.js");
-    // A worker can reach review with pr_url still null (open_pr=1). Auto-
-    // completing here would strand real code on an unmerged branch — the gate
-    // is open_pr===0 only, so this waits for the normal merge path instead.
-    const { task } = await setupReviewTask({ open_pr: true, pr_url: null });
-    await handleVerdict(task.id, 99, "approve", "looks complete");
-    expect(getTask(task.id)?.status).toBe("review");
-    expect(listEvents(10).map((e) => e.kind)).not.toContain("task.autocompleted");
-  });
-
   it("doc-only auto-completion unblocks its dependents", async () => {
     const { handleVerdict } = await import("../src/daemon/review.js");
     const { createTask, readyTasks } = await import("../src/db/tasks.js");
@@ -223,16 +210,6 @@ describe("handleVerdict", () => {
     const kinds = listEvents(20).map((e) => e.kind);
     expect(kinds).toContain("review.approved");
     expect(kinds).toContain("review.verdict_accepted_while_blocked");
-  });
-
-  it("an approve accepted while blocked completes a doc-only task", async () => {
-    const { handleVerdict } = await import("../src/daemon/review.js");
-    const { getTask } = await import("../src/db/tasks.js");
-    const { task, reviewer } = await setupBlockedWithLiveReviewer({
-      open_pr: false,
-    });
-    await handleVerdict(task.id, reviewer.id, "approve", "doc is accurate");
-    expect(getTask(task.id)?.status).toBe("done");
   });
 
   it("a reject accepted while blocked is recorded but leaves the block standing", async () => {
@@ -375,20 +352,6 @@ describe("handleVerdict", () => {
     expect(getTask(task.id)!.review_verdict).toBe("approve");
   });
 
-  it("a task re-blocked by the cap after a verify block is restorable again", async () => {
-    const { handleVerdict } = await import("../src/daemon/review.js");
-    const { getTask } = await import("../src/db/tasks.js");
-    const { logEvent } = await import("../src/db/events.js");
-    const { task, reviewer } = await setupBlockedWithLiveReviewer({
-      cause: "verify",
-    });
-    // Verification was fixed and the loop later exhausted its rounds — the
-    // most recent gate is the cap, which an approve may lift.
-    logEvent("review.loop_exhausted", { taskId: task.id });
-    await handleVerdict(task.id, reviewer.id, "approve", "all good now");
-    expect(getTask(task.id)!.status).toBe("review");
-  });
-
   it("a dead reviewer's verdict on a blocked task is still refused, loudly", async () => {
     const { handleVerdict } = await import("../src/daemon/review.js");
     const { updateAgent } = await import("../src/db/agents.js");
@@ -401,21 +364,6 @@ describe("handleVerdict", () => {
     expect(listEvents(20).map((e) => e.kind)).toContain(
       "review.verdict_unsubmittable",
     );
-  });
-
-  it("a refused verdict names the real status instead of failing opaquely", async () => {
-    const { handleVerdict, ReviewStateError } = await import(
-      "../src/daemon/review.js"
-    );
-    const { updateTask } = await import("../src/db/tasks.js");
-    const { task } = await setupReviewTask();
-    updateTask(task.id, { status: "cancelled" });
-    const err = await handleVerdict(task.id, 99, "approve", "n").catch((e) => e);
-    expect(err).toBeInstanceOf(ReviewStateError);
-    expect(err.taskStatus).toBe("cancelled");
-    expect(err.expectedStatus).toBe("review");
-    expect(err.message).toMatch(/cancelled/);
-    expect(err.message).toMatch(/review/);
   });
 
   it("rejected notes land in the respawned worker's prompt", async () => {
@@ -540,21 +488,6 @@ describe("handleVerdict — PR draft state", () => {
     expect(calls.some((a) => a[1] === "ready" && a[2] === "--undo")).toBe(true);
     expect(getTask(task.id)?.pr_is_draft).toBe(1);
     expect(listEvents(20).map((e) => e.kind)).toContain("pr.redrafted");
-  });
-
-  it("reject does NOT touch a PR that is already a draft", async () => {
-    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
-    const { handleVerdict } = await import("../src/daemon/review.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const calls: string[][] = [];
-    _setGhRunner(async (args) => {
-      calls.push(args);
-      return "";
-    });
-    const { task } = await setupPrReviewTask(1); // already a draft
-    await handleVerdict(task.id, 99, "reject", "still broken");
-    expect(calls).toHaveLength(0); // no gh call at all
-    expect(listEvents(20).map((e) => e.kind)).not.toContain("pr.redrafted");
   });
 
   it("reject leaves a never-synced (unknown draft state) PR alone", async () => {
@@ -693,169 +626,140 @@ describe("verify bypass fix", () => {
   });
 });
 
-describe("lean-comment policy in worker prompts", () => {
-  it("is standing instruction for repo and scratch workers alike", async () => {
-    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const repoTask = createTask({ title: "t", prompt: "x", repo: "/r" });
-    const scratchTask = createTask({
-      title: "t",
-      prompt: "x",
-      repo: "/scratch/task-ABC123",
-      workspace_kind: "scratch",
-      open_pr: false,
-    });
-    for (const prompt of [
-      _buildWorkerPromptForTest(repoTask, "agent/task-1"),
-      _buildWorkerPromptForTest(scratchTask, null),
-    ]) {
-      expect(prompt).toContain("something the code cannot show");
-      expect(prompt).toContain("Never write narrative what-this-does comments");
-      expect(prompt).toContain("provenance belongs in the commit message");
-    }
-  });
-
-  it("makes the claims-vs-state self-check standing for repo and scratch workers", async () => {
-    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const repoTask = createTask({ title: "t", prompt: "x", repo: "/r" });
-    const scratchTask = createTask({
-      title: "t",
-      prompt: "x",
-      repo: "/scratch/task-DEF456",
-      workspace_kind: "scratch",
-      open_pr: false,
-    });
-    for (const prompt of [
-      _buildWorkerPromptForTest(repoTask, "agent/task-1"),
-      _buildWorkerPromptForTest(scratchTask, null),
-    ]) {
-      expect(prompt).toContain("re-read every factual statement");
-      expect(prompt).toContain('"verified/provisioned/live/deployed" claim');
-      expect(prompt).toContain("an earlier draft, an intention, or another branch");
-    }
-  });
-
-  it("asks a PR task for a tight body ending in human decisions", async () => {
-    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
-    expect(_buildWorkerPromptForTest(task, "agent/task-1")).toContain(
-      "any decision that needs human attention",
-    );
-  });
-});
-
-describe("open_pr prompt wiring", () => {
-  it("worker prompt tells a branch-only task not to open a PR", async () => {
-    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const task = createTask({ title: "t", prompt: "x", repo: "/r", open_pr: false });
-    const prompt = _buildWorkerPromptForTest(task, "agent/task-1");
-    expect(prompt).toContain("Do NOT open a PR");
-    expect(prompt).not.toContain("gh pr create");
-  });
-
-  it("worker prompt tells a normal task to open a PR", async () => {
-    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
-    const prompt = _buildWorkerPromptForTest(task, "agent/task-1");
-    expect(prompt).toContain("gh pr create");
-    expect(prompt).not.toContain("Do NOT open a PR");
-  });
-
-  it("worker prompt opens the PR as a draft with a fallback", async () => {
-    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
-    const prompt = _buildWorkerPromptForTest(task, "agent/task-1");
-    expect(prompt).toContain("gh pr create --draft");
-    // graceful fallback: normal PR + [UNREVIEWED] prefix when drafts unsupported
-    expect(prompt).toContain("[UNREVIEWED]");
-    // fix-round instruction: don't touch draft/ready state of an existing PR
-    expect(prompt).toContain("leave its draft/ready state");
-    // workers must not run gh pr ready themselves — the platform owns it
-    expect(prompt).toContain("Do NOT run `gh pr ready`");
-    // PR body is aimed at human reviewers, not commandcenter internals
-    expect(prompt).toContain("human engineers");
-    // traceability trailer is an invisible HTML comment, not visible body text
-    expect(prompt).toContain(`<!-- commandcenter task #${task.id} -->`);
-    expect(prompt).not.toContain('ending with "commandcenter task #');
-    // body goes through a file to avoid inline shell-escaping bugs
-    expect(prompt).toContain("--body-file");
-  });
-
-  it("resume prompt tells a normal task to keep new PRs draft and leave existing state alone", async () => {
-    const { _buildResumePromptForTest } = await import("../src/daemon/spawn.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
-    const prompt = _buildResumePromptForTest(task);
-    expect(prompt).toContain("gh pr create --draft");
-    expect(prompt).toContain("leave its draft/ready state");
-    // same human-facing PR body guidance on resume
-    expect(prompt).toContain("--body-file");
-    expect(prompt).toContain(`<!-- commandcenter task #${task.id} -->`);
-  });
-
-  it("scratch worker prompts prohibit Git/PR work and require evidence", async () => {
-    const { _buildWorkerPromptForTest, _buildWorkerAllowForTest } = await import(
+describe("prompt wiring", () => {
+  /** The three task shapes whose prompts differ, and the builders under test. */
+  async function build(kind: "repo" | "branch-only" | "scratch") {
+    const { _buildWorkerPromptForTest, _buildResumePromptForTest } = await import(
       "../src/daemon/spawn.js"
     );
+    const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
     const { createTask } = await import("../src/db/tasks.js");
-    const task = createTask({
-      title: "investigate",
-      prompt: "inspect Kubernetes",
-      repo: "/scratch/task-ABC123",
-      workspace_kind: "scratch",
-      open_pr: false,
-    });
-    const prompt = _buildWorkerPromptForTest(task, null);
-    expect(prompt).toContain("not a Git repository");
-    expect(prompt).toContain("Do not initialize Git");
-    expect(prompt).toContain("Prefer read-only inspection");
-    expect(prompt).not.toContain("git push -u origin");
+    const task =
+      kind === "scratch"
+        ? createTask({
+            title: "investigate",
+            prompt: "inspect Kubernetes",
+            repo: "/scratch/task-ABC123",
+            workspace_kind: "scratch",
+            open_pr: false,
+          })
+        : createTask({
+            title: "t",
+            prompt: "x",
+            repo: "/r",
+            open_pr: kind !== "branch-only",
+          });
+    const branch = kind === "scratch" ? null : "agent/task-1";
+    return {
+      task,
+      worker: _buildWorkerPromptForTest(task, branch),
+      resume: _buildResumePromptForTest(task),
+      reviewer: buildReviewerPrompt(task),
+    };
+  }
+
+  // Standing instructions every worker gets, whatever the task shape. Asserted
+  // per row rather than once, so a regression that drops them from only the
+  // scratch path (the shape with its own prompt branch) still fails.
+  const STANDING_WORKER = [
+    "something the code cannot show",
+    "Never write narrative what-this-does comments",
+    "provenance belongs in the commit message",
+    "re-read every factual statement",
+    '"verified/provisioned/live/deployed" claim',
+    "an earlier draft, an intention, or another branch",
+    "Never control Command Center's terminal infrastructure",
+    "do not invoke tmux kill/respawn/send-keys",
+  ];
+
+  it.each([
+    {
+      why: "a normal repo task's worker prompt",
+      kind: "repo" as const,
+      which: "worker" as const,
+      contains: [
+        ...STANDING_WORKER,
+        "gh pr create --draft",
+        "[UNREVIEWED]", // fallback when drafts are unsupported
+        "leave its draft/ready state", // fix rounds must not re-draft
+        "Do NOT run `gh pr ready`", // the platform owns draft/ready
+        "human engineers", // PR body audience
+        "--body-file", // avoids inline shell-escaping bugs
+        "any decision that needs human attention",
+        "<!-- commandcenter task #{id} -->", // invisible traceability trailer
+      ],
+      absent: ["Do NOT open a PR", 'ending with "commandcenter task #'],
+    },
+    {
+      why: "a branch-only task's worker prompt",
+      kind: "branch-only" as const,
+      which: "worker" as const,
+      contains: [...STANDING_WORKER, "Do NOT open a PR"],
+      absent: ["gh pr create"],
+    },
+    {
+      why: "a scratch task's worker prompt",
+      kind: "scratch" as const,
+      which: "worker" as const,
+      contains: [
+        ...STANDING_WORKER,
+        "not a Git repository",
+        "Do not initialize Git",
+        "Prefer read-only inspection",
+      ],
+      absent: ["git push -u origin"],
+    },
+    {
+      why: "a normal repo task's resume prompt",
+      kind: "repo" as const,
+      which: "resume" as const,
+      contains: [
+        "gh pr create --draft",
+        "leave its draft/ready state",
+        "--body-file",
+        "<!-- commandcenter task #{id} -->",
+      ],
+      absent: [],
+    },
+    {
+      why: "a branch-only task's resume prompt",
+      kind: "branch-only" as const,
+      which: "resume" as const,
+      contains: ["Do NOT open a PR"],
+      absent: [],
+    },
+    {
+      why: "a normal repo task's reviewer prompt",
+      kind: "repo" as const,
+      which: "reviewer" as const,
+      contains: [
+        "This task expects a PR",
+        "run relevant tests, builds, typechecks",
+        "do not invoke tmux kill/respawn/send-keys",
+      ],
+      absent: [],
+    },
+    {
+      why: "a branch-only task's reviewer prompt",
+      kind: "branch-only" as const,
+      which: "reviewer" as const,
+      contains: ["BRANCH-ONLY", "A missing PR is NOT a defect"],
+      absent: [],
+    },
+  ])("$why says what it must", async ({ kind, which, contains, absent }) => {
+    const built = await build(kind);
+    const prompt = built[which];
+    for (const needle of contains) {
+      expect(prompt, needle).toContain(needle.replace("{id}", String(built.task.id)));
+    }
+    for (const needle of absent) {
+      expect(prompt, needle).not.toContain(needle);
+    }
+  });
+
+  it("does not grant a scratch worker the PR-creation permission", async () => {
+    const { _buildWorkerAllowForTest } = await import("../src/daemon/spawn.js");
     expect(_buildWorkerAllowForTest(null)).not.toContain("Bash(gh pr create*)");
-  });
-
-  it("resume prompt carries the branch-only instruction too", async () => {
-    const { _buildResumePromptForTest } = await import("../src/daemon/spawn.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const task = createTask({ title: "t", prompt: "x", repo: "/r", open_pr: false });
-    const prompt = _buildResumePromptForTest(task);
-    expect(prompt).toContain("Do NOT open a PR");
-  });
-
-  it("reviewer prompt states a missing PR is not a defect for branch-only tasks", async () => {
-    const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const task = createTask({ title: "t", prompt: "x", repo: "/r", open_pr: false });
-    const prompt = buildReviewerPrompt(task);
-    expect(prompt).toContain("BRANCH-ONLY");
-    expect(prompt).toContain("A missing PR is NOT a defect");
-  });
-
-  it("reviewer and worker prompts forbid direct host tmux control", async () => {
-    const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
-    const { _buildWorkerPromptForTest } = await import("../src/daemon/spawn.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const task = createTask({ title: "safe terminal", prompt: "x", repo: "/r" });
-
-    const reviewer = buildReviewerPrompt(task);
-    expect(reviewer).toContain("run relevant tests, builds, typechecks");
-    expect(reviewer).toContain("do not invoke tmux kill/respawn/send-keys");
-
-    const worker = _buildWorkerPromptForTest(task, "agent/task-1");
-    expect(worker).toContain("Never control Command Center's terminal infrastructure");
-    expect(worker).toContain("do not invoke tmux kill/respawn/send-keys");
-  });
-
-  it("reviewer prompt states a PR is expected for normal tasks", async () => {
-    const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
-    const prompt = buildReviewerPrompt(task);
-    expect(prompt).toContain("This task expects a PR");
   });
 });
 

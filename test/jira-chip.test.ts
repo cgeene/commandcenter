@@ -26,27 +26,24 @@ function task(over: Partial<JiraChipTask> = {}): JiraChipTask {
 }
 
 describe("jiraChip — category → label/color", () => {
-  it("maps 'new' to To Do", () => {
-    const chip = jiraChip(task({ jira_status_category: "new", jira_state: "open" }), ENV);
-    expect(chip).toMatchObject({ kind: "synced", label: "To Do", cls: "jira-todo" });
-  });
-
-  it("maps 'indeterminate' to In Progress", () => {
-    const chip = jiraChip(task({ jira_status_category: "indeterminate" }), ENV);
-    expect(chip).toMatchObject({ kind: "synced", label: "In Progress", cls: "jira-progress" });
-  });
-
-  it("maps 'done' to Done", () => {
-    const chip = jiraChip(task({ jira_status_category: "done", jira_state: "done" }), ENV);
-    expect(chip).toMatchObject({ kind: "synced", label: "Done", cls: "jira-done" });
-  });
-
-  it("falls back to the raw state name for an unknown/absent category", () => {
-    const chip = jiraChip(
-      task({ jira_status_category: null, jira_state: "code review" }),
-      ENV,
-    );
-    expect(chip).toMatchObject({ kind: "synced", label: "code review", cls: "jira-unknown" });
+  // JIRA's status CATEGORY drives the chip, not the per-project state name, so an
+  // unrecognized category falls back to showing the raw name rather than lying.
+  it("maps each status category to its label and class", () => {
+    for (const { why, category, state, label, cls } of [
+      { why: "new", category: "new", state: "open", label: "To Do", cls: "jira-todo" },
+      { why: "indeterminate", category: "indeterminate", state: undefined, label: "In Progress", cls: "jira-progress" },
+      { why: "done", category: "done", state: "done", label: "Done", cls: "jira-done" },
+      { why: "an unknown/absent category falls back to the raw state name", category: null, state: "code review", label: "code review", cls: "jira-unknown" },
+    ] as const) {
+      const chip = jiraChip(
+        task({
+          jira_status_category: category,
+          ...(state === undefined ? {} : { jira_state: state }),
+        }),
+        ENV,
+      );
+      expect(chip, why).toMatchObject({ kind: "synced", label, cls });
+    }
   });
 
   it("builds a browse URL from the configured base (never hardcoded)", () => {
@@ -96,16 +93,15 @@ describe("jiraChip — pending vs failing states", () => {
 });
 
 describe("shouldHaveJiraTicket — the iff-PR + enabled-repo gate", () => {
-  it("true only when PR + open_pr + repo enabled", () => {
-    expect(shouldHaveJiraTicket(task(), ENV.enabledRepos)).toBe(true);
-  });
-  it("false without a PR", () => {
-    expect(shouldHaveJiraTicket(task({ pr_url: null }), ENV.enabledRepos)).toBe(false);
-  });
-  it("false for a doc-only task (open_pr = 0)", () => {
-    expect(shouldHaveJiraTicket(task({ open_pr: 0 }), ENV.enabledRepos)).toBe(false);
-  });
-  it("false for a repo that is not JIRA-enabled", () => {
-    expect(shouldHaveJiraTicket(task({ repo: "/repos/other" }), ENV.enabledRepos)).toBe(false);
+  // A ticket is owed iff the task has a PR, opens one, and its repo is enabled.
+  it("is true only for a PR-bearing, PR-opening task in an enabled repo", () => {
+    for (const { why, over, owed } of [
+      { why: "all three conditions met", over: {}, owed: true },
+      { why: "no PR", over: { pr_url: null }, owed: false },
+      { why: "a doc-only task (open_pr = 0)", over: { open_pr: 0 }, owed: false },
+      { why: "a repo that is not JIRA-enabled", over: { repo: "/repos/other" }, owed: false },
+    ] as const) {
+      expect(shouldHaveJiraTicket(task(over as never), ENV.enabledRepos), why).toBe(owed);
+    }
   });
 });

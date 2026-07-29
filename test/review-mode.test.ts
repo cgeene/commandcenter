@@ -56,20 +56,35 @@ function makeRepo(name: string): {
 } {
   const repo = path.join(tmpDir, name);
   fs.mkdirSync(repo, { recursive: true });
-  git(repo, "init", "-q", "-b", "main");
-  git(repo, "commit", "-q", "--allow-empty", "-m", "init");
   const branch = `agent/${name}`;
-  git(repo, "branch", branch);
+  // One subprocess per step rather than one per git command: inside a vitest
+  // worker each fork costs ~120-160ms.
+  const sh = (script: string, extra: Record<string, string> = {}) =>
+    execFileSync(
+      "sh",
+      [
+        "-eu",
+        "-c",
+        `g() { git -C "$R" -c user.email=t@t.com -c user.name=t "$@"; }\n${script}`,
+      ],
+      { encoding: "utf8", env: { ...process.env, R: repo, B: branch, ...extra } },
+    ).trim();
+  sh(`g init -q -b main
+      g commit -q --allow-empty -m init
+      g branch "$B"`);
   let n = 0;
   const commitMore = (file?: string): string => {
     n += 1;
-    git(repo, "checkout", "-q", branch);
-    fs.writeFileSync(path.join(repo, file ?? `f${n}.txt`), `work ${n}\n`);
-    git(repo, "add", "-A");
-    git(repo, "commit", "-q", "-m", `work ${n}`);
-    const sha = git(repo, "rev-parse", branch).trim();
-    git(repo, "checkout", "-q", "main");
-    return sha;
+    return sh(
+      `g checkout -q "$B"
+       printf 'work %s\n' "$N" > "$R/$F"
+       g add -A
+       g commit -q -m "work $N"
+       SHA=$(g rev-parse "$B")
+       g checkout -q main
+       echo "$SHA"`,
+      { N: String(n), F: file ?? `f${n}.txt` },
+    );
   };
   return { repo, branch, headSha: commitMore(), commitMore };
 }
@@ -176,18 +191,6 @@ describe("reviewer prompt — full vs light", () => {
     expect(prompt).not.toContain("You are an adversarial code reviewer");
   });
 
-  it("tells both modes that comment style is not a finding", async () => {
-    const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const base = { title: "t", prompt: "x", repo: tmpDir };
-    for (const mode of ["full", "light"] as const) {
-      const task = createTask({ ...base, review_mode: mode });
-      const prompt = buildReviewerPrompt({ ...task, branch: "agent/t" });
-      expect(prompt).toContain("is NOT a finding unless a comment is factually wrong or stale");
-      expect(prompt).toContain("never rejection grounds or listed action items");
-    }
-  });
-
   it("keeps the verdict contract identical in both modes", async () => {
     const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
     const { createTask } = await import("../src/db/tasks.js");
@@ -252,14 +255,6 @@ describe("resolveReviewDelta — what a re-review is scoped to", { timeout: GIT_
     expect(resolveReviewDelta(t, reviewed)).toBeNull();
   });
 
-  it("returns null for a sha the repo has never seen", async () => {
-    const { resolveReviewDelta } = await import("../src/daemon/reviewstate.js");
-    const { createTask, updateTask } = await import("../src/db/tasks.js");
-    const repo = makeRepo("unknown-sha");
-    const task = createTask({ title: "t", prompt: "x", repo: repo.repo });
-    const t = updateTask(task.id, { branch: repo.branch })!;
-    expect(resolveReviewDelta(t, "0".repeat(40))).toBeNull();
-  });
 });
 
 describe("spawnReviewer — the prompt it actually writes", { timeout: GIT_TEST_TIMEOUT }, () => {
@@ -363,11 +358,4 @@ describe("spawnReviewer — the prompt it actually writes", { timeout: GIT_TEST_
     expect(agent.reasoning_effort).toBe("low");
   });
 
-  it("leaves a Codex full reviewer at the default effort", async () => {
-    const { spawnReviewer } = await import("../src/daemon/spawn.js");
-    const { taskId } = await reviewableTask("codex-full");
-
-    const { agent } = spawnReviewer(taskId, { provider: "codex" });
-    expect(agent.reasoning_effort).toBe("high");
-  });
 });

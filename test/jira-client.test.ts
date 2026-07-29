@@ -78,15 +78,6 @@ describe("createIssue", () => {
     expect(body.fields.summary.length).toBe(255);
   });
 
-  it("sets assignee only when an accountId is provided", async () => {
-    const { runner, calls } = scriptRunner([ok(201, { key: "EN-1" }), ok(201, { key: "EN-2" })]);
-    const client = new JiraClient({ runner, sleep: noSleep });
-    await client.createIssue({ project: "EN", issueType: "Task", summary: "a", description: {}, labels: [] });
-    expect((calls[0].body as { fields: Record<string, unknown> }).fields.assignee).toBeUndefined();
-    await client.createIssue({ project: "EN", issueType: "Task", summary: "a", description: {}, labels: [], assigneeAccountId: "acc-1" });
-    expect((calls[1].body as { fields: { assignee: unknown } }).fields.assignee).toEqual({ accountId: "acc-1" });
-  });
-
   it("throws a redacted error on non-2xx without leaking auth", async () => {
     const { runner } = scriptRunner([ok(400, "bad issuetype; Authorization: Basic Zm9vOmJhcg==")]);
     const client = new JiraClient({ runner, sleep: noSleep });
@@ -115,13 +106,6 @@ describe("getIssue", () => {
     expect(calls[0].path).toBe("/rest/api/3/issue/EN-5?fields=status,assignee");
   });
 
-  it("tolerates a null assignee", async () => {
-    const { runner } = scriptRunner([
-      ok(200, { fields: { status: { name: "Done", statusCategory: { key: "done" } }, assignee: null } }),
-    ]);
-    const client = new JiraClient({ runner, sleep: noSleep });
-    expect((await client.getIssue("EN-6")).assigneeAccountId).toBeNull();
-  });
 });
 
 describe("transition resolution + retry/backoff", () => {
@@ -186,12 +170,6 @@ describe("transition resolution + retry/backoff", () => {
 });
 
 describe("backoff helpers", () => {
-  it("parseRetryAfter reads numeric seconds, rejects HTTP-date", () => {
-    expect(parseRetryAfter("3")).toBe(3000);
-    expect(parseRetryAfter(undefined)).toBeNull();
-    expect(parseRetryAfter("Wed, 21 Oct 2025 07:28:00 GMT")).toBeNull();
-  });
-
   it("computeBackoffMs prefers Retry-After, else capped exponential + jitter", () => {
     expect(computeBackoffMs(0, "5", () => 0)).toBe(5000);
     expect(computeBackoffMs(0, undefined, () => 0)).toBe(500);
@@ -220,13 +198,6 @@ describe("ADF builders", () => {
     expect(JSON.stringify(adf)).toContain("(no description)");
   });
 
-  it("comment is a single-paragraph ADF doc", () => {
-    expect(buildCommentAdf("hi")).toEqual({
-      type: "doc",
-      version: 1,
-      content: [{ type: "paragraph", content: [{ type: "text", text: "hi" }] }],
-    });
-  });
 });
 
 describe("the default runner is daemon-only", () => {

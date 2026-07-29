@@ -8,6 +8,42 @@ vi.setConfig({ testTimeout: 30_000 });
 let tmpDir: string;
 let originalPath: string | undefined;
 
+// Default bound for these tests. Generous on purpose: the cases that are NOT
+// about hanging drive a real /bin/sh fake through to completion, and a loaded
+// box can take most of a second just to spawn it. A tight default here made
+// "sanitises stale-target send failures" report a timeout instead of the error
+// it was asserting on.
+const TMUX_TIMEOUT_MS = 15_000;
+
+// Bound for the deliberately-hung cases, via armHang().
+//
+// THE RULE, because getting it wrong produces a load flake that looks like a
+// real failure: this short bound is only valid when the FIRST tmux invocation on
+// the path under test is the one that hangs. Then the fake execs `sleep 60`,
+// never returns, and there is nothing to race — the only question is whether the
+// bound fires, and the elapsed assertions use the wide BOUNDED_MS ceiling below.
+//
+// If any tmux call has to SUCCEED before the hanging one, that call must beat the
+// bound too, and on a loaded box spawning /bin/sh can take most of a second. Such
+// cases pass MIXED_PATH_HANG_MS instead. `hang-enter` is exactly that shape:
+// sendText issues `send-keys -l` first and only hangs on the following `Enter`,
+// so a short bound can time out on the literal and the test then fails asserting
+// which calls were made. (`hang-capture` is NOT that shape — capturePane is the
+// only tmux call on the peek path.)
+const HANG_TIMEOUT_MS = 500;
+
+// For paths where something must complete before the hang, and for the /healthz
+// ordering test, which needs the hung send to still be outstanding while health
+// is served. The wider bound is the whole cost of these cases.
+const MIXED_PATH_HANG_MS = 3_000;
+
+// What a bounded call must beat. The fake tmux below hangs for 60s, so any
+// return comfortably under that proves the timeout fired — while staying wide
+// enough that a loaded box cannot fail it on scheduling jitter alone. Asserting
+// a tight multiple of TMUX_TIMEOUT_MS instead would be a wall-clock race, which
+// is the class of flake this suite is trying to be rid of.
+const BOUNDED_MS = 20_000;
+
 const fakeTmux = `#!/bin/sh
 mode="\${CC_FAKE_TMUX_MODE:-ok}"
 
@@ -80,7 +116,7 @@ beforeEach(async () => {
   process.env.CC_FAKE_TMUX_LOG = path.join(tmpDir, "calls.log");
   process.env.CC_DATA_DIR = path.join(tmpDir, "data");
   const { _setTmuxTimeoutForTest } = await import("../src/daemon/tmux.js");
-  _setTmuxTimeoutForTest(2_000);
+  _setTmuxTimeoutForTest(TMUX_TIMEOUT_MS);
 });
 
 afterEach(async () => {
@@ -96,6 +132,13 @@ afterEach(async () => {
   await new Promise((resolve) => setImmediate(resolve));
 });
 
+/** Arm a fake-tmux mode that never returns, bounded tightly. */
+async function armHang(mode: string, boundMs = HANG_TIMEOUT_MS): Promise<void> {
+  process.env.CC_FAKE_TMUX_MODE = mode;
+  const { _setTmuxTimeoutForTest } = await import("../src/daemon/tmux.js");
+  _setTmuxTimeoutForTest(boundMs);
+}
+
 function calls(): string[] {
   const log = process.env.CC_FAKE_TMUX_LOG!;
   return fs.existsSync(log)
@@ -106,12 +149,12 @@ function calls(): string[] {
 describe("bounded daemon tmux commands", () => {
   it("bounds a hung literal send", async () => {
     const { sendText } = await import("../src/daemon/tmux.js");
-    process.env.CC_FAKE_TMUX_MODE = "hang-literal";
+    await armHang("hang-literal");
     const started = Date.now();
 
     const failure = await sendText("cc:@1", "sensitive message").catch((error) => error);
 
-    expect(Date.now() - started).toBeLessThan(3_500);
+    expect(Date.now() - started).toBeLessThan(BOUNDED_MS);
     expect(failure).toMatchObject({
       code: "timeout",
       message: "tmux send-keys timed out",
@@ -122,12 +165,12 @@ describe("bounded daemon tmux commands", () => {
 
   it("bounds Enter delivery after the literal text succeeds", async () => {
     const { sendText } = await import("../src/daemon/tmux.js");
-    process.env.CC_FAKE_TMUX_MODE = "hang-enter";
+    await armHang("hang-enter", MIXED_PATH_HANG_MS);
     const started = Date.now();
 
     const failure = await sendText("cc:@1", "message").catch((error) => error);
 
-    expect(Date.now() - started).toBeLessThan(3_800);
+    expect(Date.now() - started).toBeLessThan(BOUNDED_MS);
     expect(failure).toMatchObject({ code: "timeout" });
     expect(calls()).toEqual(["-l", "Enter"]);
   });
@@ -151,13 +194,15 @@ describe("bounded daemon tmux commands", () => {
 
   it("bounds synchronous scheduler observation and remains usable afterward", async () => {
     const { listLiveWindowIds } = await import("../src/daemon/tmux.js");
-    process.env.CC_FAKE_TMUX_MODE = "hang-all";
+    await armHang("hang-all");
     const started = Date.now();
 
     expect(listLiveWindowIds()).toBeNull();
 
-    expect(Date.now() - started).toBeLessThan(3_500);
+    expect(Date.now() - started).toBeLessThan(BOUNDED_MS);
     process.env.CC_FAKE_TMUX_MODE = "ok";
+    const { _setTmuxTimeoutForTest } = await import("../src/daemon/tmux.js");
+    _setTmuxTimeoutForTest(TMUX_TIMEOUT_MS);
     expect(listLiveWindowIds()).toEqual(["cc:@1"]);
   });
 
@@ -178,12 +223,12 @@ describe("bounded daemon tmux commands", () => {
       tmux_target: "cc:@1",
     });
     const app = buildApp();
-    process.env.CC_FAKE_TMUX_MODE = "hang-capture";
+    await armHang("hang-capture");
     const started = Date.now();
 
     const peek = await app.request(`/api/agents/${agent.id}/peek`);
 
-    expect(Date.now() - started).toBeLessThan(3_500);
+    expect(Date.now() - started).toBeLessThan(BOUNDED_MS);
     expect(peek.status).toBe(503);
     expect(await peek.json()).toEqual({ error: "tmux pane unavailable" });
     const health = await app.request("/healthz");
@@ -199,7 +244,7 @@ describe("bounded daemon tmux commands", () => {
       tmux_target: "cc:@1",
     });
     const app = buildApp();
-    process.env.CC_FAKE_TMUX_MODE = "hang-all";
+    await armHang("hang-all");
     const started = Date.now();
 
     const hook = await app.request(`/api/hooks/agent/${agent.id}`, {
@@ -211,7 +256,7 @@ describe("bounded daemon tmux commands", () => {
       }),
     });
 
-    expect(Date.now() - started).toBeLessThan(3_500);
+    expect(Date.now() - started).toBeLessThan(BOUNDED_MS);
     expect(hook.status).toBe(200);
     const health = await app.request("/healthz");
     expect(health.status).toBe(200);
@@ -227,7 +272,13 @@ describe("bounded daemon tmux commands", () => {
       tmux_target: "cc:@1",
     });
     const app = buildApp();
-    process.env.CC_FAKE_TMUX_MODE = "hang-literal";
+    // A WIDE bound for this case specifically. The assertion below is an
+    // ordering one, and how long /healthz takes to be served is the thing under
+    // test — so the hung send has to stay outstanding for far longer than a
+    // loaded box could plausibly take to answer one in-process request. At the
+    // 500ms armHang() default /healthz would have had ~450ms to win, which is
+    // tighter than the 1500ms the previous version of this test allowed.
+    await armHang("hang-literal", MIXED_PATH_HANG_MS);
 
     const send = app.request(`/api/agents/${agent.id}/send`, {
       method: "POST",
@@ -236,10 +287,19 @@ describe("bounded daemon tmux commands", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const healthStarted = Date.now();
-    const health = await app.request("/healthz");
-    expect(health.status).toBe(200);
-    expect(Date.now() - healthStarted).toBeLessThan(1_500);
+    // Ordering, not elapsed time: /healthz must come back while the hung send is
+    // STILL outstanding. A blocked event loop would serve it only after the send
+    // gave up, so losing this race is exactly the regression — and unlike a
+    // millisecond bound it cannot be failed by a busy machine.
+    const servedFirst = await Promise.race([
+      Promise.resolve(app.request("/healthz")).then((res) => ({
+        who: "health" as const,
+        res,
+      })),
+      Promise.resolve(send).then(() => ({ who: "send" as const, res: null })),
+    ]);
+    expect(servedFirst.who).toBe("health");
+    expect(servedFirst.res?.status).toBe(200);
 
     const response = await send;
     expect(response.status).toBe(503);
@@ -262,7 +322,7 @@ describe("bounded daemon tmux commands", () => {
       tmux_target: "cc:@1",
     });
     const app = buildApp();
-    process.env.CC_FAKE_TMUX_MODE = "hang-all";
+    await armHang("hang-all");
 
     const response = await app.request(`/api/agents/${agent.id}/send`, {
       method: "POST",

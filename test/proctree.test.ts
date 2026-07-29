@@ -48,6 +48,38 @@ async function waitForExit(pids: number[], timeoutMs = 10_000): Promise<number[]
   return pids.filter(alive);
 }
 
+/**
+ * Poll until `ready()` returns something truthy, then hand it back.
+ *
+ * How long a freshly spawned process takes to fork its own children and show up
+ * in `ps` is unbounded and load-dependent, so every precondition in this file is
+ * WAITED FOR rather than slept past. Fixed delays are what made these tests fail
+ * under fleet load ("expected 0 to be greater than 0" — the child had not forked
+ * yet when the assertion ran).
+ */
+async function waitFor<T>(
+  ready: () => T | undefined,
+  what: string,
+  timeoutMs = 20_000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = ready();
+    if (value !== undefined) return value;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+/** The pane's own row plus everything hanging off it, once the child exists. */
+function paneTreeOnce(panePid: number): ProcRow[] | undefined {
+  const procs = snapshotProcesses();
+  const paneRow = procs.find((p) => p.pid === panePid);
+  if (!paneRow) return undefined;
+  const tree = collectProcessTree([paneRow], procs, selfAncestry(procs));
+  return tree.length > 1 ? tree : undefined;
+}
+
 describe("ps parsing", () => {
   it("reads the five-column ps table", () => {
     const rows = parseProcessTable(
@@ -182,12 +214,13 @@ describe("terminatePaneTree (real processes)", () => {
     );
     pane.unref();
     const panePid = pane.pid!;
-    await new Promise((r) => setTimeout(r, 1200));
 
     // The detached child is in its own session and process group with no tty,
     // so nothing but the parent link connects it to the pane.
-    const strays = descendants(panePid);
-    expect(strays.length).toBeGreaterThan(0);
+    const strays = await waitFor(() => {
+      const found = descendants(panePid);
+      return found.length > 0 ? found : undefined;
+    }, "the pane's detached descendants to appear");
 
     const killed = terminatePaneTree({ pid: panePid, tty: "" });
     expect(killed).toContain(panePid);
@@ -204,13 +237,10 @@ describe("terminatePaneTree (real processes)", () => {
       { stdio: "ignore" },
     );
     pane.unref();
-    await new Promise((r) => setTimeout(r, 900));
-
-    const procs = snapshotProcesses();
-    const paneRow = procs.find((p) => p.pid === pane.pid)!;
-    const tree = collectProcessTree([paneRow], procs, selfAncestry(procs));
-    const stubborn = tree.filter((p) => p.pid !== pane.pid);
-    expect(stubborn.length).toBeGreaterThan(0);
+    const tree = await waitFor(
+      () => paneTreeOnce(pane.pid!),
+      "the SIGTERM-ignoring child to appear under the pane",
+    );
 
     terminatePaneTree({ pid: pane.pid!, tty: "" });
     await new Promise((r) => setTimeout(r, 400));
@@ -237,7 +267,10 @@ describe("terminatePaneTree (real processes)", () => {
       { stdio: "ignore" },
     );
     pane.unref();
-    await new Promise((r) => setTimeout(r, 900));
+    await waitFor(
+      () => paneTreeOnce(pane.pid!),
+      "the SIGTERM-ignoring child to appear under the pane",
+    );
 
     // A long grace so the timer cannot fire on its own during the test.
     process.env.CC_REAP_GRACE_MS = "600000";
@@ -266,13 +299,25 @@ describe("sweepVanishedPaneGroup (real processes)", () => {
       stdio: "ignore",
     });
     leader.unref();
-    await new Promise((r) => setTimeout(r, 700));
     const pgid = leader.pid!;
+    // The shell has to fork its background subshell INTO the group before the
+    // leader is killed; killing first leaves nothing to sweep.
+    await waitFor(
+      () => (snapshotProcesses().filter((p) => p.pgid === pgid).length >= 2 ? true : undefined),
+      "the group's second member to be forked",
+    );
 
     // Simulate the vanished pane: the group leader dies, its children live on.
+    // Awaiting `exit` also lets node reap the child — sweepVanishedPaneGroup
+    // DECLINES while the leader is still in the process table, so a zombie here
+    // would make this test assert the wrong branch.
+    const reaped = new Promise<void>((resolve) => leader.once("exit", () => resolve()));
     process.kill(pgid, "SIGKILL");
-    await new Promise((r) => setTimeout(r, 300));
-    const orphans = snapshotProcesses().filter((p) => p.pgid === pgid);
+    await reaped;
+    const orphans = await waitFor(() => {
+      const left = snapshotProcesses().filter((p) => p.pgid === pgid && p.pid !== pgid);
+      return left.length > 0 ? left : undefined;
+    }, "orphans left behind in the dead leader's group");
     expect(orphans.length).toBeGreaterThan(0);
 
     const sweep = sweepVanishedPaneGroup(pgid, 3600);
@@ -287,7 +332,15 @@ describe("sweepVanishedPaneGroup (real processes)", () => {
       stdio: "ignore",
     });
     leader.unref();
-    await new Promise((r) => setTimeout(r, 400));
+    // The leader must actually be visible as its own group leader, or this
+    // would exercise the "clean" branch instead of the "declined" one.
+    await waitFor(
+      () =>
+        snapshotProcesses().some((p) => p.pid === leader.pid && p.pgid === leader.pid)
+          ? true
+          : undefined,
+      "the live group leader to appear in the process table",
+    );
 
     // "declined", not "clean": callers must keep pane_pid on this path, or a
     // false vanish would disarm the sweep for the agent's real death.

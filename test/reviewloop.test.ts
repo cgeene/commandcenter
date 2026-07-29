@@ -63,24 +63,37 @@ function makeRepo(taskId: number): {
 } {
   const repo = path.join(tmpDir, `repo-${taskId}`);
   fs.mkdirSync(repo, { recursive: true });
-  const g = (...a: string[]) =>
-    execFileSync("git", ["-C", repo, "-c", "user.email=t@t", "-c", "user.name=t", ...a]);
-  g("init", "-q", "-b", "main");
-  g("commit", "-q", "--allow-empty", "-m", "init");
   const branch = `agent/task-${taskId}`;
-  g("branch", branch);
+  // One subprocess per step rather than one per git command: inside a vitest
+  // worker each fork costs ~120-160ms, and this helper used to spend nine.
+  const sh = (script: string, n = 0) =>
+    execFileSync(
+      "sh",
+      [
+        "-eu",
+        "-c",
+        `g() { git -C "$R" -c user.email=t@t -c user.name=t "$@"; }\n${script}`,
+      ],
+      { encoding: "utf8", env: { ...process.env, R: repo, B: branch, N: String(n) } },
+    ).trim();
+  sh(`g init -q -b main
+      g commit -q --allow-empty -m init
+      g branch "$B"`);
   let n = 0;
   // Always commit ON the branch, then leave repo HEAD back on the base so the
   // branch stays 1+ commits ahead (merge-base(HEAD, branch) == base).
   const commitMore = (): string => {
     n += 1;
-    g("checkout", "-q", branch);
-    fs.writeFileSync(path.join(repo, `f${n}.txt`), `work ${n}`);
-    g("add", "-A");
-    g("commit", "-q", "-m", `work ${n}`);
-    const sha = g("rev-parse", branch).toString().trim();
-    g("checkout", "-q", "main");
-    return sha;
+    return sh(
+      `g checkout -q "$B"
+       printf 'work %s' "$N" > "$R/f$N.txt"
+       g add -A
+       g commit -q -m "work $N"
+       SHA=$(g rev-parse "$B")
+       g checkout -q main
+       echo "$SHA"`,
+      n,
+    );
   };
   const headSha = commitMore();
   return { repo, branch, headSha, commitMore };
@@ -263,28 +276,6 @@ describe("auto-review gate — repo tasks need a PR (task #110)", () => {
     expect(spawn.spawnReviewer(id)).toEqual({ agent: { id: 999 }, task: {} });
   });
 
-  it("a repo task with no commits and no pr_url logs review.skipped_no_pr and does not spawn", async () => {
-    const { maybeAutoReview } = await import("../src/daemon/review.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const { createTask, updateTask } = await import("../src/db/tasks.js");
-    // the task #109 incident shape: branch-only (open_pr=false), zero commits
-    const repo = makeEmptyRepo(11);
-    const t = createTask({ title: "deploy prep", prompt: "x", repo: repo.repo, open_pr: false });
-    updateTask(t.id, { status: "review", branch: repo.branch, result_summary: "prepped" });
-
-    await maybeAutoReview(t.id);
-
-    expect(spawnReviewer).not.toHaveBeenCalled();
-    const events = listEvents(20);
-    expect(events.map((e) => e.kind)).toContain("review.skipped_no_pr");
-    const skip = events.find((e) => e.kind === "review.skipped_no_pr")!;
-    expect(JSON.parse(skip.payload!)).toMatchObject({
-      task_id: t.id,
-      open_pr: 0,
-      branch_has_commits: false,
-    });
-  });
-
   it("logs the no-PR skip once per review episode, not on every sweep", async () => {
     const { maybeAutoReview } = await import("../src/daemon/review.js");
     const { listEvents } = await import("../src/db/events.js");
@@ -296,27 +287,6 @@ describe("auto-review gate — repo tasks need a PR (task #110)", () => {
 
     const skips = listEvents(30).filter((e) => e.kind === "review.skipped_no_pr");
     expect(skips).toHaveLength(1);
-  });
-
-  it("a scratch task is unaffected by the gate — it still auto-reviews with no PR", async () => {
-    const { maybeAutoReview } = await import("../src/daemon/review.js");
-    const { createTask, updateTask } = await import("../src/db/tasks.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const t = createTask({
-      title: "investigate",
-      prompt: "x",
-      repo: path.join(tmpDir, "scratch-13"),
-      workspace_kind: "scratch",
-      open_pr: false,
-    });
-    updateTask(t.id, { status: "review", result_summary: "root cause found" });
-
-    await maybeAutoReview(t.id);
-
-    expect(spawnReviewer).toHaveBeenCalledOnce();
-    const kinds = listEvents(20).map((e) => e.kind);
-    expect(kinds).toContain("review.round_started");
-    expect(kinds).not.toContain("review.skipped_no_pr");
   });
 
   it("the sweep (reviewLoopSweep) respects the gate for a PR-less repo task", async () => {

@@ -124,6 +124,41 @@ describe("CLI --blocked-by parsing", () => {
 });
 
 describe("updateTask blocked_by", () => {
+  // The five ways a blocker assignment is refused at the DB layer. One test
+  // rather than five near-identical ones: each is "this call throws, and the
+  // graph is left exactly as it was". Kept SEPARATE from the API-layer cases,
+  // which assert a different job — translating these throws into 409 rather than
+  // a 500, with the error text the UI shows.
+  it("refuses every invalid blocker shape, leaving the graph untouched", async () => {
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const mk = (over: Record<string, unknown> = {}) =>
+      createTask({ title: "t", prompt: "x", repo: "/r", ...over });
+
+    const self = mk();
+    expect(() => updateTask(self.id, { blocked_by: self.id })).toThrow(
+      /cannot be blocked by itself/,
+    );
+    // still usable afterwards, and still unblocked
+    expect(updateTask(self.id, { priority: 1 })?.blocked_by).toBeNull();
+
+    const a = mk({ title: "a" });
+    const b2 = mk({ title: "b" });
+    updateTask(b2.id, { blocked_by: a.id });
+    expect(() => updateTask(a.id, { blocked_by: b2.id })).toThrow(/dependency cycle/);
+    expect(getTask(a.id)?.blocked_by).toBeNull();
+
+    // a longer chain: c1 <- c2 <- c3, then c1 -> c3 would close the loop
+    const c1 = mk({ title: "c1" });
+    const c2 = mk({ title: "c2", blocked_by: c1.id });
+    const c3 = mk({ title: "c3", blocked_by: c2.id });
+    expect(() => updateTask(c1.id, { blocked_by: c3.id })).toThrow(/dependency cycle/);
+
+    // unknown blocker, caught before the FK constraint would fire — on both paths
+    const u = mk();
+    expect(() => updateTask(u.id, { blocked_by: 9999 })).toThrow(/does not exist/);
+    expect(() => mk({ blocked_by: 4242 })).toThrow(/does not exist/);
+  });
+
   it("sets and clears a blocker", async () => {
     const { createTask, updateTask } = await import("../src/db/tasks.js");
     const a = createTask({ title: "a", prompt: "x", repo: "/r" });
@@ -131,38 +166,6 @@ describe("updateTask blocked_by", () => {
 
     expect(updateTask(b.id, { blocked_by: a.id })?.blocked_by).toBe(a.id);
     expect(updateTask(b.id, { blocked_by: null })?.blocked_by).toBeNull();
-  });
-
-  it("rejects a task blocking on itself", async () => {
-    const { createTask, updateTask } = await import("../src/db/tasks.js");
-    const t = createTask({ title: "t", prompt: "x", repo: "/r" });
-    expect(() => updateTask(t.id, { blocked_by: t.id })).toThrow(
-      /cannot be blocked by itself/,
-    );
-    expect(updateTask(t.id, { priority: 1 })?.blocked_by).toBeNull();
-  });
-
-  it("rejects a two-task cycle", async () => {
-    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
-    const a = createTask({ title: "a", prompt: "x", repo: "/r" });
-    const b = createTask({ title: "b", prompt: "x", repo: "/r" });
-    updateTask(b.id, { blocked_by: a.id });
-
-    expect(() => updateTask(a.id, { blocked_by: b.id })).toThrow(
-      /dependency cycle/,
-    );
-    expect(getTask(a.id)?.blocked_by).toBeNull();
-  });
-
-  it("rejects a longer cycle", async () => {
-    const { createTask, updateTask } = await import("../src/db/tasks.js");
-    const a = createTask({ title: "a", prompt: "x", repo: "/r" });
-    const b = createTask({ title: "b", prompt: "x", repo: "/r", blocked_by: a.id });
-    const c = createTask({ title: "c", prompt: "x", repo: "/r", blocked_by: b.id });
-
-    expect(() => updateTask(a.id, { blocked_by: c.id })).toThrow(
-      /dependency cycle/,
-    );
   });
 
   it("still allows a diamond — two tasks waiting on the same blocker", async () => {
@@ -173,19 +176,6 @@ describe("updateTask blocked_by", () => {
 
     expect(updateTask(b.id, { blocked_by: a.id })?.blocked_by).toBe(a.id);
     expect(updateTask(c.id, { blocked_by: a.id })?.blocked_by).toBe(a.id);
-  });
-
-  it("rejects an unknown blocker instead of failing at the FK constraint", async () => {
-    const { createTask, updateTask } = await import("../src/db/tasks.js");
-    const t = createTask({ title: "t", prompt: "x", repo: "/r" });
-    expect(() => updateTask(t.id, { blocked_by: 9999 })).toThrow(/does not exist/);
-  });
-
-  it("createTask also rejects an unknown blocker", async () => {
-    const { createTask } = await import("../src/db/tasks.js");
-    expect(() =>
-      createTask({ title: "t", prompt: "x", repo: "/r", blocked_by: 4242 }),
-    ).toThrow(/does not exist/);
   });
 
   it("accepts a blocker that is already done — the task stays ready", async () => {
@@ -241,6 +231,69 @@ describe("ready queue", () => {
 });
 
 describe("PATCH /api/tasks/:id blocked_by", () => {
+  // The same refusals through the API, one row each. What this layer adds over
+  // the DB tests is the STATUS mapping (409 for a graph conflict, 400 for a
+  // schema violation — never a 500) and the error text; the graph-untouched
+  // checks ride along so a refusal can never half-apply.
+  it("maps every blocker refusal to the right status without touching the graph", async () => {
+    const { buildApp } = await import("../src/daemon/api.js");
+    const { createTask, getTask } = await import("../src/db/tasks.js");
+    const mk = (over: Record<string, unknown> = {}) =>
+      createTask({ title: "t", prompt: "x", repo: "/r", ...over });
+
+    for (const { why, build, status, error } of [
+      {
+        why: "a self-block",
+        build: () => {
+          const t = mk();
+          return { id: t.id, body: { blocked_by: t.id }, stillUnblocked: t.id };
+        },
+        status: 409,
+        error: /cannot be blocked by itself/,
+      },
+      {
+        why: "a cycle",
+        build: () => {
+          const x = mk({ title: "x" });
+          const y = mk({ title: "y", blocked_by: x.id });
+          return { id: x.id, body: { blocked_by: y.id }, stillUnblocked: x.id };
+        },
+        status: 409,
+        error: /dependency cycle/,
+      },
+      {
+        why: "an unknown blocker",
+        build: () => ({ id: mk().id, body: { blocked_by: 4242 }, stillUnblocked: undefined }),
+        status: 409,
+        error: /does not exist/,
+      },
+      {
+        why: "a non-positive blocker id (schema, not graph)",
+        build: () => ({ id: mk().id, body: { blocked_by: 0 }, stillUnblocked: undefined }),
+        status: 400,
+        error: undefined,
+      },
+    ]) {
+      const { id, body, stillUnblocked } = build();
+      const res = await patch(id, body);
+      expect(res.status, why).toBe(status);
+      if (error) {
+        expect(((await res.json()) as { error: string }).error, why).toMatch(error);
+      }
+      if (stillUnblocked !== undefined) {
+        expect(getTask(stillUnblocked)?.blocked_by, why).toBeNull();
+      }
+    }
+
+    // The create path refuses the same way, with the same status.
+    const created = await buildApp().request("/api/tasks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "t", prompt: "x", repo: "/r", blocked_by: 77 }),
+    });
+    expect(created.status).toBe(409);
+  });
+
   it("sets and clears the blocker", async () => {
     const { createTask } = await import("../src/db/tasks.js");
     const a = createTask({ title: "a", prompt: "x", repo: "/r" });
@@ -275,56 +328,6 @@ describe("PATCH /api/tasks/:id blocked_by", () => {
     expect(ready.map((t) => t.id)).toEqual([b.id]);
   });
 
-  it("rejects a self-block with 409", async () => {
-    const { createTask, getTask } = await import("../src/db/tasks.js");
-    const t = createTask({ title: "t", prompt: "x", repo: "/r" });
-    const res = await patch(t.id, { blocked_by: t.id });
-    expect(res.status).toBe(409);
-    expect((await res.json()) as { error: string }).toEqual({
-      error: `task #${t.id} cannot be blocked by itself`,
-    });
-    expect(getTask(t.id)?.blocked_by).toBeNull();
-  });
-
-  it("rejects a cycle with 409 and leaves the graph untouched", async () => {
-    const { createTask, getTask } = await import("../src/db/tasks.js");
-    const a = createTask({ title: "a", prompt: "x", repo: "/r" });
-    const b = createTask({ title: "b", prompt: "x", repo: "/r", blocked_by: a.id });
-
-    const res = await patch(a.id, { blocked_by: b.id });
-    expect(res.status).toBe(409);
-    expect(((await res.json()) as { error: string }).error).toMatch(
-      /dependency cycle/,
-    );
-    expect(getTask(a.id)?.blocked_by).toBeNull();
-    expect(getTask(b.id)?.blocked_by).toBe(a.id);
-  });
-
-  it("rejects an unknown blocker with 409", async () => {
-    const { createTask } = await import("../src/db/tasks.js");
-    const t = createTask({ title: "t", prompt: "x", repo: "/r" });
-    const res = await patch(t.id, { blocked_by: 4242 });
-    expect(res.status).toBe(409);
-    expect(((await res.json()) as { error: string }).error).toMatch(
-      /does not exist/,
-    );
-  });
-
-  it("rejects a non-positive blocker id at the schema", async () => {
-    const { createTask } = await import("../src/db/tasks.js");
-    const t = createTask({ title: "t", prompt: "x", repo: "/r" });
-    expect((await patch(t.id, { blocked_by: 0 })).status).toBe(400);
-  });
-
-  it("POST /api/tasks rejects an unknown blocker with 409", async () => {
-    const { buildApp } = await import("../src/daemon/api.js");
-    const res = await buildApp().request("/api/tasks", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ title: "t", prompt: "x", repo: "/r", blocked_by: 77 }),
-    });
-    expect(res.status).toBe(409);
-  });
 });
 
 describe("cancel reporting", () => {

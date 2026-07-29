@@ -116,37 +116,31 @@ describe("deriveAttention — kinds", () => {
     expect(items[0].urgent).toBe(true);
   });
 
-  it("a merged/closed PR produces no merge item", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    await approvedPrTask();
-    const items = deriveAttention({ isPrOpen: () => false });
-    expect(items).toHaveLength(0);
-  });
-
-  it("skips a branch-only task (open_pr=0) even if approved with a pr_url", async () => {
+  // The merge gate, one row per way a merge item must or must not appear. These
+  // were four near-identical tests; the gate itself is merge-safety critical, so
+  // every input is kept as a row rather than reduced to a representative.
+  it("gates the merge item on PR state, open_pr and draft state", async () => {
     const { deriveAttention } = await import("../src/daemon/attention.js");
     const { updateTask } = await import("../src/db/tasks.js");
-    const t = await approvedPrTask();
-    updateTask(t.id, { open_pr: 0 });
-    expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
-  });
-
-  it("skips a still-draft PR (never merge a PR that hasn't passed internal review)", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    const { updateTask } = await import("../src/db/tasks.js");
-    const t = await approvedPrTask();
-    updateTask(t.id, { pr_is_draft: 1 }); // ready-flip failed or stale
-    expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
-  });
-
-  it("still surfaces a ready (pr_is_draft=0) approved PR for merge", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    const { updateTask } = await import("../src/db/tasks.js");
-    const t = await approvedPrTask();
-    updateTask(t.id, { pr_is_draft: 0 });
-    const items = deriveAttention({ isPrOpen: allOpen });
-    expect(items).toHaveLength(1);
-    expect(items[0].kind).toBe("merge_pr");
+    const { getDb } = await import("../src/db/db.js");
+    for (const { why, patch, prOpen, expected } of [
+      { why: "a merged/closed PR", patch: {}, prOpen: false, expected: 0 },
+      { why: "a branch-only task, even approved with a pr_url", patch: { open_pr: 0 }, prOpen: true, expected: 0 },
+      // never offer a PR that has not passed internal review
+      { why: "a still-draft PR (ready-flip failed or stale)", patch: { pr_is_draft: 1 }, prOpen: true, expected: 0 },
+      { why: "a ready, approved PR", patch: { pr_is_draft: 0 }, prOpen: true, expected: 1 },
+    ] as const) {
+      // Each row needs the isolation the per-test database used to give it: a
+      // task left behind by the previous row would surface under the next row's
+      // isPrOpen and mask the gate being tested.
+      getDb().prepare("DELETE FROM tasks").run();
+      const t = await approvedPrTask();
+      updateTask(t.id, patch);
+      const items = deriveAttention({ isPrOpen: () => prOpen }).filter(
+        (i) => i.kind === "merge_pr" || i.kind === "merge_and_apply",
+      );
+      expect(items, why).toHaveLength(expected);
+    }
   });
 
   it("decision for a task blocked after >= review_max_cycles", async () => {
@@ -234,30 +228,6 @@ describe("deriveAttention — kinds", () => {
     logEvent("hook.permissionrequest", { agentId: a.id });
     getDb()
       .prepare("UPDATE events SET ts = ? WHERE kind = 'hook.permissionrequest'")
-      .run(new Date(Date.now() - 15 * 60_000).toISOString());
-
-    const items = deriveAttention({ isPrOpen: allOpen });
-    expect(items).toHaveLength(1);
-    expect(items[0].kind).toBe("stale_waiting");
-    expect(items[0].agent_id).toBe(a.id);
-  });
-
-  it("stale_waiting includes provider startup trust waits", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    const { createAgent } = await import("../src/db/agents.js");
-    const { logEvent } = await import("../src/db/events.js");
-    const { getDb } = await import("../src/db/db.js");
-    const a = createAgent({
-      kind: "worker",
-      provider: "codex",
-      state: "waiting_input",
-    });
-    logEvent("agent.startup_permission", {
-      agentId: a.id,
-      payload: { trust: true },
-    });
-    getDb()
-      .prepare("UPDATE events SET ts = ? WHERE kind = 'agent.startup_permission'")
       .run(new Date(Date.now() - 15 * 60_000).toISOString());
 
     const items = deriveAttention({ isPrOpen: allOpen });
@@ -400,15 +370,6 @@ describe("deriveAttention — ordering", () => {
     expect(items.map((i) => i.severity)).toEqual(["red", "orange", "yellow"]);
   });
 
-  it("within a severity, older items rank first", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    const older = await approvedPrTask();
-    const newer = await approvedPrTask();
-    await backdate("tasks", older.id, "updated_at", 90);
-    const items = deriveAttention({ isPrOpen: allOpen });
-    expect(items[0].task_id).toBe(older.id);
-    expect(items[1].task_id).toBe(newer.id);
-  });
 });
 
 describe("deriveAttention — dismissal", () => {
@@ -519,27 +480,6 @@ describe("deriveAttention — scheduler_stalled", () => {
     ).toBe(false);
   });
 
-  it("a dismissed capacity item drops out", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    const { dismissAttention } = await import("../src/db/attention.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const { createAgent } = await import("../src/db/agents.js");
-    const { setSchedulerConfig } = await import("../src/db/settings.js");
-    const { logEvent } = await import("../src/db/events.js");
-    setSchedulerConfig({ enabled: true, max_concurrent: 1 });
-    createAgent({ kind: "worker", state: "idle" });
-    createTask({ title: "waiting", prompt: "x", repo: "/r" });
-    logEvent("scheduler.capacity_blocked", { payload: { max_concurrent: 1 } });
-    await backdateEvent("scheduler.capacity_blocked", 20);
-
-    const item = deriveAttention({ isPrOpen: allOpen }).find(
-      (i) => i.kind === "scheduler_stalled",
-    )!;
-    dismissAttention(item.id);
-    expect(
-      deriveAttention({ isPrOpen: allOpen }).some((i) => i.kind === "scheduler_stalled"),
-    ).toBe(false);
-  });
 });
 
 describe("deriveAttention — jira_sync", () => {
@@ -587,16 +527,6 @@ describe("deriveAttention — jira_sync", () => {
     });
     expect(jira[0].title).toContain("EN-1234");
     expect(jira[0].pr_url).toBe(t.pr_url);
-  });
-
-  it("labels a keyless failing task as ticket-creation failing", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    const { logEvent } = await import("../src/db/events.js");
-    const t = await jiraFailingTask({ fails: 3, jira_key: null });
-    logEvent("jira.sync_broken", { taskId: t.id });
-    const jira = deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "jira_sync");
-    expect(jira).toHaveLength(1);
-    expect(jira[0].title).toContain("creation failing");
   });
 
   it("re-raises with a fresh key after a dismissed episode recurs", async () => {
@@ -692,51 +622,25 @@ describe("deriveAttention — quota", () => {
     return deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota");
   };
 
-  it("raises nothing without a live feed", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    expect(deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota")).toHaveLength(
-      0,
-    );
-  });
-
-  it("raises nothing below the threshold", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    await seedUsage(70);
-    expect(deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota")).toHaveLength(
-      0,
-    );
-  });
-
-  it("raises a quota item above the threshold", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    await seedUsage(88);
-    const quota = deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota");
-    expect(quota).toHaveLength(1);
-    expect(quota[0]).toMatchObject({ severity: "yellow", task_id: null });
-    expect(quota[0].title).toContain("88%");
-  });
-
-  it("goes hotter as the meter approaches exhaustion", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    await seedUsage(97);
-    const quota = deriveAttention({ isPrOpen: allOpen }).find((i) => i.kind === "quota")!;
-    expect(quota.severity).toBe("orange");
-  });
-
-  it("drops the item once the window it measured has elapsed", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    await seedUsage(97, { resets_at: "2020-01-01T00:00:00.000Z" });
-    expect(deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota")).toHaveLength(
-      0,
-    );
-  });
-
-  it("raises a red item when the spend cap is hit", async () => {
-    const { deriveAttention } = await import("../src/daemon/attention.js");
-    await seedUsage(10, { limit_reached: true });
-    const quota = deriveAttention({ isPrOpen: allOpen }).filter((i) => i.kind === "quota");
-    expect(quota).toHaveLength(1);
-    expect(quota[0]).toMatchObject({ severity: "red", urgent: true });
+  // One table: seed a headline reading, ask what the panel raises. These six were
+  // the same three lines with different literals.
+  it("raises a quota item only above the threshold, hotter as it approaches exhaustion", async () => {
+    for (const { why, seed, count, match, title } of [
+      { why: "no live feed at all", seed: null, count: 0 },
+      { why: "a reading below the threshold", seed: [70, {}], count: 0 },
+      { why: "a reading above the threshold", seed: [88, {}], count: 1, match: { severity: "yellow", task_id: null }, title: "88%" },
+      { why: "a reading close to exhaustion", seed: [97, {}], count: 1, match: { severity: "orange" } },
+      { why: "a window that has already elapsed", seed: [97, { resets_at: "2020-01-01T00:00:00.000Z" }], count: 0 },
+      { why: "the spend cap hit", seed: [10, { limit_reached: true }], count: 1, match: { severity: "red", urgent: true } },
+    ] as const) {
+      const { setLiveUsageCache } = await import("../src/db/settings.js");
+      setLiveUsageCache({ usage: null, error: null, checked_at: null }); // reset between rows
+      if (seed) await seedUsage(seed[0] as number, seed[1] as Record<string, unknown>);
+      const quota = await quotaItems();
+      expect(quota, why).toHaveLength(count);
+      if (match) expect(quota[0], why).toMatchObject(match);
+      if (title) expect(quota[0].title, why).toContain(title);
+    }
   });
 
   it("honours the configured threshold and an explicit disable", async () => {

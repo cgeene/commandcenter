@@ -19,34 +19,24 @@ function task(overrides: Partial<ActionTask> = {}): ActionTask {
 }
 
 describe("canSpawnWorker", () => {
-  it("offers direct spawning on a queued orchestrated task", () => {
-    expect(canSpawnWorker(task())).toBe(true);
-  });
-
-  it("still offers it on queued and claimed direct tasks", () => {
-    expect(canSpawnWorker(task({ dispatch_mode: "direct" }))).toBe(true);
-    expect(canSpawnWorker(task({ dispatch_mode: "direct", status: "claimed" }))).toBe(true);
-  });
-
-  it("never offers it on a portfolio parent", () => {
-    expect(canSpawnWorker(task({ workspace_kind: "portfolio" }))).toBe(false);
-    expect(
-      canSpawnWorker(task({ workspace_kind: "portfolio", dispatch_mode: "direct" })),
-    ).toBe(false);
-  });
-
-  it("offers it on scratch tasks, which do get spawned directly", () => {
-    expect(canSpawnWorker(task({ workspace_kind: "scratch" }))).toBe(true);
-  });
-
-  it("does not offer it once an orchestrated task has left the queue", () => {
-    for (const status of ["claimed", "in_progress", "review", "done", "cancelled"]) {
-      expect(canSpawnWorker(task({ status }))).toBe(false);
+  // Pure gating over (dispatch_mode, workspace_kind, status): one row per rule.
+  it("offers direct spawning only where a worker can actually be spawned", () => {
+    for (const { why, over, offered } of [
+      { why: "a queued orchestrated task", over: {}, offered: true },
+      { why: "a queued direct task", over: { dispatch_mode: "direct" }, offered: true },
+      { why: "a claimed direct task", over: { dispatch_mode: "direct", status: "claimed" }, offered: true },
+      // A portfolio parent is decomposed, never worked directly.
+      { why: "a portfolio parent", over: { workspace_kind: "portfolio" }, offered: false },
+      { why: "a direct portfolio parent", over: { workspace_kind: "portfolio", dispatch_mode: "direct" }, offered: false },
+      { why: "a scratch task, which does get spawned directly", over: { workspace_kind: "scratch" }, offered: true },
+      { why: "a finished direct task", over: { dispatch_mode: "direct", status: "review" }, offered: false },
+    ] as const) {
+      expect(canSpawnWorker(task(over as Partial<ActionTask>)), why).toBe(offered);
     }
-  });
-
-  it("does not offer it on finished direct tasks", () => {
-    expect(canSpawnWorker(task({ dispatch_mode: "direct", status: "review" }))).toBe(false);
+    // An orchestrated task that has left the queue is main's to re-dispatch.
+    for (const status of ["claimed", "in_progress", "review", "done", "cancelled"] as const) {
+      expect(canSpawnWorker(task({ status })), status).toBe(false);
+    }
   });
 });
 

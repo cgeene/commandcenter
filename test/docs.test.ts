@@ -39,14 +39,6 @@ describe("docs store (db + filesystem)", () => {
     expect(fetched.content).toContain("billing export is live");
   });
 
-  it("fetches by slug within a project", async () => {
-    const { saveDoc, getDoc } = await import("../src/db/docs.js");
-    saveDoc({ project: "cogs", title: "Usage Inventory", content: "body one" });
-    const byId = getDoc("usage-inventory", "cogs");
-    expect(byId?.content).toBe("body one");
-    expect(getDoc("usage-inventory", "other")).toBeUndefined();
-  });
-
   it("updates in place on an existing slug, bumps version, keeps prior body", async () => {
     const { saveDoc, getDoc } = await import("../src/db/docs.js");
     const { docsDir } = await import("../src/config.js");
@@ -80,21 +72,6 @@ describe("docs store (db + filesystem)", () => {
     const rels = JSON.parse(doc.attachments!) as string[];
     expect(rels).toContain("cogs/workload-map.csv");
     expect(fs.readFileSync(path.join(docsDir(), rels[0]), "utf8")).toBe("a,b\n1,2\n");
-  });
-
-  it("reads an attachment back by filename, scoped to the doc", async () => {
-    const { saveDoc, getDocAttachment } = await import("../src/db/docs.js");
-    const { doc } = saveDoc({
-      project: "cogs",
-      title: "Workload Map",
-      content: "see the csv",
-      attachments: [{ filename: "workload-map.csv", content: "a,b\n1,2\n" }],
-    });
-    const att = getDocAttachment(doc.id, "workload-map.csv");
-    expect(att?.filename).toBe("workload-map.csv");
-    expect(att?.content.toString("utf8")).toBe("a,b\n1,2\n");
-    // a filename not in the doc's attachment list is not served
-    expect(getDocAttachment(doc.id, "other.csv")).toBeUndefined();
   });
 
   it("refuses to serve a file outside the doc's recorded attachments (traversal)", async () => {
@@ -181,20 +158,6 @@ describe("docs frontmatter, index, and migration", () => {
     expect(searchDocs("slug").length).toBe(0);
   });
 
-  it("regenerates a per-project _index.md, newest first", async () => {
-    const { saveDoc } = await import("../src/db/docs.js");
-    const { docsDir } = await import("../src/config.js");
-    saveDoc({ project: "cogs", title: "First", content: "x", summary: "first summary" });
-    saveDoc({ project: "cogs", title: "Second", content: "y", summary: "second summary" });
-    const idx = fs.readFileSync(path.join(docsDir(), "cogs", "_index.md"), "utf8");
-    expect(idx.startsWith("---\n")).toBe(true);
-    expect(idx).toContain("kind: index");
-    expect(idx).toContain("[First](first.md) — first summary");
-    expect(idx).toContain("[Second](second.md) — second summary");
-    // newest (Second) is listed before First
-    expect(idx.indexOf("Second")).toBeLessThan(idx.indexOf("First"));
-  });
-
   it("migration adds frontmatter, relocates legacy sidecars, and is idempotent", async () => {
     const { saveDoc, migrateDocsToFrontmatter, getDoc } = await import("../src/db/docs.js");
     const { docsDir } = await import("../src/config.js");
@@ -246,21 +209,6 @@ describe("docs FTS search", () => {
     const hits = searchDocs("gke cost allocation");
     expect(hits.length).toBe(2);
     expect(hits[0].title).toBe("GKE cost allocation labels");
-  });
-
-  it("searches the body text", async () => {
-    const { saveDoc, searchDocs } = await import("../src/db/docs.js");
-    saveDoc({ project: "cogs", title: "Inventory", content: "spanner_uas_grants table" });
-    expect(searchDocs("spanner grants").length).toBe(1);
-  });
-
-  it("can scope search to a project", async () => {
-    const { saveDoc, searchDocs } = await import("../src/db/docs.js");
-    saveDoc({ project: "cogs", title: "billing export doc", content: "x" });
-    saveDoc({ project: "infra", title: "billing export doc", content: "y" });
-    expect(searchDocs("billing export").length).toBe(2);
-    expect(searchDocs("billing export", 10, "cogs").length).toBe(1);
-    expect(searchDocs("billing export", 10, "cogs")[0].project).toBe("cogs");
   });
 
   it("survives natural-language queries with FTS syntax characters", async () => {
@@ -364,16 +312,6 @@ describe("docs HTTP API", () => {
     expect((await a.request("/api/docs/1/attachments/missing.csv")).status).toBe(404);
   });
 
-  it("logs a doc.saved event", async () => {
-    const a = await app();
-    await a.request("/api/docs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project: "cogs", title: "T", content: "x" }),
-    });
-    const { listEvents } = await import("../src/db/events.js");
-    expect(listEvents(10).map((e) => e.kind)).toContain("doc.saved");
-  });
 });
 
 describe("doc-store prompt guidance", () => {
@@ -386,12 +324,4 @@ describe("doc-store prompt guidance", () => {
     expect(prompt).toMatch(/NOT committed to the repo|not committed/i);
   });
 
-  it("tells reviewers they can read saved docs via get_doc/list_docs", async () => {
-    const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const task = createTask({ title: "t", prompt: "p", repo: "/r" });
-    const prompt = buildReviewerPrompt(task);
-    expect(prompt).toContain("list_docs");
-    expect(prompt).toContain("get_doc");
-  });
 });

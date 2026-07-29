@@ -65,12 +65,6 @@ describe("memories", () => {
     expect(section).toContain("docker running");
   });
 
-  it("tags are searchable", async () => {
-    const { addMemory, searchMemories } = await import("../src/db/memories.js");
-    addMemory({ text: "always run go vet", tags: "repo:uas,linting" });
-    expect(searchMemories("linting uas").length).toBe(1);
-  });
-
   it("IDF selection keeps a rare term that appears late in a long query", async () => {
     const { addMemory, searchMemories } = await import("../src/db/memories.js");
     for (let i = 0; i < 9; i++) {

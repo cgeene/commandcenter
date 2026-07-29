@@ -1,43 +1,49 @@
 import { describe, expect, it } from "vitest";
 import { localeEnv } from "../src/daemon/locale.js";
 
+const UTF8 = /utf-?8/i;
+
 describe("localeEnv", () => {
-  it("forces a UTF-8 locale when the environment has none (the launchd case)", () => {
-    const env = localeEnv({ PATH: "/usr/bin", HOME: "/home/x" });
-    expect(env.PATH).toBe("/usr/bin"); // other vars preserved
-    expect(env.LANG).toMatch(/utf-?8/i);
-    expect(env.LC_CTYPE).toMatch(/utf-?8/i);
-  });
-
-  it("sets LC_CTYPE even when LANG names a non-UTF-8 locale", () => {
-    const env = localeEnv({ LANG: "C" });
-    expect(env.LC_CTYPE).toMatch(/utf-?8/i);
-    expect(env.LANG).toMatch(/utf-?8/i);
-  });
-
-  it("drops a non-UTF-8 LC_ALL so LC_CTYPE can take effect", () => {
-    const env = localeEnv({ LC_ALL: "C", LANG: "C" });
-    expect(env.LC_ALL).toBeUndefined();
-    expect(env.LC_CTYPE).toMatch(/utf-?8/i);
-  });
-
-  it("leaves an already-UTF-8 environment untouched (via LANG)", () => {
-    const env = localeEnv({ LANG: "de_DE.UTF-8" });
-    expect(env.LANG).toBe("de_DE.UTF-8");
-    expect(env.LC_CTYPE).toBeUndefined();
-    expect(env.LC_ALL).toBeUndefined();
-  });
-
-  it("respects a UTF-8 LC_ALL and does not override it", () => {
-    const env = localeEnv({ LC_ALL: "en_GB.UTF-8", LANG: "C" });
-    expect(env.LC_ALL).toBe("en_GB.UTF-8");
-    expect(env.LANG).toBe("C"); // untouched: LC_ALL already wins for ctype
-  });
-
-  it("respects a UTF-8 LC_CTYPE even if LANG is non-UTF-8", () => {
-    const env = localeEnv({ LC_CTYPE: "en_US.UTF-8", LANG: "C" });
-    expect(env.LC_CTYPE).toBe("en_US.UTF-8");
-    expect(env.LANG).toBe("C");
+  // The rule: the child must end up with a UTF-8 ctype, without overriding a
+  // UTF-8 locale the operator already set. LC_ALL outranks LC_CTYPE outranks
+  // LANG, so a non-UTF-8 LC_ALL has to be dropped rather than left to win.
+  it("guarantees a UTF-8 ctype without overriding one already set", () => {
+    for (const { why, base, expect: want } of [
+      {
+        // the launchd case: no locale at all in the environment
+        why: "an environment with no locale",
+        base: { PATH: "/usr/bin", HOME: "/home/x" },
+        expect: { PATH: "/usr/bin", LANG: UTF8, LC_CTYPE: UTF8 },
+      },
+      { why: "LANG naming a non-UTF-8 locale", base: { LANG: "C" }, expect: { LANG: UTF8, LC_CTYPE: UTF8 } },
+      {
+        why: "a non-UTF-8 LC_ALL, which must be dropped so LC_CTYPE can take effect",
+        base: { LC_ALL: "C", LANG: "C" },
+        expect: { LC_ALL: undefined, LC_CTYPE: UTF8 },
+      },
+      {
+        why: "an already-UTF-8 LANG (left completely alone)",
+        base: { LANG: "de_DE.UTF-8" },
+        expect: { LANG: "de_DE.UTF-8", LC_CTYPE: undefined, LC_ALL: undefined },
+      },
+      {
+        // LC_ALL already wins for ctype, so LANG needs no correction
+        why: "a UTF-8 LC_ALL",
+        base: { LC_ALL: "en_GB.UTF-8", LANG: "C" },
+        expect: { LC_ALL: "en_GB.UTF-8", LANG: "C" },
+      },
+      {
+        why: "a UTF-8 LC_CTYPE even with a non-UTF-8 LANG",
+        base: { LC_CTYPE: "en_US.UTF-8", LANG: "C" },
+        expect: { LC_CTYPE: "en_US.UTF-8", LANG: "C" },
+      },
+    ] as const) {
+      const env = localeEnv({ ...base }) as Record<string, string | undefined>;
+      for (const [key, want2] of Object.entries(want)) {
+        if (want2 instanceof RegExp) expect(env[key], `${why}: ${key}`).toMatch(want2);
+        else expect(env[key], `${why}: ${key}`).toBe(want2);
+      }
+    }
   });
 
   it("does not mutate the passed-in base environment", () => {

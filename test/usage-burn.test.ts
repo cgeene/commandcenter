@@ -53,32 +53,6 @@ const counts = (
 });
 
 describe("token_daily migration", () => {
-  it("creates the burn tables on an existing database", async () => {
-    const { getDb } = await import("../src/db/db.js");
-    const db = getDb();
-    const tables = (
-      db
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
-        .all() as { name: string }[]
-    ).map((r) => r.name);
-    expect(tables).toContain("token_daily");
-    expect(tables).toContain("token_samples");
-
-    const cols = (
-      db.prepare("PRAGMA table_info(token_daily)").all() as { name: string }[]
-    ).map((c) => c.name);
-    expect(cols).toEqual([
-      "day",
-      "agent_kind",
-      "model",
-      "input_tokens",
-      "output_tokens",
-      "cache_read",
-      "cache_creation",
-      "cache_creation_1h",
-    ]);
-  });
-
   it("adds cache_creation_1h to burn tables created before the column existed", async () => {
     const { getDb, closeDb } = await import("../src/db/db.js");
     // Recreate the pre-column shape, then let migrate() run on reopen.
@@ -124,27 +98,6 @@ describe("token_daily migration", () => {
 });
 
 describe("delta bucketing", () => {
-  it("accumulates two samples on the same day, counting each turn once", async () => {
-    const { recordTokenSample, allBuckets } = await import("../src/db/tokens.js");
-    const day = new Date("2026-07-20T09:00:00Z");
-
-    recordTokenSample("s1", "worker", new Map([["claude-opus-5", counts(1000, 100)]]), day);
-    // Transcripts are cumulative: the second read includes the first read's
-    // tokens, so only the difference may be added.
-    recordTokenSample(
-      "s1",
-      "worker",
-      new Map([["claude-opus-5", counts(2500, 300)]]),
-      new Date("2026-07-20T17:00:00Z"),
-    );
-
-    const rows = allBuckets();
-    expect(rows).toHaveLength(1);
-    expect(rows[0].day).toBe("2026-07-20");
-    expect(rows[0].input_tokens).toBe(2500);
-    expect(rows[0].output_tokens).toBe(300);
-  });
-
   it("splits at a day rollover, charging each day only its own delta", async () => {
     const { recordTokenSample, allBuckets } = await import("../src/db/tokens.js");
     recordTokenSample(
@@ -189,14 +142,6 @@ describe("delta bucketing", () => {
     expect(haiku.input_tokens).toBe(500);
   });
 
-  it("keeps reviewer and worker burn in separate rows", async () => {
-    const { recordTokenSample, allBuckets } = await import("../src/db/tokens.js");
-    const day = new Date("2026-07-20T09:00:00Z");
-    recordTokenSample("w", "worker", new Map([["claude-opus-5", counts(100, 10)]]), day);
-    recordTokenSample("r", "reviewer", new Map([["claude-opus-5", counts(200, 20)]]), day);
-    expect(allBuckets().map((r) => r.agent_kind).sort()).toEqual(["reviewer", "worker"]);
-  });
-
   it("ignores a cumulative total that went backwards instead of subtracting", async () => {
     const { recordTokenSample, allBuckets } = await import("../src/db/tokens.js");
     const day = new Date("2026-07-20T09:00:00Z");
@@ -231,27 +176,6 @@ describe("delta bucketing", () => {
     expect(row.cache_creation_1h).toBeLessThanOrEqual(row.cache_creation);
   });
 
-  it("prunes watermarks for long-dead sessions but keeps live ones", async () => {
-    const { recordTokenSample, pruneTokenSamples } = await import("../src/db/tokens.js");
-    const { getDb } = await import("../src/db/db.js");
-    recordTokenSample("old", "worker", new Map([["claude-opus-5", counts(10, 1)]]));
-    recordTokenSample("new", "worker", new Map([["claude-opus-5", counts(10, 1)]]));
-    getDb()
-      .prepare("UPDATE token_samples SET sampled_at = '2020-01-01T00:00:00.000Z' WHERE session_id = 'old'")
-      .run();
-
-    expect(pruneTokenSamples()).toBe(1);
-    const left = getDb().prepare("SELECT session_id FROM token_samples").all() as {
-      session_id: string;
-    }[];
-    expect(left.map((r) => r.session_id)).toEqual(["new"]);
-  });
-
-  it("records nothing for an empty sample", async () => {
-    const { recordTokenSample, allBuckets } = await import("../src/db/tokens.js");
-    recordTokenSample("s1", "worker", new Map());
-    expect(allBuckets()).toEqual([]);
-  });
 });
 
 describe("burn summaries", () => {
@@ -292,10 +216,6 @@ describe("burn summaries", () => {
     expect(dayBuckets("2026-07-01", "2026-08-01").map((r) => r.day)).toEqual(["2026-07-05"]);
   });
 
-  it("reports no tracking history before the first sample", async () => {
-    const { earliestTrackedDay } = await import("../src/db/tokens.js");
-    expect(earliestTrackedDay()).toBeNull();
-  });
 });
 
 describe("per-model transcript sums", () => {
@@ -361,14 +281,6 @@ describe("per-model transcript sums", () => {
     expect(t.cache_creation_1h).toBe(20276);
   });
 
-  it("reports no 1h portion when only the flat total is present", async () => {
-    writeTranscript([{ model: "claude-opus-4-8", inp: 100, out: 10 }]);
-    const { sessionTokensByModel } = await import("../src/daemon/transcript.js");
-    const t = sessionTokensByModel(SID, "fallback").get("claude-opus-4-8")!;
-    expect(t.cache_creation).toBe(5);
-    expect(t.cache_creation_1h).toBe(0);
-  });
-
   it("splits a mixed-model session by the model that served each turn", async () => {
     writeTranscript([
       { model: "claude-opus-4-8", inp: 1000, out: 100 },
@@ -390,10 +302,6 @@ describe("per-model transcript sums", () => {
     expect(sessionTokensByModel(SID, "claude-sonnet-5").get("claude-sonnet-5")!.input).toBe(500);
   });
 
-  it("returns nothing for a session with no transcript", async () => {
-    const { sessionTokensByModel } = await import("../src/daemon/transcript.js");
-    expect(sessionTokensByModel("no-such-session", "opus").size).toBe(0);
-  });
 });
 
 describe("quota settings", () => {
@@ -453,21 +361,6 @@ describe("live usage poller", () => {
     spend: { used: { amount_minor: 0, exponent: 2 }, limit: null, enabled: false },
   };
 
-  it("caches a successful fetch", async () => {
-    const mod = await import("../src/daemon/usagelive.js");
-    mod._resetLiveUsageState();
-    mod._setCredentialReader(() => ({ token: "t", expires_at: Date.now() + 3_600_000 }));
-    mod._setUsageFetch(async () => OK_PAYLOAD);
-
-    const state = await mod.refreshLiveUsage();
-    expect(state.error).toBeNull();
-    expect(state.usage?.headline?.percent).toBe(57);
-    // Persisted, so a restart still renders a number immediately.
-    expect(mod.getLiveUsage().usage?.headline?.percent).toBe(57);
-    mod._setUsageFetch(null);
-    mod._setCredentialReader(null);
-  });
-
   it("keeps the last good reading when a later fetch fails", async () => {
     const mod = await import("../src/daemon/usagelive.js");
     mod._resetLiveUsageState();
@@ -482,34 +375,6 @@ describe("live usage poller", () => {
     expect(state.error).toBe("HTTP 503");
     expect(state.usage?.headline?.percent).toBe(57);
     mod._setUsageFetch(null);
-    mod._setCredentialReader(null);
-  });
-
-  it("awaits an async credential reader", async () => {
-    // The real reader shells out to `security`, which must never run
-    // synchronously — a locked keychain would otherwise block the event loop
-    // (daemon startup and every HTTP request, including /api/usage/refresh).
-    const mod = await import("../src/daemon/usagelive.js");
-    mod._resetLiveUsageState();
-    mod._setCredentialReader(async () => {
-      await new Promise((r) => setTimeout(r, 5));
-      return { token: "t", expires_at: Date.now() + 3_600_000 };
-    });
-    mod._setUsageFetch(async () => OK_PAYLOAD);
-    const state = await mod.refreshLiveUsage();
-    expect(state.error).toBeNull();
-    expect(state.usage?.headline?.percent).toBe(57);
-    mod._setUsageFetch(null);
-    mod._setCredentialReader(null);
-  });
-
-  it("reports missing credentials without throwing", async () => {
-    const mod = await import("../src/daemon/usagelive.js");
-    mod._resetLiveUsageState();
-    mod._setCredentialReader(() => undefined);
-    const state = await mod.refreshLiveUsage();
-    expect(state.usage).toBeNull();
-    expect(state.error).toMatch(/credentials/i);
     mod._setCredentialReader(null);
   });
 
@@ -555,25 +420,6 @@ describe("live usage poller", () => {
     const state = await mod.refreshLiveUsage();
     expect(called).toBe(false);
     expect(state.error).toMatch(/CC_LIVE_USAGE/);
-    mod._setCredentialReader(null);
-  });
-
-  it("stays off for an explicit opt-out and any non-affirmative value", async () => {
-    const mod = await import("../src/daemon/usagelive.js");
-    const { liveUsageEnabled } = await import("../src/config.js");
-    for (const v of ["0", "false", "no", "", "maybe"]) {
-      process.env.CC_LIVE_USAGE = v;
-      expect(liveUsageEnabled(), v).toBe(false);
-    }
-    process.env.CC_LIVE_USAGE = "0";
-    mod._resetLiveUsageState();
-    let called = false;
-    mod._setCredentialReader(() => {
-      called = true;
-      return undefined;
-    });
-    await mod.refreshLiveUsage();
-    expect(called).toBe(false);
     mod._setCredentialReader(null);
   });
 

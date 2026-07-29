@@ -4,17 +4,17 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 
-// Real git repos (init/clone/commit/push/merge) rather than mocks: the whole
-// point of freshening is what git actually does to a branch, and a stubbed git
-// would prove nothing about conflicts or the preserved diff. Same timeout
-// reasoning as test/worktree.test.ts — these are slow under parallel load.
-// hookTimeout matters as much as testTimeout here (and is what the full suite
-// tripped over first): beforeEach builds a bare remote plus a seeded clone, and
-// that synchronous git work has been measured past vitest's 10s hook default
-// when the whole suite is running in parallel. Both budgets are generous
-// because every case here pays for real git I/O — a case measured at 9s alone
-// has been seen past 30s on a machine running several agents at once, so the
-// limit tracks machine load, not the assertions.
+// Two fixtures, deliberately. `freshenCandidates`, `mergeNudgePass` and the
+// `auto_freshen` switch are pure database predicates — freshenPass does no git
+// at all until a candidate survives them — so those cases build no repo and run
+// in microseconds. Only the cases whose subject IS what git does to a branch (a
+// real merge commit, a real conflict, a push that must not happen) pay for a
+// real remote.
+//
+// Fixture git is issued as one batched `sh -c` script rather than a call per
+// command: inside a vitest worker each execFileSync fork costs ~160ms (it
+// copies the worker's heap page tables), so the invocation COUNT — not git
+// itself — was this file's dominant cost.
 vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 
 vi.mock("../src/daemon/tmux.js", () => ({
@@ -30,7 +30,6 @@ vi.mock("../src/daemon/tmux.js", () => ({
 let tmpDir: string;
 let remoteDir: string;
 let repoDir: string;
-let fetchMock: ReturnType<typeof vi.fn>;
 let notifyModule: typeof import("../src/daemon/notify.js");
 const realFetch = globalThis.fetch;
 
@@ -42,48 +41,40 @@ function pushTitles(): string[] {
   return notifyModule.recordedPushes().map((push) => push.title);
 }
 
+/** Just the "approved — PR ready to merge" pushes, so a test that also provokes
+ *  a merge nudge still counts the latch it cares about. */
+function readyPushes(): string[] {
+  return pushTitles().filter((title) => title.includes("ready to merge"));
+}
+
 function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
-function commit(repo: string, message: string): void {
-  git(repo, "add", "-A");
-  git(repo, "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-m", message);
+/** Run several git commands in ONE subprocess. Returns trimmed stdout, so a
+ *  script ending in `echo "$SHA"` hands the sha back. */
+function gitScript(script: string, env: Record<string, string>): string {
+  return execFileSync("sh", ["-eu", "-c", script], {
+    encoding: "utf8",
+    env: { ...process.env, ...env },
+  }).trim();
 }
 
-function write(repo: string, name: string, contents: string): void {
-  fs.writeFileSync(path.join(repo, name), contents);
-}
-
-beforeEach(async () => {
+/** Per-test data dir, notify recorder and freshen latch. No git. */
+async function resetRuntime(): Promise<void> {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-freshen-"));
   process.env.CC_DATA_DIR = path.join(tmpDir, "data");
   process.env.CC_NTFY_URL = "https://ntfy.test/cc";
-  fetchMock = vi.fn(async () => new Response("ok"));
-  globalThis.fetch = fetchMock as unknown as typeof fetch;
+  globalThis.fetch = vi.fn(async () => new Response("ok")) as unknown as typeof fetch;
   notifyModule = await import("../src/daemon/notify.js");
   notifyModule.clearRecordedPushes();
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   const { _resetFreshenState } = await import("../src/daemon/freshen.js");
   _resetFreshenState();
+}
 
-  remoteDir = path.join(tmpDir, "remote.git");
-  fs.mkdirSync(remoteDir);
-  git(remoteDir, "init", "--bare", "-b", "main");
-
-  repoDir = path.join(tmpDir, "repo");
-  fs.mkdirSync(repoDir);
-  git(repoDir, "init", "-b", "main");
-  git(repoDir, "remote", "add", "origin", remoteDir);
-  git(repoDir, "config", "user.email", "t@t.com");
-  git(repoDir, "config", "user.name", "t");
-  write(repoDir, "shared.txt", "base\n");
-  commit(repoDir, "chore: initial");
-  git(repoDir, "push", "-u", "origin", "main");
-});
-
-afterEach(async () => {
+async function teardownRuntime(): Promise<void> {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   globalThis.fetch = realFetch;
@@ -92,51 +83,6 @@ afterEach(async () => {
   // The git work here is synchronous and can block this worker's event loop for
   // seconds; yield so vitest's worker RPC replies drain (see worktree.test.ts).
   await new Promise((resolve) => setImmediate(resolve));
-});
-
-/** A pushed agent branch for `taskId` that changed one file, plus the task row
- *  in the state the freshener expects (parked in review with an open PR). */
-async function setupAgentTask(opts: {
-  file: string;
-  contents: string;
-  verifyCmd?: string;
-  approved?: boolean;
-}) {
-  const { createTask, updateTask } = await import("../src/db/tasks.js");
-  const task = createTask({
-    title: `t-${opts.file}`,
-    prompt: "do the thing",
-    repo: repoDir,
-    verify_cmd: opts.verifyCmd,
-  });
-  const branch = `agent/task-${task.id}`;
-  git(repoDir, "checkout", "-q", "-b", branch);
-  write(repoDir, opts.file, opts.contents);
-  commit(repoDir, `feat: ${opts.file}`);
-  git(repoDir, "push", "-q", "-u", "origin", branch);
-  const tip = git(repoDir, "rev-parse", "HEAD");
-  git(repoDir, "checkout", "-q", "main");
-  updateTask(task.id, {
-    status: "review",
-    branch,
-    pr_url: `https://github.com/o/r/pull/${task.id}`,
-    pr_state: "open",
-    pr_is_draft: 0,
-    result_summary: `added ${opts.file}`,
-    ...(opts.approved
-      ? { review_verdict: "approve", review_head_sha: tip, review_cycles: 1 }
-      : {}),
-  });
-  return { task: (await import("../src/db/tasks.js")).getTask(task.id)!, branch, tip };
-}
-
-/** Move the default branch forward on the remote. */
-function advanceMain(file: string, contents: string): string {
-  git(repoDir, "checkout", "-q", "main");
-  write(repoDir, file, contents);
-  commit(repoDir, `feat: main ${file}`);
-  git(repoDir, "push", "-q", "origin", "main");
-  return git(repoDir, "rev-parse", "HEAD");
 }
 
 async function eventKinds(): Promise<string[]> {
@@ -150,11 +96,257 @@ async function eventPayload(kind: string): Promise<Record<string, unknown>> {
   return event?.payload ? (JSON.parse(event.payload) as Record<string, unknown>) : {};
 }
 
-describe("freshenPass — clean merge", () => {
-  it("pushes the merge commit, preserves the diff against main, and carries the approval", async () => {
+async function countEvents(kind: string): Promise<number> {
+  const { listEvents } = await import("../src/db/events.js");
+  return listEvents(200).filter((e) => e.kind === kind).length;
+}
+
+// ---------------------------------------------------------------------------
+// Gating, nudges and error handling: pure database predicates, no repo built.
+// ---------------------------------------------------------------------------
+
+describe("freshen gating, nudges and error handling", () => {
+  beforeEach(resetRuntime);
+  afterEach(teardownRuntime);
+
+  /** A task row in the state the freshener expects: parked in review with an
+   *  open non-draft PR on its own agent branch. No git anywhere. */
+  async function reviewTask(patch: Record<string, unknown> = {}) {
+    const { createTask, updateTask, getTask } = await import("../src/db/tasks.js");
+    const task = createTask({ title: "t", prompt: "do the thing", repo: tmpDir });
+    updateTask(task.id, {
+      status: "review",
+      branch: `agent/task-${task.id}`,
+      pr_url: `https://github.com/o/r/pull/${task.id}`,
+      pr_state: "open",
+      pr_is_draft: 0,
+      result_summary: "did it",
+      ...patch,
+    });
+    return getTask(task.id)!;
+  }
+
+  it("only ever considers this task's own agent branch", async () => {
+    const { freshenCandidates } = await import("../src/daemon/freshen.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    const task = await reviewTask();
+    expect(freshenCandidates().map((t) => t.id)).toEqual([task.id]);
+
+    for (const branch of [
+      "feature/manual", // a hand-made branch
+      `agent/task-${task.id + 99}`, // another task's branch
+      "main",
+      null,
+    ]) {
+      updateTask(task.id, { branch });
+      expect(freshenCandidates(), `branch ${branch}`).toEqual([]);
+    }
+    updateTask(task.id, { branch: `agent/task-${task.id}` });
+    expect(freshenCandidates().map((t) => t.id)).toEqual([task.id]);
+    // The resume-suffixed form of this task's branch is still its own.
+    updateTask(task.id, { branch: `agent/task-${task.id}-resume-2` });
+    expect(freshenCandidates().map((t) => t.id)).toEqual([task.id]);
+  });
+
+  it("skips a task whose worker or reviewer is still live", async () => {
+    const { freshenCandidates } = await import("../src/daemon/freshen.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const task = await reviewTask();
+    expect(freshenCandidates().map((t) => t.id)).toEqual([task.id]);
+    createAgent({ kind: "reviewer", state: "working", task_id: task.id });
+    expect(freshenCandidates()).toEqual([]);
+  });
+
+  it("skips merged/closed PRs, branch-only tasks, and human-publication tasks", async () => {
+    const { freshenCandidates } = await import("../src/daemon/freshen.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    const task = await reviewTask();
+    for (const patch of [
+      { pr_state: "merged" },
+      { pr_state: "closed" },
+      { pr_state: null },
+      { open_pr: 0 },
+      { publication_mode: "human" as const },
+      { status: "in_progress" as const },
+    ]) {
+      updateTask(task.id, patch);
+      expect(freshenCandidates(), JSON.stringify(patch)).toEqual([]);
+      updateTask(task.id, {
+        pr_state: "open",
+        open_pr: 1,
+        publication_mode: "agent",
+        status: "review",
+      });
+    }
+    expect(freshenCandidates().map((t) => t.id)).toEqual([task.id]);
+  });
+
+  it("is disabled by the auto_freshen switch", async () => {
     const { freshenPass } = await import("../src/daemon/freshen.js");
-    const { getTask } = await import("../src/db/tasks.js");
-    const { notifyApprovedReady } = await import("../src/daemon/review.js");
+    const { setIntegrationSettings } = await import("../src/db/settings.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    const task = await reviewTask();
+    // A repo path that does not exist, so the first git call freshenPass makes
+    // is guaranteed to fail loudly. With the switch off it must never get that
+    // far; with it on the error proves the task really was a live candidate and
+    // the silence above was the switch, not an empty queue.
+    updateTask(task.id, { repo: path.join(tmpDir, "gone") });
+
+    setIntegrationSettings({ auto_freshen: false });
+    await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
+    expect(await eventKinds()).toEqual([]);
+
+    setIntegrationSettings({ auto_freshen: true });
+    await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
+    expect(await eventKinds()).toContain("pr.freshen_error");
+  });
+
+  it("swallows failures and never runs two passes at once", async () => {
+    const { integrationPass } = await import("../src/daemon/freshen.js");
+    const { updateTask } = await import("../src/db/tasks.js");
+    const task = await reviewTask();
+    updateTask(task.id, { repo: path.join(tmpDir, "gone") });
+
+    await expect(integrationPass()).resolves.toBeUndefined();
+    expect(await eventKinds()).toContain("pr.freshen_error");
+  });
+
+  it("nudges once when an approved PR waits while its repo moves on", async () => {
+    const { mergeNudgePass } = await import("../src/daemon/freshen.js");
+    const { createTask } = await import("../src/db/tasks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const task = await reviewTask({ review_verdict: "approve", review_cycles: 1 });
+    logEvent("review.approved", { taskId: task.id });
+    const later = new Date(Date.now() + 10 * 60 * 60_000);
+
+    // Nothing else in the repo: waiting costs nobody anything.
+    mergeNudgePass(later);
+    expect(await countEvents("pr.merge_nudge")).toBe(0);
+
+    createTask({ title: "next", prompt: "x", repo: tmpDir });
+    mergeNudgePass(new Date()); // inside the window: still silent
+    expect(await countEvents("pr.merge_nudge")).toBe(0);
+
+    mergeNudgePass(later);
+    mergeNudgePass(later);
+    expect(await countEvents("pr.merge_nudge")).toBe(1); // said once, not per pass
+    expect(pushTitles()).toEqual([
+      `task #${task.id} — approved PR waiting while its repo moves on`,
+    ]);
+  });
+
+  it("stays silent for a draft PR, an unapproved task, or a disabled window", async () => {
+    const { mergeNudgePass } = await import("../src/daemon/freshen.js");
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { setIntegrationSettings } = await import("../src/db/settings.js");
+    const task = await reviewTask({ review_verdict: "approve", review_cycles: 1 });
+    logEvent("review.approved", { taskId: task.id });
+    createTask({ title: "next", prompt: "x", repo: tmpDir });
+    const later = new Date(Date.now() + 10 * 60 * 60_000);
+
+    updateTask(task.id, { pr_is_draft: 1 });
+    mergeNudgePass(later);
+    updateTask(task.id, { pr_is_draft: 0, review_verdict: null });
+    mergeNudgePass(later);
+    updateTask(task.id, { review_verdict: "approve" });
+    setIntegrationSettings({ merge_nudge_minutes: null });
+    mergeNudgePass(later);
+    expect(await countEvents("pr.merge_nudge")).toBe(0);
+
+    // ...and the same row DOES nudge once the three blockers are lifted, so the
+    // silence above is the guards and not a broken fixture.
+    setIntegrationSettings({ merge_nudge_minutes: 60 });
+    mergeNudgePass(later);
+    expect(await countEvents("pr.merge_nudge")).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// What git actually does to the branch: real bare remote, real merges.
+// ---------------------------------------------------------------------------
+
+describe("freshenPass — real git", () => {
+  beforeEach(async () => {
+    await resetRuntime();
+    remoteDir = path.join(tmpDir, "remote.git");
+    repoDir = path.join(tmpDir, "repo");
+    gitScript(
+      `mkdir -p "$REMOTE" "$REPO"
+       git -C "$REMOTE" init -q --bare -b main
+       git -C "$REPO" init -q -b main
+       git -C "$REPO" remote add origin "$REMOTE"
+       git -C "$REPO" config user.email t@t.com
+       git -C "$REPO" config user.name t
+       printf 'base\n' > "$REPO/shared.txt"
+       git -C "$REPO" add -A
+       git -C "$REPO" commit -q -m 'chore: initial'
+       git -C "$REPO" push -q -u origin main`,
+      { REMOTE: remoteDir, REPO: repoDir },
+    );
+  });
+  afterEach(teardownRuntime);
+
+  /** A pushed agent branch for a new task that changed one file, plus the task
+   *  row in the state the freshener expects (parked in review with an open PR). */
+  async function setupAgentTask(opts: {
+    file: string;
+    contents: string;
+    verifyCmd?: string;
+    approved?: boolean;
+  }) {
+    const { createTask, updateTask, getTask } = await import("../src/db/tasks.js");
+    const task = createTask({
+      title: `t-${opts.file}`,
+      prompt: "do the thing",
+      repo: repoDir,
+      verify_cmd: opts.verifyCmd,
+    });
+    const branch = `agent/task-${task.id}`;
+    const tip = gitScript(
+      `git -C "$REPO" checkout -q -b "$BRANCH"
+       printf '%s' "$CONTENTS" > "$REPO/$FILE"
+       git -C "$REPO" add -A
+       git -C "$REPO" commit -q -m "feat: $FILE"
+       git -C "$REPO" push -q -u origin "$BRANCH"
+       TIP=$(git -C "$REPO" rev-parse HEAD)
+       git -C "$REPO" checkout -q main
+       echo "$TIP"`,
+      { REPO: repoDir, BRANCH: branch, FILE: opts.file, CONTENTS: opts.contents },
+    );
+    updateTask(task.id, {
+      status: "review",
+      branch,
+      pr_url: `https://github.com/o/r/pull/${task.id}`,
+      pr_state: "open",
+      pr_is_draft: 0,
+      result_summary: `added ${opts.file}`,
+      ...(opts.approved
+        ? { review_verdict: "approve", review_head_sha: tip, review_cycles: 1 }
+        : {}),
+    });
+    return { task: getTask(task.id)!, branch, tip };
+  }
+
+  /** Move the default branch forward on the remote. */
+  function advanceMain(file: string, contents: string): void {
+    gitScript(
+      `git -C "$REPO" checkout -q main
+       printf '%s' "$CONTENTS" > "$REPO/$FILE"
+       git -C "$REPO" add -A
+       git -C "$REPO" commit -q -m "feat: main $FILE"
+       git -C "$REPO" push -q origin main`,
+      { REPO: repoDir, FILE: file, CONTENTS: contents },
+    );
+  }
+
+  it("pushes the merge commit, preserves the diff against main, and carries the approval", async () => {
+    const { freshenPass, mergeNudgePass } = await import("../src/daemon/freshen.js");
+    const { createTask, getTask } = await import("../src/db/tasks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { notifyApprovedReady, maybeAutoReview } = await import(
+      "../src/daemon/review.js"
+    );
     const { task, branch, tip } = await setupAgentTask({
       file: "feature.txt",
       contents: "feature\n",
@@ -165,7 +357,17 @@ describe("freshenPass — clean merge", () => {
     // approved SHA, claiming its latch. That is the precondition for carrying
     // the latch forward below.
     notifyApprovedReady(getTask(task.id)!);
-    expect(pushTitles()).toHaveLength(1);
+    expect(readyPushes()).toHaveLength(1);
+
+    // A contender in the same repo, and one nudge already spent, so the
+    // post-freshen nudge assertion below is about the key and not about an
+    // unnudgeable row.
+    logEvent("review.approved", { taskId: task.id });
+    createTask({ title: "next", prompt: "x", repo: repoDir });
+    const later = new Date(Date.now() + 10 * 60 * 60_000);
+    mergeNudgePass(later);
+    expect(await countEvents("pr.merge_nudge")).toBe(1);
+
     advanceMain("other.txt", "other\n");
 
     await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
@@ -203,7 +405,23 @@ describe("freshenPass — clean merge", () => {
     const { approvedReadyLatchKey } = await import("../src/daemon/review.js");
     expect(notifyLatched(approvedReadyLatchKey(task.id, newTip))).toBe(true);
     notifyApprovedReady(getTask(task.id)!);
-    expect(pushTitles()).toHaveLength(1); // still just the approval-time push
+    expect(readyPushes()).toHaveLength(1); // still just the approval-time push
+
+    // The review loop looking again must not supersede the carried approval or
+    // burn a round on our own merge commit.
+    await maybeAutoReview(task.id);
+    const after = getTask(task.id)!;
+    expect(after.review_verdict).toBe("approve");
+    expect(after.review_cycles).toBe(1);
+    expect(after.pr_is_draft).toBe(0);
+    expect(await eventKinds()).not.toContain("review.verdict_superseded");
+    expect(await eventKinds()).not.toContain("review.round_started");
+
+    // Freshening advanced review_head_sha onto the merge commit for the SAME
+    // approval, so anything SHA-keyed would page the human again per re-merge.
+    mergeNudgePass(later);
+    expect(await countEvents("pr.merge_nudge")).toBe(1);
+    expect(pushTitles().filter((t) => t.includes("approved PR waiting"))).toHaveLength(1);
   });
 
   it("does not swallow the ready-to-merge push that was never delivered", async () => {
@@ -241,107 +459,73 @@ describe("freshenPass — clean merge", () => {
     ]);
   });
 
-  it("leaves the carried approval alone when the review loop looks again", async () => {
-    const { freshenPass } = await import("../src/daemon/freshen.js");
-    const { maybeAutoReview } = await import("../src/daemon/review.js");
-    const { getTask } = await import("../src/db/tasks.js");
-    const { task } = await setupAgentTask({
-      file: "feature.txt",
-      contents: "feature\n",
-      approved: true,
-    });
-    advanceMain("other.txt", "other\n");
-
-    await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
-    await maybeAutoReview(task.id);
-
-    const fresh = getTask(task.id)!;
-    expect(fresh.review_verdict).toBe("approve"); // not superseded by our merge
-    expect(fresh.review_cycles).toBe(1); // no extra round burned
-    expect(fresh.pr_is_draft).toBe(0);
-    expect(await eventKinds()).not.toContain("review.verdict_superseded");
-    expect(await eventKinds()).not.toContain("review.round_started");
-  });
-
-  it("does nothing at all when the branch already contains main", async () => {
-    const { freshenPass } = await import("../src/daemon/freshen.js");
-    const { branch, tip } = await setupAgentTask({ file: "a.txt", contents: "a\n" });
-
-    await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
-
-    expect(git(repoDir, "rev-parse", `origin/${branch}`)).toBe(tip);
-    expect(await eventKinds()).not.toContain("pr.freshen_attempt");
-  });
-});
-
-describe("freshenPass — conflict", () => {
-  it("pushes nothing and respawns the worker with the standard conflict brief", async () => {
+  // Both no-push outcomes in ONE pass. They were two tests paying for two
+  // fixtures and two real merges to prove the same rule -- freshening pushes
+  // NOTHING unless the merge is clean AND verification passes -- and running
+  // them together additionally proves one task's failure does not contaminate
+  // the other's handling, which is what a pass actually does in production.
+  // The default freshen_per_pass_limit is 2, so both are processed.
+  it("pushes nothing and respawns the worker, for a conflict and for a failed verify", async () => {
     const { freshenPass } = await import("../src/daemon/freshen.js");
     const { getTask } = await import("../src/db/tasks.js");
-    const { task, branch, tip } = await setupAgentTask({
+    // main moves shared.txt, which conflicts with the first branch and merges
+    // cleanly into the second (whose own change is feature.txt).
+    const conflicted = await setupAgentTask({
       file: "shared.txt",
       contents: "branch side\n",
+    });
+    const verifyFailed = await setupAgentTask({
+      file: "feature.txt",
+      contents: "feature\n",
+      verifyCmd: "echo boom >&2; exit 1",
     });
     advanceMain("shared.txt", "main side\n");
 
     const spawned: number[] = [];
     await freshenPass({ spawn: (id) => spawned.push(id) });
 
-    expect(git(repoDir, "rev-parse", `origin/${branch}`)).toBe(tip); // nothing pushed
-    expect(spawned).toEqual([task.id]);
+    // Neither branch moved on origin, and both workers were handed back the work.
+    for (const { branch, tip } of [conflicted, verifyFailed]) {
+      expect(git(repoDir, "rev-parse", `origin/${branch}`), branch).toBe(tip);
+    }
+    expect([...spawned].sort()).toEqual(
+      [conflicted.task.id, verifyFailed.task.id].sort(),
+    );
+    expect(await eventKinds()).not.toContain("pr.freshened");
 
-    const fresh = getTask(task.id)!;
-    expect(fresh.status).toBe("queued"); // requeued so the worker can be spawned
-    expect(fresh.agent_id).toBeNull();
-    // The standardized brief, appended to the prompt so it reaches both a fresh
-    // and a resumed session.
-    expect(fresh.prompt).toContain("do the thing");
-    expect(fresh.prompt).toContain("Integration fix round 1");
-    expect(fresh.prompt).toContain("ALREADY COMPLETE");
-    expect(fresh.prompt).toContain("git merge origin/main");
-    expect(fresh.prompt).toContain("never a rebase");
-    expect(fresh.prompt).toContain("keeping BOTH sides' intent");
-    expect(fresh.prompt).toContain("`shared.txt`");
-    expect(fresh.prompt).toContain(`git push origin ${branch}`);
-    expect(fresh.prompt).toContain("added shared.txt"); // its own result summary
-
+    // The conflict side: requeued, with the standardized brief appended to the
+    // prompt so it reaches both a fresh and a resumed session.
+    const c = getTask(conflicted.task.id)!;
+    expect(c.status).toBe("queued"); // requeued so the worker can be spawned
+    expect(c.agent_id).toBeNull();
+    expect(c.prompt).toContain("do the thing");
+    expect(c.prompt).toContain("Integration fix round 1");
+    expect(c.prompt).toContain("ALREADY COMPLETE");
+    expect(c.prompt).toContain("git merge origin/main");
+    expect(c.prompt).toContain("never a rebase");
+    expect(c.prompt).toContain("keeping BOTH sides' intent");
+    expect(c.prompt).toContain("`shared.txt`");
+    expect(c.prompt).toContain(`git push origin ${conflicted.branch}`);
+    expect(c.prompt).toContain("added shared.txt"); // its own result summary
     expect(await eventPayload("pr.freshen_conflict")).toMatchObject({
       conflicts: ["shared.txt"],
       respawned: true,
     });
-    // The throwaway merge tree never survives a failed attempt.
-    expect(fs.existsSync(path.join(tmpDir, "data", "worktrees"))).toBe(true);
+
+    // The verify side: a different brief, carrying the failure output.
+    const v = getTask(verifyFailed.task.id)!;
+    expect(v.prompt).toContain("verification FAILED");
+    expect(v.prompt).toContain("boom");
+    expect(await eventPayload("pr.freshen_verify_failed")).toMatchObject({
+      respawned: true,
+    });
+
+    // The throwaway merge tree never survives a failed attempt, either kind.
     expect(
       fs
         .readdirSync(path.join(tmpDir, "data", "worktrees"))
         .filter((d) => d.endsWith("-freshen")),
     ).toEqual([]);
-  });
-});
-
-describe("freshenPass — verification", () => {
-  it("does not push when the merged tree fails the task's verify command", async () => {
-    const { freshenPass } = await import("../src/daemon/freshen.js");
-    const { getTask } = await import("../src/db/tasks.js");
-    const { task, branch, tip } = await setupAgentTask({
-      file: "feature.txt",
-      contents: "feature\n",
-      verifyCmd: "echo boom >&2; exit 1",
-    });
-    advanceMain("other.txt", "other\n");
-
-    const spawned: number[] = [];
-    await freshenPass({ spawn: (id) => spawned.push(id) });
-
-    expect(git(repoDir, "rev-parse", `origin/${branch}`)).toBe(tip); // nothing pushed
-    expect(spawned).toEqual([task.id]);
-    const fresh = getTask(task.id)!;
-    expect(fresh.prompt).toContain("verification FAILED");
-    expect(fresh.prompt).toContain("boom");
-    expect(await eventPayload("pr.freshen_verify_failed")).toMatchObject({
-      respawned: true,
-    });
-    expect(await eventKinds()).not.toContain("pr.freshened");
   });
 
   it("throws the merge away when the task moves on while verification runs", async () => {
@@ -367,12 +551,10 @@ describe("freshenPass — verification", () => {
     expect(await eventKinds()).toContain("pr.freshen_abandoned");
     expect(await eventKinds()).not.toContain("pr.freshened");
   });
-});
 
-describe("freshenPass — storm control", () => {
   it("halts and notifies once when a PR keeps needing freshening without merging", async () => {
     const { freshenPass } = await import("../src/daemon/freshen.js");
-    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const { logEvent } = await import("../src/db/events.js");
     const { setIntegrationSettings } = await import("../src/db/settings.js");
     setIntegrationSettings({ freshen_max_attempts: 2 });
     const { task, branch, tip } = await setupAgentTask({
@@ -387,19 +569,16 @@ describe("freshenPass — storm control", () => {
     await freshenPass({ spawn: () => expect.unreachable("must not respawn once halted") });
 
     expect(git(repoDir, "rev-parse", `origin/${branch}`)).toBe(tip);
-    const halts = listEvents(200).filter((e) => e.kind === "pr.freshen_halted");
-    expect(halts).toHaveLength(1); // said once, not every pass
-    expect(
-      listEvents(200).filter((e) => e.kind === "pr.freshen_attempt"),
-    ).toHaveLength(2); // no new attempts were made
+    expect(await countEvents("pr.freshen_halted")).toBe(1); // said once, not every pass
+    expect(await countEvents("pr.freshen_attempt")).toBe(2); // no new attempts were made
   });
 
   it("never halts a PR that is already up to date, however many freshens it took", async () => {
-    // The cap is on a PR that KEEPS NEEDING freshening. Three clean re-merges
-    // followed by a human who has not merged yet is the happy path, and it must
-    // not turn into "the platform stopped re-merging its PR" on the next poll.
+    // The cap is on a PR that KEEPS NEEDING freshening. Clean re-merges followed
+    // by a human who has not merged yet is the happy path, and it must not turn
+    // into "the platform stopped re-merging its PR" on the next poll.
     const { freshenPass } = await import("../src/daemon/freshen.js");
-    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const { logEvent } = await import("../src/db/events.js");
     const { setIntegrationSettings } = await import("../src/db/settings.js");
     setIntegrationSettings({ freshen_max_attempts: 2 });
     const { task, branch, tip } = await setupAgentTask({
@@ -415,207 +594,35 @@ describe("freshenPass — storm control", () => {
     await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
     await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
 
+    // A branch that already contains main is left completely alone — no push,
+    // and no attempt recorded against its cap.
     expect(git(repoDir, "rev-parse", `origin/${branch}`)).toBe(tip);
-    expect(listEvents(200).filter((e) => e.kind === "pr.freshen_halted")).toEqual([]);
+    expect(await countEvents("pr.freshen_halted")).toBe(0);
+    expect(await countEvents("pr.freshen_attempt")).toBe(3); // still just the seeded ones
     expect(pushTitles()).toEqual([]); // and no "stopped re-merging" page
 
     // Once main DOES move past it, the cap applies as normal.
     advanceMain("other.txt", "other\n");
     await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
-    expect(
-      listEvents(200).filter((e) => e.kind === "pr.freshen_halted"),
-    ).toHaveLength(1);
-    expect(pushTitles()).toEqual([
-      `task #${task.id} — stopped re-merging its PR`,
-    ]);
+    expect(await countEvents("pr.freshen_halted")).toBe(1);
+    expect(pushTitles()).toEqual([`task #${task.id} — stopped re-merging its PR`]);
   });
 
   it("queues a merge burst instead of freshening every stale PR at once", async () => {
     const { freshenPass } = await import("../src/daemon/freshen.js");
     const { setIntegrationSettings } = await import("../src/db/settings.js");
-    const { listEvents } = await import("../src/db/events.js");
     setIntegrationSettings({ freshen_per_pass_limit: 1 });
     await setupAgentTask({ file: "one.txt", contents: "1\n" });
     await setupAgentTask({ file: "two.txt", contents: "2\n" });
-    await setupAgentTask({ file: "three.txt", contents: "3\n" });
     advanceMain("other.txt", "other\n");
 
     await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
 
-    expect(listEvents(200).filter((e) => e.kind === "pr.freshened")).toHaveLength(1);
-    expect(listEvents(200).filter((e) => e.kind === "pr.freshen_deferred")).toHaveLength(2);
+    expect(await countEvents("pr.freshened")).toBe(1);
+    expect(await countEvents("pr.freshen_deferred")).toBe(1);
 
-    // The deferred ones are picked up by the following pass.
+    // The deferred one is picked up by the following pass.
     await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
-    expect(listEvents(200).filter((e) => e.kind === "pr.freshened")).toHaveLength(2);
-  });
-
-  it("is disabled by the auto_freshen switch", async () => {
-    const { freshenPass } = await import("../src/daemon/freshen.js");
-    const { setIntegrationSettings } = await import("../src/db/settings.js");
-    setIntegrationSettings({ auto_freshen: false });
-    const { branch, tip } = await setupAgentTask({ file: "a.txt", contents: "a\n" });
-    advanceMain("other.txt", "other\n");
-
-    await freshenPass();
-
-    expect(git(repoDir, "rev-parse", `origin/${branch}`)).toBe(tip);
-    expect(await eventKinds()).not.toContain("pr.freshen_attempt");
-  });
-});
-
-describe("freshenCandidates — guard rails", () => {
-  it("never touches a branch that is not this task's agent branch", async () => {
-    const { freshenPass, freshenCandidates } = await import("../src/daemon/freshen.js");
-    const { updateTask } = await import("../src/db/tasks.js");
-    const { task } = await setupAgentTask({ file: "a.txt", contents: "a\n" });
-    advanceMain("other.txt", "other\n");
-    // A hand-made branch, and another task's branch: both are off limits.
-    git(repoDir, "branch", "feature/manual", `agent/task-${task.id}`);
-    git(repoDir, "push", "-q", "origin", "feature/manual");
-    updateTask(task.id, { branch: "feature/manual" });
-    expect(freshenCandidates()).toEqual([]);
-
-    updateTask(task.id, { branch: `agent/task-${task.id + 99}` });
-    expect(freshenCandidates()).toEqual([]);
-
-    await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
-    expect(git(repoDir, "rev-parse", "origin/feature/manual")).toBe(
-      git(repoDir, "rev-parse", `origin/agent/task-${task.id}`),
-    );
-    expect(await eventKinds()).not.toContain("pr.freshen_attempt");
-  });
-
-  it("skips a task whose worker or reviewer is still live", async () => {
-    const { freshenCandidates } = await import("../src/daemon/freshen.js");
-    const { createAgent } = await import("../src/db/agents.js");
-    const { task } = await setupAgentTask({ file: "a.txt", contents: "a\n" });
-    expect(freshenCandidates().map((t) => t.id)).toEqual([task.id]);
-    createAgent({ kind: "reviewer", state: "working", task_id: task.id });
-    expect(freshenCandidates()).toEqual([]);
-  });
-
-  it("skips merged/closed PRs, branch-only tasks, and human-publication tasks", async () => {
-    const { freshenCandidates } = await import("../src/daemon/freshen.js");
-    const { updateTask } = await import("../src/db/tasks.js");
-    const { task } = await setupAgentTask({ file: "a.txt", contents: "a\n" });
-    for (const patch of [
-      { pr_state: "merged" },
-      { pr_state: "closed" },
-      { pr_state: null },
-      { open_pr: 0 },
-      { publication_mode: "human" as const },
-      { status: "in_progress" as const },
-    ]) {
-      updateTask(task.id, patch);
-      expect(freshenCandidates()).toEqual([]);
-      updateTask(task.id, {
-        pr_state: "open",
-        open_pr: 1,
-        publication_mode: "agent",
-        status: "review",
-      });
-    }
-    expect(freshenCandidates().map((t) => t.id)).toEqual([task.id]);
-  });
-});
-
-describe("mergeNudgePass", () => {
-  it("nudges once when an approved PR waits while other tasks in the repo are active", async () => {
-    const { mergeNudgePass } = await import("../src/daemon/freshen.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const { logEvent, listEvents } = await import("../src/db/events.js");
-    const { task } = await setupAgentTask({
-      file: "a.txt",
-      contents: "a\n",
-      approved: true,
-    });
-    logEvent("review.approved", { taskId: task.id });
-
-    // Nothing else in the repo: waiting costs nobody anything.
-    mergeNudgePass(new Date(Date.now() + 10 * 60 * 60_000));
-    expect(listEvents(50).filter((e) => e.kind === "pr.merge_nudge")).toHaveLength(0);
-
-    createTask({ title: "next", prompt: "x", repo: repoDir });
-    // Inside the window still says nothing.
-    mergeNudgePass(new Date());
-    expect(listEvents(50).filter((e) => e.kind === "pr.merge_nudge")).toHaveLength(0);
-
-    const later = new Date(Date.now() + 10 * 60 * 60_000);
-    mergeNudgePass(later);
-    mergeNudgePass(later);
-    expect(listEvents(50).filter((e) => e.kind === "pr.merge_nudge")).toHaveLength(1);
-    expect(pushTitles()).toEqual([
-      `task #${task.id} — approved PR waiting while its repo moves on`,
-    ]);
-  });
-
-  it("does not re-nudge for the same approval after a clean freshen moves the branch", async () => {
-    // Freshening advances review_head_sha onto its merge commit for the SAME
-    // approval, so anything SHA-keyed would page the human again per re-merge.
-    const { freshenPass, mergeNudgePass } = await import("../src/daemon/freshen.js");
-    const { createTask, getTask } = await import("../src/db/tasks.js");
-    const { logEvent, listEvents } = await import("../src/db/events.js");
-    const { task, tip } = await setupAgentTask({
-      file: "feature.txt",
-      contents: "feature\n",
-      approved: true,
-    });
-    logEvent("review.approved", { taskId: task.id });
-    createTask({ title: "next", prompt: "x", repo: repoDir });
-    const later = new Date(Date.now() + 10 * 60 * 60_000);
-
-    mergeNudgePass(later);
-    expect(listEvents(80).filter((e) => e.kind === "pr.merge_nudge")).toHaveLength(1);
-
-    advanceMain("other.txt", "other\n");
-    await freshenPass({ spawn: () => expect.unreachable("no respawn expected") });
-    // The approval really did move onto the merge commit — otherwise this test
-    // would pass for the wrong reason.
-    const fresh = getTask(task.id)!;
-    expect(fresh.review_verdict).toBe("approve");
-    expect(fresh.review_head_sha).not.toBe(tip);
-
-    mergeNudgePass(later);
-    expect(listEvents(80).filter((e) => e.kind === "pr.merge_nudge")).toHaveLength(1);
-    expect(
-      pushTitles().filter((t) => t.includes("approved PR waiting")),
-    ).toHaveLength(1);
-  });
-
-  it("stays silent for a draft PR, an unapproved task, or a disabled window", async () => {
-    const { mergeNudgePass } = await import("../src/daemon/freshen.js");
-    const { createTask, updateTask } = await import("../src/db/tasks.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const { setIntegrationSettings } = await import("../src/db/settings.js");
-    const { task } = await setupAgentTask({
-      file: "a.txt",
-      contents: "a\n",
-      approved: true,
-    });
-    createTask({ title: "next", prompt: "x", repo: repoDir });
-    const later = new Date(Date.now() + 10 * 60 * 60_000);
-
-    updateTask(task.id, { pr_is_draft: 1 });
-    mergeNudgePass(later);
-    updateTask(task.id, { pr_is_draft: 0, review_verdict: null });
-    mergeNudgePass(later);
-    updateTask(task.id, { review_verdict: "approve" });
-    setIntegrationSettings({ merge_nudge_minutes: null });
-    mergeNudgePass(later);
-    expect(listEvents(50).filter((e) => e.kind === "pr.merge_nudge")).toHaveLength(0);
-  });
-});
-
-describe("integrationPass", () => {
-  it("swallows failures and never runs two passes at once", async () => {
-    const { integrationPass } = await import("../src/daemon/freshen.js");
-    const { updateTask } = await import("../src/db/tasks.js");
-    const { task } = await setupAgentTask({ file: "a.txt", contents: "a\n" });
-    // A repo path that no longer exists: every git call throws.
-    updateTask(task.id, { repo: path.join(tmpDir, "gone") });
-
-    await expect(integrationPass()).resolves.toBeUndefined();
-    expect(await eventKinds()).toContain("pr.freshen_error");
+    expect(await countEvents("pr.freshened")).toBe(2);
   });
 });

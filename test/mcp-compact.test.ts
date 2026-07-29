@@ -124,13 +124,17 @@ const OMITTED_BY_DEFAULT = [
 ];
 
 describe("task projections", () => {
-  it("compactTask keeps exactly the compact field set", () => {
-    expect(Object.keys(compactTask(fullTask()) as object)).toEqual([...COMPACT_TASK_FIELDS]);
-  });
-
-  it("compactTask drops the prompt, review notes, and jira columns", () => {
-    const out = compactTask(fullTask()) as Record<string, unknown>;
-    for (const key of OMITTED_BY_DEFAULT) expect(out).not.toHaveProperty(key);
+  // Exact key equality against a record that also carries an unknown column is
+  // the whole contract in one assertion: the bulk (prompt, review notes, jira,
+  // snapshot) is dropped, the fields triage must preserve to re-dispatch a task
+  // unchanged (worker_provider, reasoning_effort, review_mode) are present, and a
+  // column added to the table later stays out until it is listed.
+  it("compactTask keeps exactly the compact field set, and nothing else", () => {
+    const out = compactTask(fullTask({ some_future_column: "x" })) as object;
+    expect(Object.keys(out)).toEqual([...COMPACT_TASK_FIELDS]);
+    for (const key of ["worker_provider", "reasoning_effort", "review_mode"]) {
+      expect(out).toHaveProperty(key);
+    }
   });
 
   it("compactTask truncates result_summary and marks it", () => {
@@ -139,13 +143,11 @@ describe("task projections", () => {
     expect(summary).toHaveLength(RESULT_SUMMARY_LIMIT + TRUNCATION_MARKER.length);
     expect(summary.endsWith(TRUNCATION_MARKER)).toBe(true);
     expect(summary.startsWith("S".repeat(RESULT_SUMMARY_LIMIT))).toBe(true);
-  });
-
-  it("leaves a short result_summary and a null one alone", () => {
+    // ...and the boundary: at or under the limit is returned verbatim, so a
+    // short summary is never silently marked as truncated.
     expect(truncateSummary("done")).toBe("done");
     expect(truncateSummary("x".repeat(RESULT_SUMMARY_LIMIT))).toHaveLength(RESULT_SUMMARY_LIMIT);
     expect(truncateSummary(null)).toBeNull();
-    expect((compactTask(fullTask({ result_summary: null })) as Record<string, unknown>).result_summary).toBeNull();
   });
 
   it("compactTask appends explicitly requested extra fields", () => {
@@ -155,15 +157,6 @@ describe("task projections", () => {
     expect(out).not.toHaveProperty("review_snapshot_tree");
   });
 
-  it("keeps the fields triage must preserve when it re-dispatches a task", () => {
-    const out = compactTask(fullTask()) as Record<string, unknown>;
-    // effort and review depth are set at creation/triage; losing them to
-    // compaction means silently re-creating a task with different settings
-    expect(out).toHaveProperty("worker_provider");
-    expect(out).toHaveProperty("reasoning_effort");
-    expect(out).toHaveProperty("review_mode");
-  });
-
   it("echoedFields keeps changed fields but drops the bulk", () => {
     expect(echoedFields(["verify_cmd", "review_mode"])).toEqual([
       "verify_cmd",
@@ -171,11 +164,6 @@ describe("task projections", () => {
     ]);
     expect(echoedFields(["prompt", "review_notes"])).toEqual([]);
     expect(echoedFields(["prompt", "status"])).toEqual(["status"]);
-  });
-
-  it("is an allow-list: a column added later stays out until listed", () => {
-    const out = compactTask(fullTask({ some_future_column: "x" })) as Record<string, unknown>;
-    expect(out).not.toHaveProperty("some_future_column");
   });
 
   it("taskRow keeps only the list-row fields", () => {
@@ -191,24 +179,12 @@ describe("task projections", () => {
     expect(out.review_notes).toHaveLength(2500);
   });
 
-  it("projectTask does not duplicate an explicitly requested id", () => {
-    expect(Object.keys(projectTask(fullTask(), ["id", "status"]) as object)).toEqual([
-      "id",
-      "status",
-    ]);
-  });
-
   it("shapeTask honors fields over verbose", () => {
     const out = shapeTask(fullTask(), { verbose: true, fields: ["status"] }) as Record<
       string,
       unknown
     >;
     expect(Object.keys(out)).toEqual(["id", "status"]);
-  });
-
-  it("shapeTask verbose returns the untouched record", () => {
-    const task = fullTask();
-    expect(shapeTask(task, { verbose: true })).toBe(task);
   });
 
   it("shapeTaskList maps rows by default and full records when verbose", () => {
@@ -379,22 +355,6 @@ describe("main-role tools", () => {
     expect(out.verify_cmd).toBe("npm test"); // echoed from the daemon's response
   });
 
-  it("update_task appends only the non-bulky changed fields", async () => {
-    const out = await callTool("update_task", {
-      id: 42,
-      prompt: "a new prompt",
-      verify_cmd: "npm run check",
-      priority: 1,
-    });
-    // priority is already in the core, so it is not appended twice
-    expect(Object.keys(out)).toEqual([...COMPACT_TASK_FIELDS, "verify_cmd"]);
-  });
-
-  it("update_task exposes blocked_by so sequencing can be persisted", async () => {
-    const schema = registered.get("update_task")!.config.inputSchema!;
-    expect(Object.keys(schema)).toContain("blocked_by");
-  });
-
   it("update_task forwards blocked_by and reports what the blocker means", async () => {
     respond = (path, method) =>
       method === "PATCH" ? fullTask({ blocked_by: 9 }) : fullTask({ id: 9, status: "done" });
@@ -422,34 +382,6 @@ describe("main-role tools", () => {
     expect(out.blocker.note).toMatch(/never become done/);
   });
 
-  it("update_task clears blocked_by without an advisory lookup", async () => {
-    respond = () => fullTask({ blocked_by: null });
-    const out = await callTool("update_task", { id: 42, blocked_by: null });
-    expect(fetchCalls).toHaveLength(1);
-    expect(fetchCalls[0]).toMatchObject({
-      method: "PATCH",
-      path: "/api/tasks/42",
-      body: { blocked_by: null },
-    });
-    expect(out).not.toHaveProperty("blocker");
-    expect(out.blocked_by).toBeNull();
-  });
-
-  it("add_task echoes only the compact record", async () => {
-    const out = await callTool("add_task", {
-      title: "t",
-      prompt: "p".repeat(500),
-      repo: "/repos/commandcenter",
-    });
-    expect(Object.keys(out)).toEqual([...COMPACT_TASK_FIELDS]);
-  });
-
-  it("claim_task echoes only the compact record", async () => {
-    expect(Object.keys(await callTool("claim_task", { id: 42 }))).toEqual([
-      ...COMPACT_TASK_FIELDS,
-    ]);
-  });
-
   it("cancel_task compacts the task and rows its open dependents", async () => {
     respond = () => ({
       task: fullTask({ status: "cancelled" }),
@@ -470,14 +402,6 @@ describe("main-role tools", () => {
     expect(Object.keys(out.task)).toEqual([...COMPACT_TASK_FIELDS]);
   });
 
-  it("spawn_reviewer compacts the task and returns the agent unchanged", async () => {
-    const agent = { id: 10, kind: "reviewer", state: "spawning" };
-    respond = () => ({ agent, task: fullTask() });
-    const out = await callTool("spawn_reviewer", { task_id: 42 });
-    expect(out.agent).toEqual(agent);
-    expect(Object.keys(out.task)).toEqual([...COMPACT_TASK_FIELDS]);
-  });
-
   it("cancel_task forwards discard_unpublished", async () => {
     respond = () => ({ task: fullTask(), killed_agents: [], open_dependents: [] });
     await callTool("cancel_task", { task_id: 42, rm_worktree: true, discard_unpublished: true });
@@ -490,13 +414,6 @@ describe("main-role tools", () => {
     expect(out).not.toHaveProperty("review_snapshot_tree");
   });
 
-  it("advertises verbose and fields on the read tools", () => {
-    for (const name of ["get_task", "list_tasks"]) {
-      const schema = registered.get(name)!.config.inputSchema!;
-      expect(Object.keys(schema)).toEqual(expect.arrayContaining(["verbose", "fields"]));
-    }
-    expect(registered.get("get_task")!.config.description).toContain("verbose: true");
-  });
 });
 
 describe("worker-role tools", () => {

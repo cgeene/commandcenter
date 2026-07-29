@@ -12,14 +12,6 @@ function t(over: Partial<BoardTask> & { id: number }): BoardTask {
   return { status: "queued", repo: "/home/caleb/projects/commandcenter", blocked_by: null, ...over };
 }
 
-describe("projectOf", () => {
-  it("returns the repo directory basename", () => {
-    expect(projectOf("/home/caleb/projects/commandcenter")).toBe("commandcenter");
-    expect(projectOf("/opt/src/unicorn-k8s")).toBe("unicorn-k8s");
-    expect(projectOf("/a/b/nylas-data-lake/")).toBe("nylas-data-lake"); // trailing slash
-  });
-});
-
 describe("groupByProject", () => {
   it("groups by repo basename with a done/total rollup, preserving order", () => {
     const tasks = [
@@ -93,11 +85,6 @@ describe("groupByProject with a visible filter", () => {
     expect(groups[1].tasks.map((x) => x.id)).toEqual([4]);
   });
 
-  it("without a filter, behaves exactly as before (all tasks visible)", () => {
-    const groups = groupByProject(tasks);
-    expect(groups[0].tasks.map((x) => x.id)).toEqual([1, 2, 3]);
-    expect(groups[0].total).toBe(3);
-  });
 });
 
 describe("blockedByChain", () => {

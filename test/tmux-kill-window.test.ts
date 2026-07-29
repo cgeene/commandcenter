@@ -16,7 +16,9 @@ const SESSION = `cc-test-kw-${process.pid}`;
 
 const tmuxAvailable = spawnSync("tmux", ["-V"], { stdio: "ignore" }).status === 0;
 
-// The whole file is real-process orchestration with fixed settling delays.
+// The whole file is real-process orchestration: a generous ceiling, but every
+// wait below is a polled precondition rather than a fixed delay, so the budget
+// tracks machine load instead of being spent on every run.
 vi.setConfig({ testTimeout: 60_000 });
 
 function tmux(...args: string[]): string {
@@ -42,6 +44,28 @@ async function waitForExit(pids: number[], timeoutMs = 15_000): Promise<number[]
     await new Promise((r) => setTimeout(r, 100));
   }
   return pids.filter(alive);
+}
+
+/**
+ * Poll until `ready()` returns something truthy, then hand it back.
+ *
+ * How long tmux takes to start a pane, and how long that pane takes to fork its
+ * own children, is unbounded and load-dependent. Every precondition here is
+ * WAITED FOR rather than slept past — fixed settling delays are what made this
+ * file both slow and load-fragile.
+ */
+async function waitFor<T>(
+  ready: () => T | undefined,
+  what: string,
+  timeoutMs = 30_000,
+): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = ready();
+    if (value !== undefined) return value;
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 25));
+  }
 }
 
 /** Descendants of `root` in a fresh snapshot, `root` itself excluded. */
@@ -108,16 +132,19 @@ describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree",
       "-c", "/tmp",
       leakyCommand,
     ).trim();
-    await new Promise((r) => setTimeout(r, 1500));
-
-    const panePid = Number(
-      tmux("display-message", "-p", "-t", target, "#{pane_pid}").trim(),
-    );
-    const strays = descendants(panePid);
-    expect(strays.length).toBeGreaterThan(0);
+    const panePid = await waitFor(() => {
+      const raw = tmux("display-message", "-p", "-t", target, "#{pane_pid}").trim();
+      const pid = Number(raw);
+      return Number.isInteger(pid) && pid > 1 ? pid : undefined;
+    }, "tmux to report the pane pid");
+    const strays = await waitFor(() => {
+      const found = descendants(panePid);
+      return found.length > 0 ? found : undefined;
+    }, "the pane's background children to be forked");
 
     tmux("kill-window", "-t", target);
-    await new Promise((r) => setTimeout(r, 800));
+    // The pane's own process really is gone; what is left is the leak.
+    expect(await waitForExit([panePid])).toEqual([]);
     const survivors = strays.filter(alive);
     expect(survivors.length).toBeGreaterThan(0);
 
@@ -128,20 +155,19 @@ describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree",
   it("kills the whole tree when the daemon's killWindow tears the window down", async () => {
     const { newWindow, killWindow, paneProcess } = await import("../src/daemon/tmux.js");
     const target = newWindow("kwtest", "/tmp", leakyCommand);
-    await new Promise((r) => setTimeout(r, 1500));
-
-    const pane = paneProcess(target);
-    expect(pane).not.toBeNull();
-    const strays = descendants(pane!.pid);
-    expect(strays.length).toBeGreaterThan(0);
+    const pane = await waitFor(() => paneProcess(target) ?? undefined, "the pane to start");
+    const strays = await waitFor(() => {
+      const found = descendants(pane.pid);
+      return found.length > 0 ? found : undefined;
+    }, "the pane's background children to be forked");
 
     const killed = killWindow(target);
-    expect(killed).toContain(pane!.pid);
+    expect(killed).toContain(pane.pid);
     // Not an exact set comparison: the leaf `sleep` respawns every second, so
     // killWindow's own snapshot legitimately differs from the one above. What
     // must hold is that nothing observed before the reap is left running.
     expect(killed.length).toBeGreaterThanOrEqual(3);
-    expect(await waitForExit([pane!.pid, ...strays])).toEqual([]);
+    expect(await waitForExit([pane.pid, ...strays])).toEqual([]);
   });
 
   it("reports no pane process for a window that is gone", async () => {
@@ -150,14 +176,15 @@ describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree",
     // a live, unrelated agent's pane pid and get that agent's tree killed.
     const { newWindow, paneProcess } = await import("../src/daemon/tmux.js");
     const bystander = newWindow("bystander", "/tmp", "sleep 600");
-    await new Promise((r) => setTimeout(r, 500));
-    const bystanderPane = paneProcess(bystander);
-    expect(bystanderPane).not.toBeNull();
+    const bystanderPane = await waitFor(
+      () => paneProcess(bystander) ?? undefined,
+      "the bystander pane to start",
+    );
 
     expect(paneProcess(`${SESSION}:@99999`)).toBeNull();
 
     const { killWindow } = await import("../src/daemon/tmux.js");
-    expect(killWindow(bystander)).toContain(bystanderPane!.pid);
+    expect(killWindow(bystander)).toContain(bystanderPane.pid);
   });
 
   it("reports no pane process for a pane whose command already exited", async () => {
@@ -167,13 +194,13 @@ describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree",
     // the killAgent test below).
     const { newWindow, paneProcess, killWindow } = await import("../src/daemon/tmux.js");
     const target = newWindow("deadpane", "/tmp", "sleep 600");
-    await new Promise((r) => setTimeout(r, 500));
-    const pane = paneProcess(target)!;
+    const pane = await waitFor(() => paneProcess(target) ?? undefined, "the pane to start");
     process.kill(pane.pid, "SIGKILL");
     await waitForExit([pane.pid]);
-    await new Promise((r) => setTimeout(r, 300));
 
-    expect(paneProcess(target)).toBeNull();
+    // tmux needs a moment to notice the pane's command exited.
+    await waitFor(() => (paneProcess(target) === null ? true : undefined),
+      "tmux to stop reporting a live pane process");
     expect(killWindow(target)).toEqual([]);
   });
 
@@ -187,14 +214,13 @@ describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree",
     const { killAgent } = await import("../src/daemon/spawn.js");
 
     const target = newWindow("crashed", "/tmp", NOHUP_LEAK);
-    await new Promise((r) => setTimeout(r, 1200));
-    const pane = paneProcess(target)!;
-    expect(pane).not.toBeNull();
-
-    const leftovers = snapshotProcesses()
-      .filter((p) => p.pgid === pane.pid && p.pid !== pane.pid)
-      .map((p) => p.pid);
-    expect(leftovers.length).toBeGreaterThan(0);
+    const pane = await waitFor(() => paneProcess(target) ?? undefined, "the pane to start");
+    const leftovers = await waitFor(() => {
+      const found = snapshotProcesses()
+        .filter((p) => p.pgid === pane.pid && p.pid !== pane.pid)
+        .map((p) => p.pid);
+      return found.length > 0 ? found : undefined;
+    }, "the nohup'd job to be forked into the pane's group");
 
     const agent = createAgent({ kind: "worker", state: "working", tmux_target: target });
     updateAgent(agent.id, { pane_pid: pane.pid });
@@ -202,9 +228,9 @@ describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree",
     // Crash the agent's own process; its nohup'd job keeps running.
     process.kill(pane.pid, "SIGKILL");
     await waitForExit([pane.pid]);
-    await new Promise((r) => setTimeout(r, 400));
+    await waitFor(() => (paneProcess(target) === null ? true : undefined),
+      "tmux to stop reporting a live pane process");
     expect(windowExists(target)).toBe(true); // remain-on-exit corpse
-    expect(paneProcess(target)).toBeNull();
     expect(leftovers.filter(alive).length).toBeGreaterThan(0);
 
     killAgent(agent.id);

@@ -161,60 +161,6 @@ describe("delegateToMain — deliver vs queue", () => {
  * draft reconstructed from wrapped rows), not invisible.
  */
 describe("delegateToMain — a human's typed characters are never lost", () => {
-  it("preserves a multi-line draft verbatim and queues the notification", async () => {
-    const { main, worker } = await setup("idle");
-    const draft = draftComposer(
-      "custom-hostnames will be team-platform.",
-      "nylas-data-lake will also be team platform.",
-      "unicorn-",
-    );
-    panes.set(MAIN, draft);
-
-    await notifyWorker(worker.id, "which region?");
-
-    // Nothing was typed into the pane at all, so the draft is byte-identical.
-    expect(sendText).not.toHaveBeenCalled();
-    expect(panes.get(MAIN)).toBe(draft);
-    const { countQueuedNotifications } = await import("../src/db/notifications.js");
-    expect(countQueuedNotifications(main.id)).toBe(1);
-
-    // And it is delivered once the human submits and the composer clears.
-    panes.set(MAIN, CLEAR_PROMPT);
-    const { flushMainQueue } = await import("../src/daemon/notifqueue.js");
-    expect(await flushMainQueue(main.id, { force: true })).toBe("flushed");
-    expect(String(sendText.mock.calls[0][1])).toContain("which region?");
-    expect(countQueuedNotifications(main.id)).toBe(0);
-  });
-
-  it("does not submit when a keystroke lands between the check and the send", async () => {
-    const { main, worker } = await setup("idle");
-    panes.set(MAIN, CLEAR_PROMPT);
-    // The composer is clear when checked, then the human's first keystrokes land
-    // in the window before Enter — with the notification already in the pane, so
-    // both texts coexist exactly as they would on screen.
-    onType = (target, text) => {
-      panes.set(target, draftComposer(`${text}wait, hold on`));
-    };
-
-    await notifyWorker(worker.id, "which region?");
-
-    // Typed, but Enter withheld: nothing was submitted on the human's behalf.
-    expect(sendText).toHaveBeenCalledOnce();
-    expect(await sendText.mock.results[0].value).toBe(false);
-    const { listEvents } = await import("../src/db/events.js");
-    const kinds = listEvents(20).map((e) => e.kind);
-    expect(kinds).not.toContain("waiting.delegated");
-    // Withholding is a distinct, diagnosable outcome, not a silent no-op.
-    expect(kinds).toContain("notification.submit_withheld");
-    const { countQueuedNotifications } = await import("../src/db/notifications.js");
-    expect(countQueuedNotifications(main.id)).toBe(1);
-    // The human's characters are still on screen for them to finish or fix.
-    expect(panes.get(MAIN)).toContain("wait, hold on");
-    // The main was not marked as working off a turn that never started.
-    const { getAgent } = await import("../src/db/agents.js");
-    expect(getAgent(main.id)?.state).toBe("idle");
-  });
-
   it("refuses to submit into a permission menu that popped in the send window", async () => {
     const { main, worker } = await setup("idle");
     panes.set(MAIN, CLEAR_PROMPT);

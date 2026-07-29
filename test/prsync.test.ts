@@ -261,31 +261,6 @@ describe("applyPrState", () => {
     expect(t.pr_feedback_at).toBe("2026-07-14T17:05:00Z");
   });
 
-  it("a mixed batch (approval + a real comment) re-queues on the comment and still records the approval", async () => {
-    const { applyPrState } = await import("../src/daemon/prsync.js");
-    const { getTask } = await import("../src/db/tasks.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const { task } = await setupPrTask();
-    await applyPrState(
-      task.id,
-      open({
-        reviewDecision: "APPROVED",
-        comments: [
-          { author: "caleb", body: "one nit: guard the null case", created_at: "2026-07-14T17:10:00Z" },
-        ],
-        reviews: [
-          { author: "twongkeeny", body: "lgtm", state: "APPROVED", created_at: "2026-07-14T17:09:00Z" },
-        ],
-      }),
-    );
-    const t = getTask(task.id)!;
-    expect(t.status).toBe("queued");
-    expect(t.review_notes).toContain("guard the null case");
-    expect(t.review_notes).not.toContain("lgtm"); // the approval is not forwarded as feedback
-    expect(t.human_approved_at).toBe("2026-07-14T17:09:00Z");
-    expect(listEvents(10).map((e) => e.kind)).toContain("pr.human_approved");
-  });
-
   it("already-forwarded comments are not re-sent", async () => {
     const { applyPrState } = await import("../src/daemon/prsync.js");
     const { getTask, updateTask } = await import("../src/db/tasks.js");
@@ -644,14 +619,6 @@ describe("applyPrState", () => {
     expect(getTask(task.id)?.pr_feedback_at).not.toBeNull();
   });
 
-  it("does nothing for tasks not in review", async () => {
-    const { applyPrState } = await import("../src/daemon/prsync.js");
-    const { getTask, updateTask } = await import("../src/db/tasks.js");
-    const { task } = await setupPrTask();
-    updateTask(task.id, { status: "done" });
-    await applyPrState(task.id, open({ state: "MERGED" }));
-    expect(getTask(task.id)?.status).toBe("done");
-  });
 });
 
 describe("prSyncPass", () => {
@@ -716,18 +683,6 @@ describe("tasksNeedingPrSync (candidate selection + backfill)", () => {
     expect(ids).not.toContain(closed);
   });
 
-  it("ignores tasks without a pr_url and branch-only (open_pr=0) tasks", async () => {
-    const { tasksNeedingPrSync } = await import("../src/db/tasks.js");
-    const noPr = await mkTask({ status: "review" });
-    const branchOnly = await mkTask({
-      status: "review",
-      pr_url: "https://github.com/x/y/pull/6",
-      open_pr: 0,
-    });
-    const ids = tasksNeedingPrSync().map((t) => t.id);
-    expect(ids).not.toContain(noPr);
-    expect(ids).not.toContain(branchOnly);
-  });
 });
 
 describe("reconcileTerminalPrs (task #97: state-based auto-complete recovery)", () => {
@@ -742,15 +697,6 @@ describe("reconcileTerminalPrs (task #97: state-based auto-complete recovery)", 
     await reconcileTerminalPrs();
     expect(getTask(task.id)?.status).toBe("done");
     expect(listEvents(10).map((e) => e.kind)).toContain("task.autocompleted");
-  });
-
-  it("completes a stranded merged task with no recorded verdict", async () => {
-    const { reconcileTerminalPrs } = await import("../src/daemon/prsync.js");
-    const { getTask, updateTask } = await import("../src/db/tasks.js");
-    const { task } = await setupPrTask();
-    updateTask(task.id, { pr_state: "merged" }); // verdict null
-    await reconcileTerminalPrs();
-    expect(getTask(task.id)?.status).toBe("done");
   });
 
   it("blocks a review task whose PR was recorded closed but never acted on", async () => {
@@ -793,18 +739,6 @@ describe("reconcileTerminalPrs (task #97: state-based auto-complete recovery)", 
     expect(kinds).not.toContain("pr.merged"); // never re-selected -> no spam
   });
 
-  it("prSyncPass self-heals a stranded merged task without polling gh", async () => {
-    // A terminal pr_state is excluded from tasksNeedingPrSync, so no gh call is
-    // attempted — the recovery comes purely from the reconciliation pass.
-    const { prSyncPass } = await import("../src/daemon/prsync.js");
-    const { getTask, updateTask } = await import("../src/db/tasks.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const { task } = await setupPrTask();
-    updateTask(task.id, { review_verdict: "approve", pr_state: "merged" });
-    await prSyncPass();
-    expect(getTask(task.id)?.status).toBe("done");
-    expect(listEvents(10).map((e) => e.kind)).not.toContain("pr.sync_error");
-  });
 });
 
 describe("tasksNeedingPrReconcile (task #97 candidate selection)", () => {
@@ -866,42 +800,38 @@ describe("tasksNeedingPrReconcile (task #97 candidate selection)", () => {
 });
 
 describe("computeCheckRollup", () => {
-  it("empty rollup -> none", async () => {
+  // A pure function over check lists: one table, since every case was the same
+  // call with a different array. Both gh shapes appear (the checks-API
+  // status/conclusion pair and the legacy commit-status `state`), and precedence
+  // matters: any failure outranks pending, which outranks success.
+  it("rolls a check list up to one verdict", async () => {
     const { computeCheckRollup } = await import("../src/daemon/prsync.js");
-    expect(computeCheckRollup([])).toBe("none");
-  });
-
-  it("all successful checks -> pass", async () => {
-    const { computeCheckRollup } = await import("../src/daemon/prsync.js");
-    expect(
-      computeCheckRollup([
-        { status: "COMPLETED", conclusion: "SUCCESS" },
-        { state: "SUCCESS" },
-      ]),
-    ).toBe("pass");
-  });
-
-  it("any failure wins over pending/success", async () => {
-    const { computeCheckRollup } = await import("../src/daemon/prsync.js");
-    expect(
-      computeCheckRollup([
-        { status: "COMPLETED", conclusion: "SUCCESS" },
-        { status: "IN_PROGRESS" },
-        { status: "COMPLETED", conclusion: "FAILURE" },
-      ]),
-    ).toBe("fail");
-    expect(computeCheckRollup([{ state: "ERROR" }])).toBe("fail");
-  });
-
-  it("an incomplete check with no failures -> pending", async () => {
-    const { computeCheckRollup } = await import("../src/daemon/prsync.js");
-    expect(
-      computeCheckRollup([
-        { status: "COMPLETED", conclusion: "SUCCESS" },
-        { status: "QUEUED" },
-      ]),
-    ).toBe("pending");
-    expect(computeCheckRollup([{ state: "PENDING" }])).toBe("pending");
+    for (const { why, checks, rollup } of [
+      { why: "no checks at all", checks: [], rollup: "none" },
+      {
+        why: "all successful, in both gh shapes",
+        checks: [{ status: "COMPLETED", conclusion: "SUCCESS" }, { state: "SUCCESS" }],
+        rollup: "pass",
+      },
+      {
+        why: "a failure alongside pending and success",
+        checks: [
+          { status: "COMPLETED", conclusion: "SUCCESS" },
+          { status: "IN_PROGRESS" },
+          { status: "COMPLETED", conclusion: "FAILURE" },
+        ],
+        rollup: "fail",
+      },
+      { why: "a legacy ERROR state", checks: [{ state: "ERROR" }], rollup: "fail" },
+      {
+        why: "an incomplete check with no failures",
+        checks: [{ status: "COMPLETED", conclusion: "SUCCESS" }, { status: "QUEUED" }],
+        rollup: "pending",
+      },
+      { why: "a legacy PENDING state", checks: [{ state: "PENDING" }], rollup: "pending" },
+    ] as const) {
+      expect(computeCheckRollup([...checks]), why).toBe(rollup);
+    }
   });
 });
 

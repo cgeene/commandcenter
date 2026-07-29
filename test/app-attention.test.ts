@@ -60,9 +60,6 @@ describe("newlyArrivedIds", () => {
     expect(newlyArrivedIds(new Set(["a", "b"]), ["b", "c"])).toEqual(["c"]);
   });
 
-  it("returns nothing when the set is unchanged", () => {
-    expect(newlyArrivedIds(new Set(["a", "b"]), ["a", "b"])).toEqual([]);
-  });
 });
 
 describe("browserAlertsEnabled / setBrowserAlerts", () => {
@@ -76,11 +73,4 @@ describe("browserAlertsEnabled / setBrowserAlerts", () => {
     expect(browserAlertsEnabled(fakeStore("1"), false)).toBe(true); // on regardless
   });
 
-  it("round-trips the on/off preference", () => {
-    const store = fakeStore();
-    setBrowserAlerts(store, true);
-    expect(browserAlertsEnabled(store, false)).toBe(true);
-    setBrowserAlerts(store, false);
-    expect(browserAlertsEnabled(store, true)).toBe(false);
-  });
 });

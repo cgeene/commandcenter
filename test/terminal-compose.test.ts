@@ -20,14 +20,17 @@ function fakeStore(initial: Record<string, string> = {}) {
 }
 
 describe("composeBarEnabled", () => {
-  it("defaults to on for touch devices and off for everything else", () => {
-    expect(composeBarEnabled(fakeStore(), true)).toBe(true);
-    expect(composeBarEnabled(fakeStore(), false)).toBe(false);
-  });
-
-  it("lets a stored choice override the device default in both directions", () => {
-    expect(composeBarEnabled(fakeStore({ [COMPOSE_BAR_KEY]: "0" }), true)).toBe(false);
-    expect(composeBarEnabled(fakeStore({ [COMPOSE_BAR_KEY]: "1" }), false)).toBe(true);
+  // Pure preference resolution: one row per (stored value, device default).
+  it("prefers a stored choice and otherwise follows the device", () => {
+    for (const { why, stored, touch, on } of [
+      { why: "no stored choice on a touch device", stored: undefined, touch: true, on: true },
+      { why: "no stored choice on a desktop", stored: undefined, touch: false, on: false },
+      { why: "stored off overrides a touch device", stored: "0", touch: true, on: false },
+      { why: "stored on overrides a desktop", stored: "1", touch: false, on: true },
+    ]) {
+      const store = fakeStore(stored === undefined ? {} : { [COMPOSE_BAR_KEY]: stored });
+      expect(composeBarEnabled(store, touch), why).toBe(on);
+    }
   });
 
   it("round-trips through setComposeBarEnabled", () => {
@@ -40,78 +43,71 @@ describe("composeBarEnabled", () => {
 });
 
 describe("isTouchLike", () => {
-  it("treats a coarse pointer as touch", () => {
-    expect(isTouchLike(true, 0)).toBe(true);
-  });
-
-  it("trusts a reported fine pointer over the touch-point count", () => {
-    // A touchscreen laptop driven by a mouse: it has touch points, but its
-    // primary pointer is fine, so it's a desktop and gets no compose bar.
-    expect(isTouchLike(false, 10)).toBe(false);
-  });
-
-  it("falls back to touch points only when the pointer query is unavailable", () => {
-    expect(isTouchLike(null, 5)).toBe(true);
-    expect(isTouchLike(null, 0)).toBe(false);
-  });
-
-  it("is false for a plain mouse-driven desktop", () => {
-    expect(isTouchLike(false, 0)).toBe(false);
+  // A touchscreen laptop driven by a mouse has touch points but a fine primary
+  // pointer: it is a desktop and gets no compose bar. The touch-point count is
+  // only consulted when the pointer query is unavailable.
+  it("trusts the primary pointer, falling back to touch points only when unknown", () => {
+    for (const { why, coarse, points, touch } of [
+      { why: "a coarse pointer", coarse: true, points: 0, touch: true },
+      { why: "a fine pointer despite touch points", coarse: false, points: 10, touch: false },
+      { why: "no pointer query, with touch points", coarse: null, points: 5, touch: true },
+      { why: "no pointer query, no touch points", coarse: null, points: 0, touch: false },
+      { why: "a plain mouse-driven desktop", coarse: false, points: 0, touch: false },
+    ] as const) {
+      expect(isTouchLike(coarse, points), why).toBe(touch);
+    }
   });
 });
 
 describe("sanitizeComposeText", () => {
-  it("folds CRLF and bare CR to newlines", () => {
-    expect(sanitizeComposeText("a\r\nb\rc")).toBe("a\nb\nc");
-  });
-
-  it("flattens tabs to spaces so they don't trigger completion in the TUI", () => {
-    expect(sanitizeComposeText("a\tb")).toBe("a b");
-  });
-
-  it("drops control characters that would be read as escape sequences", () => {
-    expect(sanitizeComposeText("a\x1b[Ab\x00c\x7f")).toBe("a[Abc");
-  });
-
-  it("trims trailing blank lines, which the send's own CR replaces", () => {
-    expect(sanitizeComposeText("hello\n\n\n")).toBe("hello");
-  });
-
-  it("leaves ordinary punctuation and unicode alone", () => {
-    // What double-space-for-a-period and dictation actually produce.
-    expect(sanitizeComposeText("Ship it. Then tell me — ok? ✅")).toBe(
-      "Ship it. Then tell me — ok? ✅",
-    );
+  // Everything the TUI would misread if it reached the pane verbatim.
+  it("strips what the terminal would misinterpret and leaves the rest alone", () => {
+    for (const { why, input, out } of [
+      { why: "CRLF and bare CR fold to newlines", input: "a\r\nb\rc", out: "a\nb\nc" },
+      { why: "tabs flatten to spaces (they trigger TUI completion)", input: "a\tb", out: "a b" },
+      { why: "control characters that would read as escape sequences", input: "a\x1b[Ab\x00c\x7f", out: "a[Abc" },
+      { why: "trailing blank lines, which the send's own CR replaces", input: "hello\n\n\n", out: "hello" },
+      // What double-space-for-a-period and dictation actually produce.
+      {
+        why: "ordinary punctuation and unicode are untouched",
+        input: "Ship it. Then tell me — ok? ✅",
+        out: "Ship it. Then tell me — ok? ✅",
+      },
+    ]) {
+      expect(sanitizeComposeText(input), why).toBe(out);
+    }
   });
 });
 
 describe("composePayload", () => {
-  it("sends the text plus a carriage return when submitting", () => {
-    expect(composePayload("deploy it", true)).toBe("deploy it\r");
-  });
-
-  it("omits the carriage return when submit is off", () => {
-    // Filling a worker's composer without answering the prompt.
-    expect(composePayload("deploy it", false)).toBe("deploy it");
-  });
-
-  it("joins multiple lines with meta-return so none of them submit early", () => {
-    expect(composePayload("one\ntwo", true)).toBe(`one${SHIFT_ENTER_NEWLINE}two\r`);
-    expect(SHIFT_ENTER_NEWLINE).not.toBe("\r");
-  });
-
-  it("returns null for an empty buffer", () => {
-    expect(composePayload("", true)).toBeNull();
-    expect(composePayload("\n\n", true)).toBeNull();
-  });
-
-  it("still sends a whitespace-only buffer — the key bar has no space key", () => {
-    expect(composePayload("  ", true)).toBe("  \r");
-  });
-
-  it("emits exactly one trailing CR even when the buffer ends in newlines", () => {
-    const payload = composePayload("done\n\n", true);
-    expect(payload).toBe("done\r");
-    expect(payload!.match(/\r/g)).toHaveLength(1);
+  // The submit contract: a trailing CR iff submitting, and never more than one,
+  // with interior newlines sent as meta-return so none of them submit early.
+  it("builds the exact keystroke payload for each buffer", () => {
+    for (const { why, buffer, submit, out, singleCr } of [
+      { why: "text with submit on", buffer: "deploy it", submit: true, out: "deploy it\r", singleCr: false },
+      // Filling a worker's composer without answering the prompt.
+      { why: "text with submit off", buffer: "deploy it", submit: false, out: "deploy it", singleCr: false },
+      {
+        why: "multiple lines joined with meta-return",
+        buffer: "one\ntwo",
+        submit: true,
+        out: `one${SHIFT_ENTER_NEWLINE}two\r`,
+        singleCr: false,
+      },
+      { why: "an empty buffer", buffer: "", submit: true, out: null, singleCr: false },
+      { why: "a newline-only buffer", buffer: "\n\n", submit: true, out: null, singleCr: false },
+      // The key bar has no space key, so whitespace is a real message.
+      { why: "a whitespace-only buffer", buffer: "  ", submit: true, out: "  \r", singleCr: false },
+      { why: "a buffer ending in newlines gets exactly one CR", buffer: "done\n\n", submit: true, out: "done\r", singleCr: true },
+    ]) {
+      const payload = composePayload(buffer, submit);
+      expect(payload, why).toBe(out);
+      // Only meaningful where the buffer itself ended in newlines: the
+      // meta-return used to join interior lines legitimately carries its own CR.
+      if (singleCr) {
+        expect(payload!.match(/\r/g), why).toHaveLength(1);
+      }
+    }
+    expect(SHIFT_ENTER_NEWLINE).not.toBe("\r"); // else the join would submit
   });
 });

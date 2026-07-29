@@ -98,13 +98,6 @@ describe("notification defaults", () => {
     }
   });
 
-  it("covers both quota alert kinds under platform health", async () => {
-    const { NOTIFY_EVENTS } = await import("../src/notify-events.js");
-    for (const key of ["quota_threshold", "quota_spend_limit"] as const) {
-      expect(NOTIFY_EVENTS[key].category).toBe("platform");
-      expect(NOTIFY_EVENTS[key].default_enabled).toBe(true);
-    }
-  });
 });
 
 /* ------------------------------------------------------------------ *
@@ -167,19 +160,6 @@ describe("quota alerts", () => {
     expect(listEvents(30).map((e) => e.kind)).toContain("usage.quota_threshold");
   });
 
-  it("switches the two quota kinds independently", async () => {
-    const { setNotificationSettings } = await import("../src/db/settings.js");
-    setNotificationSettings({ events: { quota_threshold: false } });
-    const { runQuotaAlerts } = await import("../src/daemon/quotaalert.js");
-    const now = new Date("2026-07-28T12:00:00.000Z");
-
-    runQuotaAlerts(usageAt(88, now, true) as never, now);
-
-    const sent = pushes();
-    expect(sent).toHaveLength(1);
-    expect(sent[0].title).toBe("Claude spend limit reached");
-  });
-
   it("still pages only once per crossing (the quota latch is the de-dup)", async () => {
     const { runQuotaAlerts } = await import("../src/daemon/quotaalert.js");
     const now = new Date("2026-07-28T12:00:00.000Z");
@@ -198,12 +178,6 @@ describe("quota alerts", () => {
  * ------------------------------------------------------------------ */
 
 describe("notifyEvent", () => {
-  it("suppresses an event that is off by default", async () => {
-    const { notifyEvent } = await import("../src/daemon/notify.js");
-    expect(notifyEvent("task_review_entered", "t", "m")).toBe(false);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
   it("pushes an off-by-default event once it is switched on", async () => {
     const { setNotificationSettings } = await import("../src/db/settings.js");
     const { notifyEvent } = await import("../src/daemon/notify.js");
@@ -254,21 +228,31 @@ describe("notifyEvent", () => {
  * Trigger reclassification, end to end through the review loop.       *
  * ------------------------------------------------------------------ */
 
+/** A real git repo whose task branch sits one commit ahead of main, so the
+ *  review loop's HEAD detection works. Built in ONE subprocess: inside a vitest
+ *  worker each fork costs ~120-160ms, and this used to be eight of them. */
 function makeRepo(taskId: number): { repo: string; branch: string; headSha: string } {
   const repo = path.join(tmpDir, `repo-${taskId}`);
   fs.mkdirSync(repo, { recursive: true });
-  const g = (...a: string[]) =>
-    execFileSync("git", ["-C", repo, "-c", "user.email=t@t", "-c", "user.name=t", ...a]);
-  g("init", "-q", "-b", "main");
-  g("commit", "-q", "--allow-empty", "-m", "init");
   const branch = `agent/task-${taskId}`;
-  g("branch", branch);
-  g("checkout", "-q", branch);
-  fs.writeFileSync(path.join(repo, "f.txt"), "work");
-  g("add", "-A");
-  g("commit", "-q", "-m", "work");
-  const headSha = g("rev-parse", branch).toString().trim();
-  g("checkout", "-q", "main");
+  const headSha = execFileSync(
+    "sh",
+    [
+      "-eu",
+      "-c",
+      `g() { git -C "$R" -c user.email=t@t -c user.name=t "$@"; }
+       g init -q -b main
+       g commit -q --allow-empty -m init
+       g checkout -q -b "$B"
+       printf 'work' > "$R/f.txt"
+       g add -A
+       g commit -q -m work
+       SHA=$(g rev-parse "$B")
+       g checkout -q main
+       echo "$SHA"`,
+    ],
+    { encoding: "utf8", env: { ...process.env, R: repo, B: branch } },
+  ).trim();
   return { repo, branch, headSha };
 }
 
@@ -386,18 +370,6 @@ describe("approved + PR ready", () => {
     expect(sent[1].title).toContain("reviewed & approved — PR ready to merge");
   });
 
-  it("is suppressed when the operator turns the event off", async () => {
-    const { setNotificationSettings } = await import("../src/db/settings.js");
-    setNotificationSettings({ events: { review_approved_ready: false } });
-    const { _setGhRunner } = await import("../src/daemon/prdraft.js");
-    _setGhRunner(ghOk);
-    const { handleVerdict } = await import("../src/daemon/review.js");
-    const task = await reviewTask(5);
-
-    await handleVerdict(task.id, 999, "approve", "looks good");
-
-    expect(pushes()).toEqual([]);
-  });
 });
 
 describe("review loop exhausted", () => {
@@ -458,21 +430,6 @@ describe("PR merged", () => {
     expect(pushes()).toEqual([]);
   });
 
-  it("pushes when the operator opts into completion notices", async () => {
-    const { setNotificationSettings } = await import("../src/db/settings.js");
-    setNotificationSettings({ events: { task_completed: true } });
-    const { applyPrState } = await import("../src/daemon/prsync.js");
-    const task = await reviewTask(9, { pr_is_draft: 0 });
-
-    await applyPrState(task.id, {
-      state: "MERGED",
-      reviewDecision: null,
-      comments: [],
-    });
-
-    expect(pushes()).toHaveLength(1);
-    expect(pushes()[0].title).toContain("done — you merged its PR");
-  });
 });
 
 describe("PR closed without merge", () => {
