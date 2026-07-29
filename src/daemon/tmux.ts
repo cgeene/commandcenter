@@ -21,7 +21,10 @@ export function _setTmuxTimeoutForTest(timeoutMs = TMUX_TIMEOUT_MS): void {
 
 export type TmuxFailureCode =
   | "timeout"
+  /** Proof there is nothing to talk to: no server, or no such session. */
   | "session_absent"
+  /** A server that may well be running and could not be reached anyway. */
+  | "server_unreachable"
   | "target_missing"
   | "no_client"
   | "failed";
@@ -63,12 +66,26 @@ function sanitiseFailure(error: unknown, operation: string): TmuxCommandError {
   if (/ETIMEDOUT|SIGKILL|timed out/i.test(detail)) {
     return new TmuxCommandError("timeout", operation);
   }
+  // Only shapes that PROVE there is nothing running belong here: tmux saying
+  // outright that no server or session exists, or a socket path that does not
+  // exist. A refused or failed connection is not proof — the socket can be
+  // stale, but it can equally be a live server that could not accept the
+  // client right now (a saturated backlog under concurrent tmux load, or a
+  // server mid-restart), and callers that read "absent" as "everything exited"
+  // would then kill live work.
   if (
-    /can't find session|no server running|failed to connect to server|error connecting to .*\((?:no such file or directory|connection refused)\)/i.test(
+    /can't find session|no server running|error connecting to .*\(no such file or directory\)/i.test(
       detail,
     )
   ) {
     return new TmuxCommandError("session_absent", operation);
+  }
+  if (
+    /failed to connect to server|error connecting to .*\(connection refused\)/i.test(
+      detail,
+    )
+  ) {
+    return new TmuxCommandError("server_unreachable", operation);
   }
   if (/can't find (?:window|pane)|no such (?:window|pane)|unknown target/i.test(detail)) {
     return new TmuxCommandError("target_missing", operation);
@@ -145,7 +162,11 @@ export function ensureSession(): void {
   try {
     tmux("has-session", "-t", tmuxSession());
   } catch (error) {
-    if (tmuxFailureCode(error) !== "session_absent") throw error;
+    // A refused connection is usually a socket left behind by a server that
+    // died, which `new-session` clears up — so this path still recovers from
+    // it, even though observation code must never read it as "nothing runs".
+    const code = tmuxFailureCode(error);
+    if (code !== "session_absent" && code !== "server_unreachable") throw error;
     tmux("new-session", "-d", "-s", tmuxSession(), "-n", "hub");
   }
 }
@@ -259,9 +280,10 @@ export function killWindow(target: string): number[] {
  * `dead` is an inspectable shell whose process is already gone, not a healthy
  * agent. Callers still match exact stored targets.
  *
- * `server: "absent"` marks the one empty result that can be trusted: there is
- * no tmux server, so there genuinely are no windows. Everything else must not
- * conclude a mass exit from an empty list.
+ * `server: "absent"` marks an empty result that can be trusted, and it is set
+ * only for failures that PROVE nothing is running (see sanitiseFailure) — not
+ * for a connection that merely could not be made. Every other empty result is
+ * just an empty result, and no caller may read one as a mass exit.
  */
 export interface TmuxWindows {
   live: string[];
@@ -302,9 +324,9 @@ export function listWindows(): WindowSnapshot {
       "#{session_name}:#{window_id}:#{pane_dead}",
     );
   } catch (error) {
-    // A missing session is a trustworthy empty result. Permission/socket/
-    // locale/client failures are not; the watchdog must retry without
-    // mutating agent or task state.
+    // A server tmux reports as not running is a trustworthy empty result.
+    // Timeouts, unreachable servers, permission/locale/client failures are
+    // not; the watchdog must retry without mutating agent or task state.
     return tmuxFailureCode(error) === "session_absent"
       ? { live: [], dead: [], server: "absent" }
       : null;

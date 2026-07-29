@@ -55,7 +55,13 @@ import { reviewerActive } from "./reviewerhealth.js";
 import { resolveReviewDelta } from "./reviewstate.js";
 import { strictSerialHolder, strictSerialReason } from "./serial.js";
 import { findProviderTranscript } from "./transcript.js";
-import { killWindow, newWindow, paneProcess, windowExists } from "./tmux.js";
+import {
+  killWindow,
+  newWindow,
+  paneProcess,
+  tmuxFailureCode,
+  windowExists,
+} from "./tmux.js";
 import { sweepVanishedPaneGroup } from "./proctree.js";
 import {
   createReviewWorktree,
@@ -1146,9 +1152,15 @@ function reapPaneProcesses(agent: Agent, mayHaveWindow: boolean): number[] {
     // leave it running, orphaned to pid 1 and invisible to Command Center.
     try {
       killed.push(...killWindow(agent.tmux_target));
-    } catch {
-      // The window was gone after all, or tmux could not be reached. Fall
-      // through to the recorded pane pid, which is then the only handle left.
+    } catch (error) {
+      // Only a window that is provably gone may be shrugged off (it raced with
+      // this teardown, and the recorded pane pid below is the remaining
+      // handle). Anything else — a timeout, an unreachable server — means the
+      // teardown did NOT happen, and reporting a kill that did not occur is
+      // precisely the dead-row/live-process split-brain this function exists
+      // to close out.
+      const code = tmuxFailureCode(error);
+      if (code !== "target_missing" && code !== "session_absent") throw error;
     }
   }
   // An empty result means no live pane was found behind the window — either it

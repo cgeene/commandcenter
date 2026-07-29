@@ -280,6 +280,19 @@ describe("deriveAttention — kinds", () => {
       expect(items[0].title).toContain("Watchdog blind");
     });
 
+    it("ages from the start of the spell, not from the latest cause", async () => {
+      // A daemon restart mid-spell re-logs, and the cause can differ from the
+      // one that opened it. Anchoring to the newest event would keep pushing
+      // the deadline out and the fleet would stay unwatched, silently.
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      await blindFor("watchdog.tmux_unavailable", 30);
+      await blindFor("watchdog.tmux_snapshot_implausible", 1);
+
+      const items = deriveAttention({ isPrOpen: allOpen });
+      expect(items).toHaveLength(1);
+      expect(items[0].age_ms).toBeGreaterThan(25 * 60_000);
+    });
+
     it("clears once tmux is readable again", async () => {
       const { deriveAttention } = await import("../src/daemon/attention.js");
       const { logEvent } = await import("../src/db/events.js");

@@ -487,24 +487,22 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   }
 
   // --- watchdog blind: tmux could not be read (or answered something that
-  //     cannot be true), so the health pass is deliberately doing nothing. It
-  //     is edge-triggered, so the latest event of either kind is the start of
-  //     the current spell, and a recovery event newer than it ends it. Reported
-  //     regardless of cfg.enabled — the watchdog runs even when auto-spawn is
-  //     off, and it is the only thing watching live agents. ------------------
+  //     cannot be true), so the health pass is deliberately doing nothing.
+  //     Anchored to the EARLIEST blindness event since the last recovery, of
+  //     either cause: the age is how long the fleet has gone unwatched, and a
+  //     daemon restart mid-spell re-logs, so taking the latest would keep
+  //     pushing the deadline out of reach. Reported regardless of cfg.enabled —
+  //     the watchdog runs even when auto-spawn is off, and it is the only thing
+  //     watching live agents. ------------------------------------------------
+  const tmuxRecovered = latestEventTs("watchdog.tmux_recovered") ?? null;
   const blindStarted = [
-    latestEventTs("watchdog.tmux_unavailable"),
-    latestEventTs("watchdog.tmux_snapshot_implausible"),
+    earliestEventTsAfter("watchdog.tmux_unavailable", tmuxRecovered),
+    earliestEventTsAfter("watchdog.tmux_snapshot_implausible", tmuxRecovered),
   ]
     .filter((ts): ts is string => Boolean(ts))
     .sort()
-    .pop();
-  const tmuxRecovered = latestEventTs("watchdog.tmux_recovered");
-  if (
-    blindStarted &&
-    (!tmuxRecovered || tmuxRecovered < blindStarted) &&
-    nowMs - Date.parse(blindStarted) > WATCHDOG_BLIND_MS
-  ) {
+    .shift();
+  if (blindStarted && nowMs - Date.parse(blindStarted) > WATCHDOG_BLIND_MS) {
     push({
       id: `scheduler_stalled:watchdog_blind:${blindStarted}`,
       kind: "scheduler_stalled",

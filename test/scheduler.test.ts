@@ -25,6 +25,11 @@ function seen(live: string[], dead: string[] = []) {
   return { live, dead, server: "running" as const };
 }
 
+/** What tmux reports when it proves there is no server at all. */
+function noServer() {
+  return { live: [], dead: [], server: "absent" as const };
+}
+
 function deps(
   overrides: Partial<{
     spawned: number[];
@@ -413,6 +418,40 @@ describe("watchdog", () => {
     ).toHaveLength(1);
   });
 
+  it("requeues both agents when the tmux server is provably gone", async () => {
+    // The other side of the guard: a server tmux says is not running really
+    // has taken every window with it, so the work must be requeued rather than
+    // parked behind a blind watchdog forever.
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const made = ["cc:@1004", "cc:@1015"].map((target, i) => {
+      const task = createTask({ title: `t${i}`, prompt: "x", repo: "/r" });
+      const agent = createAgent({
+        kind: "worker",
+        state: "working",
+        task_id: task.id,
+        tmux_target: target,
+      });
+      updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+      return { agent, task };
+    });
+
+    const gone = {
+      spawn: () => {},
+      windows: () => noServer(),
+      now: () => new Date(),
+    };
+    watchdog(gone);
+    watchdog(gone);
+
+    for (const { agent, task } of made) {
+      expect(getAgent(agent.id)?.state).toBe("dead");
+      expect(getTask(task.id)?.status).toBe("queued");
+    }
+  });
+
   it("restarts the confirmation streak after a pass it could not trust", async () => {
     // Two misses either side of a blind pass are not two consecutive
     // observations, and must not add up to a confirmed vanish.
@@ -473,6 +512,30 @@ describe("watchdog", () => {
     expect(getAgent(gone.id)?.state).toBe("dead");
     expect(getAgent(alive.id)?.state).toBe("working");
     expect(getTask(task.id)?.status).toBe("queued");
+  });
+
+  it("logs one event per blind spell even when the cause flaps", async () => {
+    // A loaded box alternates between a query that times out and a listing
+    // that comes back short. Re-logging on each flip would emit every 10s and
+    // keep resetting the age the Needs You escalation is measured from.
+    const { createAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    createAgent({ kind: "worker", state: "working", tmux_target: "cc:@1" });
+    createAgent({ kind: "reviewer", state: "working", tmux_target: "cc:@2" });
+
+    const base = { spawn: () => {}, now: () => new Date() };
+    watchdog({ ...base, windows: () => null });
+    watchdog({ ...base, windows: () => seen([]) });
+    watchdog({ ...base, windows: () => null });
+    watchdog({ ...base, windows: () => seen([]) });
+
+    const blind = listEvents(20).filter((event) =>
+      event.kind.startsWith("watchdog.tmux_"),
+    );
+    expect(blind.map((event) => event.kind)).toEqual([
+      "watchdog.tmux_unavailable",
+    ]);
   });
 
   it("reaps the empty window a dead agent leaves behind, once the grace period is up", async () => {

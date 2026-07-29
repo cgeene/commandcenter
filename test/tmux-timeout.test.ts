@@ -61,6 +61,21 @@ if [ "$1" = "new-session" ]; then
   exit 0
 fi
 
+# Server-level failures: every command except new-session fails, which is what
+# a stale or unreachable socket really looks like (new-session replaces it).
+if [ "$mode" = "no-server" ]; then
+  printf 'no server running on /private/tmp/tmux-501/default\\n' >&2
+  exit 1
+fi
+if [ "$mode" = "connection-refused" ]; then
+  printf 'error connecting to /private/tmp/tmux-501/default (Connection refused)\\n' >&2
+  exit 1
+fi
+if [ "$mode" = "connect-failed" ]; then
+  printf 'failed to connect to server\\n' >&2
+  exit 1
+fi
+
 if [ "$1" = "list-windows" ]; then
   if [ "$mode" = "garbled-windows" ]; then
     # What a non-UTF-8 client does to a separator, or a half-written read: the
@@ -208,6 +223,71 @@ describe("bounded daemon tmux commands", () => {
       dead: [],
       server: "running",
     });
+  });
+
+  it("trusts an empty listing only when tmux proves nothing is running", async () => {
+    // "no server running" is proof. A connection that could not be made is
+    // not: the socket may be stale, but it is equally a live server that could
+    // not accept a client right now — under precisely the concurrent-tmux load
+    // that makes the watchdog's answer matter.
+    const { listWindows } = await import("../src/daemon/tmux.js");
+
+    process.env.CC_FAKE_TMUX_MODE = "no-server";
+    expect(listWindows()).toEqual({ live: [], dead: [], server: "absent" });
+
+    process.env.CC_FAKE_TMUX_MODE = "connection-refused";
+    expect(listWindows()).toBeNull();
+
+    process.env.CC_FAKE_TMUX_MODE = "connect-failed";
+    expect(listWindows()).toBeNull();
+  });
+
+  it("still recreates the session when the socket is only refusing connections", async () => {
+    // ensureSession must keep clearing up a socket left behind by a server
+    // that died, even though observation no longer calls that proof of death.
+    const { ensureSession } = await import("../src/daemon/tmux.js");
+    process.env.CC_FAKE_TMUX_MODE = "connection-refused";
+
+    expect(() => ensureSession()).not.toThrow();
+    expect(calls()).toContain("new-session");
+  });
+
+  it("does not vanish live agents when the tmux server refuses connections", async () => {
+    // End to end through the real classifier and the real default deps: the
+    // shape of the overnight incident, where several agents were flagged in a
+    // single pass because a failed query read as an empty one.
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { watchdog, _resetSchedulerState } = await import(
+      "../src/daemon/scheduler.js"
+    );
+    _resetSchedulerState();
+
+    const made = ["cc:@1004", "cc:@1015"].map((target, i) => {
+      const task = createTask({ title: `t${i}`, prompt: "x", repo: "/r" });
+      const agent = createAgent({
+        kind: "worker",
+        state: "working",
+        task_id: task.id,
+        tmux_target: target,
+      });
+      updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+      return { agent, task };
+    });
+    process.env.CC_FAKE_TMUX_MODE = "connection-refused";
+
+    watchdog();
+    watchdog();
+
+    for (const { agent, task } of made) {
+      expect(getAgent(agent.id)?.state).toBe("working");
+      expect(getTask(task.id)?.status).toBe("in_progress");
+    }
+    const kinds = listEvents(20).map((event) => event.kind);
+    expect(kinds).not.toContain("agent.window_missing");
+    expect(kinds).not.toContain("agent.vanished");
+    expect(kinds).toContain("watchdog.tmux_unavailable");
   });
 
   it("reports a window listing it cannot parse as unobservable, not as empty", async () => {

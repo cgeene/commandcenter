@@ -485,6 +485,17 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
   const recoverReview = deps.recoverReview ?? defaultDeps.recoverReview!;
   const sweepPaneGroup = deps.sweepPaneGroup ?? sweepVanishedPaneGroup;
   const reapWindow = deps.reapWindow ?? defaultDeps.reapWindow!;
+  // A teardown that cannot reach tmux now throws rather than reporting a kill
+  // it did not perform, and one unreapable agent must not stop this pass from
+  // examining the rest. The reap is idempotent, so the next pass retries it.
+  const tryKill = (agentId: number): boolean => {
+    try {
+      kill(agentId);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   const snapshot = deps.windows();
   const nowMs = deps.now().getTime();
 
@@ -497,8 +508,13 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
   // only meaningful as consecutive observations that could be trusted, and
   // carrying a count across a blind spell is how a transient failure gets
   // promoted into a confirmed vanish.
+  //
+  // Exactly one event per spell, recording the cause that started it. A loaded
+  // box flaps between the two causes, so re-logging on a change would emit
+  // every 10s and — because the escalation ages from the first event — keep
+  // resetting the very clock that is meant to surface a blind watchdog.
   const goBlind = (reason: TmuxBlindness): void => {
-    if (tmuxObservationUnavailable !== reason) {
+    if (!tmuxObservationUnavailable) {
       tmuxObservationUnavailable = reason;
       logEvent(BLINDNESS_EVENT[reason]);
     }
@@ -670,7 +686,7 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
       if (task && (terminal || approvedAwaitingMerge)) {
         const last = Date.parse(agent.last_event_at ?? agent.spawned_at);
         if (nowMs - last > cfg.reap_after_minutes * 60_000) {
-          kill(agent.id);
+          if (!tryKill(agent.id)) continue;
           logEvent("agent.reaped", {
             agentId: agent.id,
             taskId: task.id,
@@ -708,7 +724,7 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
         // period runs out.
         if (!submitted && agent.state === "stalled") revive(agent);
         if (nowMs - Date.parse(gaveUpAt) > cfg.reap_after_minutes * 60_000) {
-          kill(agent.id);
+          if (!tryKill(agent.id)) continue;
           if (submitted) {
             logEvent("reviewer.retired", {
               agentId: agent.id,
