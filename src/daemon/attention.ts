@@ -83,6 +83,11 @@ const SCHEDULER_STALL_MS = 15 * 60_000;
 // both are the human's to resolve.
 const REWORK_STRAND_GRACE_MS = 2 * 60_000;
 
+// While the watchdog cannot read tmux it deliberately changes nothing — no
+// vanish detection, no stall detection, no reaping — so a blind spell that
+// outlives a handful of 10s passes means nothing is watching the fleet at all.
+const WATCHDOG_BLIND_MS = 5 * 60_000;
+
 function excerpt(s: string | null | undefined, n = 200): string {
   if (!s) return "";
   const trimmed = s.trim();
@@ -479,6 +484,40 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
         }
       }
     }
+  }
+
+  // --- watchdog blind: tmux could not be read (or answered something that
+  //     cannot be true), so the health pass is deliberately doing nothing. It
+  //     is edge-triggered, so the latest event of either kind is the start of
+  //     the current spell, and a recovery event newer than it ends it. Reported
+  //     regardless of cfg.enabled — the watchdog runs even when auto-spawn is
+  //     off, and it is the only thing watching live agents. ------------------
+  const blindStarted = [
+    latestEventTs("watchdog.tmux_unavailable"),
+    latestEventTs("watchdog.tmux_snapshot_implausible"),
+  ]
+    .filter((ts): ts is string => Boolean(ts))
+    .sort()
+    .pop();
+  const tmuxRecovered = latestEventTs("watchdog.tmux_recovered");
+  if (
+    blindStarted &&
+    (!tmuxRecovered || tmuxRecovered < blindStarted) &&
+    nowMs - Date.parse(blindStarted) > WATCHDOG_BLIND_MS
+  ) {
+    push({
+      id: `scheduler_stalled:watchdog_blind:${blindStarted}`,
+      kind: "scheduler_stalled",
+      title: "Watchdog blind — tmux cannot be observed",
+      context:
+        "Agent health checks are paused rather than guessing, so nothing is detecting vanished, stalled or finished agents. Check that the tmux server is responsive.",
+      severity: "orange",
+      urgent: false,
+      task_id: null,
+      agent_id: null,
+      pr_url: null,
+      created_at: blindStarted,
+    });
   }
 
   // --- quota: the live Claude feed says we are near (or past) a ceiling. The

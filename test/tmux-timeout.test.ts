@@ -62,17 +62,17 @@ if [ "$1" = "new-session" ]; then
 fi
 
 if [ "$1" = "list-windows" ]; then
-  live=0
-  for arg in "$@"; do
-    case "$arg" in
-      *pane_dead*) live=1 ;;
-    esac
-  done
-  if [ "$live" = "1" ]; then
-    printf 'cc:@1\\t0\\n'
-  else
-    printf 'cc:@1\\n'
+  if [ "$mode" = "garbled-windows" ]; then
+    # What a non-UTF-8 client does to a separator, or a half-written read: the
+    # line is there but the fields cannot be told apart.
+    printf 'cc:@1_0\\ncc:@2_0\\n'
+    exit 0
   fi
+  if [ "$mode" = "dead-window" ]; then
+    printf 'cc:@1:0\\nmy session:@2:1\\n'
+    exit 0
+  fi
+  printf 'cc:@1:0\\n'
   exit 0
 fi
 
@@ -193,17 +193,53 @@ describe("bounded daemon tmux commands", () => {
   });
 
   it("bounds synchronous scheduler observation and remains usable afterward", async () => {
-    const { listLiveWindowIds } = await import("../src/daemon/tmux.js");
+    const { listWindows } = await import("../src/daemon/tmux.js");
     await armHang("hang-all");
     const started = Date.now();
 
-    expect(listLiveWindowIds()).toBeNull();
+    expect(listWindows()).toBeNull();
 
     expect(Date.now() - started).toBeLessThan(BOUNDED_MS);
     process.env.CC_FAKE_TMUX_MODE = "ok";
     const { _setTmuxTimeoutForTest } = await import("../src/daemon/tmux.js");
     _setTmuxTimeoutForTest(TMUX_TIMEOUT_MS);
-    expect(listLiveWindowIds()).toEqual(["cc:@1"]);
+    expect(listWindows()).toEqual({
+      live: ["cc:@1"],
+      dead: [],
+      server: "running",
+    });
+  });
+
+  it("reports a window listing it cannot parse as unobservable, not as empty", async () => {
+    // The dangerous shape: tmux exits 0, so the caller would otherwise take the
+    // result at face value and conclude every agent's window is gone.
+    const { listWindows } = await import("../src/daemon/tmux.js");
+    process.env.CC_FAKE_TMUX_MODE = "garbled-windows";
+
+    expect(listWindows()).toBeNull();
+  });
+
+  it("separates windows whose pane process has exited", async () => {
+    // A session name may contain spaces, so only the last colon separates the
+    // pane-dead flag — getting that wrong would void the whole snapshot.
+    const { listWindows } = await import("../src/daemon/tmux.js");
+    process.env.CC_FAKE_TMUX_MODE = "dead-window";
+
+    expect(listWindows()).toEqual({
+      live: ["cc:@1"],
+      dead: ["my session:@2"],
+      server: "running",
+    });
+  });
+
+  it("lets a caller choose what an unobservable tmux means", async () => {
+    const { windowExists, windowPresence } = await import("../src/daemon/tmux.js");
+    await armHang("hang-all");
+
+    expect(windowPresence("cc:@1")).toBe("unknown");
+    // Reachability callers skip and retry; teardown callers still try.
+    expect(windowExists("cc:@1")).toBe(false);
+    expect(windowExists("cc:@1", { whenUnobservable: "present" })).toBe(true);
   });
 
   it("recreates the configured session when the tmux socket is absent", async () => {

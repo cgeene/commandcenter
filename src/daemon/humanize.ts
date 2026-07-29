@@ -158,6 +158,8 @@ const TEMPLATES: Record<string, Template> = {
   "agent.window_missing": (e) =>
     `${agentRef(e)} window missing once — awaiting confirmation`,
   "agent.recovered": (e) => `${agentRef(e)} recovered while its process was still live`,
+  "agent.orphan_window_reaped": (e) =>
+    `Closed ${agentRef(e)}'s leftover terminal window — its process was already gone`,
   "agent.startup_permission": (e, p) =>
     `${agentRef(e)} needs ${p.trust ? "one-time trust review" : "startup approval"}`,
   "agent.sent": (e) => `Sent input to ${worker(e)}`,
@@ -258,6 +260,8 @@ const TEMPLATES: Record<string, Template> = {
     `Withheld the merge reminder for ${taskRef(e)} — its PR state is unresolved until PR sync catches up`,
   "scheduler.config": () => `Scheduler settings changed`,
   "watchdog.tmux_unavailable": () => `tmux health observation unavailable — no agents changed`,
+  "watchdog.tmux_snapshot_implausible": () =>
+    `tmux reported none of the running agents' windows — treated as unreadable, no agents changed`,
   "watchdog.tmux_recovered": () => `tmux health observation recovered`,
   "daemon.stale": () => `Daemon is running stale code`,
 };

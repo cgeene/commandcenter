@@ -700,7 +700,7 @@ export function spawnWorker(
     });
     return { agent: getAgent(agent.id)!, task: getTask(taskId)! };
   } catch (error) {
-    if (target && windowExists(target)) {
+    if (target && windowExists(target, { whenUnobservable: "present" })) {
       try {
         killWindow(target);
       } catch {
@@ -1137,14 +1137,19 @@ export function paneAgeSeconds(agent: Agent, nowMs = Date.now()): number {
  * pid once we have — a cleared pane_pid is what marks the pane as swept, so a
  * later kill of an already-dead agent knows there is nothing left to chase.
  */
-function reapPaneProcesses(agent: Agent, liveWindow: boolean): number[] {
+function reapPaneProcesses(agent: Agent, mayHaveWindow: boolean): number[] {
   const killed: number[] = [];
   let paneHandled = true;
-  if (agent.tmux_target && liveWindow) {
+  if (agent.tmux_target && mayHaveWindow) {
     // Kills the pane's whole process tree, not just its window: an agent that
     // backgrounded a load generator, watcher or dev server would otherwise
     // leave it running, orphaned to pid 1 and invisible to Command Center.
-    killed.push(...killWindow(agent.tmux_target));
+    try {
+      killed.push(...killWindow(agent.tmux_target));
+    } catch {
+      // The window was gone after all, or tmux could not be reached. Fall
+      // through to the recorded pane pid, which is then the only handle left.
+    }
   }
   // An empty result means no live pane was found behind the window — either it
   // is gone, or `remain-on-exit` is holding a corpse whose reported pid is
@@ -1170,19 +1175,23 @@ export function killAgent(
 ): Agent {
   const agent = getAgent(agentId);
   if (!agent) throw new Error(`agent ${agentId} not found`);
-  const liveWindow = Boolean(
-    agent.tmux_target && windowExists(agent.tmux_target),
+  // Only a positive "that window is gone" may shrink this teardown; a tmux
+  // that could not be asked has to be treated as still holding the window, or
+  // one transient failure silently downgrades a kill into a no-op.
+  const mayHaveWindow = Boolean(
+    agent.tmux_target &&
+      windowExists(agent.tmux_target, { whenUnobservable: "present" }),
   );
   // A false watchdog observation can leave a live provider process behind a
   // DB row marked dead. "kill" must still stop that split-brain process — and
   // so must it for an agent the watchdog marked dead while its pane was never
   // swept (pane_pid is cleared once it has been), or its leftovers would be
   // unreachable forever.
-  if (agent.state === "dead" && !liveWindow && agent.pane_pid === null) {
+  if (agent.state === "dead" && !mayHaveWindow && agent.pane_pid === null) {
     return agent;
   }
 
-  const killedPids = reapPaneProcesses(agent, liveWindow);
+  const killedPids = reapPaneProcesses(agent, mayHaveWindow);
   updateAgent(agentId, { state: "dead" });
 
   const task = agent.task_id ? getTask(agent.task_id) : undefined;

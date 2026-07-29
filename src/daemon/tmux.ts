@@ -252,22 +252,21 @@ export function killWindow(target: string): number[] {
   return killed;
 }
 
-/** All local tmux window targets, including an older agent session retained
- * across a CC_TMUX_SESSION change. Callers still match exact stored targets. */
-export function listWindowIds(): string[] {
-  try {
-    return tmux(
-      "list-windows",
-      "-a",
-      "-F",
-      "#{session_name}:#{window_id}",
-    )
-      .trim()
-      .split("\n")
-      .filter(Boolean);
-  } catch {
-    return []; // session itself is gone
-  }
+/**
+ * Every local tmux window — including an older agent session retained across a
+ * CC_TMUX_SESSION change — split by whether its pane process is still running.
+ * `remain-on-exit` deliberately keeps a crashed window around, so a target in
+ * `dead` is an inspectable shell whose process is already gone, not a healthy
+ * agent. Callers still match exact stored targets.
+ *
+ * `server: "absent"` marks the one empty result that can be trusted: there is
+ * no tmux server, so there genuinely are no windows. Everything else must not
+ * conclude a mass exit from an empty list.
+ */
+export interface TmuxWindows {
+  live: string[];
+  dead: string[];
+  server: "running" | "absent";
 }
 
 /**
@@ -276,40 +275,83 @@ export function listWindowIds(): string[] {
  * client/socket error as "every window vanished" orphans still-running
  * provider processes from Command Center's database.
  */
-export type LiveWindowSnapshot = string[] | null;
+export type WindowSnapshot = TmuxWindows | null;
 
-function tmuxSessionIsDefinitelyAbsent(error: unknown): boolean {
-  return tmuxFailureCode(error) === "session_absent";
-}
+// tmux rejects ":" in a session name and window ids are "@<n>", so the last
+// colon on the line always separates the target from the flag — while a session
+// name is free to contain spaces, which is why this splits rather than matching
+// the whole line. A literal TAB would look safer and is not: tmux downgrades it
+// to "_" in -F output whenever the invoking client's locale is not UTF-8, which
+// turns every line into an unparseable one.
+const WINDOW_TARGET_RE = /:@\d+$/;
 
-/** Live process windows across all local tmux sessions. `remain-on-exit`
- * intentionally keeps crashed windows inspectable, so presence alone is not
- * a worker-health signal. */
-export function listLiveWindowIds(): LiveWindowSnapshot {
+/**
+ * Windows across all local tmux sessions, or null when tmux could not be asked.
+ *
+ * A line this cannot parse fails the WHOLE snapshot rather than dropping that
+ * window: a format/locale/truncation problem otherwise reads as "those windows
+ * are gone", which is exactly the observation that gets live agents killed.
+ */
+export function listWindows(): WindowSnapshot {
+  let out: string;
   try {
-    return tmux(
+    out = tmux(
       "list-windows",
       "-a",
       "-F",
-      "#{session_name}:#{window_id}\t#{pane_dead}",
-    )
-      .trim()
-      .split("\n")
-      .filter(Boolean)
-      .flatMap((line) => {
-        const [target, dead] = line.split("\t");
-        return dead === "0" ? [target] : [];
-      });
+      "#{session_name}:#{window_id}:#{pane_dead}",
+    );
   } catch (error) {
     // A missing session is a trustworthy empty result. Permission/socket/
     // locale/client failures are not; the watchdog must retry without
     // mutating agent or task state.
-    return tmuxSessionIsDefinitelyAbsent(error) ? [] : null;
+    return tmuxFailureCode(error) === "session_absent"
+      ? { live: [], dead: [], server: "absent" }
+      : null;
   }
+  const live: string[] = [];
+  const dead: string[] = [];
+  for (const line of out.trim().split("\n").filter(Boolean)) {
+    const cut = line.lastIndexOf(":");
+    const target = cut > 0 ? line.slice(0, cut) : "";
+    const paneDead = line.slice(cut + 1);
+    if (!WINDOW_TARGET_RE.test(target) || !["0", "1"].includes(paneDead)) {
+      return null;
+    }
+    (paneDead === "0" ? live : dead).push(target);
+  }
+  return { live, dead, server: "running" };
 }
 
-export function windowExists(target: string): boolean {
-  return listWindowIds().includes(target);
+/** "unknown" means tmux could not be asked — never that the window is gone. */
+export type WindowPresence = "present" | "absent" | "unknown";
+
+export function windowPresence(target: string): WindowPresence {
+  const snapshot = listWindows();
+  if (!snapshot) return "unknown";
+  return snapshot.live.includes(target) || snapshot.dead.includes(target)
+    ? "present"
+    : "absent";
+}
+
+/**
+ * Whether tmux still has this window (a `remain-on-exit` corpse counts).
+ *
+ * `whenUnobservable` is the answer for a tmux that could not be asked at all,
+ * and every caller has to pick one, because "I could not look" is not evidence
+ * either way. The default is "absent", which is the fail-closed answer for the
+ * common question "can I reach this agent right now?" — skip the optional
+ * action and retry on a later pass. Callers deciding whether to CLEAN UP want
+ * "present" instead: attempt the teardown and tolerate its failure, so that a
+ * transient error cannot leak a window or strand a live process.
+ */
+export function windowExists(
+  target: string,
+  opts: { whenUnobservable?: Exclude<WindowPresence, "unknown"> } = {},
+): boolean {
+  const presence = windowPresence(target);
+  if (presence === "unknown") return opts.whenUnobservable === "present";
+  return presence === "present";
 }
 
 /**

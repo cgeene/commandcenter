@@ -18,8 +18,7 @@ vi.mock("../src/daemon/tmux.js", () => ({
   sendEnter: async () => {},
   clearInputLine: async () => {},
   ensureSession: () => {},
-  listWindowIds: () => [],
-  listLiveWindowIds: () => [],
+  listWindows: () => ({ live: [], dead: [], server: "running" }),
 }));
 
 vi.mock("../src/daemon/genconfig.js", () => ({
@@ -111,7 +110,7 @@ function watchdogDeps(overrides: Record<string, unknown> = {}) {
       revive: (a: { id: number }) => revived.push(a.id),
       recoverReview: (a: { id: number }) => recovered.push(a.id),
       pendingPermission: () => null,
-      windowIds: () => ["cc:@review"],
+      windows: () => ({ live: ["cc:@review"], dead: [], server: "running" }),
       now: () => new Date(),
       ...overrides,
     },

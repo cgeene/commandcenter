@@ -14,8 +14,7 @@ vi.mock("../src/daemon/tmux.js", () => ({
   capturePane: () => "",
   killWindow: () => [],
   paneProcess: () => null,
-  listWindowIds: () => [],
-  listLiveWindowIds: () => [],
+  listWindows: () => ({ live: [], dead: [], server: "running" }),
   ensureSession: () => {},
   newWindow: () => "cc:@1",
 }));
@@ -78,7 +77,7 @@ async function parkedWorker(state = "idle") {
 function schedulerDeps(spawned: number[], now = new Date("2026-07-28T12:00:00Z")) {
   return {
     spawn: (id: number) => spawned.push(id),
-    windowIds: () => [],
+    windows: () => ({ live: [], dead: [], server: "running" }),
     now: () => now,
   };
 }

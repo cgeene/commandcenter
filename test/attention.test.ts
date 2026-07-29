@@ -252,6 +252,44 @@ describe("deriveAttention — kinds", () => {
     expect(items[0].kind).toBe("escalation");
   });
 
+  describe("a watchdog that cannot read tmux", () => {
+    async function blindFor(kind: string, minutesAgo: number) {
+      const { logEvent } = await import("../src/db/events.js");
+      const { getDb } = await import("../src/db/db.js");
+      logEvent(kind);
+      getDb()
+        .prepare("UPDATE events SET ts = ? WHERE kind = ?")
+        .run(new Date(Date.now() - minutesAgo * 60_000).toISOString(), kind);
+    }
+
+    it("stays quiet while the blind spell is still brief", async () => {
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      await blindFor("watchdog.tmux_unavailable", 2);
+      expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
+    });
+
+    it.each([
+      "watchdog.tmux_unavailable",
+      "watchdog.tmux_snapshot_implausible",
+    ])("surfaces a sustained blind spell (%s)", async (kind) => {
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      await blindFor(kind, 30);
+
+      const items = deriveAttention({ isPrOpen: allOpen });
+      expect(items).toHaveLength(1);
+      expect(items[0].title).toContain("Watchdog blind");
+    });
+
+    it("clears once tmux is readable again", async () => {
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      const { logEvent } = await import("../src/db/events.js");
+      await blindFor("watchdog.tmux_unavailable", 30);
+      logEvent("watchdog.tmux_recovered");
+
+      expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
+    });
+  });
+
   /**
    * Both wait producers are anchored on EVENTS, so neither notices a task moving
    * on underneath them: the wait hook and the escalation stay the newest of their
