@@ -27,7 +27,7 @@ import {
 } from "./transcript.js";
 import { recordTokenSample } from "../db/tokens.js";
 import { capturePane, windowExists } from "./tmux.js";
-import { WAIT_HOOK_EVENTS } from "./waiting.js";
+import { WAIT_HOOK_EVENTS, waitIsMoot } from "./waiting.js";
 import { codexPermissionDecision } from "../codex-policy.js";
 import { delegatePendingTaskToMain } from "./orchestration.js";
 import { runVerifyCommand, VERIFY_TIMEOUT_MS } from "./verifyenv.js";
@@ -67,12 +67,6 @@ export function resetAutoNudgeCount(agentId: number): void {
 export function __clearAutoNudgeCountsForTests(): void {
   autoNudgeCounts.clear();
 }
-
-/** Task statuses in which a finished worker's idle-prompt ping is pure noise:
- *  "review" is handled by PR #36's automatic review⇄fix loop (reject
- *  auto-resumes, approve→merge auto-completes+reaps), and a done/cancelled task
- *  has nothing left to do — its worker is only awaiting the reaper. */
-const IDLE_SUPPRESS_STATUSES: readonly string[] = ["review", "done", "cancelled"];
 
 /** True once the worker's latest turn-boundary lifecycle event is its Stop
  *  hook — i.e. it finished the turn and is not blocked mid-work on a
@@ -602,7 +596,7 @@ export async function handleHookEvent(
       // reviewers must keep. Reviewers fall through to the normal wait path.
       if (agent.kind === "worker" && isIdlePrompt && stopFiredForLatestTurn(agentId)) {
         const task = agent.task_id ? getTask(agent.task_id) : undefined;
-        if (task && IDLE_SUPPRESS_STATUSES.includes(task.status)) {
+        if (task && waitIsMoot(agent, task)) {
           updateAgent(agentId, { state: "idle" });
           logEvent("waiting.suppressed_in_review", {
             agentId,
