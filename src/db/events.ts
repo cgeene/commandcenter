@@ -38,6 +38,21 @@ export function countTaskEvents(taskId: number, kind: string): number {
   return row.n;
 }
 
+/** How many events of `kind` the task logged after event id `afterId`. Lets a
+ *  caller count retries within one episode rather than over all history. */
+export function countTaskEventsAfter(
+  taskId: number,
+  kind: string,
+  afterId: number,
+): number {
+  const row = getDb()
+    .prepare(
+      "SELECT COUNT(*) AS n FROM events WHERE task_id = ? AND kind = ? AND id > ?",
+    )
+    .get(taskId, kind, afterId) as { n: number };
+  return row.n;
+}
+
 export function countAgentEvents(agentId: number, kinds: string[]): number {
   const marks = kinds.map(() => "?").join(",");
   const row = getDb()

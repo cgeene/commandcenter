@@ -1,9 +1,8 @@
 import { dismissedKeys } from "../db/attention.js";
 import { listAgents } from "../db/agents.js";
 import { liveUsageEnabled } from "../config.js";
-import { workerSlots } from "./capacity.js";
+import { autonomousSpawnsToday, workerSlots } from "./capacity.js";
 import {
-  countEventsToday,
   earliestEventTsAfter,
   latestAgentEvent,
   latestAgentEventTs,
@@ -23,7 +22,7 @@ import {
   getSchedulerConfig,
 } from "../db/settings.js";
 import { listTasks, readyTasks } from "../db/tasks.js";
-import { reviewMaxCycles } from "./review.js";
+import { reviewMaxCycles, strandedReworkTasks } from "./review.js";
 import { WAIT_HOOK_EVENTS } from "./waiting.js";
 
 /**
@@ -75,6 +74,14 @@ const APPLY_RE = /terraform apply|gcloud .* apply|kubectl apply/i;
 // stalls, but a brief stall is normal churn. Only nag the human once it has
 // persisted past this — long enough that it's a real stuck queue, not a blip.
 const SCHEDULER_STALL_MS = 15 * 60_000;
+
+// The watchdog's rework-respawn sweep runs every 10s, so a task the rejection
+// just requeued is usually moving again long before a human could act on it.
+// Only surface the strand once it has outlived several of those attempts — after
+// which it is either genuinely failing or held by a gate (autonomous dispatch
+// off, the active window, the daily budget, a blocker, a serialized repo), and
+// both are the human's to resolve.
+const REWORK_STRAND_GRACE_MS = 2 * 60_000;
 
 function excerpt(s: string | null | undefined, n = 200): string {
   if (!s) return "";
@@ -269,6 +276,33 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
     });
   }
 
+  //     A rejection's own requeue that nobody picked up. Same standing-state
+  //     predicate the watchdog's respawn sweep runs on
+  //     (review.strandedReworkTasks — scoped to the rejection's queue entry, so
+  //     a PR-feedback or vanished-worker requeue is never described as one), so
+  //     this can only name a task that sweep has not started, and it clears
+  //     itself the moment one does. Held for REWORK_STRAND_GRACE_MS first: the
+  //     sweep normally resolves this within a watchdog tick, and a self-healing
+  //     blip is not a human's problem. The wording stays agnostic about WHY the
+  //     restart has not happened — it may be gated (autonomous dispatch off,
+  //     outside the active window, budget spent, an unfinished blocker, a
+  //     serialized repo) or failing, and both look like this to the human.
+  for (const { task: t, requeued } of strandedReworkTasks()) {
+    if (nowMs - Date.parse(requeued.ts) < REWORK_STRAND_GRACE_MS) continue;
+    push({
+      id: `stalled_transition:rework:${t.id}:${requeued.id}`,
+      kind: "stalled_transition",
+      title: `Rework not started — #${t.id} ${t.title}`,
+      context: `The reviewer rejected round ${t.review_cycles} and the task went back to the queue with no worker on it. The automatic restart has not run — it is either gated (autonomous dispatch off, active window, spawn budget, an unfinished blocker, a serialized repo) or failing. Start a worker yourself, or clear what is holding it; the reviewer notes go into its prompt. ${excerpt(t.review_notes, 140)}`,
+      severity: "orange",
+      urgent: false,
+      task_id: t.id,
+      agent_id: null,
+      pr_url: t.pr_url,
+      created_at: requeued.ts,
+    });
+  }
+
   //     Every reviewer the task was given stopped without a verdict, so the
   //     platform stopped replacing them. Anchored on the event rather than the
   //     blocked status alone: a later round or status change supersedes it, and
@@ -419,9 +453,7 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
       }
 
       // budget: today's autonomous spawn budget is spent while work waits.
-      const spawnsToday =
-        countEventsToday("scheduler.spawned") +
-        countEventsToday("reviewer.auto_spawned");
+      const spawnsToday = autonomousSpawnsToday();
       if (spawnsToday >= cfg.daily_spawn_limit) {
         const anchor = latestEventTs("scheduler.budget_reached");
         if (anchor && nowMs - Date.parse(anchor) > SCHEDULER_STALL_MS) {

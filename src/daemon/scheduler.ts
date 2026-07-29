@@ -1,18 +1,23 @@
 import { type Agent, listAgents, updateAgent } from "../db/agents.js";
 import { dueCrons, nextRun, openTasksFor, updateCron } from "../db/crons.js";
 import {
-  countEventsToday,
   countTaskEvents,
+  countTaskEventsAfter,
   latestAgentEvent,
   latestAgentEventTs,
   latestEventTs,
+  latestTaskEvent,
   logEvent,
 } from "../db/events.js";
 import { getSchedulerConfig, type SchedulerConfig } from "../db/settings.js";
 import { createTask, getTask, listTasks, updateTask } from "../db/tasks.js";
-import { workerSlots } from "./capacity.js";
+import {
+  autonomousSpawnsToday,
+  noteReworkOverCap,
+  workerSlots,
+} from "./capacity.js";
 import { tryAutoNudge } from "./hooks.js";
-import { recoverAbandonedReview } from "./review.js";
+import { recoverAbandonedReview, strandedReworkTasks } from "./review.js";
 import {
   reviewerGaveUpAt,
   reviewerSubmittedVerdict,
@@ -186,10 +191,9 @@ export function tick(deps: SchedulerDeps = defaultDeps): void {
     return;
   }
 
-  // auto-spawned reviewers draw from the same daily budget as worker spawns
-  let spawnsToday =
-    countEventsToday("scheduler.spawned") +
-    countEventsToday("reviewer.auto_spawned");
+  // auto-spawned reviewers and rework respawns draw from the same daily budget
+  // as worker spawns (capacity.autonomousSpawnsToday owns the denominator)
+  let spawnsToday = autonomousSpawnsToday();
 
   for (const task of ready) {
     if (capacity <= 0) break;
@@ -690,6 +694,120 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
             },
           );
         }
+      }
+    }
+  }
+
+  reworkDispatchSweep(deps, nowMs);
+}
+
+/** Respawn attempts allowed per rejection. Past this the task is left queued
+ *  for the human, named by the Needs-You item strandedReworkTasks feeds. */
+const MAX_REWORK_DISPATCH_ATTEMPTS = 3;
+/** Minimum gap between those attempts, so a task that cannot spawn at all
+ *  cannot burn its whole budget inside one watchdog second. */
+const REWORK_DISPATCH_RETRY_MS = 60_000;
+
+/**
+ * Restart a worker on work a review rejection sent back to the queue.
+ *
+ * A rejection is a continuation of work triage already judged and dispatched, so
+ * it needs no fresh triage: spawnWorker resumes the worker's own provider session
+ * with review_notes folded into the prompt (that is what the requeue was always
+ * written to expect — see review.strandedReworkTasks for why nothing else
+ * supplied it).
+ *
+ * It is a real autonomous session, so it answers to the same policy as every
+ * other automatic spawn: the master switch, the active window, and the daily
+ * budget (shared denominator in capacity.autonomousSpawnsToday, which counts
+ * these respawns too). Only the CONCURRENCY cap is exempt, which matches the
+ * in-place resume path — rework is a continuation, never refused for capacity,
+ * just recorded when it pushes the fleet over. Gating costs nothing in
+ * visibility: the strand stays named in the Needs-You queue the whole time it is
+ * held.
+ *
+ * Dispatchability is a separate question from failure. An unfinished blocker or
+ * a strict-serial repo held by another task is a gate that clears on its own —
+ * and the ready queue is the ONLY thing that enforces blocked_by, since
+ * spawnWorker checks status and strict-serial but never the blocker — so a gated
+ * task is skipped without spending an attempt and starts as soon as it clears.
+ * Only a genuine spawn failure burns budget.
+ *
+ * Called from the watchdog rather than the auto-spawn pass in `tick`: this is
+ * reconciliation of work already started, not new work. That also means it
+ * inherits the tmux-observability guard — spawning while tmux cannot be read
+ * would create windows nothing is tracking.
+ */
+export function reworkDispatchSweep(
+  deps: SchedulerDeps = defaultDeps,
+  nowMs: number = deps.now().getTime(),
+): void {
+  const cfg = getSchedulerConfig();
+  if (!cfg.enabled) return;
+  if (cfg.active_hours && !inActiveWindow(cfg.active_hours, new Date(nowMs))) return;
+  const stranded = strandedReworkTasks();
+  if (stranded.length === 0) return;
+
+  // Counted down within the pass, like the auto-spawn loop: several stranded
+  // tasks in one sweep must not overshoot the limit between them.
+  let spawnsToday = autonomousSpawnsToday();
+  const dispatchable = new Set(dispatchableTasks().map((t) => t.id));
+
+  for (const { task, requeued } of stranded) {
+    if (!dispatchable.has(task.id)) continue;
+    if (spawnsToday >= cfg.daily_spawn_limit) {
+      // Once per strand, not once per tick: the sweep runs every 10s and this
+      // is a standing condition the Needs-You item already carries.
+      if (
+        countTaskEventsAfter(task.id, "review.rework_budget_skipped", requeued.id) === 0
+      ) {
+        logEvent("review.rework_budget_skipped", {
+          taskId: task.id,
+          payload: { spent: spawnsToday, limit: cfg.daily_spawn_limit },
+        });
+      }
+      continue;
+    }
+    const attempts = countTaskEventsAfter(
+      task.id,
+      "review.rework_dispatch_failed",
+      requeued.id,
+    );
+    if (attempts >= MAX_REWORK_DISPATCH_ATTEMPTS) continue;
+    if (attempts > 0) {
+      const last = latestTaskEvent(task.id, ["review.rework_dispatch_failed"]);
+      if (last && nowMs - Date.parse(last.ts) < REWORK_DISPATCH_RETRY_MS) continue;
+    }
+    try {
+      deps.spawn(task.id);
+      logEvent("review.rework_respawned", {
+        taskId: task.id,
+        payload: { round: task.review_cycles },
+      });
+      spawnsToday++;
+      const respawned = getTask(task.id);
+      if (respawned?.agent_id) noteReworkOverCap(task.id, respawned.agent_id);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const attempt = attempts + 1;
+      logEvent("review.rework_dispatch_failed", {
+        taskId: task.id,
+        payload: { error: msg, attempt, max: MAX_REWORK_DISPATCH_ATTEMPTS },
+      });
+      // Push only once the retries are used up: the standing Needs-You item is
+      // already naming this task, so a transient first failure needs no page.
+      if (attempt >= MAX_REWORK_DISPATCH_ATTEMPTS) {
+        notifyEvent(
+          "worker_stalled",
+          `task #${task.id} — rejected work has nobody fixing it`,
+          `${task.title}\nThe reviewer rejected round ${task.review_cycles} and the task went back to the queue, but a worker could not be started after ${attempt} attempts: ${msg}\nIt will not move on its own — spawn a worker for it, or fix the cause and requeue it.`,
+          {
+            priority: "high",
+            tags: "rotating_light",
+            taskId: task.id,
+            once: `task:${task.id}:rework_undispatched:${requeued.id}`,
+          },
+        );
       }
     }
   }

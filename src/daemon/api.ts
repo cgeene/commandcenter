@@ -24,8 +24,8 @@ import {
   listCrons,
   updateCron,
 } from "../db/crons.js";
-import { countEventsToday, listEvents, logEvent } from "../db/events.js";
-import { workerSlots } from "./capacity.js";
+import { listEvents, logEvent } from "../db/events.js";
+import { autonomousSpawnsToday, workerSlots } from "./capacity.js";
 import { humanizeEvent } from "./humanize.js";
 import {
   addMemory,
@@ -1519,9 +1519,7 @@ export function buildApp(): Hono {
       status: {
         live_workers: counted.length,
         parked_workers: parked.length,
-        spawns_today:
-          countEventsToday("scheduler.spawned") +
-          countEventsToday("reviewer.auto_spawned"),
+        spawns_today: autonomousSpawnsToday(),
       },
     });
   });

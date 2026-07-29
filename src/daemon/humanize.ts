@@ -78,6 +78,12 @@ const TEMPLATES: Record<string, Template> = {
     `Reviewer rejected ${taskRef(e)}${p.notes ? `: ${clip(p.notes, 80)}` : ""}`,
   "review.escalated": (e) =>
     `${taskRef(e)} escalated — too many rejected reviews`,
+  "review.rework_respawned": (e, p) =>
+    `Restarted a worker on ${taskRef(e)} to address review round ${Number(p.round) || 0}`,
+  "review.rework_dispatch_failed": (e, p) =>
+    `${taskRef(e)} is queued with the reviewer's notes but no worker could be started${p.error ? `: ${clip(p.error, 80)}` : ""}`,
+  "review.rework_budget_skipped": (e) =>
+    `${taskRef(e)} is queued with the reviewer's notes — today's spawn budget is spent, so no worker was restarted`,
   "review.round_started": (e, p) => {
     const round = Number(p.round) || 0;
     const max = Number(p.max) || 0;
@@ -154,6 +160,8 @@ const TEMPLATES: Record<string, Template> = {
   "agent.send_failed": (e) => `Failed to send input to ${worker(e)}`,
   "agent.input_submitted": (e) => `Submitted ${worker(e)}'s pending input`,
   "agent.input_cleared": (e) => `Cleared ${worker(e)}'s input`,
+  "agent.idle_wait_cleared": (e) =>
+    `${agentRef(e)} was only idle, not waiting on an answer — cleared its wait`,
   "agent.auto_nudged": (e, p) => {
     const attempt = Number(p.attempt) || 0;
     return `Auto-nudged ${worker(e)} (transient API stall${attempt > 1 ? `, attempt ${attempt}` : ""})`;
