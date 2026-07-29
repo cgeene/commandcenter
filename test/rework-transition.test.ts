@@ -52,9 +52,21 @@ beforeEach(async () => {
   __clearIdleRedelegateForTests();
   __clearBackgroundParkForTests();
   __clearStallSweepLatchForTests();
+  // A verify failure the daemon can see was contended gets a retry that does
+  // not spend the round's budget. Whether some other agent is running its own
+  // test suite right now is a property of the box, so leaving this unpinned
+  // makes every budget assertion below pass or fail by luck.
+  const { __setExternalSuiteObserverForTests } = await import(
+    "../src/daemon/verifyenv.js"
+  );
+  __setExternalSuiteObserverForTests(() => 0);
 });
 
 afterEach(async () => {
+  const { __setExternalSuiteObserverForTests } = await import(
+    "../src/daemon/verifyenv.js"
+  );
+  __setExternalSuiteObserverForTests(null);
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
