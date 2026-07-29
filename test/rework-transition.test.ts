@@ -395,13 +395,64 @@ describe("stalledTransitionSweep", () => {
     expect((await attentionLater()).length).toBe(1);
   });
 
-  it("drops the item once the worker is nudged back into work", async () => {
-    const { logEvent } = await import("../src/db/events.js");
-    const { task, worker } = await strandedTask();
-    expect((await attentionLater()).length).toBe(1);
-    // A delivery into the session means something IS advancing it again.
-    logEvent("agent.sent", { agentId: worker.id, taskId: task.id });
+  // The whole path for real: the worker stops, its verify_cmd fails, the Stop
+  // hook nudges it back to work, and the sweep runs afterwards. Nothing is
+  // hand-logged — a worker mid-fix must not be called stalled, and must not
+  // have verify re-run underneath it.
+  it("never touches a worker the failing-verify nudge just put back to work", async () => {
+    const { handleHookEvent, stalledTransitionSweep, stalledFinishedWorkers } =
+      await import("../src/daemon/hooks.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, worker } = await reviewTask({ verify_cmd: "false" });
+    updateTask(task.id, {
+      status: "in_progress",
+      result_summary: "round 2 result",
+    });
+
+    await handleHookEvent(worker.id, { hook_event_name: "Stop" });
+
+    // The Stop hook ran verify, it failed, and the worker was nudged.
+    const afterStop = listEvents(50).map((e) => e.kind);
+    expect(afterStop).toContain("verify.failed");
+    expect(afterStop).toContain("task.verify_nudged");
+    expect(getTask(task.id)!.status).toBe("in_progress");
+    expect(getAgent(worker.id)?.state).toBe("working");
+    expect(sendText).toHaveBeenCalled(); // the fix list went into its session
+
+    expect(stalledFinishedWorkers(LATER())).toEqual([]);
     expect(await attentionLater()).toEqual([]);
+
+    await stalledTransitionSweep({ nowMs: LATER() });
+
+    const kinds = listEvents(80).map((e) => e.kind);
+    expect(kinds).not.toContain("task.transition_stalled");
+    // No second verify run racing the worker's edits, and no promotion of the
+    // result_summary it is still rewriting.
+    expect(kinds.filter((k) => k === "verify.started").length).toBe(1);
+    expect(getTask(task.id)!.status).toBe("in_progress");
+    expect(spawnReviewer).not.toHaveBeenCalled();
+  });
+
+  it("never re-drives a Stop the hook already processed", async () => {
+    // Even with the worker idle again, a verify marker past the Stop means the
+    // hook ran and made its call — the sweep is for Stops nobody processed.
+    const { stalledFinishedWorkers } = await import("../src/daemon/hooks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { task, worker } = await strandedTask({ verify_cmd: "true" });
+    expect(stalledFinishedWorkers(LATER()).length).toBe(1);
+    logEvent("verify.failed", { agentId: worker.id, taskId: task.id });
+    expect(stalledFinishedWorkers(LATER())).toEqual([]);
+  });
+
+  it("does not flag a worker that is mid-turn", async () => {
+    const { stalledFinishedWorkers } = await import("../src/daemon/hooks.js");
+    const { updateAgent } = await import("../src/db/agents.js");
+    const { worker } = await strandedTask();
+    expect(stalledFinishedWorkers(LATER()).length).toBe(1);
+    updateAgent(worker.id, { state: "working" });
+    expect(stalledFinishedWorkers(LATER())).toEqual([]);
   });
 
   // `queued` is what a rejection's requeue leaves behind, so it is the status a

@@ -62,6 +62,17 @@ export function approvedReadyLatchKey(
  */
 export function notifyApprovedReady(task: Task): void {
   if (task.review_verdict !== "approve") return;
+  // An approve verdict is not by itself permission to merge — the task's status
+  // is. A blocked task is held by a gate the reviewer did not evaluate (a
+  // verify_cmd that keeps failing, a PR closed without merging, a worker's
+  // report_blocked), and this is the ONE push that means "act now", so it must
+  // never fire for one. Enforced here rather than at the call sites because
+  // prsync re-derives it from standing state on every poll, so any task
+  // carrying an approve verdict is a candidate regardless of how it got there.
+  //
+  // Returning before notifyEvent also leaves the once-latch unclaimed, so the
+  // push still lands the moment the block is genuinely cleared.
+  if (task.status !== "review" && task.status !== "done") return;
   const awaitingHuman =
     task.publication_mode === "human" &&
     task.workspace_kind === "repo" &&
@@ -584,20 +595,24 @@ export async function handleVerdict(
     // Marking that PR ready would hand a human an act-now signal for a branch
     // whose verification still fails.
     if (acceptedWhileBlocked && !restorable) {
+      // review_head_sha is deliberately NOT advanced. It is the SHA an
+      // actionable approval covers: moving it here would both mint a fresh
+      // approved-ready latch key for a task that must not be announced as
+      // mergeable, and make maybeAutoReview treat this approval as current if
+      // the block is later lifted, skipping the re-review that should happen.
       updateTask(taskId, {
         review_verdict: "approve",
         review_notes: notes,
-        review_head_sha: approvedSha,
       });
       logEvent("review.approved_block_kept", {
         taskId,
         agentId,
-        payload: { pr_left_draft: task.pr_is_draft !== 0 },
+        payload: { verdict_sha: approvedSha, pr_is_draft: task.pr_is_draft },
       });
       notifyEvent(
         "task_blocked",
         `task #${taskId} approved, but it stays blocked`,
-        `${task.title}\nThe reviewer approved the work, but the task is blocked by something the review does not clear — check why it was blocked (a failing verify command, or a worker that reported blocked). The verdict is recorded and the PR is still a draft; clear the block and it can go ready.`,
+        `${task.title}\nThe reviewer approved the work, but the task is blocked by something the review does not clear — check why it was blocked (a failing verify command, a closed PR, or a worker that reported blocked). The verdict is recorded and nothing has been announced as ready to merge. Clear the block and it can go ready.`,
         {
           priority: "high",
           tags: "rotating_light",

@@ -295,6 +295,74 @@ describe("handleVerdict", () => {
     );
   });
 
+  // The dangerous shape: the PR is ALREADY out of draft from an earlier
+  // approve, so nothing about draft state protects us. prsync re-derives the
+  // ready-to-merge push from standing state on every poll, so an approve
+  // verdict on a blocked task would otherwise announce a branch whose
+  // verification still fails as mergeable.
+  it("an approve on a verify-blocked task with a READY PR never announces it mergeable", async () => {
+    const { handleVerdict, notifyApprovedReady } = await import(
+      "../src/daemon/review.js"
+    );
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, reviewer } = await setupBlockedWithLiveReviewer({
+      cause: "verify",
+    });
+    updateTask(task.id, { pr_is_draft: 0 }); // left ready by an earlier round
+    const shaBefore = getTask(task.id)!.review_head_sha;
+
+    await handleVerdict(task.id, reviewer.id, "approve", "diff is fine");
+
+    const t = getTask(task.id)!;
+    expect(t.status).toBe("blocked");
+    expect(t.review_verdict).toBe("approve"); // verdict kept
+    // The approval covers no announceable SHA: advancing it would mint a fresh
+    // latch key and make the stale approval look current after an unblock.
+    expect(t.review_head_sha).toBe(shaBefore);
+    // The standing-state push prsync makes every poll must stay silent.
+    notifyApprovedReady(t);
+    const pushed = listEvents(40)
+      .filter((e) => e.kind === "notify.pushed")
+      .map((e) => e.payload ?? "")
+      .join();
+    expect(pushed).not.toContain("review_approved_ready");
+  });
+
+  it("suppressing the ready push leaves the latch free for when the block clears", async () => {
+    const { notifyApprovedReady, approvedReadyLatchKey } = await import(
+      "../src/daemon/review.js"
+    );
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { setNotificationSettings } = await import("../src/db/settings.js");
+    const { notifyLatched } = await import("../src/db/notifylatch.js");
+    // A push has to actually be dispatchable, or "the latch stayed free" would
+    // hold for the wrong reason. Nothing leaves the process.
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("ok")));
+    try {
+      setNotificationSettings({ ntfy_url: "http://127.0.0.1:9/sink" });
+      const { task } = await setupReviewTask();
+      updateTask(task.id, {
+        status: "blocked",
+        review_verdict: "approve",
+        review_head_sha: "abc123",
+        pr_is_draft: 0,
+      });
+      const key = approvedReadyLatchKey(task.id, "abc123");
+
+      notifyApprovedReady(getTask(task.id)!); // suppressed: task is blocked
+      expect(notifyLatched(key)).toBe(false);
+
+      // Block cleared by a human — the same standing state must now push,
+      // which it can only do if the suppression never consumed the latch.
+      updateTask(task.id, { status: "review" });
+      notifyApprovedReady(getTask(task.id)!);
+      expect(notifyLatched(key)).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("an approve does NOT auto-complete a doc-only task blocked for verification", async () => {
     const { handleVerdict } = await import("../src/daemon/review.js");
     const { getTask } = await import("../src/db/tasks.js");

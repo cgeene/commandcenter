@@ -216,14 +216,15 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   // --- stalled_transition: the lifecycle itself is stuck. Two shapes, both of
   //     which used to surface only as a generic idle ping: a worker that
   //     finished with a result the platform never promoted out of in_progress,
-  //     and a reviewer holding a verdict the task's status refuses. Both are
-  //     anchored to the event that recorded the stall, and both clear as soon
-  //     as anything moves the task — see TRANSITION_PROGRESS_EVENTS. ---------
+  //     and a reviewer holding a verdict the task's status refuses.
   //
-  //     The stranded-worker half reads the SAME state predicate the rescue
-  //     sweep runs on, rather than an event marker: a marker can be buried by
-  //     the sweep's own re-drive, so a rescue that did not work would hide the
-  //     situation it failed to fix.
+  //     They are anchored differently on purpose. The stranded-worker half
+  //     calls stalledFinishedWorkers() — the same live-state predicate the
+  //     rescue sweep runs on — instead of keying off an event: an event marker
+  //     gets buried by the sweep's own re-drive, so a rescue that did NOT work
+  //     would hide the situation it had just failed to fix. The held-verdict
+  //     half has no equivalent standing state, so it does key off its event,
+  //     and clears when a later review or status event supersedes it.
   for (const { task: t, agent, stop } of stalledFinishedWorkers(nowMs)) {
     push({
       id: `stalled_transition:${t.id}:${stop.id}`, // new Stop -> new episode

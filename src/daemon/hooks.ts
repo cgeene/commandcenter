@@ -940,6 +940,17 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     )) === "sent";
 
   if (nudged) {
+    // The worker is working again, but resumeAgent records nothing on success
+    // and (outside wasReview) neither did this branch, so the task's own event
+    // log showed a finished worker and no follow-up — indistinguishable from a
+    // Stop nobody ever processed. Anything reasoning about "has this task moved
+    // since its worker stopped" needs this marker; without it the stall sweep
+    // treats a worker mid-fix as stranded and re-drives verify underneath it.
+    logEvent("task.verify_nudged", {
+      taskId: task.id,
+      agentId: agent.id,
+      payload: { attempt: priorFails + 1, max: MAX_VERIFY_NUDGES },
+    });
     if (wasReview) {
       updateTask(task.id, { status: "in_progress" });
       logEvent("task.reopened", {
@@ -992,7 +1003,12 @@ const TRANSITION_ADVANCE_EVENTS = [
   "task.reopened",
   "task.requeued",
   "task.autocompleted",
+  // Text delivered into the worker's session: it is working again, whoever
+  // sent it. agent.sent covers send_to_worker; the other two are the platform
+  // nudging on its own, which record nothing in resumeAgent itself.
   "agent.sent",
+  "agent.auto_nudged",
+  "task.verify_nudged",
 ];
 
 export interface StalledFinishedWorker {
@@ -1003,13 +1019,17 @@ export interface StalledFinishedWorker {
 
 /**
  * Tasks nothing can advance: the worker ended a turn with a result_summary, the
- * task is still `in_progress`, no verify_cmd is running, and neither a status
- * change nor a message into its session has happened since that Stop.
+ * task is still `in_progress`, and nothing has picked it up since that Stop.
  *
  * Derived purely from current state, so it is true exactly while the situation
  * lasts and false the moment anything fixes it. Both the rescue sweep and the
  * Needs You queue read it, which is what keeps "the platform is rescuing this"
  * and "the human should look at this" from ever disagreeing.
+ *
+ * Every disqualifier below is load-bearing, because a false positive is not
+ * merely noise: the sweep acts on this, and re-driving a worker that is already
+ * working re-runs verify_cmd against a half-edited tree, spends its nudge
+ * budget, and can promote a stale result_summary to review mid-turn.
  */
 export function stalledFinishedWorkers(
   nowMs = Date.now(),
@@ -1019,9 +1039,21 @@ export function stalledFinishedWorkers(
     if (!task.result_summary || !task.agent_id) continue;
     const agent = getAgent(task.agent_id);
     if (!agent || !stopFiredForLatestTurn(agent.id)) continue;
+    // Mid-turn. A nudge does not produce a new turn-boundary hook, so the
+    // check above still sees the old Stop — the live state is what tells them
+    // apart. A stale "working" from a crashed daemon only under-reports here,
+    // which is the safe direction.
+    if (agent.state === "working") continue;
     const stop = latestAgentEvent(agent.id, ["hook.stop"]);
     if (!stop || nowMs - Date.parse(stop.ts) < TRANSITION_STALL_GRACE_MS) continue;
-    if (verifyInFlight(task.id, nowMs)) continue;
+    // The Stop hook got as far as this task's verify_cmd, so it DID process
+    // this Stop; whatever it decided afterwards (promote, nudge, block) is its
+    // call. This sweep exists for Stops that were never processed at all.
+    const verified = latestTaskEventId(task.id, [
+      "verify.started",
+      ...VERIFY_DONE_EVENTS,
+    ]);
+    if (verified !== undefined && verified > stop.id) continue;
     const advanced = latestTaskEventId(task.id, TRANSITION_ADVANCE_EVENTS);
     if (advanced !== undefined && advanced > stop.id) continue;
     stalled.push({ task, agent, stop: { id: stop.id, ts: stop.ts } });
