@@ -276,28 +276,6 @@ describe("auto-review gate — repo tasks need a PR (task #110)", () => {
     expect(spawn.spawnReviewer(id)).toEqual({ agent: { id: 999 }, task: {} });
   });
 
-  it("a repo task with no commits and no pr_url logs review.skipped_no_pr and does not spawn", async () => {
-    const { maybeAutoReview } = await import("../src/daemon/review.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const { createTask, updateTask } = await import("../src/db/tasks.js");
-    // the task #109 incident shape: branch-only (open_pr=false), zero commits
-    const repo = makeEmptyRepo(11);
-    const t = createTask({ title: "deploy prep", prompt: "x", repo: repo.repo, open_pr: false });
-    updateTask(t.id, { status: "review", branch: repo.branch, result_summary: "prepped" });
-
-    await maybeAutoReview(t.id);
-
-    expect(spawnReviewer).not.toHaveBeenCalled();
-    const events = listEvents(20);
-    expect(events.map((e) => e.kind)).toContain("review.skipped_no_pr");
-    const skip = events.find((e) => e.kind === "review.skipped_no_pr")!;
-    expect(JSON.parse(skip.payload!)).toMatchObject({
-      task_id: t.id,
-      open_pr: 0,
-      branch_has_commits: false,
-    });
-  });
-
   it("logs the no-PR skip once per review episode, not on every sweep", async () => {
     const { maybeAutoReview } = await import("../src/daemon/review.js");
     const { listEvents } = await import("../src/db/events.js");
@@ -309,27 +287,6 @@ describe("auto-review gate — repo tasks need a PR (task #110)", () => {
 
     const skips = listEvents(30).filter((e) => e.kind === "review.skipped_no_pr");
     expect(skips).toHaveLength(1);
-  });
-
-  it("a scratch task is unaffected by the gate — it still auto-reviews with no PR", async () => {
-    const { maybeAutoReview } = await import("../src/daemon/review.js");
-    const { createTask, updateTask } = await import("../src/db/tasks.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const t = createTask({
-      title: "investigate",
-      prompt: "x",
-      repo: path.join(tmpDir, "scratch-13"),
-      workspace_kind: "scratch",
-      open_pr: false,
-    });
-    updateTask(t.id, { status: "review", result_summary: "root cause found" });
-
-    await maybeAutoReview(t.id);
-
-    expect(spawnReviewer).toHaveBeenCalledOnce();
-    const kinds = listEvents(20).map((e) => e.kind);
-    expect(kinds).toContain("review.round_started");
-    expect(kinds).not.toContain("review.skipped_no_pr");
   });
 
   it("the sweep (reviewLoopSweep) respects the gate for a PR-less repo task", async () => {

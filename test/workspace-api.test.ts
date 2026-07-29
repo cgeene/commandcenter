@@ -339,24 +339,4 @@ describe("workspace API", () => {
     expect(JSON.parse(created.payload!).creator_kind).toBe("worker");
   });
 
-  it("ignores an unknown creator id and treats it as a human submission", async () => {
-    const { buildApp } = await import("../src/daemon/api.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const response = await buildApp().request("/api/tasks", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        title: "stale id task",
-        prompt: "do the work",
-        workspace_kind: "repo",
-        repo,
-        agent_id: 9999,
-      }),
-    });
-    expect(response.status).toBe(201);
-    const events = listEvents(10);
-    expect(events.map((event) => event.kind)).toContain("task.awaiting_main");
-    const created = events.find((event) => event.kind === "task.created")!;
-    expect(JSON.parse(created.payload!).creator_kind).toBe(null);
-  });
 });

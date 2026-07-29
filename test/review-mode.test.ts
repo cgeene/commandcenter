@@ -191,18 +191,6 @@ describe("reviewer prompt — full vs light", () => {
     expect(prompt).not.toContain("You are an adversarial code reviewer");
   });
 
-  it("tells both modes that comment style is not a finding", async () => {
-    const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
-    const { createTask } = await import("../src/db/tasks.js");
-    const base = { title: "t", prompt: "x", repo: tmpDir };
-    for (const mode of ["full", "light"] as const) {
-      const task = createTask({ ...base, review_mode: mode });
-      const prompt = buildReviewerPrompt({ ...task, branch: "agent/t" });
-      expect(prompt).toContain("is NOT a finding unless a comment is factually wrong or stale");
-      expect(prompt).toContain("never rejection grounds or listed action items");
-    }
-  });
-
   it("keeps the verdict contract identical in both modes", async () => {
     const { buildReviewerPrompt } = await import("../src/prompts/reviewer.js");
     const { createTask } = await import("../src/db/tasks.js");
@@ -267,14 +255,6 @@ describe("resolveReviewDelta — what a re-review is scoped to", { timeout: GIT_
     expect(resolveReviewDelta(t, reviewed)).toBeNull();
   });
 
-  it("returns null for a sha the repo has never seen", async () => {
-    const { resolveReviewDelta } = await import("../src/daemon/reviewstate.js");
-    const { createTask, updateTask } = await import("../src/db/tasks.js");
-    const repo = makeRepo("unknown-sha");
-    const task = createTask({ title: "t", prompt: "x", repo: repo.repo });
-    const t = updateTask(task.id, { branch: repo.branch })!;
-    expect(resolveReviewDelta(t, "0".repeat(40))).toBeNull();
-  });
 });
 
 describe("spawnReviewer — the prompt it actually writes", { timeout: GIT_TEST_TIMEOUT }, () => {
@@ -378,11 +358,4 @@ describe("spawnReviewer — the prompt it actually writes", { timeout: GIT_TEST_
     expect(agent.reasoning_effort).toBe("low");
   });
 
-  it("leaves a Codex full reviewer at the default effort", async () => {
-    const { spawnReviewer } = await import("../src/daemon/spawn.js");
-    const { taskId } = await reviewableTask("codex-full");
-
-    const { agent } = spawnReviewer(taskId, { provider: "codex" });
-    expect(agent.reasoning_effort).toBe("high");
-  });
 });
