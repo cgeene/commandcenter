@@ -188,9 +188,15 @@ async function acquire(
 
   const startedWaiting = Date.now();
   const self: Waiter = { wake: null };
-  queue.push(self);
-  onQueued?.(active.size + queue.length - 1);
+  // Enqueueing and announcing both belong INSIDE the try: onQueued is a caller
+  // callback that writes an event, so it can throw, and a waiter left in the
+  // queue by a skipped cleanup is permanent. It would be a zombie head — asleep
+  // with nobody able to wake it — which makes the fast path below unreachable
+  // for every later run, so each one waits out the whole bound and then runs
+  // unserialized. That is worse than having no queue at all, and silent.
   try {
+    queue.push(self);
+    onQueued?.(active.size + queue.length - 1);
     for (;;) {
       if (queue[0] === self && active.size < verifyConcurrencyLimit()) {
         return { slot: admit(), queuedMs: Date.now() - startedWaiting, bypassed: false };

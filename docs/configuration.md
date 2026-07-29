@@ -106,11 +106,23 @@ flight; `verify_concurrency` bounds how much of the box that work can claim at
 the same moment. Before the verify queue existed, they were coupled in practice —
 every worker's Stop ran a full test suite immediately, so the only way to keep
 verification trustworthy was to hand-shrink the fleet. That is no longer
-necessary: raising `max_concurrent` adds queued verifications, not simultaneous
-ones. A larger fleet does make an individual verification wait longer, so if
-workers appear to sit "finished but not in review" for a while, check the
-`verify.queued` events before treating it as a stall (`stall_minutes` covers
-agents that stop emitting hook events, which a queued verify does not).
+necessary: raising `max_concurrent` adds queued verifications rather than
+simultaneous ones — **while the queue drains inside the 30-minute wait bound**.
+Past that bound the queue deliberately fails open: a run that has waited its
+full 30 minutes proceeds anyway rather than strand its task, and records
+`bypassed_queue` on its result. Each waiter's bound runs from its own enqueue, so
+a fleet large enough that queued work cannot drain in 30 minutes — many workers
+finishing together with a suite that takes a large fraction of the 10-minute
+verify timeout — will still end up running verifications simultaneously. Those
+runs are recorded as contended, and the failures they cause do not silently
+consume retry budget, but the serialization guarantee itself is bounded, not
+absolute. If `bypassed_queue` starts showing up in `verify.failed` payloads, the
+fleet is genuinely too large for the box rather than merely busy.
+
+A larger fleet also makes an individual verification wait longer, so if workers
+appear to sit "finished but not in review" for a while, check the `verify.queued`
+events before treating it as a stall (`stall_minutes` covers agents that stop
+emitting hook events, which a queued verify does not).
 
 ### `read_only_extra_allow` — a safety note
 

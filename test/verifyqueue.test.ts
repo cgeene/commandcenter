@@ -171,6 +171,45 @@ describe("the verify semaphore", () => {
     expect(verifyWasContended(second.load)).toBe(true);
   });
 
+  // logEvent writes to SQLite and does not swallow its own errors, so both
+  // callbacks can throw. A throw that skipped the queue cleanup would leave a
+  // waiter nobody can wake: the fast path below is then unreachable forever, so
+  // every later verify waits out the whole 30-minute bound and then runs
+  // unserialized — the queue silently reverting itself.
+  it("keeps admitting runs after onQueued throws", async () => {
+    const { runVerifyCommand } = await import("../src/daemon/verifyenv.js");
+    const holder = runVerifyCommand(bracketed("hold", "0.3"), cwd);
+    const victim = runVerifyCommand("true", cwd, {
+      onQueued: () => {
+        throw new Error("logEvent blew up");
+      },
+    });
+
+    await expect(victim).rejects.toThrow("logEvent blew up");
+    await holder;
+
+    const after = await runVerifyCommand("true", cwd);
+    expect(after.load.queued_ms).toBe(0);
+    expect(after.load.bypassed_queue).toBe(false);
+    expect(after.load.concurrent).toBe(1);
+  });
+
+  it("keeps admitting runs after onStart throws", async () => {
+    const { runVerifyCommand } = await import("../src/daemon/verifyenv.js");
+    const victim = runVerifyCommand("true", cwd, {
+      onStart: () => {
+        throw new Error("logEvent blew up");
+      },
+    });
+    await expect(victim).rejects.toThrow("logEvent blew up");
+
+    // The slot it never used has to be back: a leaked one would make the next
+    // run queue behind a command that is not running.
+    const after = await runVerifyCommand("true", cwd);
+    expect(after.load.queued_ms).toBe(0);
+    expect(after.load.concurrent).toBe(1);
+  });
+
   it("calls onStart when the run really starts, never while it is queued", async () => {
     const { runVerifyCommand } = await import("../src/daemon/verifyenv.js");
     const phases: string[] = [];

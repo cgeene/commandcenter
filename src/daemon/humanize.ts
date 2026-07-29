@@ -131,6 +131,8 @@ const TEMPLATES: Record<string, Template> = {
   "pr.merged": (e) =>
     `PR merged for ${taskRef(e)} — left in review (rejected verdict; needs orchestrator)`,
   "pr.closed": (e) => `PR closed without merge — ${taskRef(e)} blocked`,
+  "pr.freshen_verify_queued": (e, p) =>
+    `Re-merge check for ${taskRef(e)} is waiting to verify — ${str(p.ahead) || "0"} other verification(s) running first`,
   "pr.feedback": (e, p) => {
     const n = Number(p.comments) || 0;
     const cr = p.changes_requested ? ", changes requested" : "";

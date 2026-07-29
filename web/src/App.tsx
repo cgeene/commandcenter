@@ -914,6 +914,7 @@ function signalTitle(kind: string, payload: Record<string, unknown>): string {
     "task.requeued": "Task requeued",
     "task.autocompleted": "Task completed",
     "verify.queued": "Verification queued",
+    "pr.freshen_verify_queued": "Re-merge check queued",
     "verify.passed": "Verification passed",
     "verify.failed": "Verification failed",
     "review.approved": "Review approved",
