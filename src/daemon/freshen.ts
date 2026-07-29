@@ -1,4 +1,3 @@
-import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { listAgents } from "../db/agents.js";
@@ -21,6 +20,7 @@ import { notifyEvent } from "./notify.js";
 import { approvedReadyLatchKey } from "./review.js";
 import { spawnWorker } from "./spawn.js";
 import { MAX_TASK_PROMPT_LENGTH } from "./taskresume.js";
+import { runVerifyCommand } from "./verifyenv.js";
 import {
   fetchOriginDefaultBranch,
   fetchQuiet,
@@ -77,9 +77,6 @@ import {
  * human is told once (see mergeNudgePass).
  */
 
-/** Same ceiling the worker Stop hook uses for a task's own verification. */
-const VERIFY_TIMEOUT_MS = 10 * 60 * 1000;
-
 /** Identity for the merge commits this module creates. Passed per-invocation
  *  (never written to config) and only used when the repo/user has none, so a
  *  developer's own identity is preserved where it exists. */
@@ -122,22 +119,6 @@ function freshenWorktreeDir(repo: string, taskId: number): string {
     resolveWorktreesDir(),
     `${path.basename(repo)}-task-${taskId}-freshen`,
   );
-}
-
-function defaultRunVerify(
-  cmd: string,
-  cwd: string,
-): Promise<{ ok: boolean; output: string }> {
-  return new Promise((resolve) => {
-    execFile(
-      "sh",
-      ["-c", cmd],
-      { cwd, timeout: VERIFY_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
-      (err, stdout, stderr) => {
-        resolve({ ok: !err, output: `${stdout}\n${stderr}`.trim() });
-      },
-    );
-  });
 }
 
 /** A task whose branch some live agent still owns must not be touched: a
@@ -411,7 +392,7 @@ async function freshenTask(
     if (task.verify_cmd) {
       // The freshened tree needs its dependencies before anything can be run.
       primeWorktreeDeps(task.repo, dir, task.id);
-      const result = await (deps.runVerify ?? defaultRunVerify)(
+      const result = await (deps.runVerify ?? runVerifyCommand)(
         task.verify_cmd,
         dir,
       );

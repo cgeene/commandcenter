@@ -1,4 +1,3 @@
-import { execFile } from "node:child_process";
 import { getAgent, listAgents, updateAgent, type Agent } from "../db/agents.js";
 import {
   countAgentEvents,
@@ -31,6 +30,7 @@ import { capturePane, windowExists } from "./tmux.js";
 import { WAIT_HOOK_EVENTS } from "./waiting.js";
 import { codexPermissionDecision } from "../codex-policy.js";
 import { delegatePendingTaskToMain } from "./orchestration.js";
+import { runVerifyCommand, VERIFY_TIMEOUT_MS } from "./verifyenv.js";
 
 export interface HookPayload {
   hook_event_name?: string;
@@ -47,7 +47,6 @@ export interface HookPayload {
   [key: string]: unknown;
 }
 
-const VERIFY_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_VERIFY_NUDGES = 2;
 const MAX_AUTO_NUDGES = 2;
 const PANE_TAIL_LINES = 60;
@@ -957,7 +956,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
   // it must exist before anything can observe the gap.
   logEvent("verify.started", { taskId: task.id, agentId: agent.id });
 
-  const result = await runVerify(task.verify_cmd, task.worktree);
+  const result = await runVerifyCommand(task.verify_cmd, task.worktree);
 
   // Verification can take minutes — if the task was cancelled (or otherwise
   // moved on) while it ran, the stale result must not resurrect it.
@@ -1206,20 +1205,4 @@ export async function stalledTransitionSweep(
 /** Test-only: the in-flight latch is module state that outlives a fresh db. */
 export function __clearStallSweepLatchForTests(): void {
   stallSweepInFlight = false;
-}
-
-function runVerify(
-  cmd: string,
-  cwd: string,
-): Promise<{ ok: boolean; output: string }> {
-  return new Promise((resolve) => {
-    execFile(
-      "sh",
-      ["-c", cmd],
-      { cwd, timeout: VERIFY_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
-      (err, stdout, stderr) => {
-        resolve({ ok: !err, output: `${stdout}\n${stderr}`.trim() });
-      },
-    );
-  });
 }
