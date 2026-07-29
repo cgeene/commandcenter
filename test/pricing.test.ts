@@ -49,18 +49,27 @@ describe("model price resolution", () => {
 });
 
 describe("scheduled rate changes", () => {
-  it("uses Sonnet 5's introductory rate before the switchover", () => {
-    const p = resolveModelPrice("claude-sonnet-5", "2026-08-31")!;
-    expect(p.input).toBe(2);
-    expect(p.output).toBe(10);
+  // One table: every row is resolveModelPrice(model, date) against the published
+  // schedule. Sonnet 5 ships at an introductory rate that steps up on
+  // 2026-09-01; models with a single rate must ignore the date entirely.
+  it("resolves the rate in effect on the given day", () => {
+    for (const { why, model, day, input, output } of [
+      { why: "Sonnet 5 the day before the switchover", model: "claude-sonnet-5", day: "2026-08-31", input: 2, output: 10 },
+      { why: "Sonnet 5 on the switchover day itself", model: "claude-sonnet-5", day: "2026-09-01", input: 3, output: 15 },
+      { why: "a Date accepted in place of a day string", model: "claude-sonnet-5", day: new Date("2026-09-02T00:00:00Z"), input: 3 },
+      { why: "a single-rate model, long before any schedule", model: "claude-opus-5", day: "2020-01-01", input: 5 },
+      { why: "a single-rate model, long after", model: "claude-opus-5", day: "2030-01-01", input: 5 },
+    ] as const) {
+      const price = resolveModelPrice(model, day)!;
+      expect(price, why).toBeDefined();
+      expect(price.input, why).toBe(input);
+      if (output !== undefined) expect(price.output, why).toBe(output);
+    }
   });
 
-  it("switches Sonnet 5 to the standard rate on 2026-09-01", () => {
-    const p = resolveModelPrice("claude-sonnet-5", "2026-09-01")!;
-    expect(p.input).toBe(3);
-    expect(p.output).toBe(15);
-  });
-
+  // Kept separate: this goes through estimateCostUsd rather than the resolver, so
+  // it proves a day's BURN is priced at that day's rate, not just that the
+  // schedule lookup works.
   it("prices each day's burn at the rate in effect that day", () => {
     const tokens = {
       input_tokens: 1_000_000,
@@ -70,15 +79,6 @@ describe("scheduled rate changes", () => {
     };
     expect(estimateCostUsd(tokens, "sonnet", "2026-08-15")).toBeCloseTo(2, 6);
     expect(estimateCostUsd(tokens, "sonnet", "2026-09-15")).toBeCloseTo(3, 6);
-  });
-
-  it("accepts a Date as well as a day string", () => {
-    expect(resolveModelPrice("claude-sonnet-5", new Date("2026-09-02T00:00:00Z"))!.input).toBe(3);
-  });
-
-  it("leaves models with a single rate unaffected by the date", () => {
-    expect(resolveModelPrice("claude-opus-5", "2020-01-01")!.input).toBe(5);
-    expect(resolveModelPrice("claude-opus-5", "2030-01-01")!.input).toBe(5);
   });
 });
 
@@ -164,55 +164,29 @@ describe("cost estimation", () => {
 describe("cycle window", () => {
   const at = (iso: string) => new Date(`${iso}T12:00:00Z`);
 
-  it("runs reset-day to reset-day", () => {
-    const c = cycleWindow(at("2026-07-27"), 1);
-    expect(c.start).toBe("2026-07-01");
-    expect(c.end).toBe("2026-08-01");
-    expect(c.days_total).toBe(31);
-    expect(c.days_elapsed).toBe(27);
-  });
-
-  it("treats the reset day itself as day 1 of the NEW cycle", () => {
-    const c = cycleWindow(at("2026-07-15"), 15);
-    expect(c.start).toBe("2026-07-15");
-    expect(c.end).toBe("2026-08-15");
-    expect(c.days_elapsed).toBe(1);
-  });
-
-  it("looks back to the previous month before the reset day", () => {
-    const c = cycleWindow(at("2026-07-14"), 15);
-    expect(c.start).toBe("2026-06-15");
-    expect(c.end).toBe("2026-07-15");
-    expect(c.days_elapsed).toBe(30);
-  });
-
-  it("rolls the year over at a January boundary", () => {
-    const c = cycleWindow(at("2026-01-05"), 20);
-    expect(c.start).toBe("2025-12-20");
-    expect(c.end).toBe("2026-01-20");
-  });
-
-  it("pins a reset day past the month's end onto its last day (short months)", () => {
-    // February 2026 has 28 days, so a stored 31 must land on the 28th — not
-    // spill into March and produce an empty or doubled cycle.
-    const c = cycleWindow(at("2026-02-15"), 31);
-    expect(c.start).toBe("2026-01-31");
-    expect(c.end).toBe("2026-02-28");
-
-    const march = cycleWindow(at("2026-03-01"), 31);
-    expect(march.start).toBe("2026-02-28");
-    expect(march.end).toBe("2026-03-31");
-  });
-
-  it("handles a leap-February", () => {
-    const c = cycleWindow(at("2028-02-29"), 30);
-    expect(c.start).toBe("2028-02-29");
-    expect(c.end).toBe("2028-03-30");
-  });
-
-  it("defaults a garbage reset day to the 1st instead of throwing", () => {
-    expect(cycleWindow(at("2026-07-27"), 0).start).toBe("2026-07-01");
-    expect(cycleWindow(at("2026-07-27"), Number.NaN).start).toBe("2026-07-01");
+  // One table: every row is cycleWindow(day, resetDay) -> the same four fields.
+  // The interesting inputs are the calendar edges, so they are named rather than
+  // left implicit.
+  it("runs reset-day to reset-day across every calendar edge", () => {
+    for (const { why, day, reset, start, end, total, elapsed } of [
+      { why: "mid-cycle, reset on the 1st", day: "2026-07-27", reset: 1, start: "2026-07-01", end: "2026-08-01", total: 31, elapsed: 27 },
+      { why: "the reset day itself is day 1 of the NEW cycle", day: "2026-07-15", reset: 15, start: "2026-07-15", end: "2026-08-15", elapsed: 1 },
+      { why: "the day before the reset looks back a month", day: "2026-07-14", reset: 15, start: "2026-06-15", end: "2026-07-15", elapsed: 30 },
+      { why: "the year rolls over at a January boundary", day: "2026-01-05", reset: 20, start: "2025-12-20", end: "2026-01-20" },
+      // A stored reset day of 31 must land on February's last day, not spill into
+      // March and produce an empty or doubled cycle.
+      { why: "a reset day past a short month's end pins to its last day", day: "2026-02-15", reset: 31, start: "2026-01-31", end: "2026-02-28" },
+      { why: "...and the following cycle starts from that pinned day", day: "2026-03-01", reset: 31, start: "2026-02-28", end: "2026-03-31" },
+      { why: "a leap-February", day: "2028-02-29", reset: 30, start: "2028-02-29", end: "2028-03-30" },
+      { why: "a garbage reset day of 0 defaults to the 1st", day: "2026-07-27", reset: 0, start: "2026-07-01" },
+      { why: "a NaN reset day defaults to the 1st", day: "2026-07-27", reset: Number.NaN, start: "2026-07-01" },
+    ] as const) {
+      const c = cycleWindow(at(day), reset);
+      expect(c.start, why).toBe(start);
+      if (end !== undefined) expect(c.end, why).toBe(end);
+      if (total !== undefined) expect(c.days_total, why).toBe(total);
+      if (elapsed !== undefined) expect(c.days_elapsed, why).toBe(elapsed);
+    }
   });
 });
 

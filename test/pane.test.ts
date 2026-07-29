@@ -363,38 +363,151 @@ function composer(markerLine: string, continuation: string[] = []): string {
   ].join("\n");
 }
 
-describe("parsePane — ghost-text vs real input in the rule-framed composer", () => {
-  it("(a) treats a dim ghost-text suggestion as NOT unsubmitted input", () => {
-    const parsed = parsePane(
-      composer(`${DEFFG}❯${NBSP}${DIM}ping @caleb on PR #16 for the neutral-root name${RESET}`),
-    );
-    expect(parsed.unsubmitted_input).toBeNull();
+describe("parsePane — the composer: draft vs ghost text vs no composer", () => {
+  const DRAFT = [
+    "custom-hostnames will be team-platform.",
+    "nylas-data-lake will also be team platform.",
+    "unicorn-",
+  ] as const;
+  const JOINED =
+    "custom-hostnames will be team-platform. " +
+    "nylas-data-lake will also be team platform. unicorn-";
+
+  // One table because every case is the same question asked of a different
+  // capture: given this pane, did we find a composer and what is in it. The
+  // stakes are the same throughout — "no draft found" and "no composer found"
+  // used to be the same answer, and that is how a worker notification got typed
+  // into and submitted with a human's half-written message.
+  const COMPOSER_CASES = [
+    {
+      why: "a dim ghost-text suggestion is not a human draft",
+      pane: () => composer(`${DEFFG}❯${NBSP}${DIM}ping @caleb on PR #16 for the neutral-root name${RESET}`),
+      found: true,
+      input: null,
+    },
+    {
+      why: "default-styled typed text IS a draft (the anti-clobber case)",
+      pane: () => composer(`${DEFFG}❯${NBSP}please double check with the security team first`),
+      found: true,
+      input: "please double check with the security team first",
+    },
+    {
+      why: "a ghost continuation trailing real text keeps only the real part",
+      pane: () => composer(`${DEFFG}❯${NBSP}wait for me${DIM} to confirm the rollout first${RESET}`),
+      found: true,
+      input: "wait for me",
+    },
+    {
+      why: "an empty styled composer is found but holds nothing",
+      pane: () => composer(`${DEFFG}❯${NBSP}`),
+      found: true,
+      input: null,
+    },
+    {
+      why: "real typed text wrapping two physical lines is rejoined",
+      pane: () =>
+        composer(`${DEFFG}❯${NBSP}this is a very long line of typed but unsubmitted`, [
+          `${DEFFG}  text that keeps going onto a second physical line`,
+        ]),
+      found: true,
+      input:
+        "this is a very long line of typed but unsubmitted " +
+        "text that keeps going onto a second physical line",
+    },
+    // 51 columns: the label fills its own row and the borders wrap, so there is
+    // no leading run of `─` to match on. Missing this width is what made the
+    // input line unfindable.
+    {
+      why: "51 cols: a human draft",
+      pane: () => draftComposer("actually hold on, let me rethink"),
+      found: true,
+      input: "actually hold on, let me rethink",
+    },
+    {
+      why: "51 cols: every line of a multi-line draft, not just the marker row",
+      // The exact draft that got clobbered: the notification landed after
+      // "unicorn-" and submitted the merged text as the human's turn.
+      pane: () => draftComposer(...DRAFT),
+      found: true,
+      input: JOINED,
+    },
+    {
+      why: "51 cols: a draft whose trailing newline leaves a blank row",
+      pane: () => draftComposer("first thought", "", "second thought"),
+      found: true,
+      input: "first thought second thought",
+    },
+    {
+      why: "51 cols: an empty composer is found and empty",
+      pane: () => clearComposer(),
+      found: true,
+      input: null,
+    },
+    {
+      why: "51 cols: ghost text still reads as empty",
+      pane: () => ghostComposer(),
+      found: true,
+      input: null,
+    },
+    {
+      why: "131 cols: a multi-line draft",
+      pane: () => wideDraftComposer(...DRAFT),
+      found: true,
+      input: JOINED,
+    },
+    {
+      why: "131 cols: an empty composer is found and empty",
+      pane: () => wideClearComposer(),
+      found: true,
+      input: null,
+    },
+    {
+      why: "no input line on screen at all",
+      pane: () => noComposer(),
+      found: false,
+      input: null,
+    },
+    {
+      why: "a rule pair in the agent's own output is not a composer",
+      pane: () =>
+        [
+          "─".repeat(60),
+          "  Summary of the rollout plan",
+          "  Ship behind a flag first.",
+          "─".repeat(60),
+        ].join("\n"),
+      found: false,
+      input: null,
+    },
+    {
+      why: "a scrollback echo of an already-submitted message is not a live draft",
+      // Detection anchors on the bottom rule and walks up; agent output between
+      // that rule and an old "❯ …" row must stop the walk, or a message the
+      // human already sent would read as a draft and wedge delivery shut.
+      pane: () =>
+        [
+          "❯ an already submitted message",
+          "",
+          "⏺ Here is the answer",
+          "  continued prose",
+          "─".repeat(60),
+        ].join("\n"),
+      found: false,
+      input: null,
+    },
+  ] as const;
+
+  it("answers 'is there a composer, and what is in it' for every width and style", () => {
+    for (const { why, pane, found, input } of COMPOSER_CASES) {
+      const parsed = parsePane(pane());
+      expect(parsed.composer_found, why).toBe(found);
+      expect(parsed.unsubmitted_input, why).toBe(input);
+    }
   });
 
-  it("(b) treats default-styled typed text as unsubmitted input (anti-clobber)", () => {
-    const parsed = parsePane(
-      composer(`${DEFFG}❯${NBSP}please double check with the security team first`),
-    );
-    expect(parsed.unsubmitted_input).toBe(
-      "please double check with the security team first",
-    );
-  });
-
-  it("(c) keeps only the real part when a ghost continuation trails real text", () => {
-    const parsed = parsePane(
-      composer(`${DEFFG}❯${NBSP}wait for me${DIM} to confirm the rollout first${RESET}`),
-    );
-    expect(parsed.unsubmitted_input).toBe("wait for me");
-  });
-
-  it("(d) reports null for an empty composer", () => {
-    const parsed = parsePane(composer(`${DEFFG}❯${NBSP}`));
-    expect(parsed.unsubmitted_input).toBeNull();
-  });
-
-  it("(coexist) ghost-text stripping (Claude) and Codex menu parsing survive together", () => {
-    // Claude path: a dim ghost-text suggestion is not treated as a human draft
-    // (the mid-draft delegation gate depends on this).
+  it("strips Claude ghost text and parses a Codex menu under the same parser", () => {
+    // Kept separate: this is the only case that asserts the two provider paths
+    // do not regress each other, rather than asking one question of one pane.
     const claude = parsePane(
       composer(`${DEFFG}❯${NBSP}${DIM}ping @caleb before merging${RESET}`),
       "claude",
@@ -402,8 +515,6 @@ describe("parsePane — ghost-text vs real input in the rule-framed composer", (
     expect(claude.unsubmitted_input).toBeNull();
     expect(claude.pending_permission).toBeNull();
 
-    // Codex path: the plain selection menu still parses under the same
-    // (post-#30) parser, so cross-provider parsing coexists.
     const codex = parsePane(
       [
         "Allow running this command?",
@@ -419,132 +530,6 @@ describe("parsePane — ghost-text vs real input in the rule-framed composer", (
       { n: 1, label: "Yes" },
       { n: 2, label: "No" },
     ]);
-  });
-
-  it("keeps real typed text that wraps across two physical lines", () => {
-    const parsed = parsePane(
-      composer(`${DEFFG}❯${NBSP}this is a very long line of typed but unsubmitted`, [
-        `${DEFFG}  text that keeps going onto a second physical line`,
-      ]),
-    );
-    expect(parsed.unsubmitted_input).toBe(
-      "this is a very long line of typed but unsubmitted " +
-        "text that keeps going onto a second physical line",
-    );
-  });
-});
-
-/**
- * How the composer frame renders depends on the pane's width, and the daemon has
- * to read it at whatever width the pane happens to be (web-terminal viewers
- * attach and detach; tmux sizes the window to its smallest client). The live
- * orchestrator pane produced both of these on the same day:
- *
- *   131 cols:  "─────────…───── Manage Claude orchestrator … ──"
- *    51 cols:  " Manage Claude orchestrator task queue and workers"  (zero `─`)
- *              "──"                                                 (wrapped tail)
- *
- * Matching only a border that starts with a run of `─` misses the narrow form
- * entirely, so the input line is never found. And because "no draft found" and
- * "no composer found" used to be the same answer, that came back as "nothing
- * typed" and a worker notification was typed into — and submitted with — a
- * human's half-written message. These cases pin both widths and both halves of
- * that distinction.
- */
-describe("parsePane — composer detection across pane widths", () => {
-  const DRAFT = [
-    "custom-hostnames will be team-platform.",
-    "nylas-data-lake will also be team platform.",
-    "unicorn-",
-  ] as const;
-  const JOINED =
-    "custom-hostnames will be team-platform. " +
-    "nylas-data-lake will also be team platform. unicorn-";
-
-  describe("51 columns — label fills its own row, borders wrap", () => {
-    it("sees a human draft", () => {
-      const parsed = parsePane(draftComposer("actually hold on, let me rethink"));
-      expect(parsed.composer_found).toBe(true);
-      expect(parsed.unsubmitted_input).toBe("actually hold on, let me rethink");
-    });
-
-    it("sees every line of a multi-line draft, not just the marker row", () => {
-      // The exact draft that got clobbered: the notification landed after
-      // "unicorn-" and submitted the merged text as the human's turn.
-      const parsed = parsePane(draftComposer(...DRAFT));
-      expect(parsed.composer_found).toBe(true);
-      expect(parsed.unsubmitted_input).toBe(JOINED);
-    });
-
-    it("keeps a draft whose trailing newline leaves a blank row", () => {
-      const parsed = parsePane(draftComposer("first thought", "", "second thought"));
-      expect(parsed.composer_found).toBe(true);
-      expect(parsed.unsubmitted_input).toBe("first thought second thought");
-    });
-
-    it("reports an empty composer as found and empty", () => {
-      const parsed = parsePane(clearComposer());
-      expect(parsed.composer_found).toBe(true);
-      expect(parsed.unsubmitted_input).toBeNull();
-    });
-
-    it("still treats ghost text as empty", () => {
-      const parsed = parsePane(ghostComposer());
-      expect(parsed.composer_found).toBe(true);
-      expect(parsed.unsubmitted_input).toBeNull();
-    });
-  });
-
-  describe("131 columns — label embedded in the top rule", () => {
-    it("sees a multi-line draft", () => {
-      const parsed = parsePane(wideDraftComposer(...DRAFT));
-      expect(parsed.composer_found).toBe(true);
-      expect(parsed.unsubmitted_input).toBe(JOINED);
-    });
-
-    it("reports an empty composer as found and empty", () => {
-      const parsed = parsePane(wideClearComposer());
-      expect(parsed.composer_found).toBe(true);
-      expect(parsed.unsubmitted_input).toBeNull();
-    });
-  });
-
-  describe("nothing there", () => {
-    it("reports composer_found=false when no input line is on screen", () => {
-      const parsed = parsePane(noComposer());
-      expect(parsed.composer_found).toBe(false);
-      expect(parsed.unsubmitted_input).toBeNull();
-    });
-
-    it("does not mistake a rule pair in the agent's own output for a composer", () => {
-      const parsed = parsePane(
-        [
-          "─".repeat(60),
-          "  Summary of the rollout plan",
-          "  Ship behind a flag first.",
-          "─".repeat(60),
-        ].join("\n"),
-      );
-      expect(parsed.composer_found).toBe(false);
-      expect(parsed.unsubmitted_input).toBeNull();
-    });
-
-    it("does not read a scrollback echo of a submitted message as a live draft", () => {
-      // Detection anchors on the bottom rule and walks up; agent output between
-      // that rule and an old "❯ …" row must stop the walk, or a message the
-      // human already sent would read as a draft and wedge delivery shut.
-      const parsed = parsePane(
-        [
-          "❯ an already submitted message",
-          "",
-          "⏺ Here is the answer",
-          "  continued prose",
-          "─".repeat(60),
-        ].join("\n"),
-      );
-      expect(parsed.composer_found).toBe(false);
-      expect(parsed.unsubmitted_input).toBeNull();
-    });
   });
 });
 
@@ -579,49 +564,66 @@ function paneWithStatusBar(bar: string, transcript: string[] = []): string {
 }
 
 describe("parsePane — background shell / monitor status-bar indicator", () => {
-  it("reads a single shell and monitor from the status bar", () => {
-    const parsed = parsePane(paneWithStatusBar(statusBar("1 shell, 1 monitor")));
-    expect(parsed.background_activity).toEqual({ shells: 1, monitors: 1 });
+  // One table: every row asks the same question of a different bottom row. What
+  // separates a real bar from prose quoting one is POSITION (only the
+  // bottom-most non-blank row is read) plus whole-segment structure, never
+  // chrome wording — so the rows below deliberately include idle bars, bars with
+  // extra segments, and prose that shares the bar's shape.
+  const BAR_CASES = [
+    { why: "a single shell and monitor", bar: () => statusBar("1 shell, 1 monitor"), activity: { shells: 1, monitors: 1 } },
+    { why: "pluralised counts", bar: () => statusBar("3 shells, 2 monitors"), activity: { shells: 3, monitors: 2 } },
+    { why: "shells only", bar: () => statusBar("2 shells"), activity: { shells: 2, monitors: 0 } },
+    { why: "monitors only", bar: () => statusBar("1 monitor"), activity: { shells: 0, monitors: 1 } },
+    { why: "a bar reporting no background work", bar: () => statusBar(null), activity: null },
+    {
+      why: "an IDLE bar (no 'esc to interrupt'), trailing '← for agents'",
+      bar: () => "  ⏵⏵ don't ask on · 2 shells · ← for agents · ↓ to manage",
+      activity: { shells: 2, monitors: 0 },
+    },
+    {
+      why: "an IDLE bar whose trailing segment reads '← 1 agent'",
+      bar: () => "  ⏵⏵ don't ask on · 1 monitor · ← 1 agent · ↓ to manage",
+      activity: { shells: 0, monitors: 1 },
+    },
+    {
+      why: "a bar carrying extra unrelated segments (a PR segment appears once a PR exists)",
+      bar: () => "  ⏵⏵ don't ask on · PR #61 · 1 shell, 1 monitor · ← 1 agent · ↓ to manage",
+      activity: { shells: 1, monitors: 1 },
+    },
+    {
+      why: "a partly-matching segment (prose sharing the bar's line)",
+      bar: () => "  ⏵⏵ don't ask on · about 2 shells maybe · ← for agents",
+      activity: null,
+    },
+    {
+      why: "a bare count line that is not an interpunct-separated bar",
+      bar: () => "1 shell, 1 monitor",
+      activity: null,
+    },
+  ] as const;
+
+  it("reads the counts off any bar shape, and rejects anything that only looks like one", () => {
+    for (const { why, bar, activity } of BAR_CASES) {
+      expect(parsePane(paneWithStatusBar(bar())).background_activity, why).toEqual(activity);
+    }
   });
 
-  it("reads pluralised counts", () => {
-    const parsed = parsePane(paneWithStatusBar(statusBar("3 shells, 2 monitors")));
-    expect(parsed.background_activity).toEqual({ shells: 3, monitors: 2 });
-  });
-
-  it("reads a shells-only and a monitors-only bar", () => {
-    expect(
-      parsePane(paneWithStatusBar(statusBar("2 shells"))).background_activity,
-    ).toEqual({ shells: 2, monitors: 0 });
-    expect(
-      parsePane(paneWithStatusBar(statusBar("1 monitor"))).background_activity,
-    ).toEqual({ shells: 0, monitors: 1 });
-  });
-
-  it("is null when the status bar reports no background work", () => {
-    const parsed = parsePane(paneWithStatusBar(statusBar(null)));
-    expect(parsed.background_activity).toBeNull();
-  });
-
-  // Agents DO quote this indicator in prose — the pane this parser was written
-  // against contained the literal string "· N shell(s), N monitor". What rejects
-  // that is POSITION alone: only the bottom-most non-blank row is read.
-  it("ignores the indicator quoted in transcript prose above the bar", () => {
-    const parsed = parsePane(
+  it("ignores the indicator quoted in transcript prose, however close to the bar", () => {
+    // Agents DO quote this indicator in prose — the pane this parser was written
+    // against contained the literal string "· N shell(s), N monitor". Position
+    // alone rejects it. The second group sits directly beneath the composer rule
+    // and is the regression guard for STATUS_BAR_LOOKBACK: widening it by even
+    // one row turns these into false positives, and a false positive silences a
+    // real wait for the whole park window while invisible to the watchdog.
+    const above = parsePane(
       paneWithStatusBar(statusBar(null), [
         "⏺ Confirmed the status-bar signal: · 1 shell, 1 monitor · is what renders.",
         "  ⎿  the status-bar '· 2 shells, 3 monitors ·' indicators via parsePane",
         "",
       ]),
     );
-    expect(parsed.background_activity).toBeNull();
-  });
+    expect(above.background_activity).toBeNull();
 
-  // Same prose one row closer, directly beneath the composer rule. This is the
-  // regression guard for STATUS_BAR_LOOKBACK: widening it by even one row turns
-  // these into false positives, and a false positive silences a real wait for the
-  // whole park window while invisible to the watchdog and Needs You.
-  it("ignores prose sitting immediately below the composer, not on the bar row", () => {
     for (const prose of [
       "⏺ Confirmed: · 1 shell, 1 monitor · is what renders.",
       "·-separated segment: ⏵⏵ don't ask on · 3 shells, 2 monitors · esc to interrupt · ↓ to manage.",
@@ -631,14 +633,16 @@ describe("parsePane — background shell / monitor status-bar indicator", () => 
     }
   });
 
-  // KNOWN LIMITATION, pinned deliberately rather than left to be discovered.
-  // The whole-segment rule does NOT reject prose — these lines really do parse as
-  // counts — so if prose ever IS the bottom-most non-blank row, it registers. In
-  // a live TUI that cannot happen while the composer and bar are painted, and a
-  // worker whose TUI is unpainted is not asking a question either. If this ever
-  // needs closing, the fix is a stronger positional/structural anchor (e.g. the
-  // row must follow a composer rule or box border) — NOT a chrome-anchor check
-  // like "must contain '↓ to manage'", which the second line below defeats.
+  // KNOWN LIMITATION, pinned deliberately rather than left to be discovered, and
+  // kept as its own case so it stays visible rather than buried in a table of
+  // correct behaviours. The whole-segment rule does NOT reject prose — these
+  // lines really do parse as counts — so if prose ever IS the bottom-most
+  // non-blank row, it registers. In a live TUI that cannot happen while the
+  // composer and bar are painted, and a worker whose TUI is unpainted is not
+  // asking a question either. If this ever needs closing, the fix is a stronger
+  // positional/structural anchor (e.g. the row must follow a composer rule or box
+  // border) — NOT a chrome-anchor check like "must contain '↓ to manage'", which
+  // the second line below defeats.
   it("KNOWN LIMITATION: prose as the bottom-most row is read as a status bar", () => {
     expect(
       parsePane("⏺ Confirmed: · 1 shell, 1 monitor · is what renders.")
@@ -649,18 +653,6 @@ describe("parsePane — background shell / monitor status-bar indicator", () => 
         "·-separated segment: ⏵⏵ don't ask on · 3 shells, 2 monitors · esc to interrupt · ↓ to manage.",
       ).background_activity,
     ).toEqual({ shells: 3, monitors: 2 });
-  });
-
-  it("ignores a partly-matching segment (prose sharing the bar's line)", () => {
-    const parsed = parsePane(
-      paneWithStatusBar(`  ⏵⏵ don't ask on · about 2 shells maybe · ← for agents`),
-    );
-    expect(parsed.background_activity).toBeNull();
-  });
-
-  it("ignores a bare count line that is not an interpunct-separated bar", () => {
-    const parsed = parsePane(paneWithStatusBar("1 shell, 1 monitor"));
-    expect(parsed.background_activity).toBeNull();
   });
 
   it("still reports a permission menu alongside running background work", () => {
@@ -686,42 +678,11 @@ describe("parsePane — background shell / monitor status-bar indicator", () => 
     expect(parsed.background_activity).toEqual({ shells: 0, monitors: 1 });
   });
 
-  // The bar this suppression actually reads is the IDLE one — the hook fires
-  // after the worker's turn ends, at which point "esc to interrupt" is gone and
-  // the trailing segment can read "← 1 agent" instead of "← for agents". Both
-  // shapes were captured live while idle with background work still running, and
-  // are why the parser keys on segment structure rather than any chrome wording.
-  it("reads the indicator off an IDLE status bar (no 'esc to interrupt')", () => {
-    expect(
-      parsePane(
-        paneWithStatusBar("  ⏵⏵ don't ask on · 2 shells · ← for agents · ↓ to manage"),
-      ).background_activity,
-    ).toEqual({ shells: 2, monitors: 0 });
-    expect(
-      parsePane(
-        paneWithStatusBar("  ⏵⏵ don't ask on · 1 monitor · ← 1 agent · ↓ to manage"),
-      ).background_activity,
-    ).toEqual({ shells: 0, monitors: 1 });
-  });
-
-  // The bar grows segments as context appears (a "PR #61" segment shows up once
-  // a PR is associated), so the scan must find the counts wherever they sit
-  // rather than assuming a fixed position. Captured live while idle.
-  it("finds the counts on a bar carrying extra unrelated segments", () => {
-    const parsed = parsePane(
-      paneWithStatusBar(
-        "  ⏵⏵ don't ask on · PR #61 · 1 shell, 1 monitor · ← 1 agent · ↓ to manage",
-      ),
-    );
-    expect(parsed.background_activity).toEqual({ shells: 1, monitors: 1 });
-  });
-
   it("does not claim the Claude-only indicator for a Codex pane", () => {
-    const parsed = parsePane(
-      paneWithStatusBar(statusBar("1 shell, 1 monitor")),
-      "codex",
-    );
-    expect(parsed.background_activity).toBeNull();
+    expect(
+      parsePane(paneWithStatusBar(statusBar("1 shell, 1 monitor")), "codex")
+        .background_activity,
+    ).toBeNull();
   });
 });
 
