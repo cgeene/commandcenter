@@ -309,19 +309,18 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
   }
 
   //     Every reviewer the task was given stopped without a verdict, so the
-  //     platform stopped replacing them. Anchored on the event rather than the
-  //     blocked status alone: a later round or status change supersedes it, and
-  //     a fresh episode gets a fresh key past a dismissal.
+  //     platform stopped replacing them. The CAUSE comes from block_cause,
+  //     which abandonReview records on exactly this path: it is non-NULL only
+  //     while the task is blocked, so any status change clears it, and a
+  //     re-block for another reason (a failed verify after a resume) reads as
+  //     that reason instead of leaving this escalation standing. The event is
+  //     still read, for its id and ts only — the id discriminates episodes so a
+  //     later give-up re-raises past a dismissal, and its ts is when the
+  //     situation began.
   for (const t of tasks) {
-    if (t.status !== "blocked") continue;
-    const gaveUp = latestTaskEvent(t.id, [
-      "review.reviewer_unrecoverable",
-      "review.round_started",
-      "review.approved",
-      "review.rejected",
-      "task.status",
-    ]);
-    if (gaveUp?.kind !== "review.reviewer_unrecoverable") continue;
+    if (t.block_cause !== "reviewer_unrecoverable") continue;
+    const gaveUp = latestTaskEvent(t.id, ["review.reviewer_unrecoverable"]);
+    if (!gaveUp) continue; // no episode anchor -> no dismissable key to build
     push({
       id: `decision:reviewer_gave_up:${t.id}:${gaveUp.id}`,
       kind: "decision",
