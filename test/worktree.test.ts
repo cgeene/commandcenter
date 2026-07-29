@@ -4,10 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 
-// Each test spins up real git repos (init/clone/commit/push/fetch) rather
-// than mocking — comfortably under 5s alone, but the default per-test
-// timeout gets tight under full-suite parallel load. 15s was still not
-// enough: tests here have been measured past 18s on a loaded machine.
+// Real git throughout: what these functions are FOR is where a worktree's HEAD
+// lands, so a stubbed git would prove nothing. Fixture setup is issued as one
+// batched `sh -c` script per repo rather than a call per command — inside a
+// vitest worker each subprocess fork costs ~120-160ms, so the invocation count
+// dominated this file's runtime (and its 30s-timeout flakiness under load).
 vi.setConfig({ testTimeout: 30_000 });
 
 let tmpDir: string;
@@ -16,14 +17,22 @@ function git(repo: string, ...args: string[]): string {
   return execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
 }
 
-function writeFile(repo: string, name: string, contents: string): void {
-  fs.writeFileSync(path.join(repo, name), contents);
+/** Run several git commands in ONE subprocess. Returns trimmed stdout. */
+function sh(script: string, env: Record<string, string> = {}): string {
+  return execFileSync("sh", ["-eu", "-c", script], {
+    encoding: "utf8",
+    env: { ...process.env, ...env, TMP: tmpDir },
+  }).trim();
 }
 
-function commit(repo: string, message: string): void {
-  git(repo, "add", "-A");
-  git(repo, "-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-m", message);
-}
+/** Shell functions prepended to every fixture script: `gc <repo> <args...>`
+ *  commits with a fixed identity, `mkrepo <name>` inits a standalone repo under
+ *  $TMP, `clone <name>` clones $TMP/remote.git to $TMP/<name>. */
+const SH_HELPERS = `
+  gc() { git -C "$1" -c user.email=t@t.com -c user.name=t commit -q "\${@:2}"; }
+  mkrepo() { mkdir -p "$TMP/$1"; git -C "$TMP/$1" init -q -b main; }
+  clone() { git -C "$TMP" clone --quiet "$TMP/remote.git" "$TMP/$1"; }
+`;
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-worktree-"));
@@ -45,174 +54,143 @@ afterEach(async () => {
   await new Promise((resolve) => setImmediate(resolve));
 });
 
-/** Bare "remote" whose default branch is `main`, seeded with one commit. */
-function setupRemote(): { remoteDir: string; seedDir: string } {
-  const remoteDir = path.join(tmpDir, "remote.git");
-  fs.mkdirSync(remoteDir);
-  git(remoteDir, "init", "--bare", "-b", "main");
-
-  const seedDir = path.join(tmpDir, "seed");
-  fs.mkdirSync(seedDir);
-  git(seedDir, "init", "-b", "main");
-  git(seedDir, "remote", "add", "origin", remoteDir);
-  writeFile(seedDir, "README.md", "v1\n");
-  commit(seedDir, "chore: initial commit");
-  git(seedDir, "push", "-u", "origin", "main");
-  return { remoteDir, seedDir };
+/** Bare `$TMP/remote.git` whose default branch is `main`, seeded with one commit
+ *  via the `$TMP/seed` clone that produced it. One subprocess. */
+function setupRemote(): void {
+  sh(`${SH_HELPERS}
+      mkdir -p "$TMP/remote.git"; git -C "$TMP/remote.git" init -q --bare -b main
+      mkrepo seed
+      git -C "$TMP/seed" remote add origin "$TMP/remote.git"
+      printf 'v1\n' > "$TMP/seed/README.md"
+      git -C "$TMP/seed" add -A; gc "$TMP/seed" -m 'chore: initial commit'
+      git -C "$TMP/seed" push -q -u origin main`);
 }
 
-/** Clone of `remoteDir` — stands in for the daemon's main checkout. */
-function cloneRepo(remoteDir: string, name: string): string {
-  const dir = path.join(tmpDir, name);
-  git(tmpDir, "clone", "--quiet", remoteDir, dir);
-  return dir;
+async function events(kind: string) {
+  const { listEvents } = await import("../src/db/events.js");
+  return listEvents(40).filter((e) => e.kind === kind);
 }
 
 describe("createWorktree", () => {
   it("cuts a new branch from the fetched origin default branch, not local HEAD", async () => {
-    const { remoteDir, seedDir } = setupRemote();
-    const mainRepo = cloneRepo(remoteDir, "main-checkout");
-
-    // A second commit lands on origin/main *after* mainRepo cloned — mainRepo's
-    // cached origin/main ref does not have it yet; only a fresh fetch will.
-    writeFile(seedDir, "upstream-only.txt", "from upstream\n");
-    commit(seedDir, "feat: upstream-only change");
-    git(seedDir, "push", "origin", "main");
-    const upstreamTip = git(remoteDir, "rev-parse", "main");
-
-    // Simulate the platform bug precondition: the main checkout's HEAD sits
-    // on an unrelated, unmerged local branch (contamination).
-    git(mainRepo, "checkout", "-b", "wip/unrelated");
-    writeFile(mainRepo, "contaminated.txt", "should never appear in the task branch\n");
-    commit(mainRepo, "wip: unrelated local work");
+    setupRemote();
+    // mainRepo clones, THEN a further commit lands on origin/main, so mainRepo's
+    // cached origin/main is stale and only a fresh fetch has the new tip. Its
+    // HEAD also sits on an unrelated unmerged local branch (the contamination
+    // the fetched start-point exists to avoid).
+    const upstreamTip = sh(`${SH_HELPERS}
+      clone main-checkout
+      printf 'from upstream\n' > "$TMP/seed/upstream-only.txt"
+      git -C "$TMP/seed" add -A; gc "$TMP/seed" -m 'feat: upstream-only change'
+      git -C "$TMP/seed" push -q origin main
+      git -C "$TMP/main-checkout" checkout -q -b wip/unrelated
+      printf 'never\n' > "$TMP/main-checkout/contaminated.txt"
+      git -C "$TMP/main-checkout" add -A; gc "$TMP/main-checkout" -m 'wip: unrelated'
+      git -C "$TMP/remote.git" rev-parse main`);
+    const mainRepo = path.join(tmpDir, "main-checkout");
 
     const { createWorktree, git: worktreeGit } = await import("../src/daemon/worktree.js");
-    const { listEvents } = await import("../src/db/events.js");
     const { dir, branch } = createWorktree(mainRepo, 101);
 
     expect(branch).toBe("agent/task-101");
     expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(upstreamTip);
     expect(fs.existsSync(path.join(dir, "upstream-only.txt"))).toBe(true);
     expect(fs.existsSync(path.join(dir, "contaminated.txt"))).toBe(false);
-    expect(listEvents(20).map((e) => e.kind)).not.toContain(
-      "worktree.fallback_local_head",
-    );
+    expect(await events("worktree.fallback_local_head")).toEqual([]);
   });
 
-  it("reuses an existing branch unchanged (respawn case)", async () => {
-    const { remoteDir } = setupRemote();
-    const mainRepo = cloneRepo(remoteDir, "main-checkout");
-
-    const branchName = "agent/task-202";
-    git(mainRepo, "branch", branchName, "main");
-    // Advance HEAD past the branch so a start-point bug would be obvious.
-    writeFile(mainRepo, "later.txt", "later\n");
-    commit(mainRepo, "chore: later commit on main");
-
+  it("reuses an existing branch unchanged, and rotates a resumed attempt", async () => {
+    setupRemote();
+    // The existing branch sits at main, then HEAD advances past it, so a
+    // start-point bug (cutting from HEAD instead of reusing the ref) shows up.
+    const branchTip = sh(`${SH_HELPERS}
+      clone main-checkout
+      git -C "$TMP/main-checkout" branch agent/task-202 main
+      printf 'later\n' > "$TMP/main-checkout/later.txt"
+      git -C "$TMP/main-checkout" add -A; gc "$TMP/main-checkout" -m 'chore: later commit'
+      git -C "$TMP/main-checkout" rev-parse agent/task-202`);
+    const mainRepo = path.join(tmpDir, "main-checkout");
     const { createWorktree, git: worktreeGit } = await import("../src/daemon/worktree.js");
-    const { dir, branch } = createWorktree(mainRepo, 202);
 
-    expect(branch).toBe(branchName);
-    expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(
-      git(mainRepo, "rev-parse", branchName),
-    );
-  });
+    const reused = createWorktree(mainRepo, 202);
+    expect(reused.branch).toBe("agent/task-202");
+    expect(worktreeGit(reused.dir, "rev-parse", "HEAD").trim()).toBe(branchTip);
+    expect(branchTip).not.toBe(git(mainRepo, "rev-parse", "HEAD"));
 
-  it("creates a resumed attempt on its rotated task branch and worktree path", async () => {
-    const { remoteDir } = setupRemote();
-    const mainRepo = cloneRepo(remoteDir, "main-checkout");
-    const { createWorktree, git: worktreeGit } = await import(
-      "../src/daemon/worktree.js"
-    );
-
-    const branch = "agent/task-203-resume-2";
-    const resumed = createWorktree(mainRepo, 203, "codex", "agent", branch);
-
-    expect(resumed.branch).toBe(branch);
-    expect(resumed.dir).toContain("main-checkout-task-203-resume-2");
-    expect(worktreeGit(resumed.dir, "branch", "--show-current").trim()).toBe(
-      branch,
-    );
+    // A resumed attempt gets its own rotated branch AND its own worktree path,
+    // so it never collides with the attempt it is replacing.
+    const resumeBranch = "agent/task-202-resume-2";
+    const resumed = createWorktree(mainRepo, 202, "codex", "agent", resumeBranch);
+    expect(resumed.branch).toBe(resumeBranch);
+    expect(resumed.dir).toContain("main-checkout-task-202-resume-2");
+    expect(resumed.dir).not.toBe(reused.dir);
+    expect(worktreeGit(resumed.dir, "branch", "--show-current").trim()).toBe(resumeBranch);
   });
 
   it("hardens upstream only for opt-in human publication tasks", async () => {
-    const { remoteDir } = setupRemote();
-    const mainRepo = cloneRepo(remoteDir, "main-checkout");
-    git(mainRepo, "config", "branch.autoSetupMerge", "always");
+    setupRemote();
+    // autoSetupMerge=always is what would silently give the branch an upstream.
+    sh(`${SH_HELPERS}
+        clone main-checkout
+        git -C "$TMP/main-checkout" config branch.autoSetupMerge always`);
+    const mainRepo = path.join(tmpDir, "main-checkout");
 
     const { createWorktree } = await import("../src/daemon/worktree.js");
     const agent = createWorktree(mainRepo, 501);
-    expect(git(agent.dir, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe(
-      "origin/main",
-    );
+    expect(git(agent.dir, "rev-parse", "--abbrev-ref", "@{upstream}")).toBe("origin/main");
 
     const human = createWorktree(mainRepo, 502, "claude", "human");
-    expect(() =>
-      git(human.dir, "rev-parse", "--abbrev-ref", "@{upstream}"),
-    ).toThrow();
+    expect(() => git(human.dir, "rev-parse", "--abbrev-ref", "@{upstream}")).toThrow();
   });
 
-  it("falls back to local HEAD (loudly) when the repo has no origin remote", async () => {
-    const repo = path.join(tmpDir, "no-remote");
-    fs.mkdirSync(repo);
-    git(repo, "init", "-b", "main");
-    writeFile(repo, "f.txt", "x\n");
-    commit(repo, "chore: init");
-    const localTip = git(repo, "rev-parse", "HEAD");
+  // Both ways the fetched start-point can be unavailable. The fallback itself is
+  // the same line of code; what must differ is the recorded reason, so the two
+  // are one table rather than two near-identical tests.
+  it.each([
+    { why: "the repo has no origin remote", broken: false, reason: "no-origin-remote", taskId: 303 },
+    { why: "the fetch fails", broken: true, reason: "fetch-failed", taskId: 404 },
+  ])("falls back to local HEAD (loudly) when $why", async ({ broken, reason, taskId }) => {
+    const localTip = sh(`${SH_HELPERS}
+      mkrepo repo
+      printf 'x\n' > "$TMP/repo/f.txt"
+      git -C "$TMP/repo" add -A; gc "$TMP/repo" -m 'chore: init'
+      if [ "$BROKEN" = 1 ]; then
+        git -C "$TMP/repo" remote add origin "$TMP/does-not-exist.git"
+      fi
+      git -C "$TMP/repo" rev-parse HEAD`, { BROKEN: broken ? "1" : "0" });
+    const repo = path.join(tmpDir, "repo");
 
     const { createWorktree, git: worktreeGit } = await import("../src/daemon/worktree.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const { dir } = createWorktree(repo, 303);
+    const { dir } = createWorktree(repo, taskId);
 
     expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
-    const events = listEvents(20).filter((e) => e.kind === "worktree.fallback_local_head");
-    expect(events).toHaveLength(1);
-    expect(JSON.parse(events[0].payload!)).toMatchObject({ reason: "no-origin-remote" });
-  });
-
-  it("falls back to local HEAD (loudly) when the fetch fails", async () => {
-    const { remoteDir } = setupRemote();
-    const mainRepo = cloneRepo(remoteDir, "main-checkout");
-    // Point origin at a path that no longer exists so fetch fails fast.
-    git(mainRepo, "remote", "set-url", "origin", path.join(tmpDir, "does-not-exist.git"));
-    writeFile(mainRepo, "local-only.txt", "x\n");
-    commit(mainRepo, "chore: local only");
-    const localTip = git(mainRepo, "rev-parse", "HEAD");
-
-    const { createWorktree, git: worktreeGit } = await import("../src/daemon/worktree.js");
-    const { listEvents } = await import("../src/db/events.js");
-    const { dir } = createWorktree(mainRepo, 404);
-
-    expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
-    const events = listEvents(20).filter((e) => e.kind === "worktree.fallback_local_head");
-    expect(events).toHaveLength(1);
-    expect(JSON.parse(events[0].payload!)).toMatchObject({ reason: "fetch-failed" });
+    const logged = await events("worktree.fallback_local_head");
+    expect(logged).toHaveLength(1);
+    expect(JSON.parse(logged[0].payload!)).toMatchObject({ reason });
   });
 });
 
 describe("createReviewWorktree", () => {
   it("fetches the branch so the reviewer sees the worker's latest push, not a stale local ref", async () => {
-    const { remoteDir } = setupRemote();
+    setupRemote();
     const taskBranch = "agent/task-9";
-
-    // repoA stands in for the daemon's main checkout: creates the branch and
-    // pushes an initial commit.
-    const repoA = cloneRepo(remoteDir, "repo-a");
-    git(repoA, "checkout", "-b", taskBranch);
-    writeFile(repoA, "work.txt", "commit X\n");
-    commit(repoA, "feat: commit X");
-    git(repoA, "push", "-u", "origin", taskBranch);
-    const commitX = git(repoA, "rev-parse", taskBranch);
-
-    // repoB simulates the worker pushing a further commit after repoA's
-    // local branch ref was set — repoA's local ref is now stale.
-    const repoB = cloneRepo(remoteDir, "repo-b");
-    git(repoB, "checkout", taskBranch);
-    writeFile(repoB, "work.txt", "commit Y\n");
-    commit(repoB, "feat: commit Y");
-    git(repoB, "push", "origin", taskBranch);
-    const commitY = git(repoB, "rev-parse", taskBranch);
+    // repoA creates and pushes commit X; repoB then pushes commit Y, so repoA's
+    // local ref for the branch is stale by construction.
+    const [commitX, commitY] = sh(`${SH_HELPERS}
+      clone repo-a
+      git -C "$TMP/repo-a" checkout -q -b "$BRANCH"
+      printf 'commit X\n' > "$TMP/repo-a/work.txt"
+      git -C "$TMP/repo-a" add -A; gc "$TMP/repo-a" -m 'feat: commit X'
+      git -C "$TMP/repo-a" push -q -u origin "$BRANCH"
+      git -C "$TMP/repo-a" rev-parse "$BRANCH"
+      clone repo-b
+      git -C "$TMP/repo-b" checkout -q "$BRANCH"
+      printf 'commit Y\n' > "$TMP/repo-b/work.txt"
+      git -C "$TMP/repo-b" add -A; gc "$TMP/repo-b" -m 'feat: commit Y'
+      git -C "$TMP/repo-b" push -q origin "$BRANCH"
+      git -C "$TMP/repo-b" rev-parse "$BRANCH"`, { BRANCH: taskBranch }).split("\n");
     expect(commitY).not.toBe(commitX);
+    const repoA = path.join(tmpDir, "repo-a");
 
     const { createReviewWorktree, git: worktreeGit } = await import(
       "../src/daemon/worktree.js"
@@ -224,161 +202,110 @@ describe("createReviewWorktree", () => {
     expect(git(repoA, "rev-parse", taskBranch)).toBe(commitX);
   });
 
-  it("logs an expected (calm) fallback when the repo has no origin remote", async () => {
-    const repo = path.join(tmpDir, "no-remote");
-    fs.mkdirSync(repo);
-    git(repo, "init", "-b", "main");
-    const taskBranch = "agent/task-20";
-    git(repo, "checkout", "-b", taskBranch);
-    writeFile(repo, "work.txt", "local only\n");
-    commit(repo, "feat: local only work");
-    const localTip = git(repo, "rev-parse", taskBranch);
-
-    const { createReviewWorktree, git: worktreeGit } = await import(
-      "../src/daemon/worktree.js"
-    );
-    const { listEvents } = await import("../src/db/events.js");
-    const dir = createReviewWorktree(repo, 20, taskBranch, true);
-
-    expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
-    // No origin at all: local is the only copy, so this is expected operation
-    // and must NOT trip the alarm kind, whatever the task's open_pr flag.
-    expect(
-      listEvents(20).some((e) => e.kind === "worktree.review_fallback_local_branch"),
-    ).toBe(false);
-    const events = listEvents(20).filter(
-      (e) => e.kind === "worktree.review_local_branch_expected",
-    );
-    expect(events).toHaveLength(1);
-    expect(JSON.parse(events[0].payload!)).toMatchObject({
-      branch: taskBranch,
+  // Every way the reviewer can end up on the LOCAL branch instead of origin's.
+  // One classification, four inputs — and the calm/alarm split is the whole
+  // point, so each case asserts the other kind is absent rather than only that
+  // its own kind fired. A genuine fetch failure risks reviewing a stale tree, so
+  // it alarms whether or not the task opens a PR; the two benign cases (no
+  // origin at all, branch simply not pushed yet) must stay quiet.
+  it.each([
+    {
+      why: "the repo has no origin remote",
+      setup: "standalone",
+      openPr: true,
+      taskId: 20,
+      kind: "worktree.review_local_branch_expected",
       reason: "no-origin-remote",
-    });
-  });
-
-  it("logs an expected (calm) fallback when the branch was never pushed", async () => {
-    const { remoteDir } = setupRemote();
-    const repoA = cloneRepo(remoteDir, "repo-a");
-    const taskBranch = "agent/task-10";
-    git(repoA, "checkout", "-b", taskBranch);
-    writeFile(repoA, "work.txt", "local only\n");
-    commit(repoA, "feat: local only work");
-    const localTip = git(repoA, "rev-parse", taskBranch);
-
-    const { createReviewWorktree, git: worktreeGit } = await import(
-      "../src/daemon/worktree.js"
-    );
-    const { listEvents } = await import("../src/db/events.js");
-    const dir = createReviewWorktree(repoA, 10, taskBranch, true);
-
-    expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
-    // The benign not-yet-pushed case: origin genuinely lacks the branch, so
-    // reviewing local is correct — the calm kind, never the alarm kind.
-    expect(
-      listEvents(20).some((e) => e.kind === "worktree.review_fallback_local_branch"),
-    ).toBe(false);
-    const events = listEvents(20).filter(
-      (e) => e.kind === "worktree.review_local_branch_expected",
-    );
-    expect(events).toHaveLength(1);
-    expect(JSON.parse(events[0].payload!)).toMatchObject({
-      branch: taskBranch,
+    },
+    {
+      why: "the branch was never pushed",
+      setup: "clone",
+      openPr: true,
+      taskId: 10,
+      kind: "worktree.review_local_branch_expected",
       reason: "branch-not-on-origin",
-    });
-  });
-
-  it("logs the ALARM fallback when the fetch fails on a PR task (open_pr)", async () => {
-    const { remoteDir } = setupRemote();
-    const repoA = cloneRepo(remoteDir, "repo-a");
-    const taskBranch = "agent/task-12";
-    git(repoA, "checkout", "-b", taskBranch);
-    writeFile(repoA, "work.txt", "local only\n");
-    commit(repoA, "feat: local only work");
-    const localTip = git(repoA, "rev-parse", taskBranch);
-    // Point origin at a path that no longer exists so the fetch errors out
-    // (offline/auth-style failure) rather than reporting a missing ref.
-    git(repoA, "remote", "set-url", "origin", path.join(tmpDir, "does-not-exist.git"));
-
-    const { createReviewWorktree, git: worktreeGit } = await import(
-      "../src/daemon/worktree.js"
-    );
-    const { listEvents } = await import("../src/db/events.js");
-    const dir = createReviewWorktree(repoA, 12, taskBranch, true);
-
-    expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
-    const events = listEvents(20).filter(
-      (e) => e.kind === "worktree.review_fallback_local_branch",
-    );
-    expect(events).toHaveLength(1);
-    // A genuine fetch failure on a task that pushes to origin: origin may hold
-    // newer commits than local, so this fallback risks a stale review and is
-    // the one case worth alarming on.
-    expect(JSON.parse(events[0].payload!)).toMatchObject({
-      branch: taskBranch,
+    },
+    {
+      why: "the fetch fails on a PR task",
+      setup: "broken-origin",
+      openPr: true,
+      taskId: 12,
+      kind: "worktree.review_fallback_local_branch",
       reason: "fetch-failed",
-      open_pr: true,
-    });
-  });
-
-  it("still ALARMs on a fetch-failed fallback for a no-PR task (open_pr=false)", async () => {
-    const { remoteDir } = setupRemote();
-    const repoA = cloneRepo(remoteDir, "repo-a");
-    const taskBranch = "agent/task-13";
-    git(repoA, "checkout", "-b", taskBranch);
-    writeFile(repoA, "work.txt", "local only\n");
-    commit(repoA, "feat: local only work");
-    const localTip = git(repoA, "rev-parse", taskBranch);
-    git(repoA, "remote", "set-url", "origin", path.join(tmpDir, "does-not-exist.git"));
-
-    const { createReviewWorktree, git: worktreeGit } = await import(
-      "../src/daemon/worktree.js"
-    );
-    const { listEvents } = await import("../src/db/events.js");
-    const dir = createReviewWorktree(repoA, 13, taskBranch, false);
-
-    expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
-    // A no-PR / doc-store task still PUSHES its branch (the branch is the
-    // deliverable), so origin can hold commits the stale local ref lacks — a
-    // genuine fetch failure is a stale-review risk regardless of open_pr.
-    expect(
-      listEvents(20).some((e) => e.kind === "worktree.review_local_branch_expected"),
-    ).toBe(false);
-    const events = listEvents(20).filter(
-      (e) => e.kind === "worktree.review_fallback_local_branch",
-    );
-    expect(events).toHaveLength(1);
-    expect(JSON.parse(events[0].payload!)).toMatchObject({
-      branch: taskBranch,
+    },
+    {
+      why: "the fetch fails on a no-PR task",
+      setup: "broken-origin",
+      openPr: false,
+      taskId: 13,
+      kind: "worktree.review_fallback_local_branch",
       reason: "fetch-failed",
-      open_pr: false,
-    });
-  });
+    },
+  ])(
+    "reviews the local branch when $why",
+    async ({ setup, openPr, taskId, kind, reason }) => {
+      const taskBranch = `agent/task-${taskId}`;
+      if (setup !== "standalone") setupRemote();
+      const localTip = sh(`${SH_HELPERS}
+        if [ "$SETUP" = standalone ]; then mkrepo repo; else clone repo; fi
+        git -C "$TMP/repo" checkout -q -b "$BRANCH"
+        printf 'local only\n' > "$TMP/repo/work.txt"
+        git -C "$TMP/repo" add -A; gc "$TMP/repo" -m 'feat: local only work'
+        if [ "$SETUP" = broken-origin ]; then
+          git -C "$TMP/repo" remote set-url origin "$TMP/does-not-exist.git"
+        fi
+        git -C "$TMP/repo" rev-parse "$BRANCH"`, { SETUP: setup, BRANCH: taskBranch });
+      const repo = path.join(tmpDir, "repo");
+
+      const { createReviewWorktree, git: worktreeGit } = await import(
+        "../src/daemon/worktree.js"
+      );
+      const dir = createReviewWorktree(repo, taskId, taskBranch, openPr);
+
+      expect(worktreeGit(dir, "rev-parse", "HEAD").trim()).toBe(localTip);
+      const other =
+        kind === "worktree.review_fallback_local_branch"
+          ? "worktree.review_local_branch_expected"
+          : "worktree.review_fallback_local_branch";
+      expect(await events(other)).toEqual([]);
+      const logged = await events(kind);
+      expect(logged).toHaveLength(1);
+      expect(JSON.parse(logged[0].payload!)).toMatchObject({
+        branch: taskBranch,
+        reason,
+        ...(kind === "worktree.review_fallback_local_branch" ? { open_pr: openPr } : {}),
+      });
+    },
+  );
 
   it("re-detaches to pick up new commits on reuse (second review cycle)", async () => {
-    const { remoteDir } = setupRemote();
+    setupRemote();
     const taskBranch = "agent/task-11";
-    const repoA = cloneRepo(remoteDir, "repo-a");
-    git(repoA, "checkout", "-b", taskBranch);
-    writeFile(repoA, "work.txt", "v1\n");
-    commit(repoA, "feat: v1");
-    git(repoA, "push", "-u", "origin", taskBranch);
+    sh(`${SH_HELPERS}
+        clone repo-a
+        git -C "$TMP/repo-a" checkout -q -b "$BRANCH"
+        printf 'v1\n' > "$TMP/repo-a/work.txt"
+        git -C "$TMP/repo-a" add -A; gc "$TMP/repo-a" -m 'feat: v1'
+        git -C "$TMP/repo-a" push -q -u origin "$BRANCH"`, { BRANCH: taskBranch });
+    const repoA = path.join(tmpDir, "repo-a");
 
     const { createReviewWorktree, git: worktreeGit } = await import(
       "../src/daemon/worktree.js"
     );
     const firstDir = createReviewWorktree(repoA, 11, taskBranch, true);
-    const firstTip = worktreeGit(firstDir, "rev-parse", "HEAD");
+    const firstTip = worktreeGit(firstDir, "rev-parse", "HEAD").trim();
 
-    // Second review cycle: worker pushed more commits from elsewhere.
-    const repoB = cloneRepo(remoteDir, "repo-b");
-    git(repoB, "checkout", taskBranch);
-    writeFile(repoB, "work.txt", "v2\n");
-    commit(repoB, "feat: v2");
-    git(repoB, "push", "origin", taskBranch);
+    // Second review cycle: the worker pushed more commits since.
+    const secondPush = sh(`${SH_HELPERS}
+        printf 'v2\n' > "$TMP/repo-a/work.txt"
+        git -C "$TMP/repo-a" add -A; gc "$TMP/repo-a" -m 'feat: v2'
+        git -C "$TMP/repo-a" push -q origin "$BRANCH"
+        git -C "$TMP/remote.git" rev-parse "$BRANCH"`, { BRANCH: taskBranch });
 
     const secondDir = createReviewWorktree(repoA, 11, taskBranch, true);
-    expect(secondDir).toBe(firstDir);
-    const secondTip = worktreeGit(secondDir, "rev-parse", "HEAD");
-    expect(secondTip).not.toBe(firstTip);
+    expect(secondDir).toBe(firstDir); // same worktree reused...
+    expect(secondPush).not.toBe(firstTip);
+    // ...re-detached onto what origin holds now, not left on the first tip.
+    expect(worktreeGit(secondDir, "rev-parse", "HEAD").trim()).toBe(secondPush);
   });
 });
