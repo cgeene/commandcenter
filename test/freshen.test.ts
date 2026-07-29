@@ -31,15 +31,15 @@ let tmpDir: string;
 let remoteDir: string;
 let repoDir: string;
 let fetchMock: ReturnType<typeof vi.fn>;
+let notifyModule: typeof import("../src/daemon/notify.js");
 const realFetch = globalThis.fetch;
 
-/** Titles of the pushes dispatched so far. ntfy is configured and `fetch`
- *  stubbed (the test/notify.test.ts pattern) so "and does NOT notify"
- *  assertions are real rather than vacuously true for want of a URL. */
+/** Titles of the pushes produced so far. ntfy is configured so "and does NOT
+ *  notify" assertions are real rather than vacuously true for want of a URL;
+ *  dispatch is daemon-only, so a test run records the pushes instead of sending
+ *  them (see test/notify-dispatch-guard.test.ts). */
 function pushTitles(): string[] {
-  return fetchMock.mock.calls.map(
-    (call) => (call[1] as { headers: Record<string, string> }).headers.Title,
-  );
+  return notifyModule.recordedPushes().map((push) => push.title);
 }
 
 function git(repo: string, ...args: string[]): string {
@@ -61,6 +61,8 @@ beforeEach(async () => {
   process.env.CC_NTFY_URL = "https://ntfy.test/cc";
   fetchMock = vi.fn(async () => new Response("ok"));
   globalThis.fetch = fetchMock as unknown as typeof fetch;
+  notifyModule = await import("../src/daemon/notify.js");
+  notifyModule.clearRecordedPushes();
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   const { _resetFreshenState } = await import("../src/daemon/freshen.js");

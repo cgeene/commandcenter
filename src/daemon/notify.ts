@@ -6,6 +6,32 @@ import {
   resolveNtfyUrl,
 } from "../db/settings.js";
 import type { NotifyEventKey } from "../notify-events.js";
+import { isDaemonProcess } from "../process-role.js";
+
+/** A push a non-daemon process would have sent. Carries no URL and no token:
+ *  the point of recording is what the operator would have read, and a
+ *  verification script that dumps these must not print the topic URL. */
+export interface RecordedPush {
+  title: string;
+  message: string;
+  priority: "high" | "default" | "low";
+  tags?: string;
+}
+
+/** Bounded: a long-lived non-daemon process (a watch-mode test run) must not
+ *  accumulate these without limit. Oldest entries are dropped first. */
+const RECORDED_LIMIT = 500;
+const recorded: RecordedPush[] = [];
+
+/** Pushes this process would have sent, oldest first. Always empty in the
+ *  daemon, which sends them for real instead. */
+export function recordedPushes(): readonly RecordedPush[] {
+  return recorded;
+}
+
+export function clearRecordedPushes(): void {
+  recorded.length = 0;
+}
 
 /**
  * Fire-and-forget push via ntfy (https://docs.ntfy.sh). No-op unless an ntfy
@@ -15,11 +41,18 @@ import type { NotifyEventKey } from "../notify-events.js";
  * This is the raw transport. Call sites go through `notifyEvent` instead, so
  * every push is classified and individually switchable.
  *
- * Returns whether a request was DISPATCHED — i.e. a URL is configured — not
+ * Only the daemon puts a request on the network. Every other process that loads
+ * this module — the test suite, a dist-driving verification script, the MCP
+ * server, `node -e` — records the push in memory (see `recordedPushes`) and
+ * sends nothing, so fixture rows can never reach the operator's phone. Both
+ * paths behave identically to every caller, which keeps de-dup latches and
+ * `notify.pushed` events assertable outside the daemon.
+ *
+ * Returns whether a URL is configured and the push was therefore ACCEPTED — not
  * whether it arrived. The fetch is fire-and-forget by design (a push must never
- * affect platform state), so a network error or a 4xx from ntfy still counts as
- * dispatched. notifyEvent uses this to avoid burning a de-dup latch on a push
- * that was never even attempted; a push lost in flight is not recoverable.
+ * affect platform state), so a network error or a 4xx from ntfy still counts.
+ * notifyEvent uses this to avoid burning a de-dup latch on a push that was
+ * never even attempted; a push lost in flight is not recoverable.
  */
 export function notify(
   title: string,
@@ -28,10 +61,18 @@ export function notify(
 ): boolean {
   const url = resolveNtfyUrl();
   if (!url) return false;
-  const headers: Record<string, string> = {
-    Title: title,
-    Priority: opts?.priority ?? "default",
-  };
+  const priority = opts?.priority ?? "default";
+  if (!isDaemonProcess()) {
+    if (recorded.length >= RECORDED_LIMIT) recorded.shift();
+    recorded.push({
+      title,
+      message,
+      priority,
+      ...(opts?.tags ? { tags: opts.tags } : {}),
+    });
+    return true;
+  }
+  const headers: Record<string, string> = { Title: title, Priority: priority };
   if (opts?.tags) headers.Tags = opts.tags;
   const token = resolveNtfyToken();
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -64,7 +105,7 @@ export interface NotifyEventOpts {
  *     Notifications.
  *  2. `once` de-duplicates a standing condition down to one push.
  *
- * Returns true when a push was dispatched.
+ * Returns true when the push was accepted by the transport (see `notify`).
  */
 export function notifyEvent(
   event: NotifyEventKey,
@@ -86,7 +127,12 @@ export function notifyEvent(
   logEvent("notify.pushed", {
     taskId: opts?.taskId ?? undefined,
     agentId: opts?.agentId ?? undefined,
-    payload: { event, title, ...(opts?.once ? { once: opts.once } : {}) },
+    payload: {
+      event,
+      title,
+      ...(opts?.once ? { once: opts.once } : {}),
+      ...(isDaemonProcess() ? {} : { recorded_only: true }),
+    },
   });
   return true;
 }
