@@ -1,5 +1,6 @@
 import { randomInt } from "node:crypto";
 import { jiraBaseUrl, jiraEmail, jiraToken } from "../config.js";
+import { isDaemonProcess } from "../process-role.js";
 
 /**
  * Thin JIRA Cloud REST v3 client. Deterministic daemon code owns ALL JIRA sync
@@ -135,9 +136,19 @@ const realSleep: Sleeper = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Default runner: Basic auth from env, JSON, no throw on non-2xx. Assumes the
  *  caller has already confirmed a token exists (startJiraSync fail-closes when
- *  it doesn't). */
+ *  it doesn't).
+ *
+ *  Fails closed outside the daemon for the same reason notify.ts records instead
+ *  of sending: any process that imports this can otherwise comment on and
+ *  transition real issues with fixture data. Tests and verification scripts
+ *  inject a runner (`_setJiraClient`) and never reach this. */
 function defaultRunner(base: string): JiraRunner {
   return async (req) => {
+    if (!isDaemonProcess()) {
+      throw new Error(
+        "JIRA requests are daemon-only; inject a runner (_setJiraClient) instead",
+      );
+    }
     const email = jiraEmail();
     const token = jiraToken();
     if (!email || !token) {

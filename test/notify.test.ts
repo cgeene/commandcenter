@@ -20,18 +20,17 @@ vi.mock("../src/daemon/spawn.js", () => ({
 
 let tmpDir: string;
 let fetchMock: ReturnType<typeof vi.fn>;
+let notifyModule: typeof import("../src/daemon/notify.js");
 const realFetch = globalThis.fetch;
 
-/** Every push dispatched since the last reset, in order. */
-function pushes(): { title: string; message: string; priority: string }[] {
-  return fetchMock.mock.calls.map((call) => {
-    const init = call[1] as { body: string; headers: Record<string, string> };
-    return {
-      title: init.headers.Title,
-      message: init.body,
-      priority: init.headers.Priority,
-    };
-  });
+/** Every push this process produced since the last reset, in order.
+ *
+ *  Nothing here reaches the network: only the daemon process dispatches for
+ *  real (src/process-role.ts), so a test reads the recorded intents instead.
+ *  fetchMock stays installed as a tripwire — `expect(fetchMock).not
+ *  .toHaveBeenCalled()` is what proves the guard held. */
+function pushes(): readonly { title: string; message: string; priority: string }[] {
+  return notifyModule.recordedPushes();
 }
 
 beforeEach(async () => {
@@ -41,12 +40,17 @@ beforeEach(async () => {
   delete process.env.CC_NTFY_TOKEN;
   fetchMock = vi.fn(async () => new Response("ok"));
   globalThis.fetch = fetchMock as unknown as typeof fetch;
+  notifyModule = await import("../src/daemon/notify.js");
+  notifyModule.clearRecordedPushes();
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   spawnReviewer.mockClear();
 });
 
 afterEach(async () => {
+  // No test in this file may put a request on the wire. If this ever fires, the
+  // daemon-only dispatch guard has been lost and a test run can page a phone.
+  expect(fetchMock).not.toHaveBeenCalled();
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   globalThis.fetch = realFetch;

@@ -10,6 +10,7 @@ import {
   normalizeOauthUsage,
   type LiveUsageState,
 } from "../lib/usage.js";
+import { isDaemonProcess } from "../process-role.js";
 import { runQuotaAlerts } from "./quotaalert.js";
 
 export type { LiveUsageState };
@@ -142,6 +143,11 @@ async function defaultReadCredential(): Promise<Credential | undefined> {
 }
 
 async function defaultFetchUsage(token: string): Promise<unknown> {
+  // Daemon-only: see src/process-role.ts. Tests and verification scripts inject
+  // `_setUsageFetch`.
+  if (!isDaemonProcess()) {
+    throw new Error("live usage is daemon-only; inject _setUsageFetch instead");
+  }
   const res = await fetch(USAGE_URL, {
     headers: {
       // The token goes on the wire and nowhere else — not into logs, events,
