@@ -3,14 +3,17 @@ import { dueCrons, nextRun, openTasksFor, updateCron } from "../db/crons.js";
 import {
   countEventsToday,
   countTaskEvents,
+  countTaskEventsAfter,
   latestAgentEvent,
   latestAgentEventTs,
   latestEventTs,
+  latestTaskEvent,
   logEvent,
 } from "../db/events.js";
 import { getSchedulerConfig, type SchedulerConfig } from "../db/settings.js";
 import { createTask, getTask, listTasks, updateTask } from "../db/tasks.js";
-import { workerSlots } from "./capacity.js";
+import { noteReworkOverCap, workerSlots } from "./capacity.js";
+import { strandedReworkTasks } from "./review.js";
 import { flushMainQueue } from "./notifqueue.js";
 import { notifyEvent } from "./notify.js";
 import { parsePane, type PendingPermission } from "./pane.js";
@@ -629,6 +632,80 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
             },
           );
         }
+      }
+    }
+  }
+
+  reworkDispatchSweep(deps, nowMs);
+}
+
+/** Respawn attempts allowed per rejection. Past this the task is left queued
+ *  for the human, named by the Needs-You item strandedReworkTasks feeds. */
+const MAX_REWORK_DISPATCH_ATTEMPTS = 3;
+/** Minimum gap between those attempts, so a task that cannot spawn at all
+ *  cannot burn its whole budget inside one watchdog second. */
+const REWORK_DISPATCH_RETRY_MS = 60_000;
+
+/**
+ * Restart a worker on work a review rejection sent back to the queue.
+ *
+ * A rejection is a continuation of work triage already judged and dispatched, so
+ * it needs no fresh triage: spawnWorker resumes the worker's own provider session
+ * with review_notes folded into the prompt (that is what the requeue was always
+ * written to expect — see review.strandedReworkTasks for why nothing else
+ * supplied it). Deliberately NOT part of the auto-spawn pass in `tick`: that pass
+ * is the autonomous-work policy (active hours, daily budget, direct-dispatch
+ * only), while this is control-plane reconciliation of work already started, the
+ * same job as the rest of the watchdog. Rework is likewise never refused for
+ * capacity, matching the in-place resume path.
+ *
+ * Runs from the watchdog, so it inherits the tmux-observability guard above —
+ * spawning while tmux cannot be read would create windows nothing is tracking.
+ */
+export function reworkDispatchSweep(
+  deps: SchedulerDeps = defaultDeps,
+  nowMs: number = deps.now().getTime(),
+): void {
+  for (const { task, rejected } of strandedReworkTasks()) {
+    const attempts = countTaskEventsAfter(
+      task.id,
+      "review.rework_dispatch_failed",
+      rejected.id,
+    );
+    if (attempts >= MAX_REWORK_DISPATCH_ATTEMPTS) continue;
+    if (attempts > 0) {
+      const last = latestTaskEvent(task.id, ["review.rework_dispatch_failed"]);
+      if (last && nowMs - Date.parse(last.ts) < REWORK_DISPATCH_RETRY_MS) continue;
+    }
+    try {
+      deps.spawn(task.id);
+      logEvent("review.rework_respawned", {
+        taskId: task.id,
+        payload: { round: task.review_cycles },
+      });
+      const respawned = getTask(task.id);
+      if (respawned?.agent_id) noteReworkOverCap(task.id, respawned.agent_id);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const attempt = attempts + 1;
+      logEvent("review.rework_dispatch_failed", {
+        taskId: task.id,
+        payload: { error: msg, attempt, max: MAX_REWORK_DISPATCH_ATTEMPTS },
+      });
+      // Push only once the retries are used up: the standing Needs-You item is
+      // already naming this task, so a transient first failure needs no page.
+      if (attempt >= MAX_REWORK_DISPATCH_ATTEMPTS) {
+        notifyEvent(
+          "worker_stalled",
+          `task #${task.id} — rejected work has nobody fixing it`,
+          `${task.title}\nThe reviewer rejected round ${task.review_cycles} and the task went back to the queue, but a worker could not be started after ${attempt} attempts: ${msg}\nIt will not move on its own — spawn a worker for it, or fix the cause and requeue it.`,
+          {
+            priority: "high",
+            tags: "rotating_light",
+            taskId: task.id,
+            once: `task:${task.id}:rework_undispatched:${rejected.id}`,
+          },
+        );
       }
     }
   }

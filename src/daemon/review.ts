@@ -1,4 +1,4 @@
-import { listAgents, type Agent } from "../db/agents.js";
+import { getAgent, listAgents, updateAgent, type Agent } from "../db/agents.js";
 import {
   countEventsToday,
   latestTaskEvent,
@@ -18,6 +18,7 @@ import {
   hashResult,
 } from "./reviewstate.js";
 import { killAgent, spawnReviewer, type PriorReviewRound } from "./spawn.js";
+import { idleParked } from "./waiting.js";
 import { git } from "./worktree.js";
 import {
   approvedSnapshotIsPublished,
@@ -481,11 +482,96 @@ export async function maybeAutoReview(taskId: number): Promise<void> {
 }
 
 /**
+ * Correct an agent whose `waiting_input` is a finished-turn idle park rather
+ * than a real question, so the rejection notes can be delivered into its live
+ * session instead of costing it its worker.
+ *
+ * resumeAgent refuses any waiting_input agent by design — unsolicited text
+ * typed into a pending permission menu is read as an answer to that menu — and
+ * that guard must stay in place for every caller. What is fixed here is the
+ * overloaded STATE: idleParked requires both the hook history and the pane to
+ * agree that nothing is being asked (see waiting.ts), and anything ambiguous
+ * leaves the state alone, so a genuine menu still takes the requeue path.
+ */
+function clearIdleWait(agentId: number): void {
+  const agent = getAgent(agentId);
+  if (!agent || !idleParked(agent)) return;
+  updateAgent(agentId, { state: "idle" });
+  logEvent("agent.idle_wait_cleared", {
+    agentId,
+    taskId: agent.task_id ?? undefined,
+  });
+}
+
+/** Return a rejected task to the queue with the reviewer's notes attached. */
+function requeueAfterRejection(
+  task: Task,
+  notes: string,
+  cycles: number,
+  reason: string,
+): void {
+  updateTask(task.id, {
+    status: "queued",
+    agent_id: null,
+    review_verdict: null,
+    review_notes: notes,
+    review_cycles: cycles,
+    publication_state:
+      task.publication_mode === "human" ? "editing" : task.publication_state,
+  });
+  logEvent("task.requeued", { taskId: task.id, payload: { reason } });
+}
+
+/** A rejection whose task is queued with nobody working it. */
+export interface StrandedRework {
+  task: Task;
+  /** The rejection that put it there — the age anchor and the dedup key. */
+  rejected: { id: number; ts: string };
+}
+
+/**
+ * Rejections that went back to the queue and were never picked up.
+ *
+ * The rejection→requeue path deliberately retires the worker (its notes could
+ * not be delivered, or it was parked on a menu belonging to work that was just
+ * rejected) and counts on a respawn to carry the notes into a fresh session.
+ * Nothing supplied that respawn: an orchestrated task is Claude main's to
+ * dispatch, main is deliberately never pinged about a task it filed itself, and
+ * the scheduler's auto-spawn pass only covers direct-dispatch tasks. So the task
+ * sat in `queued` with no agent and no signal to anybody.
+ *
+ * Derived from standing state rather than from the requeue event, so it covers
+ * every route into that state — a respawn that could not run, a daemon that died
+ * between the requeue and the respawn, a worker killed by hand — and clears
+ * itself as soon as a worker starts or the status moves. The rejection is the
+ * anchor: an `agent.spawned` after it means the rework is already under way.
+ *
+ * Both consumers read this one predicate — the watchdog that respawns
+ * (scheduler.reworkDispatchSweep) and the Needs-You item that names the ones it
+ * could not (attention.ts) — so they can never disagree about what is stranded.
+ */
+export function strandedReworkTasks(): StrandedRework[] {
+  const live = listAgents({ live: true });
+  const stranded: StrandedRework[] = [];
+  for (const task of listTasks("queued")) {
+    if (task.review_cycles === 0) continue;
+    const rejected = latestTaskEvent(task.id, ["review.rejected"]);
+    if (!rejected) continue;
+    const spawned = latestTaskEventId(task.id, ["agent.spawned"]);
+    if (spawned && spawned > rejected.id) continue;
+    if (live.some((a) => a.kind === "worker" && a.task_id === task.id)) continue;
+    stranded.push({ task, rejected: { id: rejected.id, ts: rejected.ts } });
+  }
+  return stranded;
+}
+
+/**
  * A reviewer submitted its verdict. Approve: flag the task (record the approved
  * HEAD so a later push is detectable as stale) and ping the human — final merge
- * stays theirs. Reject: feed the notes back into the still-live worker (or
- * requeue with the notes baked into the next prompt); the loop re-reviews after
- * the fix. At review_max_cycles rejected rounds the task blocks for the human.
+ * stays theirs. Reject: feed the notes back into the still-live worker, or
+ * requeue with the notes baked into the next prompt (the watchdog respawns a
+ * worker for it — see strandedReworkTasks); the loop re-reviews after the fix.
+ * At review_max_cycles rejected rounds the task blocks for the human.
  */
 export async function handleVerdict(
   taskId: number,
@@ -808,6 +894,11 @@ export async function handleVerdict(
     clearReviewSnapshot(taskId);
   }
 
+  // A worker parked from its own idle prompt is not holding a menu open, so the
+  // notes belong in its live session — killing it there would throw away a
+  // resumable worker for nothing.
+  if (task.agent_id) clearIdleWait(task.agent_id);
+
   const outcome = task.agent_id
     ? await resumeAgent(
         task.agent_id,
@@ -834,47 +925,31 @@ export async function handleVerdict(
     // The notes were not delivered, so leaving the task in review would park
     // it permanently: the reviewed HEAD is deduplicated and no review-state
     // watchdog retries feedback delivery. Retire this worker to free its slot,
-    // then requeue. The provider session remains recorded, and the next spawn
-    // resumes it with review_notes included in the continuation prompt.
+    // then requeue. The provider session remains recorded, and the respawn
+    // below resumes it with review_notes included in the continuation prompt.
     if (task.agent_id) killAgent(task.agent_id);
-    updateTask(taskId, {
-      status: "queued",
-      agent_id: null,
-      review_verdict: null,
-      review_notes: notes,
-      review_cycles: cycles,
-      publication_state:
-        task.publication_mode === "human" ? "editing" : task.publication_state,
-    });
     logEvent("review.feedback_delivery_failed", {
       taskId,
       agentId,
       payload: { reason: "tmux delivery unavailable" },
     });
-    logEvent("task.requeued", {
-      taskId,
-      payload: {
-        reason: "review rejected; feedback delivery failed — notes go into the respawn prompt",
-      },
-    });
+    requeueAfterRejection(
+      task,
+      notes,
+      cycles,
+      "review rejected; feedback delivery failed — notes go into the respawn prompt",
+    );
   } else {
     // A worker parked on a permission prompt can't take the notes, and the
     // prompt it's waiting on belongs to work that was just rejected — kill
     // it; the respawn resumes its session with the notes in the prompt.
     if (outcome === "waiting_input") killAgent(task.agent_id!);
-    updateTask(taskId, {
-      status: "queued",
-      agent_id: null,
-      review_verdict: null,
-      review_notes: notes,
-      review_cycles: cycles,
-      publication_state:
-        task.publication_mode === "human" ? "editing" : task.publication_state,
-    });
-    logEvent("task.requeued", {
-      taskId,
-      payload: { reason: "review rejected; worker gone — notes go into the respawn prompt" },
-    });
+    requeueAfterRejection(
+      task,
+      notes,
+      cycles,
+      "review rejected; worker gone — notes go into the respawn prompt",
+    );
   }
   return getTask(taskId)!;
 }

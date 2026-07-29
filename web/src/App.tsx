@@ -921,6 +921,8 @@ function signalTitle(kind: string, payload: Record<string, unknown>): string {
     "review.loop_exhausted": "Review exhausted",
     "review.verdict_superseded": "Review superseded",
     "review.skipped_no_pr": "Review skipped",
+    "review.rework_respawned": "Rework restarted",
+    "review.rework_dispatch_failed": "Rework not started",
     "reviewer.auto_spawned": "Reviewer spawned",
     "reviewer.spawned": "Reviewer spawned",
     "reviewer.spawn_error": "Reviewer failed",

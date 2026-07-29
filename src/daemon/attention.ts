@@ -23,7 +23,7 @@ import {
   getSchedulerConfig,
 } from "../db/settings.js";
 import { listTasks, readyTasks } from "../db/tasks.js";
-import { reviewMaxCycles } from "./review.js";
+import { reviewMaxCycles, strandedReworkTasks } from "./review.js";
 import { WAIT_HOOK_EVENTS } from "./waiting.js";
 
 /**
@@ -75,6 +75,11 @@ const APPLY_RE = /terraform apply|gcloud .* apply|kubectl apply/i;
 // stalls, but a brief stall is normal churn. Only nag the human once it has
 // persisted past this — long enough that it's a real stuck queue, not a blip.
 const SCHEDULER_STALL_MS = 15 * 60_000;
+
+// The watchdog's rework-respawn sweep runs every 10s, so a task the rejection
+// just requeued is normally moving again long before a human could act on it.
+// Only surface the strand once it has outlived several of those attempts.
+const REWORK_STRAND_GRACE_MS = 2 * 60_000;
 
 function excerpt(s: string | null | undefined, n = 200): string {
   if (!s) return "";
@@ -266,6 +271,28 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
       agent_id: held.agent_id,
       pr_url: t.pr_url,
       created_at: held.ts,
+    });
+  }
+
+  //     A rejection that went back to the queue and nobody picked up. Same
+  //     standing-state predicate the watchdog's respawn sweep runs on
+  //     (review.strandedReworkTasks), so this can only name a task that sweep has
+  //     not managed to restart, and it clears itself the moment one starts. Held
+  //     for REWORK_STRAND_GRACE_MS first: the sweep normally resolves this within
+  //     a watchdog tick, and a self-healing blip is not a human's problem.
+  for (const { task: t, rejected } of strandedReworkTasks()) {
+    if (nowMs - Date.parse(rejected.ts) < REWORK_STRAND_GRACE_MS) continue;
+    push({
+      id: `stalled_transition:rework:${t.id}:${rejected.id}`,
+      kind: "stalled_transition",
+      title: `Rework not started — #${t.id} ${t.title}`,
+      context: `The reviewer rejected round ${t.review_cycles} and the task went back to the queue, but no worker is on it and nothing else will start one. Spawn a worker — the reviewer notes go into its prompt. ${excerpt(t.review_notes, 140)}`,
+      severity: "orange",
+      urgent: false,
+      task_id: t.id,
+      agent_id: null,
+      pr_url: t.pr_url,
+      created_at: rejected.ts,
     });
   }
 
