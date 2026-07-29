@@ -1,16 +1,13 @@
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// These tests drive a real git repo and a real spawnReviewer, so the only
-// things stubbed are the ones that would reach outside the process: tmux, the
-// provider config files, and transcript discovery. Same budget as the other
-// git-driving suites — synchronous execFileSync blows past the 5s default
-// under full-suite parallel load.
-vi.setConfig({ testTimeout: 30_000 });
-
+// These tests run the real spawnReviewer, so the only things stubbed are the
+// ones that would reach outside the process: tmux, the provider config files,
+// and transcript discovery. The tasks are SCRATCH tasks on purpose — a reviewer
+// for one needs no git repo and no review worktree, which keeps this suite off
+// the git-subprocess budget the rest of the suite is already competing for.
 vi.mock("../src/daemon/tmux.js", () => ({
   newWindow: () => "cc:@review",
   windowExists: () => true,
@@ -53,51 +50,27 @@ afterEach(async () => {
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
   fs.rmSync(tmpDir, { recursive: true, force: true });
-  // The git work here is synchronous, so this worker's event loop can sit
-  // blocked for seconds at a time; yield a macrotask so vitest's worker->main
-  // replies get drained between tests.
-  await new Promise((resolve) => setImmediate(resolve));
 });
 
-/** A git repo whose task branch is one commit ahead of the base HEAD points at,
- *  with no origin remote (so the reviewer worktree resolves the local branch). */
-function makeRepo(taskId: number): { repo: string; branch: string } {
-  const repo = path.join(tmpDir, `repo-${taskId}`);
-  fs.mkdirSync(repo, { recursive: true });
-  const g = (...a: string[]) =>
-    execFileSync("git", [
-      "-C",
-      repo,
-      "-c",
-      "user.email=t@t",
-      "-c",
-      "user.name=t",
-      ...a,
-    ]);
-  g("init", "-q", "-b", "main");
-  g("commit", "-q", "--allow-empty", "-m", "init");
-  const branch = `agent/task-${taskId}`;
-  g("checkout", "-q", "-b", branch);
-  fs.writeFileSync(path.join(repo, "work.txt"), "work\n");
-  g("add", "-A");
-  g("commit", "-q", "-m", "work");
-  g("checkout", "-q", "main");
-  return { repo, branch };
-}
-
-/** A task sitting in review with a PR, plus the worker that produced it. */
+/** A scratch task sitting in review with a reviewable deliverable. */
 async function reviewTask(n: number, fields: Record<string, unknown> = {}) {
   const { createTask, updateTask } = await import("../src/db/tasks.js");
-  const { repo, branch } = makeRepo(n);
-  const task = createTask({ title: `t${n}`, prompt: "x", repo });
+  const { allocateScratchWorkspace } = await import(
+    "../src/daemon/workspaces.js"
+  );
+  const task = createTask({
+    title: `t${n}`,
+    prompt: "x",
+    repo: allocateScratchWorkspace(),
+    workspace_kind: "scratch",
+    open_pr: false,
+  });
   updateTask(task.id, {
     status: "review",
-    branch,
     result_summary: "claims done",
-    pr_url: `https://github.com/x/y/pull/${n}`,
     ...fields,
   });
-  return { taskId: task.id, repo, branch };
+  return { taskId: task.id };
 }
 
 async function makeReviewer(
@@ -328,10 +301,12 @@ describe("review recovery after a reviewer gives up", () => {
     const { recoverAbandonedReview } = await import("../src/daemon/review.js");
     const { logEvent, listEvents } = await import("../src/db/events.js");
     const { updateTask } = await import("../src/db/tasks.js");
+    const { hashResult } = await import("../src/daemon/reviewstate.js");
     const { taskId } = await reviewTask(9);
-    // The dead round recorded what it was judging; that fingerprint is what
-    // would otherwise suppress a re-review of the unchanged HEAD.
-    updateTask(taskId, { review_head_sha: "deadbeef", review_result_hash: "h" });
+    // Exactly the fingerprint the dead round left behind. Nothing about the
+    // submission changed, so the loop-safety guard would suppress a re-review
+    // unless the recovery clears it.
+    updateTask(taskId, { review_result_hash: hashResult("claims done") });
     const zombie = await makeReviewer(taskId, { state: "idle" });
     logEvent("reviewer.reaped", { agentId: zombie.id, taskId });
 
