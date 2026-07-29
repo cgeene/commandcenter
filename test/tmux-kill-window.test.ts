@@ -1,7 +1,13 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { snapshotProcesses } from "../src/daemon/proctree.js";
+import {
+  DETACHED_KEEPALIVE_SOURCE,
+  groupMembers,
+  killTrackedGroups,
+  trackKeepaliveGroupUnder,
+} from "./fixtures/procgroups.js";
 
 // End-to-end proof of the bug this guards against: `tmux kill-window` alone
 // leaves anything the pane backgrounded into its own process group running,
@@ -90,8 +96,14 @@ function descendants(root: number): number[] {
 // A pane process that backgrounds a detached child, which itself backgrounds a
 // loop — the shape a worker produces with `(while :; do :; done) &` under a
 // harness that runs commands in their own session.
-const LEAKY = `require('node:child_process').spawn('/bin/sh',['-c','(while :; do sleep 1; done) & sleep 600'],{detached:true,stdio:'ignore'});setTimeout(()=>{},600000)`;
-const leakyCommand = `${process.execPath} -e ${JSON.stringify(LEAKY)}`;
+const leakyCommand = `${process.execPath} -e ${JSON.stringify(DETACHED_KEEPALIVE_SOURCE)}`;
+
+// The fixtures below create real strays on purpose. Reap them as a GROUP, and
+// from a hook rather than inline, so a failure or a timeout above cannot leave
+// the keepalive loop running at pid 1.
+afterEach(() => {
+  killTrackedGroups();
+});
 
 // A pane that leaves a job which ignores SIGHUP. Unlike the detached shape
 // above, this one stays in the pane's process group — so it is still reachable
@@ -137,10 +149,13 @@ describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree",
       const pid = Number(raw);
       return Number.isInteger(pid) && pid > 1 ? pid : undefined;
     }, "tmux to report the pane pid");
-    const strays = await waitFor(() => {
-      const found = descendants(panePid);
-      return found.length > 0 ? found : undefined;
-    }, "the pane's background children to be forked");
+    // Register the loop's process group while the parent chain is still intact:
+    // once the window dies, the group id is the only handle left on it.
+    const leakedGroup = await waitFor(
+      () => trackKeepaliveGroupUnder(panePid),
+      "the pane's backgrounded keepalive loop to be forked",
+    );
+    const strays = descendants(panePid);
 
     tmux("kill-window", "-t", target);
     // The pane's own process really is gone; what is left is the leak.
@@ -148,18 +163,31 @@ describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree",
     const survivors = strays.filter(alive);
     expect(survivors.length).toBeGreaterThan(0);
 
-    spawnSync("/bin/kill", ["-9", ...survivors.map(String)], { stdio: "ignore" });
-    await waitForExit(survivors);
+    // A group kill, not `kill -9 <pids>`: the backgrounded loop outlives its
+    // leader, so signalling the pids observed above would strand it at pid 1.
+    killTrackedGroups();
+    expect(await waitForExit(strays)).toEqual([]);
+    // Asserted on the group, not on `strays`: the loop is absent from that
+    // snapshot whenever it caught the leader before the fork, which is exactly
+    // when a pid-list cleanup silently leaks.
+    await waitFor(
+      () => (groupMembers(leakedGroup).length === 0 ? true : undefined),
+      "the leaked process group to be empty",
+    );
   });
 
   it("kills the whole tree when the daemon's killWindow tears the window down", async () => {
     const { newWindow, killWindow, paneProcess } = await import("../src/daemon/tmux.js");
     const target = newWindow("kwtest", "/tmp", leakyCommand);
     const pane = await waitFor(() => paneProcess(target) ?? undefined, "the pane to start");
-    const strays = await waitFor(() => {
-      const found = descendants(pane.pid);
-      return found.length > 0 ? found : undefined;
-    }, "the pane's background children to be forked");
+    // Waiting for the whole group, not merely the first child: killWindow can
+    // only reap what its own snapshot can see, so a half-forked tree here would
+    // both fail the count below and leak the loop.
+    const leakedGroup = await waitFor(
+      () => trackKeepaliveGroupUnder(pane.pid),
+      "the pane's backgrounded keepalive loop to be forked",
+    );
+    const strays = descendants(pane.pid);
 
     const killed = killWindow(target);
     expect(killed).toContain(pane.pid);
@@ -168,6 +196,11 @@ describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree",
     // must hold is that nothing observed before the reap is left running.
     expect(killed.length).toBeGreaterThanOrEqual(3);
     expect(await waitForExit([pane.pid, ...strays])).toEqual([]);
+    // killWindow is supposed to reach the whole detached group, loop included.
+    await waitFor(
+      () => (groupMembers(leakedGroup).length === 0 ? true : undefined),
+      "the detached process group to be fully reaped",
+    );
   });
 
   it("reports no pane process for a window that is gone", async () => {
