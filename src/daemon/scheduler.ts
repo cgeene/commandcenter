@@ -1,6 +1,7 @@
 import { type Agent, getAgent, listAgents, updateAgent } from "../db/agents.js";
 import { dueCrons, nextRun, openTasksFor, updateCron } from "../db/crons.js";
 import {
+  countAgentEvents,
   countTaskEvents,
   countTaskEventsAfter,
   latestAgentEvent,
@@ -10,7 +11,7 @@ import {
   logEvent,
 } from "../db/events.js";
 import { getSchedulerConfig, type SchedulerConfig } from "../db/settings.js";
-import { createTask, getTask, listTasks, updateTask } from "../db/tasks.js";
+import { createTask, getTask, listTasks, type Task, updateTask } from "../db/tasks.js";
 import {
   autonomousSpawnsToday,
   noteReworkOverCap,
@@ -46,6 +47,35 @@ import { dispatchableTasks } from "./serial.js";
 const TERMINAL_STATUSES = ["done", "cancelled", "failed"];
 /** capacity_blocked / budget events fire at most this often (throttle). */
 const BLOCKED_EVENT_THROTTLE_MS = 60 * 60_000;
+
+/** The ways a worker can be lost with nothing to show for it: its window
+ *  disappeared, or its spawn never attached one. */
+type WorkerLoss = "vanished" | "spawn_abandoned";
+
+/**
+ * Markers for those losses, counted TOGETHER against the task's one genuine
+ * retry. A separate budget per cause would let a task alternate between them
+ * without limit — and a daemon that keeps dying mid-spawn produces exactly that
+ * alternation — so the budget is per task, not per flavour of loss.
+ */
+const WORKER_LOSS_EVENTS: Record<WorkerLoss, string> = {
+  vanished: "agent.vanished",
+  spawn_abandoned: "worker.spawn_abandoned",
+};
+
+/** Push copy per cause. The give-up line is deliberately cause-agnostic: with
+ *  one shared budget the two attempts can have been lost different ways. */
+const WORKER_LOSS_COPY: Record<WorkerLoss, { retry: string; onceTag: string }> = {
+  vanished: {
+    retry: "its worker vanished; the scheduler will retry it once. Nothing needed from you yet.",
+    onceTag: "worker_vanished",
+  },
+  spawn_abandoned: {
+    retry:
+      "its worker never finished starting up, so no work was done; the scheduler will retry it once. Nothing needed from you yet.",
+    onceTag: "worker_spawn_abandoned",
+  },
+};
 
 export interface SchedulerDeps {
   spawn: (taskId: number) => void;
@@ -594,6 +624,103 @@ function reapUnconfirmedKills(
   }
 }
 
+/**
+ * Hand the task back to the queue after losing the worker that held it, or stop
+ * retrying it.
+ *
+ * One retry per task, across every way a worker can be lost without finishing
+ * (see WORKER_LOSS_EVENTS). `task.recovered` is subtracted because a false
+ * vanish that was reconciled cost the task nothing.
+ *
+ * CALL ORDER: the loss event for THIS loss must already be logged, so it is
+ * part of the count — the first loss reads 1 and retries, the second reads 2
+ * and gives up.
+ */
+function requeueOrGiveUp(agent: Agent, task: Task, cause: WorkerLoss): void {
+  const spent =
+    Object.values(WORKER_LOSS_EVENTS).reduce(
+      (total, kind) => total + countTaskEvents(task.id, kind),
+      0,
+    ) - countTaskEvents(task.id, "task.recovered");
+  if (spent <= 1) {
+    updateTask(task.id, { status: "queued", agent_id: null });
+    logEvent("task.requeued", { taskId: task.id });
+    notifyEvent(
+      "worker_stalled",
+      `task #${task.id} requeued`,
+      `${task.title} — ${WORKER_LOSS_COPY[cause].retry}`,
+      { tags: "recycle", taskId: task.id, agentId: agent.id },
+    );
+    return;
+  }
+  updateTask(task.id, { status: "failed" });
+  logEvent("task.failed", { taskId: task.id });
+  notifyEvent(
+    "task_failed",
+    `task #${task.id} failed — giving up`,
+    `${task.title}\nTwo workers were given this task and neither produced anything, so the scheduler stopped retrying. It will not run again until you requeue it.`,
+    {
+      priority: "high",
+      tags: "x",
+      taskId: task.id,
+      agentId: agent.id,
+      once: `task:${task.id}:failed:${WORKER_LOSS_COPY[cause].onceTag}`,
+    },
+  );
+}
+
+/**
+ * When did this worker's spawn stop being able to produce anything? Returns null
+ * while it might still, so this doubles as "is it reapable", plus the timestamp
+ * its grace period is measured from — the same shape as reviewerhealth.ts's
+ * `reviewerGaveUpAt`, for the one worker state nothing else claims.
+ *
+ * spawnWorker's own catch closes the SYNCHRONOUS window between createAgent and
+ * attachPane: it marks the row dead and rolls the task back. So this state is
+ * only reachable when the daemon process dies in that window itself — a restart,
+ * an upgrade, an OOM kill — where no catch runs at all. The row is left
+ * `spawning` with no target, the SessionStart timeout relabels it `stalled`, and
+ * then nothing touches it: the vanished-agent pass needs a target to find
+ * missing (and deliberately does not claim paneless rows, whose story is "did
+ * not initialize", not "the window disappeared"), and the auto-reap needs a task
+ * that finished. Meanwhile capacity.ts counts it against max_concurrent forever.
+ *
+ * Every condition below demands POSITIVE evidence that no process sits behind
+ * the row, because freeing a slot for a worker that is really running is worse
+ * than the leak — the requeue hands its worktree and provider session to a
+ * replacement:
+ *
+ *  - no tmux_target AND no pane_pid. attachPane records the two together, so a
+ *    row missing both was never given a window or a process handle. There is
+ *    nothing to kill and, equally, nothing whose death could be confirmed;
+ *  - `stalled`, anchored on `agent.session_start_missing` — the watchdog's own
+ *    statement that the handshake window passed in silence. `spawning` is
+ *    excluded because a spawn may still be in flight, and every state a live
+ *    session produces (working/idle/waiting_input) is excluded by construction;
+ *  - not one `hook.sessionstart` in its history. A provider that reached its
+ *    hooks is a real session whatever the row says afterwards, and the silence
+ *    detector can move such a row to `stalled` too.
+ *
+ * What it cannot see: a daemon killed in the one statement between `newWindow`
+ * returning and `attachPane` storing the target leaves a window no row claims.
+ * Nothing can find that window — a target is the only handle, and unclaimed
+ * targets are ordinary (the hub, a human's own windows, the grouped viewer
+ * sessions termws.ts makes) — so the SessionStart evidence is the closest proxy
+ * available: a provider that got that far and ran normally would have
+ * handshook, and this refuses the row if it did. The sliver left is a provider
+ * that started but is parked on a one-time trust prompt, which no paneless row
+ * can be read for. That one is worth accepting: a provider sitting at a prompt
+ * has not touched the worktree and will not until a human answers it, whereas
+ * the slot leak is permanent.
+ */
+function abandonedSpawnAt(agent: Agent): string | null {
+  if (agent.kind !== "worker") return null;
+  if (agent.tmux_target !== null || agent.pane_pid !== null) return null;
+  if (agent.state !== "stalled") return null;
+  if (countAgentEvents(agent.id, ["hook.sessionstart"]) > 0) return null;
+  return latestAgentEventTs(agent.id, ["agent.session_start_missing"]) ?? null;
+}
+
 /** Health pass: confirm vanished tmux windows before requeueing, recover a
  *  false vanish if its process is still live, surface startup trust prompts,
  *  and flag silent workers as stalled. Runs every 10s even when scheduling is
@@ -720,36 +847,7 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
       });
       const task = agent.task_id ? getTask(agent.task_id) : undefined;
       if (task && ["in_progress", "claimed"].includes(task.status)) {
-        // A false vanish that was reconciled does not consume the task's one
-        // genuine retry budget.
-        const vanishes =
-          countTaskEvents(task.id, "agent.vanished") -
-          countTaskEvents(task.id, "task.recovered");
-        if (vanishes <= 1) {
-          updateTask(task.id, { status: "queued", agent_id: null });
-          logEvent("task.requeued", { taskId: task.id });
-          notifyEvent(
-            "worker_stalled",
-            `task #${task.id} requeued`,
-            `${task.title} — its worker vanished; the scheduler will retry it once. Nothing needed from you yet.`,
-            { tags: "recycle", taskId: task.id, agentId: agent.id },
-          );
-        } else {
-          updateTask(task.id, { status: "failed" });
-          logEvent("task.failed", { taskId: task.id });
-          notifyEvent(
-            "task_failed",
-            `task #${task.id} failed — giving up`,
-            `${task.title}\nIts worker vanished twice, so the scheduler stopped retrying. It will not run again until you requeue it.`,
-            {
-              priority: "high",
-              tags: "x",
-              taskId: task.id,
-              agentId: agent.id,
-              once: `task:${task.id}:failed:worker_vanished`,
-            },
-          );
-        }
+        requeueOrGiveUp(agent, task, "vanished");
       }
       continue;
     }
@@ -831,6 +929,35 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
           });
           continue;
         }
+      }
+    }
+
+    // abandoned-spawn reap: a worker row whose pane was never attached. Held
+    // apart from the branches above on purpose — the vanished-agent pass must
+    // keep needing a target, so that a paneless `spawning` worker still becomes
+    // `stalled` with agent.session_start_missing rather than being reported as a
+    // window that disappeared. This acts on the state that relabelling leaves
+    // behind, so the signal survives and the row still gets retired.
+    if (agent.kind === "worker") {
+      const abandonedAt = abandonedSpawnAt(agent);
+      if (
+        abandonedAt &&
+        nowMs - Date.parse(abandonedAt) > cfg.reap_after_minutes * 60_000
+      ) {
+        kill(agent.id);
+        logEvent("worker.spawn_abandoned", {
+          agentId: agent.id,
+          taskId: agent.task_id ?? undefined,
+          payload: { provider: agent.provider, abandoned_at: abandonedAt },
+        });
+        const task = agent.task_id ? getTask(agent.task_id) : undefined;
+        // `claimed` is the usual status here: spawnWorker claims the task before
+        // it creates the row and only promotes it to in_progress after the pane
+        // is attached, so an interrupted spawn leaves the claim standing.
+        if (task && ["in_progress", "claimed"].includes(task.status)) {
+          requeueOrGiveUp(agent, task, "spawn_abandoned");
+        }
+        continue;
       }
     }
 
