@@ -8,13 +8,14 @@ const newWindow = vi.fn(
 );
 const windowExists = vi.fn(() => false);
 const killWindow = vi.fn((_target: string) => [] as number[]);
+const paneProcess = vi.fn((_target: string) => null as { pid: number } | null);
 
 vi.mock("../src/daemon/tmux.js", () => ({
   newWindow: (name: string, cwd: string, command: string) =>
     newWindow(name, cwd, command),
   windowExists: (target: string) => windowExists(target),
   killWindow: (target: string) => killWindow(target),
-  paneProcess: () => null,
+  paneProcess: (target: string) => paneProcess(target),
 }));
 
 let tmpDir: string;
@@ -24,10 +25,13 @@ beforeEach(async () => {
   process.env.CC_DATA_DIR = tmpDir;
   delete process.env.CC_MAIN_WORKSPACE;
   delete process.env.CC_MAIN_MODEL;
-  newWindow.mockClear();
+  newWindow.mockReset();
+  newWindow.mockReturnValue("cc:@7");
   windowExists.mockReset();
   windowExists.mockReturnValue(false);
   killWindow.mockClear();
+  paneProcess.mockReset();
+  paneProcess.mockReturnValue(null);
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
 });
@@ -84,6 +88,124 @@ describe("main orchestrator spawn", () => {
 
     process.env.CC_MAIN_MODEL = "opus";
     expect(spawnMain().model).toBe("opus");
+  });
+
+  it("is not blocked by a live main row whose spawn never attached a pane", async () => {
+    const { spawnMain } = await import("../src/daemon/spawn.js");
+    const { createAgent, getAgent, listAgents } = await import(
+      "../src/db/agents.js"
+    );
+    const { listEvents } = await import("../src/db/events.js");
+    // What a spawn interrupted between createAgent and attachPane leaves behind,
+    // after the watchdog's SessionStart timeout has relabelled it. No pane, and
+    // no handshake ever arrived, so no session answered for it.
+    const leaked = createAgent({ kind: "main", state: "stalled" });
+
+    const main = spawnMain();
+
+    expect(main.id).not.toBe(leaked.id);
+    expect(main.tmux_target).toBe("cc:@7");
+    // The leaked row is retired, not merely stepped over, so only one main row
+    // answers for the orchestrator.
+    expect(getAgent(leaked.id)?.state).toBe("dead");
+    expect(listAgents({ live: true }).filter((a) => a.kind === "main")).toHaveLength(1);
+    expect(listEvents(10).map((event) => event.kind)).toContain(
+      "main.spawn_abandoned",
+    );
+  });
+
+  it("refuses to spawn over a paneless main whose provider session came up", async () => {
+    // The one statement between newWindow returning and attachPane storing the
+    // target: a daemon death there leaves a real orchestrator window that no row
+    // claims, and its provider still handshakes (handleHookEvent resolves the
+    // row by agent id, never by target). Retiring that row would hand the queue
+    // to a second orchestrator and blind the platform to the first.
+    const { spawnMain } = await import("../src/daemon/spawn.js");
+    const { createAgent, getAgent, listAgents } = await import(
+      "../src/db/agents.js"
+    );
+    const { logEvent } = await import("../src/db/events.js");
+    const started = createAgent({ kind: "main", state: "spawning" });
+    logEvent("hook.sessionstart", { agentId: started.id });
+
+    expect(() => spawnMain()).toThrow(/never recorded a pane/);
+
+    expect(getAgent(started.id)?.state).toBe("spawning");
+    expect(listAgents({ live: true }).filter((a) => a.kind === "main")).toEqual([
+      expect.objectContaining({ id: started.id }),
+    ]);
+    expect(newWindow).not.toHaveBeenCalled();
+  });
+
+  it("refuses while another spawnMain may still be in flight", async () => {
+    // spawnMain runs in the daemon and in `cc upgrade --main`, so one process can
+    // see the other between createAgent and attachPane.
+    const { spawnMain } = await import("../src/daemon/spawn.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const inFlight = createAgent({ kind: "main", state: "spawning" });
+
+    expect(() => spawnMain()).toThrow(/may still be in flight/);
+    expect(getAgent(inFlight.id)?.state).toBe("spawning");
+
+    // The refusal is time-bounded: once no spawn could still be running, the
+    // row is retired and a replacement starts.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(Date.parse(inFlight.spawned_at) + 61_000);
+      expect(spawnMain().tmux_target).toBe("cc:@7");
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(getAgent(inFlight.id)?.state).toBe("dead");
+  });
+
+  it("still refuses to start a second main while one holds a pane, even idle", async () => {
+    // `idle` is the orchestrator's resting state between turns, not a zombie:
+    // it is exactly when triage delegation wants it, so it must keep refusing.
+    const { spawnMain } = await import("../src/daemon/spawn.js");
+    const { createAgent, updateAgent } = await import("../src/db/agents.js");
+
+    for (const state of ["idle", "working", "waiting_input", "stalled"] as const) {
+      const live = createAgent({ kind: "main", state, tmux_target: "cc:@3" });
+      expect(() => spawnMain()).toThrow(/already live/);
+      updateAgent(live.id, { state: "dead" });
+    }
+  });
+
+  it("leaves no live main row behind when the spawn throws before attaching", async () => {
+    const { spawnMain } = await import("../src/daemon/spawn.js");
+    const { listAgents } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    newWindow.mockImplementation(() => {
+      throw new Error("tmux new-window failed");
+    });
+
+    expect(() => spawnMain()).toThrow(/tmux new-window failed/);
+
+    expect(listAgents({ live: true })).toEqual([]);
+    expect(listEvents(10).map((event) => event.kind)).toContain(
+      "agent.spawn_failed",
+    );
+    // No window was created, so there is nothing to tear down.
+    expect(killWindow).not.toHaveBeenCalled();
+
+    // And the wedge is gone: the next attempt gets through.
+    newWindow.mockImplementation(() => "cc:@8");
+    expect(spawnMain().tmux_target).toBe("cc:@8");
+  });
+
+  it("kills the window it opened when the spawn throws after newWindow", async () => {
+    const { spawnMain } = await import("../src/daemon/spawn.js");
+    const { listAgents } = await import("../src/db/agents.js");
+    windowExists.mockReturnValue(true);
+    paneProcess.mockImplementation(() => {
+      throw new Error("pane lookup failed");
+    });
+
+    expect(() => spawnMain()).toThrow(/pane lookup failed/);
+
+    expect(killWindow).toHaveBeenCalledWith("cc:@7");
+    expect(listAgents({ live: true })).toEqual([]);
   });
 
   it("can kill a live split-brain process even when its DB row says dead", async () => {

@@ -946,6 +946,8 @@ function signalTitle(kind: string, payload: Record<string, unknown>): string {
     "agent.stalled": "Agent stalled",
     "agent.vanished": "Agent vanished",
     "worker.spawn_abandoned": "Worker never started",
+    "main.spawn_abandoned": "Main agent never started",
+    "agent.spawn_failed": "Agent failed to start",
     "agent.auto_nudged": "Agent nudged",
     "waiting.escalated": "Waiting escalated",
     "waiting.delegated": "Question delegated",
@@ -984,6 +986,7 @@ function signalCategory(kind: string, payload: Record<string, unknown>): SignalF
     kind === "task.blocked" ||
     kind === "task.failed" ||
     kind === "worker.spawn_abandoned" ||
+    kind === "main.spawn_abandoned" ||
     kind === "task.stopped_incomplete" ||
     kind === "review.rejected" ||
     kind === "review.verdict_superseded" ||
