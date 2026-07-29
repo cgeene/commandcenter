@@ -36,6 +36,7 @@ const sendText = vi.fn(
 vi.mock("../src/daemon/tmux.js", () => ({
   windowExists: () => true,
   listWindows: () => ({ live: [...panes.keys()], dead: [], server: "running" }),
+  probeWindow: () => "absent" as const,
   sendText: (...args: unknown[]) =>
     (sendText as unknown as (...a: unknown[]) => Promise<boolean>)(...args),
   capturePane: (target: string) => panes.get(target) ?? "",

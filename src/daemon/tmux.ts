@@ -360,6 +360,36 @@ export function windowPresence(target: string): WindowPresence {
 }
 
 /**
+ * Ask about ONE window without going through the bulk listing.
+ *
+ * This exists to corroborate a `listWindows` result that cannot be believed: a
+ * different tmux command, one target at a time, so a listing that came back
+ * short or unparseable cannot also supply its own second opinion.
+ *
+ * `display-message` does NOT fail on a target that no longer exists — it
+ * quietly answers about the session's current window instead (see
+ * paneProcess) — so the identity it reports has to be read back and compared.
+ */
+export function probeWindow(target: string): WindowPresence {
+  let out: string;
+  try {
+    out = tmux(
+      "display-message",
+      "-p",
+      "-t",
+      target,
+      "#{session_name}:#{window_id}",
+    ).trim();
+  } catch (error) {
+    const code = tmuxFailureCode(error);
+    return code === "target_missing" || code === "session_absent"
+      ? "absent"
+      : "unknown";
+  }
+  return out === target ? "present" : "absent";
+}
+
+/**
  * Whether tmux still has this window (a `remain-on-exit` corpse counts).
  *
  * `whenUnobservable` is the answer for a tmux that could not be asked at all,

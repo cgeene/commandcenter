@@ -3,6 +3,7 @@ import { listAgents } from "../db/agents.js";
 import { liveUsageEnabled } from "../config.js";
 import { autonomousSpawnsToday, workerSlots } from "./capacity.js";
 import {
+  countAgentEvents,
   earliestEventTsAfter,
   latestAgentEvent,
   latestAgentEventTs,
@@ -514,6 +515,33 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
       agent_id: null,
       pr_url: null,
       created_at: blindStarted,
+    });
+  }
+
+  // --- unfinished teardown: killAgent could not reach tmux, so the row is
+  //     dead while its provider process may well still be running. Derived
+  //     from the row rather than the event, so it self-heals the moment the
+  //     watchdog's retry gets the handle surrendered — and stands only once
+  //     those retries are spent, which is when it becomes the human's. Two
+  //     live providers can share one worktree and one session here, so this
+  //     outranks the other scheduler items. --------------------------------
+  for (const agent of listAgents()) {
+    if (agent.state !== "dead" || agent.pane_pid === null) continue;
+    if (countAgentEvents(agent.id, ["agent.kill_unconfirmed"]) === 0) continue;
+    const anchor = latestAgentEventTs(agent.id, ["agent.kill_unconfirmed"]);
+    if (!anchor) continue;
+    const task = agent.task_id ? tasksById.get(agent.task_id) : undefined;
+    push({
+      id: `stalled_transition:kill_unconfirmed:${agent.id}:${anchor}`,
+      kind: "stalled_transition",
+      title: `a${agent.id} may still be running — Command Center could not stop it`,
+      context: `tmux was unreachable when it was killed${task ? `, and #${task.id} has moved on without it` : ""}. Check its terminal and stop the process if it is still there.`,
+      severity: "orange",
+      urgent: false,
+      task_id: agent.task_id,
+      agent_id: agent.id,
+      pr_url: null,
+      created_at: anchor,
     });
   }
 

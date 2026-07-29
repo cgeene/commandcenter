@@ -252,6 +252,46 @@ describe("deriveAttention — kinds", () => {
     expect(items[0].kind).toBe("escalation");
   });
 
+  describe("a teardown tmux would not confirm", () => {
+    async function unconfirmedKill(panePid: number | null) {
+      const { createAgent, updateAgent } = await import("../src/db/agents.js");
+      const { logEvent } = await import("../src/db/events.js");
+      const agent = createAgent({
+        kind: "worker",
+        state: "working",
+        tmux_target: "cc:@7",
+      });
+      updateAgent(agent.id, { pane_pid: panePid });
+      logEvent("agent.kill_unconfirmed", { agentId: agent.id });
+      updateAgent(agent.id, { state: "dead" });
+      return agent;
+    }
+
+    it("surfaces a dead row that may still have a process behind it", async () => {
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      const agent = await unconfirmedKill(4242);
+
+      const items = deriveAttention({ isPrOpen: allOpen });
+      expect(items).toHaveLength(1);
+      expect(items[0]).toMatchObject({
+        kind: "stalled_transition",
+        agent_id: agent.id,
+        severity: "orange",
+      });
+      expect(items[0].title).toContain("may still be running");
+    });
+
+    it("clears as soon as the retry gets the pane handle surrendered", async () => {
+      const { deriveAttention } = await import("../src/daemon/attention.js");
+      const { updateAgent } = await import("../src/db/agents.js");
+      const agent = await unconfirmedKill(4242);
+
+      updateAgent(agent.id, { pane_pid: null });
+
+      expect(deriveAttention({ isPrOpen: allOpen })).toHaveLength(0);
+    });
+  });
+
   describe("a watchdog that cannot read tmux", () => {
     async function blindFor(kind: string, minutesAgo: number) {
       const { logEvent } = await import("../src/db/events.js");

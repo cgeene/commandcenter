@@ -19,6 +19,7 @@ vi.mock("../src/daemon/tmux.js", () => ({
   clearInputLine: async () => {},
   ensureSession: () => {},
   listWindows: () => ({ live: [], dead: [], server: "running" }),
+  probeWindow: () => "absent" as const,
 }));
 
 vi.mock("../src/daemon/genconfig.js", () => ({

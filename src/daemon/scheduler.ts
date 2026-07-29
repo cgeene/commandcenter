@@ -1,4 +1,4 @@
-import { type Agent, listAgents, updateAgent } from "../db/agents.js";
+import { type Agent, getAgent, listAgents, updateAgent } from "../db/agents.js";
 import { dueCrons, nextRun, openTasksFor, updateCron } from "../db/crons.js";
 import {
   countTaskEvents,
@@ -31,7 +31,9 @@ import {
   capturePane,
   killWindow,
   listWindows,
+  probeWindow,
   type TmuxWindows,
+  type WindowPresence,
   type WindowSnapshot,
 } from "./tmux.js";
 import { versionInfo } from "./version.js";
@@ -56,6 +58,8 @@ export interface SchedulerDeps {
   sweepPaneGroup?: (panePid: number, ageSec: number) => PaneSweepResult;
   /** Remove a leftover window whose pane process has already exited. */
   reapWindow?: (target: string) => void;
+  /** Second opinion on one window, for a snapshot that cannot be believed. */
+  probeWindow?: (target: string) => WindowPresence;
   /** Try to type a silent agent back into working (transient API errors only). */
   revive?: (agent: Agent) => void;
   /** Start a replacement round for a reviewer that was reaped without one. */
@@ -69,6 +73,7 @@ const defaultDeps: SchedulerDeps = {
   now: () => new Date(),
   sweepPaneGroup: sweepVanishedPaneGroup,
   reapWindow: (target) => void killWindow(target),
+  probeWindow,
   // Both are fire-and-forget: a recovery attempt must never break the watchdog
   // pass, and neither has anything to report back into this loop.
   revive: (agent) => void tryAutoNudge(agent).catch(() => {}),
@@ -93,10 +98,17 @@ let budgetNotifiedDay: string | null = null;
 let lastScratchPruneDay: string | null = null;
 let tmuxObservationUnavailable: TmuxBlindness | null = null;
 let blindSpellReconciled = false;
+let implausiblePasses = 0;
+let implausibleCorroborated = false;
 const missingWindowChecks = new Map<number, number>();
+const killRetries = new Map<number, number>();
 const SESSION_START_TIMEOUT_MS = 90_000;
 const WINDOW_MISSING_CONFIRMATIONS = 2;
 const WATCHDOG_INTERVAL_MS = 10_000;
+/** Implausible passes to sit out before asking tmux about each window directly. */
+const IMPLAUSIBLE_PROBE_AFTER = 3;
+/** Teardown retries per agent before the Needs-You item takes over. */
+const MAX_KILL_RETRIES = 3;
 
 export function _resetSchedulerState(): void {
   lastInWindow = null;
@@ -104,7 +116,10 @@ export function _resetSchedulerState(): void {
   lastScratchPruneDay = null;
   tmuxObservationUnavailable = null;
   blindSpellReconciled = false;
+  implausiblePasses = 0;
+  implausibleCorroborated = false;
   missingWindowChecks.clear();
+  killRetries.clear();
 }
 
 /** Why the watchdog cannot trust what tmux just told it. */
@@ -132,6 +147,11 @@ function blindSpellIsOpen(): boolean {
   );
 }
 
+/** Targets the daemon believes it still owns, for corroborating a snapshot. */
+function claimedTargets(agents: Agent[]): string[] {
+  return agents.flatMap((agent) => (agent.tmux_target ? [agent.tmux_target] : []));
+}
+
 /**
  * Whether a snapshot tmux answered successfully can be believed.
  *
@@ -144,15 +164,48 @@ function blindSpellIsOpen(): boolean {
  * Two deliberate exemptions. A tmux server that is genuinely absent really has
  * no windows, and a single agent going missing is ordinary (that is the case
  * the confirmation counter exists for), so neither is second-guessed here.
+ *
+ * DISBELIEF MUST NOT BE A DEAD END. The condition is self-sustaining — the only
+ * thing that shrinks the claimed set is the vanish branch, which this very
+ * check skips — so `corroborateSnapshot` below is what eventually settles it.
+ * Killing the whole cc session while other sessions live on the same server
+ * reaches this state legitimately, and there is no human at 03:00 to break the
+ * tie.
  */
 function snapshotIsImplausible(snapshot: TmuxWindows, agents: Agent[]): boolean {
   if (snapshot.server === "absent") return false;
-  const claimed = agents.flatMap((agent) =>
-    agent.tmux_target ? [agent.tmux_target] : [],
-  );
+  const claimed = claimedTargets(agents);
   if (claimed.length < 2) return false;
   const present = new Set([...snapshot.live, ...snapshot.dead]);
   return !claimed.some((target) => present.has(target));
+}
+
+/**
+ * Settle a snapshot the plausibility check refused, by asking tmux about each
+ * window on its own — a different command down a different path, so a bulk
+ * listing that came back short cannot also supply its own second opinion.
+ *
+ * Every window answering "gone" means the snapshot was right after all and the
+ * fleet really did go with the session (`tmux kill-session -t cc` while other
+ * sessions keep the server up gets here honestly). Anything else — one window
+ * still there, or a probe that could not be answered — leaves the disbelief
+ * standing, which is the whole point of it.
+ *
+ * Only run every IMPLAUSIBLE_PROBE_AFTER passes: it costs one tmux call per
+ * agent, and the answer is not going to change within 10 seconds.
+ */
+function corroborateSnapshot(
+  probe: (target: string) => WindowPresence,
+  agents: Agent[],
+): boolean {
+  if (++implausiblePasses < IMPLAUSIBLE_PROBE_AFTER) return false;
+  implausiblePasses = 0;
+  const verdicts = claimedTargets(agents).map((target) => probe(target));
+  const gone = verdicts.every((presence) => presence === "absent");
+  logEvent("watchdog.tmux_snapshot_probed", {
+    payload: { probed: verdicts.length, corroborated: gone },
+  });
+  return gone;
 }
 
 export function inActiveWindow(
@@ -494,6 +547,53 @@ function reapOrphanWindows(
   }
 }
 
+/**
+ * Finish a teardown that could not be completed at the time.
+ *
+ * killAgent never throws when tmux is unreachable — its callers are usually
+ * handling a failure of their own, and an exception would strand them — so it
+ * marks the row dead, keeps pane_pid as the handle, and logs
+ * agent.kill_unconfirmed. That leaves a provider process running behind a dead
+ * row, which nothing else looks at: the vanish loop and recoverFalseVanishes
+ * only read live rows, and recoverFalseVanishes would refuse this one anyway
+ * because its kill is newer than any vanish.
+ *
+ * Left alone it is worse than a leak. The rejection path requeues the task, and
+ * the respawn resumes the SAME session in the SAME worktree — two providers,
+ * one transcript. This runs before that sweep in the same pass, so a retry that
+ * succeeds gets there first.
+ *
+ * The discriminator is the retained pane_pid: every teardown that did complete
+ * gives that handle up. Retries are capped, after which the Needs-You item
+ * derived from the same row state is the human's cue.
+ */
+function reapUnconfirmedKills(
+  kill: (agentId: number) => void,
+  liveWindows: string[],
+): void {
+  if (liveWindows.length === 0) return;
+  const owners = new Map<string, Agent>();
+  for (const agent of [...listAgents()].sort((a, b) => a.id - b.id)) {
+    if (agent.tmux_target) owners.set(agent.tmux_target, agent);
+  }
+  for (const target of liveWindows) {
+    const agent = owners.get(target);
+    if (!agent || agent.state !== "dead" || agent.pane_pid === null) continue;
+    const attempts = (killRetries.get(agent.id) ?? 0) + 1;
+    if (attempts > MAX_KILL_RETRIES) continue;
+    killRetries.set(agent.id, attempts);
+    kill(agent.id);
+    logEvent("agent.kill_retried", {
+      agentId: agent.id,
+      taskId: agent.task_id ?? undefined,
+      payload: {
+        attempt: attempts,
+        settled: getAgent(agent.id)?.pane_pid === null,
+      },
+    });
+  }
+}
+
 /** Health pass: confirm vanished tmux windows before requeueing, recover a
  *  false vanish if its process is still live, surface startup trust prompts,
  *  and flag silent workers as stalled. Runs every 10s even when scheduling is
@@ -505,6 +605,7 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
   const recoverReview = deps.recoverReview ?? defaultDeps.recoverReview!;
   const sweepPaneGroup = deps.sweepPaneGroup ?? sweepVanishedPaneGroup;
   const reapWindow = deps.reapWindow ?? defaultDeps.reapWindow!;
+  const probe = deps.probeWindow ?? defaultDeps.probeWindow!;
   const snapshot = deps.windows();
   const nowMs = deps.now().getTime();
 
@@ -530,12 +631,26 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
     missingWindowChecks.clear();
   };
   if (snapshot === null) {
+    implausiblePasses = 0;
     goBlind("query_failed");
     return;
   }
   if (snapshotIsImplausible(snapshot, listAgents({ live: true }))) {
-    goBlind("implausible_snapshot");
-    return;
+    // Disbelief has to be able to end. Once probing each window one at a time
+    // agrees they are all gone, the snapshot is accepted (and stays accepted
+    // while the condition holds, or the confirmation counter this unblocks
+    // would be cleared again on the very next pass).
+    if (
+      !implausibleCorroborated &&
+      !corroborateSnapshot(probe, listAgents({ live: true }))
+    ) {
+      goBlind("implausible_snapshot");
+      return;
+    }
+    implausibleCorroborated = true;
+  } else {
+    implausibleCorroborated = false;
+    implausiblePasses = 0;
   }
   // Close out the spell on the first pass that can be trusted. The stored
   // check runs once per process: after it, this flag has seen every transition
@@ -550,7 +665,10 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
   blindSpellReconciled = true;
 
   const windowIds = snapshot.live;
+  // Order matters: recovery first, so a false vanish whose process is still
+  // live is revived rather than torn down as an unfinished kill.
   recoverFalseVanishes(deps, windowIds);
+  reapUnconfirmedKills(kill, windowIds);
   reapOrphanWindows(
     reapWindow,
     snapshot.dead,

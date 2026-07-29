@@ -149,6 +149,10 @@ const TEMPLATES: Record<string, Template> = {
   // --- agents ---
   "agent.spawned": (e) => `Spawned ${agentRef(e)}${e.task_id != null ? ` on ${taskRef(e)}` : ""}`,
   "agent.killed": (e) => `Killed ${agentRef(e)}`,
+  "agent.kill_retried": (e, p) =>
+    p.settled
+      ? `Finished stopping ${agentRef(e)} on retry`
+      : `Retried stopping ${agentRef(e)} (attempt ${str(p.attempt) || "?"}) — still unconfirmed`,
   "agent.kill_unconfirmed": (e, p) =>
     `Could not confirm ${agentRef(e)} was stopped — tmux was unreachable${p.pane_handle_retained ? "; kept its pane handle to retry" : ""}`,
   "agent.stalled": (e) => `${worker(e)} stalled on ${taskRef(e)}`,
@@ -264,6 +268,10 @@ const TEMPLATES: Record<string, Template> = {
   "watchdog.tmux_unavailable": () => `tmux health observation unavailable — no agents changed`,
   "watchdog.tmux_snapshot_implausible": () =>
     `tmux reported none of the running agents' windows — treated as unreadable, no agents changed`,
+  "watchdog.tmux_snapshot_probed": (_e, p) =>
+    p.corroborated
+      ? `Checked all ${str(p.probed)} agent windows individually — they really are gone`
+      : `Checked ${str(p.probed)} agent windows individually — the listing still cannot be trusted`,
   "watchdog.tmux_recovered": () => `tmux health observation recovered`,
   "daemon.stale": () => `Daemon is running stale code`,
 };

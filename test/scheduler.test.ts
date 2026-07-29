@@ -394,14 +394,15 @@ describe("watchdog", () => {
       spawn: () => {},
       windows: () => seen([]),
       now: () => new Date(),
+      // Asked one at a time, tmux says the windows are right there — the bulk
+      // listing was wrong, and no number of repeats makes it right.
+      probeWindow: () => "present" as const,
       sweepPaneGroup: (panePid: number) => {
         swept.push(panePid);
         return { outcome: "swept" as const, killed: [panePid] };
       },
     };
-    watchdog(empty);
-    watchdog(empty);
-    watchdog(empty);
+    for (let pass = 0; pass < 5; pass++) watchdog(empty);
 
     for (const { agent, task } of agents) {
       expect(getAgent(agent.id)?.state).toBe("working");
@@ -416,6 +417,53 @@ describe("watchdog", () => {
         (event) => event.kind === "watchdog.tmux_snapshot_implausible",
       ),
     ).toHaveLength(1);
+  });
+
+  it("stops disbelieving a listing once every window checks out gone", async () => {
+    // `tmux kill-session -t cc` while other sessions keep the server up: the
+    // listing is non-empty and holds no agent window, so it looks broken every
+    // pass, and the only thing that would shrink the claimed set is the vanish
+    // branch the disbelief skips. Left unbounded the queue sits dead until a
+    // human intervenes — the outcome this whole task exists to prevent.
+    const { createTask, getTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const made = ["cc:@1004", "cc:@1015"].map((target, i) => {
+      const task = createTask({ title: `t${i}`, prompt: "x", repo: "/r" });
+      const agent = createAgent({
+        kind: "worker",
+        state: "working",
+        task_id: task.id,
+        tmux_target: target,
+      });
+      updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+      return { agent, task };
+    });
+
+    const probed: string[] = [];
+    const elsewhere = {
+      spawn: () => {},
+      windows: () => seen(["viewer:@0", "viewer:@1"]),
+      now: () => new Date(),
+      probeWindow: (target: string) => {
+        probed.push(target);
+        return "absent" as const;
+      },
+    };
+    // Three passes of disbelief, then the probe settles it and the ordinary
+    // two-observation confirmation runs.
+    for (let pass = 0; pass < 4; pass++) watchdog(elsewhere);
+
+    expect(probed).toEqual(["cc:@1004", "cc:@1015"]);
+    for (const { agent, task } of made) {
+      expect(getAgent(agent.id)?.state).toBe("dead");
+      expect(getTask(task.id)?.status).toBe("queued");
+    }
+    expect(listEvents(30).map((event) => event.kind)).toContain(
+      "watchdog.tmux_snapshot_probed",
+    );
   });
 
   it("requeues both agents when the tmux server is provably gone", async () => {
@@ -565,6 +613,99 @@ describe("watchdog", () => {
       "watchdog.tmux_recovered",
     );
     expect(deriveAttention({ isPrOpen: () => true })).toHaveLength(0);
+  });
+
+  it("finishes a teardown that tmux would not confirm, before anything respawns", async () => {
+    // killAgent could not reach tmux, so it marked the row dead and kept the
+    // pane handle. The process is still running behind a live window, and the
+    // rejection path has already requeued the task for a respawn that resumes
+    // the same session in the same worktree — this is the only thing that
+    // reconciles it.
+    const { createAgent, updateAgent, getAgent } = await import("../src/db/agents.js");
+    const { logEvent, listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const agent = createAgent({
+      kind: "worker",
+      state: "working",
+      tmux_target: "cc:@7",
+    });
+    updateAgent(agent.id, { pane_pid: 4242 });
+    logEvent("agent.kill_unconfirmed", { agentId: agent.id });
+    updateAgent(agent.id, { state: "dead" });
+
+    const killed: number[] = [];
+    watchdog({
+      spawn: () => {},
+      windows: () => seen(["cc:@7"]),
+      now: () => new Date(),
+      kill: (id: number) => {
+        killed.push(id);
+        updateAgent(id, { pane_pid: null }); // this retry got through
+      },
+    });
+
+    expect(killed).toEqual([agent.id]);
+    expect(getAgent(agent.id)?.pane_pid).toBeNull();
+    expect(listEvents(20).map((event) => event.kind)).toContain(
+      "agent.kill_retried",
+    );
+  });
+
+  it("gives up retrying a teardown rather than looping on it forever", async () => {
+    const { createAgent, updateAgent } = await import("../src/db/agents.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const agent = createAgent({
+      kind: "worker",
+      state: "working",
+      tmux_target: "cc:@7",
+    });
+    updateAgent(agent.id, { pane_pid: 4242 });
+    updateAgent(agent.id, { state: "dead" });
+
+    const killed: number[] = [];
+    const stuck = {
+      spawn: () => {},
+      windows: () => seen(["cc:@7"]),
+      now: () => new Date(),
+      kill: (id: number) => void killed.push(id), // never gets through
+    };
+    for (let pass = 0; pass < 6; pass++) watchdog(stuck);
+
+    expect(killed).toHaveLength(3);
+  });
+
+  it("recovers a false vanish rather than tearing it down as an unfinished kill", async () => {
+    // Both passes key off a dead row with a live window; recovery has to win,
+    // or a transient miss would turn into the kill it was never given.
+    const { createTask, updateTask } = await import("../src/db/tasks.js");
+    const { createAgent, updateAgent, getAgent } = await import("../src/db/agents.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+
+    const task = createTask({ title: "t", prompt: "x", repo: "/r" });
+    const agent = createAgent({
+      kind: "worker",
+      state: "working",
+      task_id: task.id,
+      tmux_target: "cc:@9",
+    });
+    updateAgent(agent.id, { pane_pid: 4242, session_id: "s1" });
+    updateTask(task.id, { status: "in_progress", agent_id: agent.id });
+    logEvent("agent.vanished", { agentId: agent.id, taskId: task.id });
+    updateAgent(agent.id, { state: "dead" });
+
+    const killed: number[] = [];
+    watchdog({
+      spawn: () => {},
+      windows: () => seen(["cc:@9"]),
+      now: () => new Date(),
+      kill: (id: number) => void killed.push(id),
+    });
+
+    expect(getAgent(agent.id)?.state).toBe("working");
+    expect(killed).toEqual([]);
   });
 
   it("reaps the empty window a dead agent leaves behind, once the grace period is up", async () => {

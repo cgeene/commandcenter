@@ -1146,6 +1146,8 @@ interface PaneTeardown {
    * running may well still be running.
    */
   confirmed: boolean;
+  /** Whether the pane pid survived this teardown, as the row now reads. */
+  handleRetained: boolean;
 }
 
 /**
@@ -1188,10 +1190,15 @@ function reapPaneProcesses(agent: Agent, mayHaveWindow: boolean): PaneTeardown {
   }
   // Only give up the handle once it has actually been acted on. A declined
   // sweep looked at a live pane (or could not look at all) and did nothing.
-  if (agent.pane_pid !== null && paneHandled) {
+  const surrendered = agent.pane_pid !== null && paneHandled;
+  if (surrendered) {
     updateAgent(agent.id, { pane_pid: null });
   }
-  return { killed, confirmed: windowSettled || swept };
+  return {
+    killed,
+    confirmed: windowSettled || swept,
+    handleRetained: agent.pane_pid !== null && !surrendered,
+  };
 }
 
 export function killAgent(
@@ -1229,7 +1236,7 @@ export function killAgent(
     logEvent("agent.kill_unconfirmed", {
       agentId,
       taskId: agent.task_id ?? undefined,
-      payload: { pane_handle_retained: agent.pane_pid !== null },
+      payload: { pane_handle_retained: teardown.handleRetained },
     });
   }
   updateAgent(agentId, { state: "dead" });
