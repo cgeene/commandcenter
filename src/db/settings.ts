@@ -35,6 +35,13 @@ export interface SchedulerConfig {
   max_concurrent: number;
   /** Autonomous spawns allowed per UTC day — the budget backstop. */
   daily_spawn_limit: number;
+  /** How many verify_cmd runs the daemon will execute at once, across all
+   *  workers, reviewers and the freshen pass. A verify_cmd is usually a whole
+   *  test suite, so this is deliberately NOT tied to max_concurrent: aggregate
+   *  verify load must not scale with fleet size. Raise it only on a box with
+   *  cores to spare — the cost of oversubscribing is verification that fails on
+   *  timing rather than on defects. */
+  verify_concurrency: number;
   /** Minutes without any hook event before a working agent is marked stalled. */
   stall_minutes: number;
   /** Only auto-spawn inside this window (hours, local time); null = always. start > end wraps overnight (e.g. 22 -> 6). */
@@ -67,6 +74,7 @@ export const SCHEDULER_DEFAULTS: SchedulerConfig = {
   enabled: false,
   max_concurrent: 3,
   daily_spawn_limit: 20,
+  verify_concurrency: 1,
   stall_minutes: 15,
   active_hours: null,
   auto_review: true,

@@ -90,6 +90,7 @@ button. Unknown keys fall back to the defaults below.
 | `enabled` | `false` | Master switch for autonomous spawning. The dashboard kill switch flips this. |
 | `max_concurrent` | `3` | Max workers on active work. Counts workers whose task is `claimed`/`in_progress` (including a rework round after a rejection), workers with no task yet, workers idling on a finished or blocked task, and workers whose task sits in `review` with no reviewer still working on it. Workers **parked under a running reviewer** are exempt, for up to 4 hours per review round — see [`architecture.md`](architecture.md#worker-concurrency). Manual spawns aren't counted against it but occupy slots. |
 | `daily_spawn_limit` | `20` | Autonomous spawns allowed per UTC day — a budget backstop. Manual spawns still work after the limit. |
+| `verify_concurrency` | `1` | How many `verify_cmd` runs the daemon executes at once, across every worker, reviewer and the auto-freshen pass. A `verify_cmd` is usually a whole test suite, so this is deliberately **not** tied to `max_concurrent`: total verify load must not grow with fleet size. Extra runs queue (FIFO, bounded at 30 minutes, after which a run proceeds anyway rather than strand its task) and the queue wait is not charged against the 10-minute verify timeout. Raise it only on a box with cores to spare — oversubscribing makes verification fail on timing instead of on defects. Every failure event records the load it ran under, so a contended failure is distinguishable from a real one, and one contended failure per work round does not consume the verify-retry budget. |
 | `stall_minutes` | `15` | Minutes without any hook event before a working agent is marked stalled and pushed to your phone. |
 | `active_hours` | `null` | Only auto-spawn within this hour window (local time). `null` = always. `start > end` wraps overnight (e.g. `22-6`). |
 | `auto_review` | `true` | Auto-spawn an adversarial reviewer when a task reaches `review`. Report-only tasks (e.g. the dreamer) are skipped. |
@@ -97,6 +98,41 @@ button. Unknown keys fall back to the defaults below.
 | `attention_stale_minutes` | `10` | Minutes an agent may sit in `waiting_input` before the "Needs You" panel flags it as stale. |
 | `reap_after_minutes` | `10` | Minutes a worker on a **terminal** task (`done`/`cancelled`/`failed`) may sit idle before the watchdog auto-reaps it — kills its tmux window along with the pane's whole process tree, and frees the `max_concurrent` slot. The grace window lets a human read the terminal right after completion. |
 | `read_only_extra_allow` | `[]` | Extra **read-only** permission patterns appended to the baked-in read-only profile for worker/reviewer settings. |
+
+### `max_concurrent` vs `verify_concurrency`
+
+These two are independent on purpose. `max_concurrent` bounds how much work is in
+flight; `verify_concurrency` bounds how much of the box that work can claim at
+the same moment. Before the verify queue existed, they were coupled in practice —
+every worker's Stop ran a full test suite immediately, so the only way to keep
+verification trustworthy was to hand-shrink the fleet. That is no longer
+necessary: raising `max_concurrent` adds queued verifications rather than
+simultaneous ones — **while the queue drains inside the 30-minute wait bound**.
+Past that bound the queue deliberately fails open: a run that has waited its
+full 30 minutes proceeds anyway rather than strand its task, and records
+`bypassed_queue` on its result. Each waiter's bound runs from its own enqueue, so
+a fleet large enough that queued work cannot drain in 30 minutes — many workers
+finishing together with a suite that takes a large fraction of the 10-minute
+verify timeout — will still end up running verifications simultaneously. Those
+runs are recorded as contended, and the failures they cause do not silently
+consume retry budget, but the serialization guarantee itself is bounded, not
+absolute. If `bypassed_queue` starts showing up in `verify.failed` payloads, the
+fleet is genuinely too large for the box rather than merely busy.
+
+A larger fleet also makes an individual verification wait longer, so if workers
+appear to sit "finished but not in review" for a while, check the `verify.queued`
+events before treating it as a stall.
+
+`stall_minutes` needs no compensating increase for any of this, and a value
+raised to cover slow verifications can go back to the 15-minute default. The
+stall watchdog only marks an agent stalled while its state is `working`, and the
+`Stop` hook sets the agent to `idle` before it runs `verify_cmd` at all — so a
+verification cannot trip stall detection however long it queues or runs. What
+`stall_minutes` actually detects is an agent that goes silent *mid-work*, which
+does get more likely when the box is thrashing; the queue reduces the thrashing
+the platform itself causes, but not load from anything else on the machine. If
+agents still get marked stalled after this, treat it as real box-wide load rather
+than as a verification artifact.
 
 ### `read_only_extra_allow` — a safety note
 

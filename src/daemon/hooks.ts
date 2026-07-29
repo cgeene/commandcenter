@@ -30,7 +30,13 @@ import { capturePane, windowExists } from "./tmux.js";
 import { WAIT_HOOK_EVENTS, waitIsMoot } from "./waiting.js";
 import { codexPermissionDecision } from "../codex-policy.js";
 import { delegatePendingTaskToMain } from "./orchestration.js";
-import { runVerifyCommand, VERIFY_TIMEOUT_MS } from "./verifyenv.js";
+import {
+  runVerifyCommand,
+  verifyLoadNote,
+  verifyWasContended,
+  VERIFY_QUEUE_MAX_WAIT_MS,
+  VERIFY_TIMEOUT_MS,
+} from "./verifyenv.js";
 
 export interface HookPayload {
   hook_event_name?: string;
@@ -48,6 +54,11 @@ export interface HookPayload {
 }
 
 const MAX_VERIFY_NUDGES = 2;
+/** Extra retries granted, per work round, for a verify failure the daemon can
+ *  see was contended (a second verify run in flight, or a queue bypass). One is
+ *  enough to absorb a single false failure without ever letting a genuinely
+ *  broken task retry forever. */
+const MAX_CONTENDED_RETRIES = 1;
 const MAX_AUTO_NUDGES = 2;
 const PANE_TAIL_LINES = 60;
 
@@ -153,8 +164,14 @@ const ROUND_START_EVENTS = [
 interface VerifyRound {
   /** Event id the current round started at; 0 when the task never restarted. */
   startId: number;
-  /** Verify nudges already spent on this round. */
-  nudges: number;
+  /** Verify failures already nudged for on this round, contended ones included.
+   *  Only ever used for reporting — never for the budget. */
+  attempts: number;
+  /** Of those, how many counted against the retry budget. */
+  spent: number;
+  /** Of those, how many were excused as contention (capped at
+   *  MAX_CONTENDED_RETRIES per round). */
+  forgiven: number;
 }
 
 /**
@@ -173,26 +190,45 @@ interface VerifyRound {
  * budget would never be reached. Chaining through the marker's payload is
  * therefore load-bearing, and so is logging that reopen BEFORE the nudge
  * marker it belongs to — see the ordering note at that call site.
+ *
+ * `spent` and `attempts` diverge only when a failure was excused as contention:
+ * markers written before that existed carry `attempt` alone, so it stands in for
+ * both.
  */
 function verifyRound(taskId: number): VerifyRound {
   const startId = latestTaskEventId(taskId, ROUND_START_EVENTS) ?? 0;
   const nudge = latestTaskEvent(taskId, ["task.verify_nudged"]);
-  if (!nudge || nudge.id < startId) return { startId, nudges: 0 };
-  let attempt: unknown;
-  try {
-    attempt = nudge.payload
-      ? (JSON.parse(nudge.payload) as { attempt?: unknown }).attempt
-      : undefined;
-  } catch {
-    attempt = undefined;
+  if (!nudge || nudge.id < startId) {
+    return { startId, attempts: 0, spent: 0, forgiven: 0 };
   }
-  // An unreadable marker counts as a spent budget: erring toward one blocked
-  // task beats erring toward nudging the same failure forever.
-  const spent =
-    typeof attempt === "number" && Number.isFinite(attempt) && attempt > 0
-      ? attempt
-      : MAX_VERIFY_NUDGES;
-  return { startId, nudges: spent };
+  let marker: { attempt?: unknown; spent?: unknown; forgiven?: unknown } = {};
+  try {
+    if (nudge.payload) marker = JSON.parse(nudge.payload) as typeof marker;
+  } catch {
+    marker = {};
+  }
+  const count = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0
+      ? value
+      : undefined;
+  const attempts = count(marker.attempt);
+  // An unreadable marker counts as a spent budget, and as having used up its
+  // contention allowance: erring toward one blocked task beats erring toward
+  // nudging the same failure forever.
+  if (attempts === undefined || attempts === 0) {
+    return {
+      startId,
+      attempts: MAX_VERIFY_NUDGES,
+      spent: MAX_VERIFY_NUDGES,
+      forgiven: MAX_CONTENDED_RETRIES,
+    };
+  }
+  return {
+    startId,
+    attempts,
+    spent: count(marker.spent) ?? attempts,
+    forgiven: count(marker.forgiven) ?? 0,
+  };
 }
 
 /** Past this, a `verify.started` with no outcome is not a run in progress — it
@@ -200,26 +236,37 @@ function verifyRound(taskId: number): VerifyRound {
  *  runVerify's own timeout, so it can never cut short a live run. */
 const VERIFY_STALE_MS = VERIFY_TIMEOUT_MS + 2 * 60_000;
 
+/** Same idea for a run that is queued behind another verify and has not spawned
+ *  anything yet. Bounded by how long the queue itself will make it wait. */
+const VERIFY_QUEUE_STALE_MS = VERIFY_QUEUE_MAX_WAIT_MS + 2 * 60_000;
+
 /**
- * Is a verify_cmd run currently executing for this task?
+ * Is a verify_cmd run currently executing — or waiting its turn to — for this
+ * task?
  *
  * runVerify blocks the Stop-hook handler for as long as the command takes
- * (minutes for a real test suite), and the task stays `in_progress` that whole
- * time. Callers use this to tell "the transition is on its way" apart from
- * "nothing is going to move this task", which from the outside look identical.
+ * (minutes for a real test suite) plus however long it waits for a free verify
+ * slot, and the task stays `in_progress` that whole time. Callers use this to
+ * tell "the transition is on its way" apart from "nothing is going to move this
+ * task", which from the outside look identical.
  *
  * Both consumers — the idle-ping suppression and stalledFinishedWorkers — must
  * go through this rather than testing for a verify event directly. A daemon
- * killed mid-verify leaves a verify.started that never resolves, and treating
- * that as "still running" forever would permanently hide the stall it created.
+ * killed mid-verify leaves a verify.started (or a verify.queued) that never
+ * resolves, and treating that as "still running" forever would permanently hide
+ * the stall it created.
  */
 export function verifyInFlight(taskId: number, nowMs = Date.now()): boolean {
   const latest = latestTaskEvent(taskId, [
+    "verify.queued",
     "verify.started",
     ...VERIFY_DONE_EVENTS,
   ]);
-  if (latest?.kind !== "verify.started") return false;
-  return nowMs - Date.parse(latest.ts) < VERIFY_STALE_MS;
+  if (!latest) return false;
+  const ageMs = nowMs - Date.parse(latest.ts);
+  if (latest.kind === "verify.started") return ageMs < VERIFY_STALE_MS;
+  if (latest.kind === "verify.queued") return ageMs < VERIFY_QUEUE_STALE_MS;
+  return false;
 }
 
 interface StallCheck {
@@ -954,13 +1001,22 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     if (pass && (!resumed || pass > resumed)) return;
   }
 
-  // Logged BEFORE the await: the task sits in `in_progress` for however long
-  // the command takes, and this is the only record that the transition is
-  // already under way. verifyInFlight() and the stall sweep both key on it, so
-  // it must exist before anything can observe the gap.
-  logEvent("verify.started", { taskId: task.id, agentId: agent.id });
-
-  const result = await runVerifyCommand(task.verify_cmd, task.worktree);
+  // Both events are logged from inside runVerifyCommand's callbacks, BEFORE it
+  // resolves: the task sits in `in_progress` for however long the command takes
+  // (plus any wait for a free verify slot), and these are the only record that
+  // the transition is already under way. verifyInFlight() and the stall sweep
+  // both key on them, so one of them must exist before anything can observe the
+  // gap. verify.started specifically means "a command is executing now" — a
+  // queued run logs verify.queued and nothing else until it actually starts.
+  const result = await runVerifyCommand(task.verify_cmd, task.worktree, {
+    onQueued: (ahead) =>
+      logEvent("verify.queued", {
+        taskId: task.id,
+        agentId: agent.id,
+        payload: { ahead },
+      }),
+    onStart: () => logEvent("verify.started", { taskId: task.id, agentId: agent.id }),
+  });
 
   // Verification can take minutes — if the task was cancelled (or otherwise
   // moved on) while it ran, the stale result must not resurrect it.
@@ -983,22 +1039,38 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
   }
 
   const round = verifyRound(task.id);
+  // A failure the daemon can see was contended is not evidence about the diff:
+  // it gets a retry that does not come out of the round's budget, capped per
+  // round so a genuinely failing task still reaches `blocked`. The load context
+  // goes on the event either way, so a human reading a block can tell a busy
+  // box from a broken change.
+  const contended = verifyWasContended(result.load);
+  const forgiven = contended && round.forgiven < MAX_CONTENDED_RETRIES;
   logEvent("verify.failed", {
     taskId: task.id,
     agentId: agent.id,
-    payload: { output: result.output.slice(-2000) },
+    payload: {
+      output: result.output.slice(-2000),
+      contended,
+      budget_excused: forgiven,
+      load: result.load,
+    },
   });
 
   const stallNote = stall.error
     ? `\n\n(this turn followed ${MAX_AUTO_NUDGES} auto-recovery attempts for a transient error: ${stall.error})`
     : "";
+  const loadNote = contended
+    ? `\n\nThe box was running another verification at the same time (${verifyLoadNote(result.load)}), so this failure may be timing rather than your change — re-run the command yourself before assuming a defect.`
+    : "";
 
-  const attempt = round.nudges + 1;
+  const attempt = round.attempts + 1;
+  const spent = round.spent + (forgiven ? 0 : 1);
   const nudged =
-    round.nudges < MAX_VERIFY_NUDGES &&
+    (round.spent < MAX_VERIFY_NUDGES || forgiven) &&
     (await resumeAgent(
       agent.id,
-      `Verification failed (\`${task.verify_cmd}\`). Fix the issues and finish the task. Output tail:\n${result.output.slice(-1500)}${stallNote}`,
+      `Verification failed (\`${task.verify_cmd}\`). Fix the issues and finish the task. Output tail:\n${result.output.slice(-1500)}${stallNote}${loadNote}`,
     )) === "sent";
 
   if (nudged) {
@@ -1023,19 +1095,28 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     logEvent("task.verify_nudged", {
       taskId: task.id,
       agentId: agent.id,
-      payload: { attempt, max: MAX_VERIFY_NUDGES },
+      payload: {
+        attempt,
+        spent,
+        forgiven: round.forgiven + (forgiven ? 1 : 0),
+        max: MAX_VERIFY_NUDGES,
+        contended,
+      },
     });
   } else {
     updateTask(task.id, { status: "blocked", block_cause: "verify_failed" });
     logEvent("task.blocked", {
       taskId: task.id,
       agentId: agent.id,
-      payload: { reason: "verification failed repeatedly" },
+      payload: {
+        reason: "verification failed repeatedly",
+        load: result.load,
+      },
     });
     notifyEvent(
       "task_blocked",
       `task #${task.id} blocked — verification keeps failing`,
-      `${task.title}\n\`${task.verify_cmd}\` failed ${attempt} time${attempt === 1 ? "" : "s"} on this round of work and the worker could not fix it${stallNote}. It will not retry on its own — steer it, requeue it, or fix the verify command.`,
+      `${task.title}\n\`${task.verify_cmd}\` failed ${attempt} time${attempt === 1 ? "" : "s"} on this round of work and the worker could not fix it${stallNote}. Last run: ${verifyLoadNote(result.load)}. It will not retry on its own — steer it, requeue it, or fix the verify command.`,
       {
         priority: "high",
         tags: "rotating_light",

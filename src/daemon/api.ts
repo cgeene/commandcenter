@@ -1488,6 +1488,7 @@ export function buildApp(): Hono {
     enabled: z.boolean().optional(),
     max_concurrent: z.number().int().min(1).max(10).optional(),
     daily_spawn_limit: z.number().int().min(1).max(200).optional(),
+    verify_concurrency: z.number().int().min(1).max(8).optional(),
     stall_minutes: z.number().int().min(2).max(240).optional(),
     active_hours: z
       .object({

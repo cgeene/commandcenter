@@ -913,6 +913,8 @@ function signalTitle(kind: string, payload: Record<string, unknown>): string {
     "task.reopened": "Task reopened",
     "task.requeued": "Task requeued",
     "task.autocompleted": "Task completed",
+    "verify.queued": "Verification queued",
+    "pr.freshen_verify_queued": "Re-merge check queued",
     "verify.passed": "Verification passed",
     "verify.failed": "Verification failed",
     "review.approved": "Review approved",
@@ -2133,6 +2135,7 @@ function SchedulerSection({
       await api("PATCH", "/api/scheduler", {
         max_concurrent: draft.max_concurrent,
         daily_spawn_limit: draft.daily_spawn_limit,
+        verify_concurrency: draft.verify_concurrency,
         stall_minutes: draft.stall_minutes,
         active_hours: draft.active_hours,
         auto_review: draft.auto_review,
@@ -2176,6 +2179,19 @@ function SchedulerSection({
             max={200}
             value={draft.daily_spawn_limit}
             onChange={(e) => set("daily_spawn_limit", Number(e.target.value))}
+          />
+        </SettingRow>
+        <SettingRow
+          label="Concurrent verifications"
+          when="immediate"
+          hint="verify_cmd runs allowed at once, fleet-wide. A verify_cmd is usually a whole test suite; extra runs queue."
+        >
+          <input
+            type="number"
+            min={1}
+            max={8}
+            value={draft.verify_concurrency}
+            onChange={(e) => set("verify_concurrency", Number(e.target.value))}
           />
         </SettingRow>
         <SettingRow
