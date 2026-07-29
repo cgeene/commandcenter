@@ -8,6 +8,17 @@ vi.setConfig({ testTimeout: 30_000 });
 let tmpDir: string;
 let originalPath: string | undefined;
 
+// The bound the daemon is put under for these tests. Small, because every
+// "hung" case has to wait it out.
+const TMUX_TIMEOUT_MS = 400;
+
+// What a bounded call must beat. The fake tmux below hangs for 60s, so any
+// return comfortably under that proves the timeout fired — while staying wide
+// enough that a loaded box cannot fail it on scheduling jitter alone. Asserting
+// a tight multiple of TMUX_TIMEOUT_MS instead would be a wall-clock race, which
+// is the class of flake this suite is trying to be rid of.
+const BOUNDED_MS = 20_000;
+
 const fakeTmux = `#!/bin/sh
 mode="\${CC_FAKE_TMUX_MODE:-ok}"
 
@@ -80,7 +91,7 @@ beforeEach(async () => {
   process.env.CC_FAKE_TMUX_LOG = path.join(tmpDir, "calls.log");
   process.env.CC_DATA_DIR = path.join(tmpDir, "data");
   const { _setTmuxTimeoutForTest } = await import("../src/daemon/tmux.js");
-  _setTmuxTimeoutForTest(2_000);
+  _setTmuxTimeoutForTest(TMUX_TIMEOUT_MS);
 });
 
 afterEach(async () => {
@@ -111,7 +122,7 @@ describe("bounded daemon tmux commands", () => {
 
     const failure = await sendText("cc:@1", "sensitive message").catch((error) => error);
 
-    expect(Date.now() - started).toBeLessThan(3_500);
+    expect(Date.now() - started).toBeLessThan(BOUNDED_MS);
     expect(failure).toMatchObject({
       code: "timeout",
       message: "tmux send-keys timed out",
@@ -127,7 +138,7 @@ describe("bounded daemon tmux commands", () => {
 
     const failure = await sendText("cc:@1", "message").catch((error) => error);
 
-    expect(Date.now() - started).toBeLessThan(3_800);
+    expect(Date.now() - started).toBeLessThan(BOUNDED_MS);
     expect(failure).toMatchObject({ code: "timeout" });
     expect(calls()).toEqual(["-l", "Enter"]);
   });
@@ -156,7 +167,7 @@ describe("bounded daemon tmux commands", () => {
 
     expect(listLiveWindowIds()).toBeNull();
 
-    expect(Date.now() - started).toBeLessThan(3_500);
+    expect(Date.now() - started).toBeLessThan(BOUNDED_MS);
     process.env.CC_FAKE_TMUX_MODE = "ok";
     expect(listLiveWindowIds()).toEqual(["cc:@1"]);
   });
@@ -183,7 +194,7 @@ describe("bounded daemon tmux commands", () => {
 
     const peek = await app.request(`/api/agents/${agent.id}/peek`);
 
-    expect(Date.now() - started).toBeLessThan(3_500);
+    expect(Date.now() - started).toBeLessThan(BOUNDED_MS);
     expect(peek.status).toBe(503);
     expect(await peek.json()).toEqual({ error: "tmux pane unavailable" });
     const health = await app.request("/healthz");
@@ -211,7 +222,7 @@ describe("bounded daemon tmux commands", () => {
       }),
     });
 
-    expect(Date.now() - started).toBeLessThan(3_500);
+    expect(Date.now() - started).toBeLessThan(BOUNDED_MS);
     expect(hook.status).toBe(200);
     const health = await app.request("/healthz");
     expect(health.status).toBe(200);
@@ -236,10 +247,19 @@ describe("bounded daemon tmux commands", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 50));
 
-    const healthStarted = Date.now();
-    const health = await app.request("/healthz");
-    expect(health.status).toBe(200);
-    expect(Date.now() - healthStarted).toBeLessThan(1_500);
+    // Ordering, not elapsed time: /healthz must come back while the hung send is
+    // STILL outstanding. A blocked event loop would serve it only after the send
+    // gave up, so losing this race is exactly the regression — and unlike a
+    // millisecond bound it cannot be failed by a busy machine.
+    const servedFirst = await Promise.race([
+      Promise.resolve(app.request("/healthz")).then((res) => ({
+        who: "health" as const,
+        res,
+      })),
+      Promise.resolve(send).then(() => ({ who: "send" as const, res: null })),
+    ]);
+    expect(servedFirst.who).toBe("health");
+    expect(servedFirst.res?.status).toBe(200);
 
     const response = await send;
     expect(response.status).toBe(503);
