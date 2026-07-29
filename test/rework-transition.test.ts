@@ -177,6 +177,133 @@ describe("rework round re-enters review", () => {
   });
 });
 
+/**
+ * The retry budget for a failing verify_cmd belongs to the round of work being
+ * done now, not to the task's whole history. Counted per lifetime, a task that
+ * had used the budget up months of rounds ago blocked on the FIRST failure of a
+ * rework round — the worker was never told what failed and never got to fix it.
+ */
+describe("the verify-retry budget is per work round", () => {
+  /** Task in `in_progress` with a worker, a failing verify_cmd, and a result. */
+  async function workingTask() {
+    const { updateTask } = await import("../src/db/tasks.js");
+    const { task, worker } = await reviewTask({ verify_cmd: "false" });
+    updateTask(task.id, {
+      status: "in_progress",
+      result_summary: "round result",
+    });
+    return { task, worker };
+  }
+
+  async function eventKinds(limit = 120) {
+    const { listEvents } = await import("../src/db/events.js");
+    return listEvents(limit).map((e) => e.kind);
+  }
+
+  async function nudgeAttempts(taskId: number) {
+    const { listEvents } = await import("../src/db/events.js");
+    return listEvents(200)
+      .filter((e) => e.task_id === taskId && e.kind === "task.verify_nudged")
+      .map((e) => (JSON.parse(e.payload!) as { attempt: number }).attempt)
+      .reverse();
+  }
+
+  it("nudges the worker on the first failure of a round after a rejection", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { handleVerdict } = await import("../src/daemon/review.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { setSchedulerConfig } = await import("../src/db/settings.js");
+    setSchedulerConfig({ review_max_cycles: 6 });
+    const { task, worker } = await reviewTask({
+      verify_cmd: "false",
+      review_cycles: 1,
+    });
+
+    // Earlier rounds already burned the whole budget.
+    for (const attempt of [1, 2]) {
+      logEvent("verify.failed", { taskId: task.id, agentId: worker.id });
+      logEvent("task.verify_nudged", {
+        taskId: task.id,
+        agentId: worker.id,
+        payload: { attempt, max: 2 },
+      });
+    }
+
+    // A reviewer rejects: task.reopened, worker back to work — a new round.
+    await handleVerdict(task.id, 99, "reject", "round notes");
+    expect(getTask(task.id)!.status).toBe("in_progress");
+    updateTask(task.id, { result_summary: "rework result" });
+    sendText.mockClear();
+
+    await handleHookEvent(worker.id, { hook_event_name: "Stop" });
+
+    // The failure output went back into the worker's session, and the task is
+    // still being worked rather than blocked with nobody told why.
+    expect(await nudgeAttempts(task.id)).toEqual([1, 2, 1]);
+    expect(sendText).toHaveBeenCalled();
+    expect(getTask(task.id)!.status).toBe("in_progress");
+    expect(await eventKinds()).not.toContain("task.blocked");
+  });
+
+  it("gives a requeued task a fresh budget after it blocked in an earlier round", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { logEvent } = await import("../src/db/events.js");
+    const { task, worker } = await workingTask();
+
+    // Three failures in one round: two nudges, then the block.
+    for (let i = 0; i < 3; i++) {
+      await handleHookEvent(worker.id, { hook_event_name: "Stop" });
+    }
+    expect(getTask(task.id)!.status).toBe("blocked");
+    expect(await nudgeAttempts(task.id)).toEqual([1, 2]);
+
+    // A human requeues it and a worker picks it up again.
+    updateTask(task.id, { status: "in_progress" });
+    logEvent("task.requeued", { taskId: task.id });
+
+    await handleHookEvent(worker.id, { hook_event_name: "Stop" });
+
+    expect(await nudgeAttempts(task.id)).toEqual([1, 2, 1]);
+    expect(getTask(task.id)!.status).toBe("in_progress");
+  });
+
+  it("still blocks a task that fails three times inside one round", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getTask } = await import("../src/db/tasks.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { task, worker } = await workingTask();
+
+    for (const expected of ["in_progress", "in_progress", "blocked"]) {
+      await handleHookEvent(worker.id, { hook_event_name: "Stop" });
+      expect(getTask(task.id)!.status).toBe(expected);
+    }
+
+    expect(await nudgeAttempts(task.id)).toEqual([1, 2]);
+    const blocked = listEvents(200).find((e) => e.kind === "task.blocked");
+    expect(blocked?.task_id).toBe(task.id);
+  });
+
+  // The nudge branch reopens a task it found in `review`, and that reopen is
+  // itself a round marker. A worker that moves itself back to `review` every
+  // turn therefore walks this path repeatedly — if the reopen reset the budget,
+  // the task would be nudged forever instead of ever blocking.
+  it("blocks a worker that re-enters review before each failure", async () => {
+    const { handleHookEvent } = await import("../src/daemon/hooks.js");
+    const { getTask, updateTask } = await import("../src/db/tasks.js");
+    const { task, worker } = await reviewTask({ verify_cmd: "false" });
+
+    for (const expected of ["in_progress", "in_progress", "blocked"]) {
+      updateTask(task.id, { status: "review" });
+      await handleHookEvent(worker.id, { hook_event_name: "Stop" });
+      expect(getTask(task.id)!.status).toBe(expected);
+    }
+
+    expect(await nudgeAttempts(task.id)).toEqual([1, 2]);
+  });
+});
+
 describe("the verify window is not a wait", () => {
   it("an idle ping while verify_cmd is running is suppressed, not delegated", async () => {
     const { handleHookEvent, verifyInFlight } = await import(

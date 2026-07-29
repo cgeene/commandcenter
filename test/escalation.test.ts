@@ -13,6 +13,8 @@ beforeEach(async () => {
   delete process.env.CC_NTFY_URL;
   fetchMock = vi.fn(async () => new Response("ok"));
   globalThis.fetch = fetchMock as unknown as typeof fetch;
+  const { clearRecordedPushes } = await import("../src/daemon/notify.js");
+  clearRecordedPushes();
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
 });
@@ -97,7 +99,11 @@ describe("watchdog escalation", () => {
     getDb().prepare("DELETE FROM events WHERE kind = 'waiting.escalated'").run();
     watchdog(noopDeps);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // Dispatch is daemon-only, so a test run records the push instead of
+    // sending it (see test/notify-dispatch-guard.test.ts).
+    const { recordedPushes } = await import("../src/daemon/notify.js");
+    expect(recordedPushes()).toHaveLength(1);
+    expect(fetchMock).not.toHaveBeenCalled();
     const pushed = listEvents(20).filter((e) => e.kind === "notify.pushed");
     expect(pushed.length).toBe(1);
     expect(JSON.parse(pushed[0].payload ?? "{}").once).toMatch(

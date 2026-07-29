@@ -146,6 +146,62 @@ export function __clearBackgroundParkForTests(): void {
 /** Terminal markers of a verify run started by transitionOnStop. */
 const VERIFY_DONE_EVENTS = ["verify.passed", "verify.failed"] as const;
 
+/** Something outside this task's own turn loop pushed it back into work: a
+ *  review rejection or PR feedback (task.reopened), a requeue, an archive
+ *  resume, or a fresh worker. Each one starts a new work round — the point
+ *  before which nothing that happened is about the work being done now. */
+const ROUND_START_EVENTS = [
+  "task.reopened",
+  "task.archived_resumed",
+  "task.requeued",
+  "agent.spawned",
+];
+
+interface VerifyRound {
+  /** Event id the current round started at; 0 when the task never restarted. */
+  startId: number;
+  /** Verify nudges already spent on this round. */
+  nudges: number;
+}
+
+/**
+ * How much of the verify-retry budget the task's CURRENT work round has used.
+ *
+ * Scoped per round rather than per task lifetime: a task that used the budget
+ * up in an earlier round still has to be told what failed on the first failure
+ * of the next one. Counted lifetime, a rework round after a review rejection
+ * blocked on its first failure, without the worker ever seeing the output.
+ *
+ * The count is read back from the newest `task.verify_nudged` marker's own
+ * attempt number, NOT by counting `verify.failed` since the round marker: the
+ * nudge branch in transitionOnStop logs a round marker of its own
+ * (`task.reopened`) whenever it pulls a task out of `review`, so any
+ * count-since-the-marker resets to zero every time that path runs and the
+ * budget would never be reached. Chaining through the marker's payload is
+ * therefore load-bearing, and so is logging that reopen BEFORE the nudge
+ * marker it belongs to — see the ordering note at that call site.
+ */
+function verifyRound(taskId: number): VerifyRound {
+  const startId = latestTaskEventId(taskId, ROUND_START_EVENTS) ?? 0;
+  const nudge = latestTaskEvent(taskId, ["task.verify_nudged"]);
+  if (!nudge || nudge.id < startId) return { startId, nudges: 0 };
+  let attempt: unknown;
+  try {
+    attempt = nudge.payload
+      ? (JSON.parse(nudge.payload) as { attempt?: unknown }).attempt
+      : undefined;
+  } catch {
+    attempt = undefined;
+  }
+  // An unreadable marker counts as a spent budget: erring toward one blocked
+  // task beats erring toward nudging the same failure forever.
+  const spent =
+    typeof attempt === "number" && Number.isFinite(attempt) && attempt > 0
+      ? attempt
+      : MAX_VERIFY_NUDGES;
+  return { startId, nudges: spent };
+}
+
 /** Past this, a `verify.started` with no outcome is not a run in progress — it
  *  is the residue of a daemon that died mid-verify. Comfortably beyond
  *  runVerify's own timeout, so it can never cut short a live run. */
@@ -886,19 +942,12 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
 
   // Already in review AND already verified since work last resumed — an
   // extra Stop, e.g. after the human messaged the idle worker. Nothing to
-  // re-run. Every review -> work transition logs a resume marker
-  // (task.reopened / task.archived_resumed / task.requeued / agent.spawned),
-  // so a pass that predates
-  // the latest one never suppresses a re-verify of the new work. Event ids
-  // order reliably where same-second timestamps cannot.
+  // re-run. Every review -> work transition logs a ROUND_START_EVENTS marker,
+  // so a pass that predates the latest one never suppresses a re-verify of the
+  // new work. Event ids order reliably where same-second timestamps cannot.
   if (wasReview) {
     const pass = latestTaskEventId(task.id, ["verify.passed"]);
-    const resumed = latestTaskEventId(task.id, [
-      "task.reopened",
-      "task.archived_resumed",
-      "task.requeued",
-      "agent.spawned",
-    ]);
+    const resumed = latestTaskEventId(task.id, ROUND_START_EVENTS);
     if (pass && (!resumed || pass > resumed)) return;
   }
 
@@ -930,7 +979,7 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     return;
   }
 
-  const priorFails = countTaskEvents(task.id, "verify.failed");
+  const round = verifyRound(task.id);
   logEvent("verify.failed", {
     taskId: task.id,
     agentId: agent.id,
@@ -941,25 +990,15 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     ? `\n\n(this turn followed ${MAX_AUTO_NUDGES} auto-recovery attempts for a transient error: ${stall.error})`
     : "";
 
+  const attempt = round.nudges + 1;
   const nudged =
-    priorFails < MAX_VERIFY_NUDGES &&
+    round.nudges < MAX_VERIFY_NUDGES &&
     (await resumeAgent(
       agent.id,
       `Verification failed (\`${task.verify_cmd}\`). Fix the issues and finish the task. Output tail:\n${result.output.slice(-1500)}${stallNote}`,
     )) === "sent";
 
   if (nudged) {
-    // The worker is working again, but resumeAgent records nothing on success
-    // and (outside wasReview) neither did this branch, so the task's own event
-    // log showed a finished worker and no follow-up — indistinguishable from a
-    // Stop nobody ever processed. Anything reasoning about "has this task moved
-    // since its worker stopped" needs this marker; without it the stall sweep
-    // treats a worker mid-fix as stranded and re-drives verify underneath it.
-    logEvent("task.verify_nudged", {
-      taskId: task.id,
-      agentId: agent.id,
-      payload: { attempt: priorFails + 1, max: MAX_VERIFY_NUDGES },
-    });
     if (wasReview) {
       updateTask(task.id, { status: "in_progress" });
       logEvent("task.reopened", {
@@ -967,6 +1006,22 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
         payload: { reason: "verify failed" },
       });
     }
+    // ORDER MATTERS: this marker must be logged AFTER the reopen above.
+    // task.reopened is a ROUND_START_EVENTS marker, and verifyRound() only
+    // reads an attempt count back from a nudge marker newer than the round's
+    // start — log them the other way round and every pass through this branch
+    // looks like the first failure of a fresh round, so the budget never runs
+    // out and the task is nudged forever.
+    //
+    // The marker is also what tells the rest of the platform this task moved:
+    // resumeAgent records nothing on success, so without it the task's log
+    // shows a finished worker and no follow-up, and the stall sweep treats a
+    // worker mid-fix as stranded and re-drives verify underneath it.
+    logEvent("task.verify_nudged", {
+      taskId: task.id,
+      agentId: agent.id,
+      payload: { attempt, max: MAX_VERIFY_NUDGES },
+    });
   } else {
     updateTask(task.id, { status: "blocked" });
     logEvent("task.blocked", {
@@ -977,13 +1032,16 @@ async function transitionOnStop(task: Task, agent: Agent): Promise<void> {
     notifyEvent(
       "task_blocked",
       `task #${task.id} blocked — verification keeps failing`,
-      `${task.title}\n\`${task.verify_cmd}\` failed ${priorFails + 1} times and the worker could not fix it${stallNote}. It will not retry on its own — steer it, requeue it, or fix the verify command.`,
+      `${task.title}\n\`${task.verify_cmd}\` failed ${attempt} time${attempt === 1 ? "" : "s"} on this round of work and the worker could not fix it${stallNote}. It will not retry on its own — steer it, requeue it, or fix the verify command.`,
       {
         priority: "high",
         tags: "rotating_light",
         taskId: task.id,
         agentId: agent.id,
-        once: `task:${task.id}:blocked:verify:${priorFails + 1}`,
+        // Keyed on the round as well as the attempt: the same attempt number
+        // recurs in every later round, and a lifetime-unique key would latch
+        // the first block and silently swallow all the others.
+        once: `task:${task.id}:blocked:verify:r${round.startId}:${attempt}`,
       },
     );
   }

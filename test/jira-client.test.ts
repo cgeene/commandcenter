@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildCommentAdf,
   buildDescriptionAdf,
@@ -226,5 +226,27 @@ describe("ADF builders", () => {
       version: 1,
       content: [{ type: "paragraph", content: [{ type: "text", text: "hi" }] }],
     });
+  });
+});
+
+describe("the default runner is daemon-only", () => {
+  // Same class as the ntfy dispatch guard: any process can import this module,
+  // and a JIRA write comments on and transitions a real issue.
+  it("refuses to reach JIRA from a process that is not the daemon", async () => {
+    const fetchMock = vi.fn(async () => new Response("{}"));
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      const res = await new JiraClient({ sleep: noSleep, maxRetries: 0 })
+        .addComment("EN-1", buildCommentAdf("hi"))
+        .then(
+          () => "resolved",
+          (err: Error) => err.message,
+        );
+      expect(res).toContain("daemon-only");
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });

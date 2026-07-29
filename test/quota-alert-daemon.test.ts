@@ -11,7 +11,16 @@ import type { LiveUsage, UsageMeter } from "../src/lib/usage.js";
  */
 
 let tmpDir: string;
-let pushes: Array<{ title: string; body: string }>;
+let notifyModule: typeof import("../src/daemon/notify.js");
+let fetchMock: ReturnType<typeof vi.fn>;
+
+/** Pushes produced so far. Dispatch is daemon-only, so a test run records the
+ *  intent instead of sending it (see test/notify-dispatch-guard.test.ts). */
+function pushes(): { title: string; body: string }[] {
+  return notifyModule
+    .recordedPushes()
+    .map((push) => ({ title: push.title, body: push.message }));
+}
 
 const ENV_KEYS = ["CC_NTFY_URL", "CC_NTFY_TOKEN", "CC_LIVE_USAGE", "CC_CLAUDE_HOME"] as const;
 let savedEnv: Record<string, string | undefined>;
@@ -28,20 +37,18 @@ beforeEach(async () => {
   // No test may reach the real keychain or a developer's on-disk credential.
   process.env.CC_CLAUDE_HOME = path.join(tmpDir, "claude-home");
 
-  pushes = [];
-  vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
-    pushes.push({
-      title: String((init?.headers as Record<string, string>)?.Title ?? ""),
-      body: String(init?.body ?? ""),
-    });
-    return new Response("ok", { status: 200 });
-  });
+  // A tripwire, not a collector: no test here may reach the network.
+  fetchMock = vi.fn(async () => new Response("ok", { status: 200 }));
+  vi.stubGlobal("fetch", fetchMock);
 
+  notifyModule = await import("../src/daemon/notify.js");
+  notifyModule.clearRecordedPushes();
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
 });
 
 afterEach(async () => {
+  expect(fetchMock).not.toHaveBeenCalled();
   vi.unstubAllGlobals();
   const { closeDb } = await import("../src/db/db.js");
   closeDb();
@@ -85,17 +92,17 @@ describe("runQuotaAlerts", () => {
 
     runQuotaAlerts(usage(70));
     await flush();
-    expect(pushes).toHaveLength(0);
+    expect(pushes()).toHaveLength(0);
 
     runQuotaAlerts(usage(85));
     await flush();
-    expect(pushes).toHaveLength(1);
-    expect(pushes[0].title).toContain("85%");
+    expect(pushes()).toHaveLength(1);
+    expect(pushes()[0].title).toContain("85%");
     expect(getQuotaAlertLatch().threshold_window).toBe(`session@${RESETS}`);
 
     runQuotaAlerts(usage(92));
     await flush();
-    expect(pushes).toHaveLength(1); // the hourly re-observation must not re-page
+    expect(pushes()).toHaveLength(1); // the hourly re-observation must not re-page
   });
 
   it("logs an event for the crossing", async () => {
@@ -114,7 +121,7 @@ describe("runQuotaAlerts", () => {
     setQuotaSettings({ alert_threshold_percent: 50 });
     runQuotaAlerts(usage(55));
     await flush();
-    expect(pushes).toHaveLength(1);
+    expect(pushes()).toHaveLength(1);
   });
 
   it("never pushes when the threshold is cleared", async () => {
@@ -124,7 +131,7 @@ describe("runQuotaAlerts", () => {
     setQuotaSettings({ alert_threshold_percent: null });
     runQuotaAlerts(usage(99));
     await flush();
-    expect(pushes).toHaveLength(0);
+    expect(pushes()).toHaveLength(0);
   });
 
   it("pushes on the spend cap", async () => {
@@ -142,8 +149,8 @@ describe("runQuotaAlerts", () => {
       }),
     );
     await flush();
-    expect(pushes).toHaveLength(1);
-    expect(pushes[0].title).toContain("spend limit");
+    expect(pushes()).toHaveLength(1);
+    expect(pushes()[0].title).toContain("spend limit");
   });
 });
 
@@ -159,7 +166,7 @@ describe("refreshLiveUsage — a broken feed never pages", () => {
       const state = await refreshLiveUsage();
       expect(state.error).toBeTruthy();
       await flush();
-      expect(pushes).toHaveLength(0);
+      expect(pushes()).toHaveLength(0);
     } finally {
       _setCredentialReader(null);
     }
@@ -179,7 +186,7 @@ describe("refreshLiveUsage — a broken feed never pages", () => {
     try {
       await refreshLiveUsage();
       await flush();
-      expect(pushes).toHaveLength(0);
+      expect(pushes()).toHaveLength(0);
       expect(getQuotaAlertLatch().threshold_window).toBeNull();
     } finally {
       _setCredentialReader(null);
@@ -200,7 +207,7 @@ describe("refreshLiveUsage — a broken feed never pages", () => {
       const state = await refreshLiveUsage();
       expect(state.error).toBeNull();
       await flush();
-      expect(pushes.map((p) => p.title)).toEqual(["Claude quota 93% used"]);
+      expect(pushes().map((p) => p.title)).toEqual(["Claude quota 93% used"]);
     } finally {
       _setCredentialReader(null);
       _setUsageFetch(null);
