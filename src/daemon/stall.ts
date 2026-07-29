@@ -4,8 +4,10 @@
 // narrating in prose (which always has other words between the bullet and
 // the phrase).
 const ANCHOR_RE = /^\s*⏺\s*API Error:/i;
+// "Connection closed mid-response" is the same class of retryable transport
+// failure as the rest, and the Codex pattern below already treats it as one.
 const SIGNATURE_RE =
-  /(Server error|Overloaded|overloaded_error|rate.?limit|Internal server error)/i;
+  /(Server error|Overloaded|overloaded_error|rate.?limit|Internal server error|Connection (?:closed|reset))/i;
 const BLOCK_START_RE = /^\s*⏺/;
 const CODEX_ERROR_RE =
   /^\s*(?:■|⚠)\s*(?:stream disconnected|connection (?:closed|failed)|unexpected status|error sending request|server error|internal server error|rate.?limit)/i;

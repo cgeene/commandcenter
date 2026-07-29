@@ -303,6 +303,35 @@ export function deriveAttention(deps: DeriveDeps): AttentionItem[] {
     });
   }
 
+  //     Every reviewer the task was given stopped without a verdict, so the
+  //     platform stopped replacing them. Anchored on the event rather than the
+  //     blocked status alone: a later round or status change supersedes it, and
+  //     a fresh episode gets a fresh key past a dismissal.
+  for (const t of tasks) {
+    if (t.status !== "blocked") continue;
+    const gaveUp = latestTaskEvent(t.id, [
+      "review.reviewer_unrecoverable",
+      "review.round_started",
+      "review.approved",
+      "review.rejected",
+      "task.status",
+    ]);
+    if (gaveUp?.kind !== "review.reviewer_unrecoverable") continue;
+    push({
+      id: `decision:reviewer_gave_up:${t.id}:${gaveUp.id}`,
+      kind: "decision",
+      title: `Review stuck — #${t.id} ${t.title} (no reviewer would finish)`,
+      context:
+        "Every reviewer spawned for this task stopped without submitting a verdict, so the platform stopped replacing them. Review it yourself, or look at why reviewers keep dying on it — an oversized diff and a hanging verify command are the usual causes.",
+      severity: "orange",
+      urgent: false,
+      task_id: t.id,
+      agent_id: t.agent_id,
+      pr_url: t.pr_url,
+      created_at: gaveUp.ts,
+    });
+  }
+
   // --- jira_sync: a task's JIRA ticket has failed to sync/create ≥ threshold
   //     times in a row. Mirrors the PR "sync broken" pattern (§5): the daemon
   //     already pages once via notify() at the threshold; this makes the

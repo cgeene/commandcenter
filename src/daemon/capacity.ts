@@ -1,5 +1,6 @@
 import { listAgents, type Agent } from "../db/agents.js";
-import { countAgentEvents, countEventsToday, logEvent } from "../db/events.js";
+import { countEventsToday, logEvent } from "../db/events.js";
+import { reviewerActive } from "./reviewerhealth.js";
 import { getSchedulerConfig } from "../db/settings.js";
 import { getTask, type Task } from "../db/tasks.js";
 
@@ -46,7 +47,8 @@ export function autonomousSpawnsToday(): number {
  *  - the reviewer's spawn threw after its row was created, so it never got a
  *    tmux pane and no process exists;
  *  - the reviewer's turn ended without it submitting a verdict, or it stalled.
- *    Nothing reaps a reviewer, so that row stays live (usually `idle`) forever.
+ *    The watchdog reaps that row and starts a replacement round, but only after
+ *    a grace period, and the replacements are capped.
  *
  * Exempting those would let live provider processes pile up with no bound and
  * no signal. They fall back to COUNTED, which is the pre-existing behavior:
@@ -79,13 +81,6 @@ export interface WorkerSlots {
   parked: Agent[];
 }
 
-/** Reviewer states that mean no verdict is coming from this agent any more.
- *  `idle` is the zombie case: a reviewer whose turn ended without submitting is
- *  deliberately left alive for the human to inspect, and nothing ever reaps it
- *  (the watchdog's reap branch is workers-only). `stalled` is the silence
- *  detector's verdict on the same thing. */
-const REVIEWER_STOPPED_STATES = new Set(["idle", "stalled", "dead"]);
-
 /**
  * Hard ceiling on how long one review round may forgive a worker's slot. A real
  * round is minutes; this is hours, so it never fires on a slow review. It is a
@@ -97,22 +92,16 @@ const REVIEWER_STOPPED_STATES = new Set(["idle", "stalled", "dead"]);
 const MAX_REVIEW_PARK_MS = 4 * 60 * 60_000;
 
 /**
- * Is this reviewer still going to land a verdict? Being "live" is not enough:
- * `listAgents({live: true})` only means `state != 'dead'`, and both a reviewer
- * that stopped without submitting and a reviewer whose spawn threw before it
- * got a pane stay live indefinitely. A worker may only be forgiven its slot on
- * positive evidence, so anything unclear here counts the worker — the cost of
- * being wrong is one deferred spawn, versus an unbounded leak the other way.
+ * Is this reviewer still going to land a verdict, AND recently enough that its
+ * worker's slot is still worth forgiving? A worker may only be forgiven on
+ * positive evidence, so anything unclear counts it — the cost of being wrong is
+ * one deferred spawn, versus an unbounded leak the other way. `reviewerActive`
+ * is the shared "is this reviewer real" test; the ceiling below is this
+ * caller's own extra conservatism and deliberately does NOT feed the spawn
+ * guards, which must not start a second reviewer on one that is still working.
  */
 function reviewerWillLandVerdict(reviewer: Agent, nowMs: number): boolean {
-  // No pane: spawn threw between createAgent and attach, so no process exists.
-  if (!reviewer.tmux_target) return false;
-  if (REVIEWER_STOPPED_STATES.has(reviewer.state)) return false;
-  // Its turn ended without a verdict at least once (hooks.reviewerStopped).
-  // Auto-nudge recovery is already exhausted by then; the human has been paged.
-  if (countAgentEvents(reviewer.id, ["reviewer.stopped_incomplete"]) > 0) {
-    return false;
-  }
+  if (!reviewerActive(reviewer)) return false;
   // Backstop. spawned_at is this round's start: each round spawns a reviewer.
   // An unparseable timestamp is treated as expired — fail closed.
   const roundAge = nowMs - Date.parse(reviewer.spawned_at);
