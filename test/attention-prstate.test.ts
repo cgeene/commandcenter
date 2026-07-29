@@ -69,24 +69,27 @@ async function unknownEvents(taskId: number) {
 }
 
 describe("normalizePrState — the single casing boundary", () => {
-  it("folds gh's UPPERCASE states onto the column's lowercase vocabulary", async () => {
+  // The one casing boundary in the system: gh speaks UPPERCASE, the column stores
+  // lowercase. Anything unrecognized must be null so callers fail CLOSED rather
+  // than treating it as open.
+  it("folds recognized states to lowercase and everything else to null", async () => {
     const { normalizePrState } = await import("../src/lib/prstate.js");
-    expect(normalizePrState("OPEN")).toBe("open");
-    expect(normalizePrState("MERGED")).toBe("merged");
-    expect(normalizePrState("CLOSED")).toBe("closed");
-    expect(normalizePrState("open")).toBe("open");
-    expect(normalizePrState("merged")).toBe("merged");
-    expect(normalizePrState("closed")).toBe("closed");
-    expect(normalizePrState(" Merged ")).toBe("merged");
-  });
-
-  it("returns null for anything it does not recognize", async () => {
-    const { normalizePrState } = await import("../src/lib/prstate.js");
-    expect(normalizePrState(null)).toBeNull();
-    expect(normalizePrState(undefined)).toBeNull();
-    expect(normalizePrState("")).toBeNull();
-    expect(normalizePrState("unknown")).toBeNull();
-    expect(normalizePrState("DRAFT")).toBeNull();
+    for (const [raw, want] of [
+      ["OPEN", "open"],
+      ["MERGED", "merged"],
+      ["CLOSED", "closed"],
+      ["open", "open"],
+      ["merged", "merged"],
+      ["closed", "closed"],
+      [" Merged ", "merged"],
+      [null, null],
+      [undefined, null],
+      ["", null],
+      ["unknown", null],
+      ["DRAFT", null],
+    ] as [string | null | undefined, string | null][]) {
+      expect(normalizePrState(raw), String(raw)).toBe(want);
+    }
   });
 
   it("prsync persists the lowercase form gh's UPPERCASE state maps to", async () => {
