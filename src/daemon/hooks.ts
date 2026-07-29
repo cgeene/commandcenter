@@ -357,11 +357,11 @@ function delegationPrompt(agent: Agent): string {
 /**
  * Startup / idle catch-up delegator: hand a worker wait to a main that has just
  * become available (working or idle) — it runs right after the orchestrator
- * clears its own startup/idle screen, catching up waits that accrued while it
- * was down. Unlike the real-time worker-wait path it does not queue, but it
- * shares the SAME prompt-clear gate (deliverToMainIfClear) so a human draft in
- * the just-ready main's composer is never clobbered; `allowWorking` keeps the
- * original "deliver to a working|idle main" reach.
+ * clears its own startup screen and after each turn it finishes, catching up
+ * waits it was never told about. Unlike the real-time worker-wait path it does
+ * not queue, but it shares the SAME prompt-clear gate (deliverToMainIfClear) so
+ * a human draft in the just-ready main's composer is never clobbered;
+ * `allowWorking` keeps the original "deliver to a working|idle main" reach.
  */
 async function delegateToMain(
   waiting: Agent,
@@ -391,13 +391,23 @@ async function delegateToMain(
   return true;
 }
 
-/** Once the orchestrator clears its own startup trust screen, hand it the
- * oldest outstanding worker/reviewer wait that occurred while it was down. */
+/** Hand the orchestrator the oldest outstanding worker/reviewer wait it has not
+ * been told about — after it clears its startup trust screen, and again on every
+ * idle_prompt once it finishes a turn. */
 async function delegateExistingWait(main: Agent): Promise<boolean> {
   const candidates = listAgents({ live: true }).filter((candidate) => {
     if (candidate.kind === "main" || candidate.state !== "waiting_input") {
       return false;
     }
+    // This path bypasses the delivery queue entirely, so notifqueue's
+    // flush-time re-validation cannot cover it — the status check has to be
+    // repeated here. It is emphatically NOT redundant with that one: the
+    // idle_prompt caller runs flushMainQueue immediately before this, and a
+    // ping EXPIRED there logs only delivery.expired, never waiting.delegated.
+    // So expiring a ping leaves the wait looking permanently un-delegated,
+    // which makes the recency test below match forever.
+    const task = candidate.task_id ? getTask(candidate.task_id) : undefined;
+    if (waitIsMoot(candidate, task)) return false;
     const started = latestAgentEvent(candidate.id, [...WAIT_HOOK_EVENTS]);
     const delegated = latestAgentEvent(candidate.id, ["waiting.delegated"]);
     return Boolean(started && (!delegated || delegated.id < started.id));
