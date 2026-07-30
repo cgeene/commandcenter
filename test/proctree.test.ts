@@ -372,10 +372,12 @@ describe("sweepVanishedPaneGroup (real processes)", () => {
     process.kill(leader.pid!, "SIGKILL");
   });
 
+  // "no_handle", not "unreachable": nothing was ever reachable to begin with, so
+  // this must not spend the token that means "the pane's descendants escaped".
   it("rejects nonsense pids", () => {
     for (const pid of [1, 0, -5]) {
       expect(sweepVanishedPaneGroup(pid, 3600)).toEqual({
-        outcome: "unreachable",
+        outcome: "no_handle",
         killed: [],
       });
     }

@@ -246,7 +246,40 @@ describe("watchdog", () => {
     expect(swept[0][1]).toBeGreaterThanOrEqual(0);
     const vanished = listEvents(20).find((e) => e.kind === "agent.vanished");
     expect(JSON.parse(vanished!.payload!).swept_pids).toEqual([7001, 7002]);
+    expect(JSON.parse(vanished!.payload!).pane_sweep).toBe("swept");
     // Marked swept, so a later kill does not sweep the same group twice.
+    expect(getAgent(agent.id)?.pane_pid).toBeNull();
+  });
+
+  it("records an unreachable sweep on agent.vanished so a blind reap is not silent", async () => {
+    // This is the path a CRASHED pane takes — the branch never calls killAgent,
+    // so agent.kill_unconfirmed cannot reach it and this payload is the only
+    // place the verdict can be written. An unreachable sweep proved nothing
+    // about what the pane left running, and the row gives up its pane pid all
+    // the same; without the verdict that is indistinguishable from a real reap.
+    const { createAgent, getAgent, updateAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const { watchdog } = await import("../src/daemon/scheduler.js");
+    const agent = createAgent({
+      kind: "worker",
+      state: "working",
+      tmux_target: "cc:@9",
+    });
+    updateAgent(agent.id, { pane_pid: 4242 });
+
+    const missing = {
+      spawn: () => {},
+      windows: () => seen([]),
+      now: () => new Date(),
+      sweepPaneGroup: () => ({ outcome: "unreachable" as const, killed: [] }),
+    };
+    watchdog(missing); // first pass only records the missing window
+    watchdog(missing); // second pass confirms the vanish
+
+    const vanished = listEvents(20).find((e) => e.kind === "agent.vanished");
+    const payload = JSON.parse(vanished!.payload!);
+    expect(payload.pane_sweep).toBe("unreachable");
+    expect(payload.swept_pids).toBeUndefined();
     expect(getAgent(agent.id)?.pane_pid).toBeNull();
   });
 

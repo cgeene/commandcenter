@@ -321,6 +321,12 @@ export type PaneSweepOutcome =
    *  same pid can only reach the same empty group, so callers should clear it,
    *  but they must not report the pane as confirmed stopped. */
   | "unreachable"
+  /** There was no usable handle to look with in the first place, so this is not
+   *  a blind reap — it is a reap that never began. Kept distinct from
+   *  "unreachable" so that token stays a specific signal: an agent whose
+   *  pane pid was never recorded properly is a different problem from a pane
+   *  whose descendants escaped the handle. Callers treat it the same way. */
+  | "no_handle"
   /** Could not look, or the pane is demonstrably still alive. Nothing was
    *  done and the caller must KEEP the recorded pane pid — it is still the
    *  only handle on this pane, and a later sweep can do better. */
@@ -373,7 +379,7 @@ export function sweepVanishedPaneGroup(
   // Not a usable handle in the first place — nothing to chase it with, so
   // nothing to keep and nothing that could have been confirmed.
   if (!Number.isInteger(panePid) || panePid <= 1) {
-    return { outcome: "unreachable", killed: [] };
+    return { outcome: "no_handle", killed: [] };
   }
   const procs = snapshotProcesses();
   // No snapshot means no observation at all. Unlike the empty-group case below
