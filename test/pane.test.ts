@@ -12,104 +12,201 @@ import {
 const ESC = String.fromCharCode(27);
 
 describe("parsePane", () => {
-  it("parses an unboxed Codex selection menu only with its confirmation footer", () => {
-    const raw = [
-      "Hooks need review",
-      "3 hooks are new or changed.",
-      "Hooks can run outside the sandbox after you trust them.",
-      "",
-      "› 1. Review hooks",
-      "  2. Trust all and continue",
-      "  3. Continue without trusting (hooks won't run)",
-      "",
-      "Press enter to confirm or esc to go back",
-    ].join("\n");
+  /**
+   * One table for the permission-menu grammar: every row asks the same question
+   * — given this pane, is a menu pending and what are its options — of a
+   * different real capture. What separates a live menu from prose that merely
+   * quotes one is the surrounding CHROME (a confirmation/continue footer, or a
+   * box border), never the option text, so the rows deliberately mix boxed and
+   * unboxed captures from both providers with lookalikes that must stay null.
+   * A false positive here is what lets a notification confirm a menu's
+   * highlighted option — usually "1. Yes".
+   */
+  const MENU_CASES = [
+    {
+      why: "codex: an unboxed selection menu, recognized by its confirmation footer",
+      provider: "codex" as const,
+      pane: () =>
+        [
+          "Hooks need review",
+          "3 hooks are new or changed.",
+          "Hooks can run outside the sandbox after you trust them.",
+          "",
+          "› 1. Review hooks",
+          "  2. Trust all and continue",
+          "  3. Continue without trusting (hooks won't run)",
+          "",
+          "Press enter to confirm or esc to go back",
+        ].join("\n"),
+      permission: {
+        question:
+          "Hooks need review 3 hooks are new or changed. Hooks can run outside the sandbox after you trust them.",
+        options: [
+          { n: 1, label: "Review hooks" },
+          { n: 2, label: "Trust all and continue" },
+          { n: 3, label: "Continue without trusting (hooks won't run)" },
+        ],
+      },
+    },
+    {
+      why: "codex: quoted options with NO live-menu chrome are not a menu",
+      provider: "codex" as const,
+      pane: () =>
+        ["• The terminal previously showed:", "› 1. Yes", "  2. No", "", "›"].join("\n"),
+      permission: null,
+    },
+    {
+      why: "codex: the project-trust menu, recognized by its continue footer",
+      provider: "codex" as const,
+      pane: () =>
+        [
+          "Do you trust the contents of this directory? Working with untrusted contents",
+          "comes with higher risk of prompt injection.",
+          "",
+          "› 1. Yes, continue",
+          "  2. No, quit",
+          "",
+          "Press enter to continue",
+        ].join("\n"),
+      permission: {
+        question:
+          "Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt injection.",
+        options: [
+          { n: 1, label: "Yes, continue" },
+          { n: 2, label: "No, quit" },
+        ],
+      },
+    },
+    {
+      why: "claude: the unboxed folder-trust menu",
+      provider: "claude" as const,
+      pane: () =>
+        [
+          "Quick safety check: Is this a project you created or one you trust?",
+          "",
+          "Security guide",
+          "",
+          "❯ 1. Yes, I trust this folder",
+          "  2. No, exit",
+          "",
+          "Enter to confirm · Esc to cancel",
+        ].join("\n"),
+      permission: {
+        question: "Security guide",
+        options: [
+          { n: 1, label: "Yes, I trust this folder" },
+          { n: 2, label: "No, exit" },
+        ],
+      },
+    },
+    {
+      why: "claude: the unboxed command-approval menu",
+      provider: "claude" as const,
+      pane: () =>
+        [
+          "This command requires approval",
+          "",
+          "Do you want to proceed?",
+          "❯ 1. Yes",
+          "  2. Yes, and don't ask again for this command",
+          "  3. No",
+          "",
+          "Esc to cancel · Tab to amend · ctrl+e to explain",
+        ].join("\n"),
+      permission: {
+        question: "Do you want to proceed?",
+        options: [
+          { n: 1, label: "Yes" },
+          { n: 2, label: "Yes, and don't ask again for this command" },
+          { n: 3, label: "No" },
+        ],
+      },
+    },
+    {
+      why: "boxed: option labels that wrap at pane width are rejoined",
+      pane: () =>
+        fixture(
+          [
+            "Some earlier output scrolled off the top.",
+            "",
+            "CORNER_TL DASHES CORNER_TR",
+            "PIPE Bash command PIPE",
+            "PIPE PIPE",
+            "PIPE   rm -rf /tmp/scratch PIPE",
+            "PIPE PIPE",
+            "PIPE Do you want to proceed? PIPE",
+            "PIPE CURSOR 1. Yes PIPE",
+            "PIPE   2. Yes, and don't ask again for rm commands in PIPE",
+            "PIPE      /tmp/scratch PIPE",
+            "PIPE   3. No, and tell Claude what to do differently PIPE",
+            "PIPE      (esc) PIPE",
+            "CORNER_BL DASHES CORNER_BR",
+          ].join("\n"),
+        ),
+      permission: {
+        question: "Do you want to proceed?",
+        options: [
+          { n: 1, label: "Yes" },
+          { n: 2, label: "Yes, and don't ask again for rm commands in /tmp/scratch" },
+          { n: 3, label: "No, and tell Claude what to do differently (esc)" },
+        ],
+      },
+      quiet: true,
+    },
+    {
+      why: "boxed: a question that itself wraps at pane width is rejoined",
+      pane: () =>
+        fixture(
+          [
+            "CORNER_TL DASHES CORNER_TR",
+            "PIPE Do you want to proceed with this PIPE",
+            "PIPE potentially destructive operation? PIPE",
+            "PIPE CURSOR 1. Yes PIPE",
+            "PIPE   2. No PIPE",
+            "CORNER_BL DASHES CORNER_BR",
+          ].join("\n"),
+        ),
+      permission: {
+        question: "Do you want to proceed with this potentially destructive operation?",
+        options: [
+          { n: 1, label: "Yes" },
+          { n: 2, label: "No" },
+        ],
+      },
+    },
+    {
+      why: "a worker quoting a menu in prose, above an empty box, is not a menu",
+      pane: () =>
+        fixture(
+          [
+            "BULLET I saw the following prompt appear earlier:",
+            "",
+            "    Do you want to proceed?",
+            "    CURSOR 1. Yes",
+            "      2. No",
+            "",
+            "  I'll wait for your guidance on how to respond.",
+            "",
+            "CORNER_TL DASHES CORNER_TR",
+            "PIPE CURSOR PIPE",
+            "CORNER_BL DASHES CORNER_BR",
+          ].join("\n"),
+        ),
+      permission: null,
+    },
+  ] as const;
 
-    expect(parsePane(raw, "codex").pending_permission).toEqual({
-      question:
-        "Hooks need review 3 hooks are new or changed. Hooks can run outside the sandbox after you trust them.",
-      options: [
-        { n: 1, label: "Review hooks" },
-        { n: 2, label: "Trust all and continue" },
-        { n: 3, label: "Continue without trusting (hooks won't run)" },
-      ],
-    });
-  });
-
-  it("does not parse quoted Codex options without live-menu chrome", () => {
-    const raw = [
-      "• The terminal previously showed:",
-      "› 1. Yes",
-      "  2. No",
-      "",
-      "›",
-    ].join("\n");
-
-    expect(parsePane(raw, "codex").pending_permission).toBeNull();
-  });
-
-  it("parses the Codex project-trust menu's continue footer", () => {
-    const raw = [
-      "Do you trust the contents of this directory? Working with untrusted contents",
-      "comes with higher risk of prompt injection.",
-      "",
-      "› 1. Yes, continue",
-      "  2. No, quit",
-      "",
-      "Press enter to continue",
-    ].join("\n");
-
-    expect(parsePane(raw, "codex").pending_permission).toEqual({
-      question:
-        "Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of prompt injection.",
-      options: [
-        { n: 1, label: "Yes, continue" },
-        { n: 2, label: "No, quit" },
-      ],
-    });
-  });
-
-  it("parses the current unboxed Claude folder-trust menu", () => {
-    const raw = [
-      "Quick safety check: Is this a project you created or one you trust?",
-      "",
-      "Security guide",
-      "",
-      "❯ 1. Yes, I trust this folder",
-      "  2. No, exit",
-      "",
-      "Enter to confirm · Esc to cancel",
-    ].join("\n");
-
-    expect(parsePane(raw, "claude").pending_permission).toEqual({
-      question: "Security guide",
-      options: [
-        { n: 1, label: "Yes, I trust this folder" },
-        { n: 2, label: "No, exit" },
-      ],
-    });
-  });
-
-  it("parses the current unboxed Claude command-approval menu", () => {
-    const raw = [
-      "This command requires approval",
-      "",
-      "Do you want to proceed?",
-      "❯ 1. Yes",
-      "  2. Yes, and don't ask again for this command",
-      "  3. No",
-      "",
-      "Esc to cancel · Tab to amend · ctrl+e to explain",
-    ].join("\n");
-
-    expect(parsePane(raw, "claude").pending_permission).toEqual({
-      question: "Do you want to proceed?",
-      options: [
-        { n: 1, label: "Yes" },
-        { n: 2, label: "Yes, and don't ask again for this command" },
-        { n: 3, label: "No" },
-      ],
-    });
+  it("recognizes a pending menu by its chrome, in every capture shape, and rejects lookalikes", () => {
+    for (const c of MENU_CASES) {
+      const parsed = "provider" in c ? parsePane(c.pane(), c.provider) : parsePane(c.pane());
+      expect(parsed.pending_permission, c.why).toEqual(c.permission);
+      // A live menu owns the pane: nothing may also read as a plain question or
+      // as text the human left unsubmitted.
+      if ("quiet" in c) {
+        expect(parsed.pending_question, c.why).toBeNull();
+        expect(parsed.unsubmitted_input, c.why).toBeNull();
+      }
+    }
   });
 
   it("ignores Codex's dim input placeholder while the agent is working", () => {
@@ -125,41 +222,6 @@ describe("parsePane", () => {
 
     const parsed = parsePane(raw, "codex");
     expect(parsed.pending_permission).toBeNull();
-    expect(parsed.pending_question).toBeNull();
-    expect(parsed.unsubmitted_input).toBeNull();
-  });
-
-  it("parses a permission menu whose options wrap at pane width", () => {
-    const raw = [
-      "Some earlier output scrolled off the top.",
-      "",
-      "CORNER_TL DASHES CORNER_TR",
-      "PIPE Bash command PIPE",
-      "PIPE PIPE",
-      "PIPE   rm -rf /tmp/scratch PIPE",
-      "PIPE PIPE",
-      "PIPE Do you want to proceed? PIPE",
-      "PIPE CURSOR 1. Yes PIPE",
-      "PIPE   2. Yes, and don't ask again for rm commands in PIPE",
-      "PIPE      /tmp/scratch PIPE",
-      "PIPE   3. No, and tell Claude what to do differently PIPE",
-      "PIPE      (esc) PIPE",
-      "CORNER_BL DASHES CORNER_BR",
-    ].join("\n");
-
-    const parsed = parsePane(fixture(raw));
-
-    expect(parsed.pending_permission).toEqual({
-      question: "Do you want to proceed?",
-      options: [
-        { n: 1, label: "Yes" },
-        {
-          n: 2,
-          label: "Yes, and don't ask again for rm commands in /tmp/scratch",
-        },
-        { n: 3, label: "No, and tell Claude what to do differently (esc)" },
-      ],
-    });
     expect(parsed.pending_question).toBeNull();
     expect(parsed.unsubmitted_input).toBeNull();
   });
@@ -219,23 +281,6 @@ describe("parsePane", () => {
     );
   });
 
-  it("joins a permission question that itself wraps across pane width", () => {
-    const raw = [
-      "CORNER_TL DASHES CORNER_TR",
-      "PIPE Do you want to proceed with this PIPE",
-      "PIPE potentially destructive operation? PIPE",
-      "PIPE CURSOR 1. Yes PIPE",
-      "PIPE   2. No PIPE",
-      "CORNER_BL DASHES CORNER_BR",
-    ].join("\n");
-
-    const parsed = parsePane(fixture(raw));
-
-    expect(parsed.pending_permission?.question).toBe(
-      "Do you want to proceed with this potentially destructive operation?",
-    );
-  });
-
   /**
    * The bug this guards against: a worker can have BOTH stale unsubmitted
    * text sitting in its input line AND assistant text above the box that
@@ -277,26 +322,6 @@ describe("parsePane", () => {
     expect(parsed.pending_question).toBeNull();
     expect(parsed.unsubmitted_input).toBeNull();
     expect(parsed.raw).toContain("❯"); // the cursor marker survives, unparsed
-  });
-
-  it("does not treat a worker merely quoting a menu in prose as a pending permission", () => {
-    const raw = [
-      "BULLET I saw the following prompt appear earlier:",
-      "",
-      "    Do you want to proceed?",
-      "    CURSOR 1. Yes",
-      "      2. No",
-      "",
-      "  I'll wait for your guidance on how to respond.",
-      "",
-      "CORNER_TL DASHES CORNER_TR",
-      "PIPE CURSOR PIPE",
-      "CORNER_BL DASHES CORNER_BR",
-    ].join("\n");
-
-    const parsed = parsePane(fixture(raw));
-
-    expect(parsed.pending_permission).toBeNull();
   });
 
   it("strips ANSI escape sequences before parsing", () => {
