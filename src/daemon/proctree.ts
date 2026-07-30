@@ -182,6 +182,14 @@ function signal(pid: number, sig: NodeJS.Signals): void {
  * killed if it is still present AND still in the process group we recorded —
  * cheap insurance against signalling an unrelated process that happened to
  * reuse the pid.
+ *
+ * Rechecking recorded pids is all this can usefully do; do not grow it into a
+ * re-walk hoping to catch what the original snapshot missed. Measured on the
+ * escaped-descendant case: by the time the grace period expires, none of the
+ * recorded pids are in the `ps` table any more and the escaped group has been
+ * reparented to pid 1 — so a re-walk from here has no live seed to start from
+ * and provably reaches nothing new. `killWindow` makes this strictly worse by
+ * killing the window immediately, without waiting out the grace.
  */
 export function escalateSurvivors(tree: readonly ProcRow[]): number[] {
   if (tree.length === 0) return [];
@@ -258,9 +266,37 @@ export interface PaneProcess {
 }
 
 /**
- * SIGTERM everything belonging to a live pane, and schedule a SIGKILL sweep of
- * whatever ignores it. Call this while the pane is still alive — the parent
- * links it walks disappear the moment the pane shell exits.
+ * SIGTERM everything that belonged to a live pane as of the snapshot, and
+ * schedule a SIGKILL sweep of whatever ignores it. Call this while the pane is
+ * still alive — the parent links it walks disappear the moment the pane shell
+ * exits.
+ *
+ * Snapshot-then-signal, and it never re-walks, so one gap remains: a descendant
+ * forked into a NEW process group after the snapshot is in neither the SIGTERM
+ * set nor `escalateSurvivors`' recheck (that only revisits recorded pids), and
+ * having left the session it misses the pty hangup `kill-window` delivers too.
+ * Measured on macOS: a pane spawning a `detached` child from inside its own
+ * SIGTERM handler left four processes alive in a group that did not exist when
+ * the snapshot was taken, surviving the escalation and an explicit
+ * `flushPendingEscalations()`.
+ *
+ * Deliberately not closed. Reaching such a child means re-walking while the
+ * pane is still alive — before `kill-window`, on every reap path — and a `ps`
+ * snapshot costs ~470ms on this machine (~950 processes), so each extra pass
+ * adds about half a second to every teardown.
+ *
+ * What makes that price not worth paying is that the window needs a process
+ * which spawns during its own SIGTERM handling, and neither provider does.
+ * Measured by SIGTERMing both real CLIs mid-response, run interactively on a
+ * pty as a pane runs them, and watching the process table across the whole
+ * teardown: zero processes appeared in either tree after the signal. `claude`
+ * does install a SIGTERM handler, but it only logs, emits one telemetry event
+ * and exits 143; `codex` dies on the default disposition (signal 15), so it has
+ * no handler that could spawn at all. A non-setsid'd child spawned in that
+ * window is still killed by the pty hangup regardless. Revisit if a provider
+ * gains a shutdown hook, or if hooks are ever configured to run on session end
+ * — Command Center registers SessionStart/Stop/Notification only, none of which
+ * fire on the way down.
  *
  * Returns the pids that were signalled.
  */
@@ -360,7 +396,8 @@ export interface PaneSweepResult {
  *    macOS offers no way back — `ps -E` will not read another process's
  *    environment, so an inherited marker cannot be matched either. Those are
  *    only reachable while the pane is alive, via terminatePaneTree, which is
- *    why every deliberate reap tears the tree down before the window goes.
+ *    why every deliberate reap tears the tree down before the window goes —
+ *    within that function's own snapshot limit, documented on it.
  *
  * So an empty result is NOT evidence of an empty pane, and this function must
  * never claim it is. Once the pane shell is gone there is no observation left
