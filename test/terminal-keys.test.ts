@@ -52,39 +52,56 @@ function fakeEvent(over: Partial<CancelableKeyEvent>): CancelableKeyEvent & {
 }
 
 describe("handleTerminalKeyEvent", () => {
-  it("on Shift+Enter: sends exactly one ESC+CR, cancels the event, returns false", () => {
-    const send = vi.fn();
-    const e = fakeEvent({ type: "keydown", key: "Enter", shiftKey: true });
+  // One table: the handler's whole dispatch decision for a keydown. Only
+  // Shift+Enter may inject and cancel; every other key must pass through
+  // untouched so xterm keeps its normal submit behaviour. `prevented` is the
+  // crux of the Shift+Enter row — it cancels the follow-on keypress so xterm's
+  // _keyPress cannot ALSO emit "\r" and submit.
+  const DISPATCH_CASES = [
+    {
+      why: "Shift+Enter injects exactly one ESC+CR, cancels the event, and returns false",
+      key: "Enter",
+      shiftKey: true,
+      returns: false, // xterm skips its own keydown handling
+      sent: "\x1b\r",
+      prevented: true,
+      propagationStopped: true,
+    },
+    {
+      why: "plain Enter sends nothing and is left to xterm to submit",
+      key: "Enter",
+      shiftKey: false,
+      returns: true,
+      sent: null,
+      prevented: false, // browser keypress fires -> xterm emits "\r"
+      propagationStopped: false,
+    },
+    {
+      why: "a non-Enter key passes through untouched",
+      key: "a",
+      shiftKey: false,
+      returns: true,
+      sent: null,
+      prevented: false,
+      propagationStopped: false,
+    },
+  ] as const;
 
-    const ret = handleTerminalKeyEvent(e, send);
+  it("injects only for Shift+Enter and leaves every other keydown to xterm", () => {
+    for (const c of DISPATCH_CASES) {
+      const send = vi.fn();
+      const e = fakeEvent({ type: "keydown", key: c.key, shiftKey: c.shiftKey });
 
-    expect(ret).toBe(false); // xterm skips its own keydown handling
-    expect(send).toHaveBeenCalledTimes(1);
-    expect(send).toHaveBeenCalledWith("\x1b\r");
-    // preventDefault is the crux: it cancels the follow-on keypress so xterm's
-    // _keyPress can't ALSO emit "\r" and submit.
-    expect(e.defaultPrevented).toBe(true);
-    expect(e.propagationStopped).toBe(true);
-  });
-
-  it("on plain Enter: sends nothing, does NOT cancel, returns true so xterm submits", () => {
-    const send = vi.fn();
-    const e = fakeEvent({ type: "keydown", key: "Enter", shiftKey: false });
-
-    const ret = handleTerminalKeyEvent(e, send);
-
-    expect(ret).toBe(true);
-    expect(send).not.toHaveBeenCalled();
-    expect(e.defaultPrevented).toBe(false); // browser keypress fires -> xterm emits "\r"
-  });
-
-  it("on a non-Enter key: passes through untouched", () => {
-    const send = vi.fn();
-    const e = fakeEvent({ type: "keydown", key: "a", shiftKey: false });
-
-    expect(handleTerminalKeyEvent(e, send)).toBe(true);
-    expect(send).not.toHaveBeenCalled();
-    expect(e.defaultPrevented).toBe(false);
+      expect(handleTerminalKeyEvent(e, send), c.why).toBe(c.returns);
+      if (c.sent === null) {
+        expect(send, c.why).not.toHaveBeenCalled();
+      } else {
+        expect(send, c.why).toHaveBeenCalledTimes(1);
+        expect(send, c.why).toHaveBeenCalledWith(c.sent);
+      }
+      expect(e.defaultPrevented, c.why).toBe(c.prevented);
+      expect(e.propagationStopped, c.why).toBe(c.propagationStopped);
+    }
   });
 
   // Simulate the browser keydown -> keypress chain the way xterm reacts to it,
