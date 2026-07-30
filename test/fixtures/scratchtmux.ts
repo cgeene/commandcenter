@@ -27,8 +27,9 @@ export const SCRATCH_SERVER_SEC = 900;
  * those behind as dead-pane corpses, which keep the session non-empty forever.
  *
  * Targets its own socket, read back from $TMUX, and does nothing at all when
- * $TMUX is unset: an empty `-S` would fall back to the DEFAULT socket, which is
- * the operator's own tmux server.
+ * $TMUX is unset: with no socket to read back there is none this can show is its
+ * own, and whatever an empty `-S` resolves to is not it. The default socket is
+ * the operator's own server, so this fails closed rather than guessing.
  *
  * Parameterised so a test can assert the bound behaviourally on a short one
  * rather than waiting out the real 900s.

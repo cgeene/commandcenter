@@ -93,9 +93,9 @@ describe.skipIf(!tmuxAvailable)("a scratch tmux server bounds its own lifetime",
   });
 
   it("does nothing at all when it cannot tell which socket it belongs to", () => {
-    // A pane outside tmux has no $TMUX, and `tmux -S ""` falls back to the
-    // DEFAULT socket — the operator's own server. The bound must stay inert
-    // rather than aim at it.
+    // A pane outside tmux has no $TMUX, so there is no socket to read back and
+    // nothing this can show is its own. The default socket is the operator's own
+    // server, so the bound must stay inert rather than let tmux pick one.
     const fakeBin = fs.mkdtempSync("/tmp/cc-hubbound-bin-");
     try {
       const marker = path.join(fakeBin, "invoked");
