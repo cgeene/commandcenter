@@ -20,6 +20,7 @@ import {
 import { tryAutoNudge } from "./hooks.js";
 import { recoverAbandonedReview, strandedReworkTasks } from "./review.js";
 import {
+  mainActive,
   reviewerGaveUpAt,
   reviewerSubmittedVerdict,
 } from "./reviewerhealth.js";
@@ -477,6 +478,7 @@ function announceStartupPermission(
 function recoverFalseVanishes(
   deps: SchedulerDeps,
   windowIds: string[],
+  nowMs: number,
 ): void {
   const live = listAgents({ live: true });
   for (const agent of listAgents().filter((candidate) => candidate.state === "dead")) {
@@ -486,7 +488,14 @@ function recoverFalseVanishes(
     if (!vanished || (killed && killed.id > vanished.id)) continue;
 
     if (agent.kind === "main") {
-      if (live.some((candidate) => candidate.kind === "main")) continue;
+      // Only an orchestrator that really exists may cost this one its recovery.
+      // A live main ROW is not that: a spawn interrupted before attachPane
+      // leaves a paneless row nothing retires, and refusing while it sits there
+      // throws away a session whose process is demonstrably still running —
+      // its context and in-flight delegations with it — for a cold start.
+      if (live.some((candidate) => candidate.kind === "main" && mainActive(candidate, nowMs))) {
+        continue;
+      }
     } else if (agent.kind === "worker") {
       const task = agent.task_id ? getTask(agent.task_id) : undefined;
       const recoverable =
@@ -794,7 +803,7 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
   const windowIds = snapshot.live;
   // Order matters: recovery first, so a false vanish whose process is still
   // live is revived rather than torn down as an unfinished kill.
-  recoverFalseVanishes(deps, windowIds);
+  recoverFalseVanishes(deps, windowIds, nowMs);
   reapUnconfirmedKills(kill, windowIds);
   reapOrphanWindows(
     reapWindow,

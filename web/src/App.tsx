@@ -357,7 +357,14 @@ export function App() {
   // the drawer simply closes.
   const selTask = panel?.kind === "task" ? (tasks.find((t) => t.id === panel.id) ?? null) : null;
 
-  const liveMain = agents.find((a) => a.kind === "main" && a.state !== "dead");
+  // A pane, not just a live row: an interrupted spawn leaves a main row that
+  // nothing retires, and showing that as the orchestrator hides the Start
+  // control, reports "main online" while nothing is being triaged, and offers a
+  // terminal button for a window that does not exist. The daemon refuses to
+  // spawn over a paneless row that really did come up, so Start stays safe.
+  const liveMain = agents.find(
+    (a) => a.kind === "main" && a.state !== "dead" && a.tmux_target !== null,
+  );
   const taskAgents = new Map<number, Agent[]>();
   for (const agent of agents) {
     if (agent.kind === "main" || agent.task_id == null || agent.state === "dead") continue;
