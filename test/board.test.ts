@@ -90,21 +90,36 @@ describe("groupByProject with a visible filter", () => {
 describe("blockedByChain", () => {
   const byId = (tasks: BoardTask[]) => new Map(tasks.map((x) => [x.id, x] as const));
 
-  it("resolves the blocker one level deep to id + status", () => {
-    const tasks = [
-      t({ id: 27, status: "review" }),
-      t({ id: 28, blocked_by: 27 }),
-    ];
-    expect(blockedByChain(tasks[1], byId(tasks))).toEqual({ id: 27, status: "review" });
-  });
+  // One table: every row resolves one task's blocked_by against the board's
+  // task map. Only whether the blocker is set, and whether it is present in the
+  // map, varies — an absent blocker must still surface as "unknown" rather than
+  // silently reading as unblocked.
+  const CHAIN_CASES = [
+    {
+      why: "a blocker present on the board resolves to its id + live status",
+      tasks: () => [t({ id: 27, status: "review" }), t({ id: 28, blocked_by: 27 })],
+      subject: 28,
+      expected: { id: 27, status: "review" },
+    },
+    {
+      why: "no blocked_by resolves to null",
+      tasks: () => [t({ id: 5, blocked_by: null })],
+      subject: 5,
+      expected: null,
+    },
+    {
+      why: "a blocker missing from the board is reported unknown, never dropped",
+      tasks: () => [t({ id: 6, blocked_by: 99 })],
+      subject: 6,
+      expected: { id: 99, status: "unknown" },
+    },
+  ] as const;
 
-  it("returns null when unblocked", () => {
-    const task = t({ id: 5, blocked_by: null });
-    expect(blockedByChain(task, byId([task]))).toBeNull();
-  });
-
-  it("reports a missing blocker as unknown rather than dropping it", () => {
-    const task = t({ id: 6, blocked_by: 99 });
-    expect(blockedByChain(task, byId([task]))).toEqual({ id: 99, status: "unknown" });
+  it("resolves a blocker one level deep, and never silently drops a missing one", () => {
+    for (const c of CHAIN_CASES) {
+      const tasks = c.tasks();
+      const subject = tasks.find((x) => x.id === c.subject)!;
+      expect(blockedByChain(subject, byId(tasks)), c.why).toEqual(c.expected);
+    }
   });
 });
