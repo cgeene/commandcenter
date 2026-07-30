@@ -23,6 +23,7 @@ import { writeCodexConfig } from "../daemon/genconfig.js";
 import { countRepositoriesUnder } from "../daemon/workspaces.js";
 import { killAgent, spawnMain } from "../daemon/spawn.js";
 import { classifyGhStatus } from "./doctor.js";
+import { planMainUpgrade } from "./mainupgrade.js";
 import { api } from "./client.js";
 
 const program = new Command()
@@ -1008,23 +1009,40 @@ program
 
     for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 500));
+      let v: { stale: boolean; started_at: string };
       try {
-        const v = await api<{ stale: boolean; started_at: string }>("GET", "/api/version");
-        console.log(`daemon back up (started ${v.started_at}, stale: ${v.stale})`);
-        if (opts.main) {
+        v = await api<{ stale: boolean; started_at: string }>("GET", "/api/version");
+      } catch {
+        continue; /* daemon not up yet */
+      }
+      console.log(`daemon back up (started ${v.started_at}, stale: ${v.stale})`);
+      // Deliberately outside the retry above, which exists only to wait for the
+      // daemon: replacing the orchestrator is not idempotent, so a swap that
+      // failed half-way must not be retried — the next pass would resolve to a
+      // different row and kill that one too.
+      if (opts.main) {
+        try {
           const agents = await api<Agent[]>("GET", "/api/agents?live=true");
-          const main = agents.find((a) => a.kind === "main");
+          const plan = planMainUpgrade(agents);
+          if (plan.action === "refuse") {
+            console.error(plan.reason);
+            process.exit(1);
+          }
+          const previous = plan.action === "replace" ? plan.agent : undefined;
           // The public kill endpoint intentionally refuses Main. Upgrade is a
           // local CLI lifecycle operation, so use the same daemon primitives
           // directly and retain the current model while replacing the process.
-          if (main) killAgent(main.id);
-          const a = spawnMain(main?.model ?? undefined);
+          if (previous) killAgent(previous.id);
+          const a = spawnMain(previous?.model ?? undefined);
           console.log(`main agent a${a.id} respawned in ${a.tmux_target}`);
+        } catch (e) {
+          console.error(
+            `daemon is back up, but the main agent was not replaced: ${e instanceof Error ? e.message : String(e)}`,
+          );
+          process.exit(1);
         }
-        return;
-      } catch {
-        /* daemon not up yet */
       }
+      return;
     }
     console.error("daemon did not come back within 15s — check the agentd window");
     process.exit(1);

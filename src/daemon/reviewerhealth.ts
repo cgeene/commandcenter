@@ -5,11 +5,14 @@ import { countAgentEvents, latestAgentEventTs } from "../db/events.js";
  * One definition of "is this agent real", shared by everything that keys a
  * decision on an agent existing: the cap exemption for a parked worker
  * (capacity.ts), the double-spawn guards (review.ts, spawn.ts), PR-feedback
- * forwarding (prsync.ts), and the watchdog's reviewer reap (scheduler.ts).
+ * forwarding (prsync.ts), the watchdog's reviewer reap and false-vanish recovery
+ * (scheduler.ts), the "Needs You" queue (attention.ts) and `cc upgrade --main`.
  *
  * Reviewers and the main agent get one predicate each because their states mean
  * different things (see `mainActive`), but both are built on the same evidence
- * and neither may be replaced by a caller's own reading of a row.
+ * and neither may be replaced by a caller's own reading of a row. For main there
+ * is also `resolveMain`, since "is there an orchestrator" and "which row is it"
+ * are separate questions and both were being answered ad hoc.
  *
  * `reviewerActive` and `reviewerGaveUpAt` are two readings of the SAME
  * signal — the reviewer's current state — so a reviewer can never be both
@@ -132,6 +135,31 @@ export function mainActive(main: Agent, nowMs = Date.now()): boolean {
  *  in a window no target points at — which is what the human must be told. */
 export function mainSessionStarted(main: Agent): boolean {
   return countAgentEvents(main.id, ["hook.sessionstart"]) > 0;
+}
+
+/**
+ * WHICH row is the main agent — the companion to `mainActive`'s "is there one at
+ * all", and the only way to answer that question. `find(a => a.kind === "main")`
+ * is not equivalent: more than one live main row is an ordinary state, because a
+ * spawn interrupted before `attachPane` leaves a paneless row that no autonomous
+ * pass retires, and a bare search resolves to whichever id happens to be lower.
+ * It is `mainActive` that separates that shell from an orchestrator.
+ *
+ * Ordering matters when two rows are active at once (a paneless spawn in flight
+ * or mid-handshake, alongside a running orchestrator):
+ *
+ *  - a row WITH a pane wins, because a target is what makes a row usable at all
+ *    — attaching, delivering into the composer and killing by target all need
+ *    one, so preferring a paneless row over a paned one would resolve to the
+ *    single row a caller can do nothing with;
+ *  - otherwise the newest wins, since spawnMain retires the rows it replaces, so
+ *    a lower id is the older attempt.
+ */
+export function resolveMain(agents: Agent[], nowMs = Date.now()): Agent | undefined {
+  const active = agents
+    .filter((agent) => agent.kind === "main" && mainActive(agent, nowMs))
+    .sort((a, b) => b.id - a.id);
+  return active.find((agent) => agent.tmux_target) ?? active[0];
 }
 
 /**
