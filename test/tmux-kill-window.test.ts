@@ -10,6 +10,7 @@ import {
   nodeEvalCommand,
   trackKeepaliveGroupUnder,
 } from "./fixtures/procgroups.js";
+import { SCRATCH_SERVER_SEC, scratchHubCommand } from "./fixtures/scratchtmux.js";
 
 // End-to-end proof of the bug this guards against: `tmux kill-window` alone
 // leaves anything the pane backgrounded into its own process group running,
@@ -160,11 +161,21 @@ describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree",
     delete process.env.TMUX; // don't let a surrounding tmux hijack the target
     dataDir = fs.mkdtempSync("/tmp/cc-kw-db-");
     process.env.CC_DATA_DIR = dataDir;
+    // Own the scratch server rather than letting `ensureSession()` create it:
+    // production's hub pane runs an unbounded login shell, and the daemon must
+    // not be bent to suit a test. `ensureSession()` below finds this session and
+    // becomes a no-op.
+    tmux(
+      "new-session", "-d", "-s", SESSION, "-n", "hub",
+      scratchHubCommand(SCRATCH_SERVER_SEC),
+    );
   });
 
   afterAll(async () => {
     const { closeDb } = await import("../src/db/db.js");
     closeDb();
+    // Kill BEFORE removing TMPDIR: the socket lives in there, and a server whose
+    // socket has been unlinked can no longer be reached by any tmux client.
     spawnSync("tmux", ["kill-server"], { stdio: "ignore" });
     fs.rmSync(TMPDIR, { recursive: true, force: true });
     fs.rmSync(dataDir, { recursive: true, force: true });

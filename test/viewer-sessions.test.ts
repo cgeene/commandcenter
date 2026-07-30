@@ -3,6 +3,7 @@ import fs from "node:fs";
 import pty from "node-pty";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { localeEnv } from "../src/daemon/locale.js";
+import { SCRATCH_SERVER_SEC, scratchHubCommand } from "./fixtures/scratchtmux.js";
 
 // End-to-end proof that grouped viewer sessions (`ccv-*`) no longer leak: an
 // armed viewer destroys itself the moment its client detaches, and
@@ -93,7 +94,10 @@ describe.skipIf(!tmuxAvailable)("viewer session lifecycle", () => {
     dataDir = fs.mkdtempSync("/tmp/cc-vs-db-");
     process.env.CC_DATA_DIR = dataDir;
 
-    tmux("new-session", "-d", "-s", SESSION, "-n", "hub");
+    tmux(
+      "new-session", "-d", "-s", SESSION, "-n", "hub",
+      scratchHubCommand(SCRATCH_SERVER_SEC),
+    );
     tmux("new-window", "-d", "-t", `=${SESSION}`, "-n", "agent");
     windowId = tmux(
       "display-message", "-p", "-t", `=${SESSION}:agent`, "#{window_id}",
@@ -103,6 +107,8 @@ describe.skipIf(!tmuxAvailable)("viewer session lifecycle", () => {
   afterAll(async () => {
     const { closeDb } = await import("../src/db/db.js");
     closeDb();
+    // Kill BEFORE removing TMPDIR: the socket lives in there, and a server whose
+    // socket has been unlinked can no longer be reached by any tmux client.
     spawnSync("tmux", ["kill-server"], { stdio: "ignore" });
     fs.rmSync(TMPDIR, { recursive: true, force: true });
     fs.rmSync(dataDir, { recursive: true, force: true });
