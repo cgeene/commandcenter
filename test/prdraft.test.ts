@@ -79,41 +79,50 @@ function ghTitleStore(initial: string) {
 const URL = "https://github.com/x/y/pull/1";
 
 describe("enforcePrTitle", () => {
-  it("prepends [KEY-N] to a clean title", async () => {
-    const { enforcePrTitle, _setGhRunner } = await import("../src/daemon/prdraft.js");
-    const { state, runner } = ghTitleStore("feat: ship it");
-    _setGhRunner(runner);
-    await enforcePrTitle(URL, "EN-7");
-    expect(state.title).toBe("[EN-7] feat: ship it");
-    expect(state.edits).toBe(1);
-  });
+  // One table: every row runs enforcePrTitle(URL, "EN-7") against a different
+  // starting title and asserts the title it lands on. `runs` and `edits` carry
+  // the idempotency case — re-running must not re-edit, because the reconciler
+  // calls this on every sync pass for the life of the PR.
+  const TITLE_CASES = [
+    {
+      why: "a clean title gets the key prepended",
+      initial: "feat: ship it",
+      expected: "[EN-7] feat: ship it",
+      edits: 1,
+    },
+    {
+      why: "a title already carrying the right key is left alone on a re-run",
+      initial: "feat: ship it",
+      runs: 2,
+      expected: "[EN-7] feat: ship it",
+      edits: 1, // only the first run edited
+    },
+    {
+      why: "a stale/wrong key is healed (strip-then-prepend), not doubled up",
+      initial: "[EN-999] feat: ship it",
+      expected: "[EN-7] feat: ship it",
+      edits: 1,
+    },
+    {
+      why: "an [UNREVIEWED] marker survives — that prefix is markPrReady's, not ours",
+      initial: "[UNREVIEWED] feat: ship it",
+      expected: "[EN-7] [UNREVIEWED] feat: ship it",
+      edits: 1,
+    },
+  ] as const;
 
-  it("is a no-op when the title already carries the right key (running twice)", async () => {
+  it("lands on [EN-7] <base> from any starting title, editing only when it must", async () => {
     const { enforcePrTitle, _setGhRunner } = await import("../src/daemon/prdraft.js");
-    const { state, runner } = ghTitleStore("feat: ship it");
-    _setGhRunner(runner);
-    await enforcePrTitle(URL, "EN-7");
-    await enforcePrTitle(URL, "EN-7"); // second run
-    expect(state.title).toBe("[EN-7] feat: ship it");
-    expect(state.edits).toBe(1); // only the first run edited
+    for (const c of TITLE_CASES) {
+      const { state, runner } = ghTitleStore(c.initial);
+      _setGhRunner(runner);
+      for (let i = 0; i < ("runs" in c ? c.runs : 1); i++) {
+        await enforcePrTitle(URL, "EN-7");
+      }
+      expect(state.title, c.why).toBe(c.expected);
+      expect(state.edits, c.why).toBe(c.edits);
+    }
   });
-
-  it("heals a stale/wrong key (strip-then-prepend)", async () => {
-    const { enforcePrTitle, _setGhRunner } = await import("../src/daemon/prdraft.js");
-    const { state, runner } = ghTitleStore("[EN-999] feat: ship it");
-    _setGhRunner(runner);
-    await enforcePrTitle(URL, "EN-7");
-    expect(state.title).toBe("[EN-7] feat: ship it");
-  });
-
-  it("preserves an [UNREVIEWED] marker (that prefix is markPrReady's, not ours)", async () => {
-    const { enforcePrTitle, _setGhRunner } = await import("../src/daemon/prdraft.js");
-    const { state, runner } = ghTitleStore("[UNREVIEWED] feat: ship it");
-    _setGhRunner(runner);
-    await enforcePrTitle(URL, "EN-7");
-    expect(state.title).toBe("[EN-7] [UNREVIEWED] feat: ship it");
-  });
-
 });
 
 describe("enforcePrTitle + markPrReady compose (disjoint prefixes, both orders)", () => {
