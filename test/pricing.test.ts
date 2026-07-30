@@ -292,32 +292,44 @@ describe("org cost cache usability", () => {
     fetched_at: "2026-08-05T10:00:00Z",
   };
 
-  it("uses the org figure when it describes the cycle on screen", () => {
-    expect(orgCycleSpend(fresh, "2026-08-01")).toEqual({
-      usd: 123.45,
-      fetched_at: "2026-08-05T10:00:00Z",
-    });
-  });
+  // One table: every row asks orgCycleSpend the same question — is this cached
+  // figure usable for the cycle on screen — of a different cache. The stakes are
+  // the same throughout: anything it returns gets labelled "org billing" and
+  // overrides the local estimate, so every unusable shape must read as null and
+  // a usable zero must NOT.
+  const CACHE_CASES = [
+    {
+      why: "a cache describing the cycle on screen is used, with its fetch time",
+      cache: () => fresh,
+      expected: { usd: 123.45, fetched_at: "2026-08-05T10:00:00Z" },
+    },
+    {
+      // The realistic failure: July's cache is kept through an August poll
+      // failure (401 after a key rotation, or the admin key being removed, both
+      // of which leave the previous figures in place). Showing July's dollars
+      // against August's quota under an "org billing" label would silently
+      // override the correct local estimate.
+      why: "a cache built for a PREVIOUS cycle is refused",
+      cache: () => ({ ...fresh, cycle_start: "2026-07-01" }),
+      expected: null,
+    },
+    {
+      why: "an all-null cache (the report never succeeded) reports nothing",
+      cache: () => ({ total_usd: null, cycle_start: null, fetched_at: null }),
+      expected: null,
+    },
+    {
+      why: "a genuine zero-spend cycle is kept, not mistaken for missing",
+      cache: () => ({ ...fresh, total_usd: 0 }),
+      expected: { usd: 0, fetched_at: "2026-08-05T10:00:00Z" },
+    },
+  ] as const;
 
-  it("refuses a cache built for a previous cycle", () => {
-    // The realistic failure: July's cache is kept through an August poll
-    // failure (401 after a key rotation, or the admin key being removed, both
-    // of which leave the previous figures in place). Showing July's dollars
-    // against August's quota under an "org billing" label would silently
-    // override the correct local estimate.
-    const stale = { ...fresh, cycle_start: "2026-07-01" };
-    expect(orgCycleSpend(stale, "2026-08-01")).toBeNull();
+  it("uses a cache only when it describes the cycle on screen", () => {
+    for (const c of CACHE_CASES) {
+      expect(orgCycleSpend(c.cache(), "2026-08-01"), c.why).toEqual(c.expected);
+    }
   });
-
-  it("reports nothing when the report never succeeded", () => {
-    expect(orgCycleSpend({ total_usd: null, cycle_start: null, fetched_at: null }, "2026-08-01"))
-      .toBeNull();
-  });
-
-  it("keeps a genuine zero-spend cycle rather than treating it as missing", () => {
-    expect(orgCycleSpend({ ...fresh, total_usd: 0 }, "2026-08-01")?.usd).toBe(0);
-  });
-
 });
 
 describe("headline + reset formatting", () => {
