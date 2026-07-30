@@ -43,20 +43,37 @@ describe("static serving", () => {
 });
 
 describe("webDistDir override", () => {
-  it("ignores a blank CC_WEB_DIST — an empty dist would satisfy startsWith('') and disable the traversal guard", () => {
-    process.env.CC_WEB_DIST = "  ";
-    const dir = webDistDir();
-    expect(path.isAbsolute(dir)).toBe(true);
-    expect(dir.endsWith(path.join("web", "dist"))).toBe(true);
-  });
+  // One table: every row hands webDistDir a different CC_WEB_DIST and asserts
+  // where it lands. The two unsafe values must be IGNORED (falling back to the
+  // bundled web/dist) rather than honoured, because the traversal guard in
+  // registerStatic compares resolved paths with startsWith — a blank or
+  // filesystem-root dist would make that comparison vacuously true.
+  const DIST_CASES = [
+    {
+      why: "a blank CC_WEB_DIST is ignored — an empty dist would satisfy startsWith('') and disable the guard",
+      env: "  ",
+      suffix: () => path.join("web", "dist"),
+    },
+    {
+      why: "a filesystem-root CC_WEB_DIST is ignored — a root dist would let the guard serve any file on the machine",
+      env: "/",
+      suffix: () => path.join("web", "dist"),
+    },
+    {
+      why: "a relative CC_WEB_DIST is resolved to absolute — the guard compares absolute resolved paths",
+      env: "./some/dist",
+      suffix: () => path.join("some", "dist"),
+      exact: () => path.resolve("./some/dist"),
+    },
+  ] as const;
 
-  it("ignores a filesystem-root CC_WEB_DIST — a root dist would let the guard serve any file on the machine", () => {
-    process.env.CC_WEB_DIST = "/";
-    expect(webDistDir().endsWith(path.join("web", "dist"))).toBe(true);
-  });
-
-  it("resolves a relative CC_WEB_DIST to absolute — the guard compares against absolute resolved paths", () => {
-    process.env.CC_WEB_DIST = "./some/dist";
-    expect(webDistDir()).toBe(path.resolve("./some/dist"));
+  it("ignores an unsafe CC_WEB_DIST and always returns an absolute dist path", () => {
+    for (const c of DIST_CASES) {
+      process.env.CC_WEB_DIST = c.env;
+      const dir = webDistDir();
+      expect(path.isAbsolute(dir), c.why).toBe(true);
+      expect(dir.endsWith(c.suffix()), c.why).toBe(true);
+      if ("exact" in c) expect(dir, c.why).toBe(c.exact());
+    }
   });
 });

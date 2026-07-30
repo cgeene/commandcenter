@@ -90,43 +90,63 @@ describe("resolveCreateTarget (LLM proposes, daemon disposes)", () => {
     return getTask(t.id)!;
   }
 
-  it("uses a validated classifier proposal when it is inside the allow-list", async () => {
-    _setClassifierRunner(async () => '{"project":"UN","issue_type":"Bug"}');
-    const { resolveCreateTarget } = await import("../src/daemon/jirasync.js");
-    const task = await makeTask();
-    const repoCfg = { enabled: true, project: "EN", projects: ["EN", "UN"], issue_types: ["Task", "Bug"] };
-    const res = await resolveCreateTarget(task, repoCfg, { enabled: true, repos: {}, classifier_model: "sonnet" });
-    expect(res).toEqual({ project: "UN", issueType: "Bug" });
-  });
+  /**
+   * One table for the disposal policy: the classifier only ever PROPOSES, and
+   * these rows are every way the daemon can overrule it. All four run the same
+   * resolveCreateTarget call against the same allow-lists; only what the model
+   * returns (or throws) and the task's own override vary. `classifierCalled`
+   * pins the one case that must not consult the model at all.
+   */
+  const ALLOW_LISTS = {
+    enabled: true,
+    project: "EN",
+    projects: ["EN", "UN"],
+    issue_types: ["Task", "Bug"],
+  };
+  const DISPOSAL_CASES = [
+    {
+      why: "a proposal inside the allow-list is used as-is",
+      runner: async () => '{"project":"UN","issue_type":"Bug"}',
+      expected: { project: "UN", issueType: "Bug" },
+    },
+    {
+      why: "out-of-list values are overruled with repo default + Task",
+      runner: async () => '{"project":"ZZZ","issue_type":"Epic"}',
+      expected: { project: "EN", issueType: "Task" },
+    },
+    {
+      why: "a classifier that times out falls back to repo default + Task",
+      runner: async () => {
+        throw new Error("timeout");
+      },
+      expected: { project: "EN", issueType: "Task" },
+    },
+    {
+      why: "a per-task jira_project override wins, but the issue type still comes from the model",
+      runner: async () => '{"project":"UN","issue_type":"Bug"}',
+      overrides: { jira_project: "TW" },
+      expected: { project: "TW", issueType: "Bug" },
+    },
+  ] as const;
 
-  it("falls back to repo default + Task when the classifier picks out-of-list values", async () => {
-    _setClassifierRunner(async () => '{"project":"ZZZ","issue_type":"Epic"}');
+  it("uses a proposal only where it is valid, and overrules it everywhere else", async () => {
     const { resolveCreateTarget } = await import("../src/daemon/jirasync.js");
-    const task = await makeTask();
-    const repoCfg = { enabled: true, project: "EN", projects: ["EN", "UN"], issue_types: ["Task", "Bug"] };
-    const res = await resolveCreateTarget(task, repoCfg, { enabled: true, repos: {}, classifier_model: "sonnet" });
-    expect(res).toEqual({ project: "EN", issueType: "Task" });
-  });
-
-  it("falls back to defaults when the classifier times out", async () => {
-    _setClassifierRunner(async () => {
-      throw new Error("timeout");
-    });
-    const { resolveCreateTarget } = await import("../src/daemon/jirasync.js");
-    const task = await makeTask();
-    const repoCfg = { enabled: true, project: "EN", projects: ["EN", "UN"], issue_types: ["Task", "Bug"] };
-    const res = await resolveCreateTarget(task, repoCfg, { enabled: true, repos: {}, classifier_model: "sonnet" });
-    expect(res).toEqual({ project: "EN", issueType: "Task" });
-  });
-
-  it("a per-task jira_project override wins over the classifier proposal", async () => {
-    _setClassifierRunner(async () => '{"project":"UN","issue_type":"Bug"}');
-    const { resolveCreateTarget } = await import("../src/daemon/jirasync.js");
-    const task = await makeTask({ jira_project: "TW" });
-    const repoCfg = { enabled: true, project: "EN", projects: ["EN", "UN"], issue_types: ["Task", "Bug"] };
-    const res = await resolveCreateTarget(task, repoCfg, { enabled: true, repos: {}, classifier_model: "sonnet" });
-    // Project forced to the override; issue type still comes from the classifier.
-    expect(res).toEqual({ project: "TW", issueType: "Bug" });
+    for (const c of DISPOSAL_CASES) {
+      let called = false;
+      _setClassifierRunner(async (...args) => {
+        called = true;
+        return c.runner(...(args as []));
+      });
+      const task = await makeTask("overrides" in c ? c.overrides : {});
+      const res = await resolveCreateTarget(task, { ...ALLOW_LISTS }, {
+        enabled: true,
+        repos: {},
+        classifier_model: "sonnet",
+      });
+      expect(res, c.why).toEqual(c.expected);
+      // Every row above has a real choice to make, so the model must be asked.
+      expect(called, c.why).toBe(true);
+    }
   });
 
   it("skips the classifier entirely when both allow-lists are singletons", async () => {
