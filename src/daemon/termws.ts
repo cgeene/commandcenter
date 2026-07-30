@@ -6,9 +6,9 @@ import { logEvent } from "../db/events.js";
 import { TERM_CLOSE_PERMANENT } from "../lib/terminal-reconnect.js";
 import { localeEnv } from "./locale.js";
 import {
-  probeWindow,
+  probeWindowAsync,
   runTmuxCommand,
-  windowPresence,
+  windowPresenceAsync,
   type WindowPresence,
 } from "./tmux.js";
 
@@ -195,48 +195,109 @@ function normalizedSize(size?: { cols: number; rows: number }): {
   };
 }
 
-/** Presence re-asks before an unobservable tmux is attached to on faith. */
+/**
+ * Whole budget for deciding whether the agent's window is there — retries
+ * included. It has to stay well inside the heartbeat interval below, and inside
+ * what an operator will wait for with a drawer open, so it is a deadline rather
+ * than a retry count: the underlying tmux queries are each bounded at seconds
+ * and a few of those in series would blow any of that.
+ */
+const PRESENCE_BUDGET_MS = 4_000;
+/** Rounds of (listing, probe) to try inside that budget. */
 const PRESENCE_ATTEMPTS = 3;
 const PRESENCE_RETRY_MS = 150;
+
+/** The answer to use for a query that outlived the budget above. */
+async function withinBudget(
+  query: Promise<WindowPresence>,
+  budgetMs: number,
+): Promise<WindowPresence> {
+  let timer: NodeJS.Timeout;
+  const expiry = new Promise<WindowPresence>((resolve) => {
+    timer = setTimeout(() => resolve("unknown"), Math.max(budgetMs, 0));
+  });
+  try {
+    // The queries do not reject, but a lost race must not leave a rejection
+    // unhandled if that ever changes.
+    return await Promise.race([query.catch(() => "unknown" as const), expiry]);
+  } finally {
+    clearTimeout(timer!);
+  }
+}
 
 /**
  * Whether the agent's window is really gone — asked the way an interactive
  * attach has to ask it.
  *
- * windowExists() answers an unobservable tmux with "absent" by default, which
- * is right for optional work that can be skipped and retried on a later pass.
- * It is wrong here: the only thing this decides is whether to close the
- * operator's terminal, a close the browser answers by reconnecting, so reading
- * "I could not ask" as "gone" turns one failed tmux query on a loaded box into
- * a permanent disconnect/reconnect cycle. So this insists on a definite answer:
- * re-ask a few times, corroborate with a different tmux command (one target at
- * a time, so a bulk listing that cannot be believed does not supply its own
- * second opinion), and report "unknown" rather than guess. An "unknown" caller
- * should attach anyway and let the attach itself fail if the window is gone.
+ * Three things make this different from windowExists():
+ *
+ * 1. It never blocks the event loop. The synchronous queries are fine for the
+ *    watchdog, which runs on a timer, but this runs while an operator waits and
+ *    while every other terminal's data pump needs the loop; a tmux that cannot
+ *    answer would otherwise freeze the daemon for as long as the timeouts take.
+ * 2. "Could not ask" is reported as "unknown", not "absent". windowExists()'s
+ *    default is right for optional work that retries on a later pass, and wrong
+ *    here: the browser answers a close by reconnecting, so guessing "gone" turns
+ *    one failed tmux query on a loaded box into an endless flicker.
+ * 3. Absence has to be said twice, by two different tmux commands, before it is
+ *    believed — the bulk listing and the single-target probe. The probe decides
+ *    absence by comparing display-message output against the target, so a
+ *    truncated answer reads as "gone" all by itself, and the listing is exactly
+ *    the query whose short/garbled answers must never be trusted (see
+ *    listWindows). Either one alone is not evidence.
+ *
+ * "unknown" means the caller should attach anyway and let the attach fail on its
+ * own if the window is really gone.
  */
 async function attachPresence(target: string): Promise<WindowPresence> {
-  for (let attempt = 1; ; attempt++) {
-    const presence = windowPresence(target);
-    if (presence !== "unknown") return presence;
-    const probed = probeWindow(target);
-    if (probed !== "unknown") return probed;
-    if (attempt >= PRESENCE_ATTEMPTS) return "unknown";
+  const deadline = Date.now() + PRESENCE_BUDGET_MS;
+  const left = () => deadline - Date.now();
+  for (let attempt = 1; attempt <= PRESENCE_ATTEMPTS; attempt++) {
+    const listed = await withinBudget(windowPresenceAsync(target), left());
+    if (listed === "present") return "present";
+    if (left() <= 0) return "unknown";
+    const probed = await withinBudget(probeWindowAsync(target), left());
+    if (probed === "present") return "present";
+    if (listed === "absent" && probed === "absent") return "absent";
+    if (attempt === PRESENCE_ATTEMPTS || left() <= PRESENCE_RETRY_MS) break;
     await new Promise((r) => setTimeout(r, PRESENCE_RETRY_MS));
+  }
+  return "unknown";
+}
+
+function sendReason(ws: WebSocket, reason: string): void {
+  try {
+    ws.send(`\r\n[commandcenter] ${reason}\r\n`);
+  } catch {
+    /* socket already gone; the close is still worth attempting */
   }
 }
 
 /**
  * Close with the reason, and tell the client not to come back: reconnecting
  * cannot fix this one (see src/lib/terminal-reconnect.ts).
+ *
+ * Reserved for conditions that cannot clear on their own — no such agent, or an
+ * agent that has finished for good. Everything else, including a window that is
+ * merely missing right now, closes transiently: spawn, respawn and resume all
+ * fill in an agent's tmux_target only after the pane exists (see spawn.ts), so
+ * a drawer opened during any of those windows must still reconnect into the
+ * terminal by itself.
  */
 function closePermanently(ws: WebSocket, reason: string): void {
-  try {
-    ws.send(`\r\n[commandcenter] ${reason}\r\n`);
-  } catch {
-    /* socket already gone; the close below is still worth attempting */
-  }
+  sendReason(ws, reason);
   try {
     ws.close(TERM_CLOSE_PERMANENT, reason);
+  } catch {
+    /* already closing */
+  }
+}
+
+/** Close in a way the client will retry, with the reason on screen. */
+function closeTransiently(ws: WebSocket, reason: string): void {
+  sendReason(ws, reason);
+  try {
+    ws.close();
   } catch {
     /* already closing */
   }
@@ -261,22 +322,29 @@ export async function attachTerminal(
   size?: { cols: number; rows: number },
 ): Promise<void> {
   const agent = getAgent(agentId);
-  if (!agent?.tmux_target) {
-    closePermanently(ws, "no live tmux window for this agent");
+  if (!agent || agent.state === "dead") {
+    logEvent("terminal.agent_gone", { agentId });
+    closePermanently(ws, "this agent is no longer running");
     return;
   }
-  // Only a definite "absent" closes. An unobservable tmux attaches anyway: if
-  // the window really is gone the attach below fails on its own, honestly and
-  // transiently, instead of this closing a healthy terminal on no evidence.
+  if (!agent.tmux_target) {
+    // A live agent without a window is mid-spawn; its pane arrives shortly.
+    closeTransiently(ws, "this agent has no tmux window yet");
+    return;
+  }
+  // Only a corroborated "absent" closes, and even then only until the agent's
+  // pane comes back — a respawn or resume re-attaches one. An unobservable tmux
+  // attaches anyway: if the window really is gone the attach below fails on its
+  // own, honestly, instead of this closing a healthy terminal on no evidence.
   const presence = await attachPresence(agent.tmux_target);
   if (presence === "absent") {
     logEvent("terminal.window_absent", { agentId });
-    closePermanently(ws, "no live tmux window for this agent");
+    closeTransiently(ws, "no live tmux window for this agent");
     return;
   }
   if (presence === "unknown") {
-    // Rare and worth seeing: it means tmux could not answer three times in a
-    // row, which is the state that used to close terminals.
+    // Rare and worth seeing: it means tmux could not answer for the whole
+    // presence budget, which is the state that used to close terminals.
     logEvent("terminal.presence_unobservable", { agentId });
   }
 

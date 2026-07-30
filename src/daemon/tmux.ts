@@ -317,23 +317,52 @@ const WINDOW_TARGET_RE = /:@\d+$/;
  * window: a format/locale/truncation problem otherwise reads as "those windows
  * are gone", which is exactly the observation that gets live agents killed.
  */
+const WINDOW_LIST_ARGS = [
+  "list-windows",
+  "-a",
+  "-F",
+  "#{session_name}:#{window_id}:#{pane_dead}",
+] as const;
+
+function windowListFailure(error: unknown): WindowSnapshot {
+  // A server tmux reports as not running is a trustworthy empty result.
+  // Timeouts, unreachable servers, permission/locale/client failures are
+  // not; the watchdog must retry without mutating agent or task state.
+  return tmuxFailureCode(error) === "session_absent"
+    ? { live: [], dead: [], server: "absent" }
+    : null;
+}
+
 export function listWindows(): WindowSnapshot {
   let out: string;
   try {
-    out = tmux(
-      "list-windows",
-      "-a",
-      "-F",
-      "#{session_name}:#{window_id}:#{pane_dead}",
-    );
+    out = tmux(...WINDOW_LIST_ARGS);
   } catch (error) {
-    // A server tmux reports as not running is a trustworthy empty result.
-    // Timeouts, unreachable servers, permission/locale/client failures are
-    // not; the watchdog must retry without mutating agent or task state.
-    return tmuxFailureCode(error) === "session_absent"
-      ? { live: [], dead: [], server: "absent" }
-      : null;
+    return windowListFailure(error);
   }
+  return parseWindowList(out);
+}
+
+/**
+ * listWindows without blocking the event loop.
+ *
+ * The synchronous form is what the watchdog and the hook paths want: they are
+ * already running inside one tick and an await would let state change under
+ * them. An interactive path (see termws.ts) needs the opposite — a query that
+ * cannot be answered holds the whole daemon otherwise, HTTP and every other
+ * open terminal included.
+ */
+export async function listWindowsAsync(): Promise<WindowSnapshot> {
+  let out: string;
+  try {
+    out = await runTmuxCommand(WINDOW_LIST_ARGS);
+  } catch (error) {
+    return windowListFailure(error);
+  }
+  return parseWindowList(out);
+}
+
+function parseWindowList(out: string): WindowSnapshot {
   const live: string[] = [];
   const dead: string[] = [];
   for (const line of out.trim().split("\n").filter(Boolean)) {
@@ -351,12 +380,22 @@ export function listWindows(): WindowSnapshot {
 /** "unknown" means tmux could not be asked — never that the window is gone. */
 export type WindowPresence = "present" | "absent" | "unknown";
 
-export function windowPresence(target: string): WindowPresence {
-  const snapshot = listWindows();
+function presenceIn(snapshot: WindowSnapshot, target: string): WindowPresence {
   if (!snapshot) return "unknown";
   return snapshot.live.includes(target) || snapshot.dead.includes(target)
     ? "present"
     : "absent";
+}
+
+export function windowPresence(target: string): WindowPresence {
+  return presenceIn(listWindows(), target);
+}
+
+/** windowPresence without blocking the event loop — see listWindowsAsync. */
+export async function windowPresenceAsync(
+  target: string,
+): Promise<WindowPresence> {
+  return presenceIn(await listWindowsAsync(), target);
 }
 
 /**
@@ -371,22 +410,37 @@ export function windowPresence(target: string): WindowPresence {
  * paneProcess) — so the identity it reports has to be read back and compared.
  */
 export function probeWindow(target: string): WindowPresence {
-  let out: string;
   try {
-    out = tmux(
-      "display-message",
-      "-p",
-      "-t",
-      target,
-      "#{session_name}:#{window_id}",
-    ).trim();
+    return probeResult(tmux(...probeArgs(target)), target);
   } catch (error) {
-    const code = tmuxFailureCode(error);
-    return code === "target_missing" || code === "session_absent"
-      ? "absent"
-      : "unknown";
+    return probeFailure(error);
   }
-  return out === target ? "present" : "absent";
+}
+
+/** probeWindow without blocking the event loop — see listWindowsAsync. */
+export async function probeWindowAsync(
+  target: string,
+): Promise<WindowPresence> {
+  try {
+    return probeResult(await runTmuxCommand(probeArgs(target)), target);
+  } catch (error) {
+    return probeFailure(error);
+  }
+}
+
+function probeArgs(target: string): string[] {
+  return ["display-message", "-p", "-t", target, "#{session_name}:#{window_id}"];
+}
+
+function probeResult(out: string, target: string): WindowPresence {
+  return out.trim() === target ? "present" : "absent";
+}
+
+function probeFailure(error: unknown): WindowPresence {
+  const code = tmuxFailureCode(error);
+  return code === "target_missing" || code === "session_absent"
+    ? "absent"
+    : "unknown";
 }
 
 /**

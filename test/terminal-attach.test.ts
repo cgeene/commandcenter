@@ -3,9 +3,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { WebSocket } from "ws";
 import { TERM_CLOSE_PERMANENT } from "../src/lib/terminal-reconnect.js";
 
-// attachTerminal decides whether to close the operator's terminal. The tmux
-// module is stubbed so each of the three presence answers ("present",
-// "absent", and the "unknown" a loaded box produces) can be driven directly.
+// attachTerminal decides whether to close the operator's terminal, and whether
+// that close is one the browser should retry. The tmux module is stubbed so each
+// of the three presence answers ("present", "absent", and the "unknown" a loaded
+// box produces) can be driven directly, from either query. Whether those queries
+// block the event loop is NOT observable here — see test/tmux-timeout.test.ts,
+// which drives this path against a real hanging tmux.
 
 type Presence = "present" | "absent" | "unknown";
 
@@ -23,9 +26,8 @@ vi.mock("../src/daemon/tmux.js", () => ({
       ? sessions.map((name) => `${name}:1`).join("\n")
       : sessions.join("\n");
   },
-  windowPresence: (target: string) => windowPresence(target),
-  probeWindow: (target: string) => probeWindow(target),
-  windowExists: () => true,
+  windowPresenceAsync: async (target: string) => windowPresence(target),
+  probeWindowAsync: async (target: string) => probeWindow(target),
 }));
 
 const events: { kind: string; agentId?: number }[] = [];
@@ -35,8 +37,11 @@ vi.mock("../src/db/events.js", () => ({
 }));
 
 let tmuxTarget: string | null = "cc:@5";
+let agentState = "working";
+let agentExists = true;
 vi.mock("../src/db/agents.js", () => ({
-  getAgent: () => (tmuxTarget === null ? undefined : { id: 7, tmux_target: tmuxTarget }),
+  getAgent: () =>
+    agentExists ? { id: 7, state: agentState, tmux_target: tmuxTarget } : undefined,
 }));
 
 const ptySpawn = vi.fn(() => fakePty());
@@ -97,6 +102,8 @@ beforeEach(() => {
   probeWindow.mockReturnValue("present");
   ptySpawn.mockImplementation(() => fakePty());
   tmuxTarget = "cc:@5";
+  agentState = "working";
+  agentExists = true;
   sessions = [];
   tmuxCalls = [];
   events.length = 0;
@@ -146,35 +153,11 @@ describe("attachTerminal presence check", () => {
     ws.emit("close");
   });
 
-  it("closes once, permanently, when the window is genuinely gone", async () => {
-    const { attachTerminal } = await import("../src/daemon/termws.js");
-    windowPresence.mockReturnValue("absent");
-    const ws = new FakeWs();
-
-    await attachTerminal(ws.asWs(), 7);
-
-    expect(ws.closes).toEqual([
-      { code: TERM_CLOSE_PERMANENT, reason: "no live tmux window for this agent" },
-    ]);
-    expect(ws.sent).toEqual([
-      "\r\n[commandcenter] no live tmux window for this agent\r\n",
-    ]);
-    expect(ptySpawn).not.toHaveBeenCalled();
-    expect(events).toEqual([{ kind: "terminal.window_absent", agentId: 7 }]);
-  });
-
-  it("closes permanently for an agent that has no window at all", async () => {
-    const { attachTerminal } = await import("../src/daemon/termws.js");
-    tmuxTarget = null;
-    const ws = new FakeWs();
-
-    await attachTerminal(ws.asWs(), 7);
-
-    expect(ws.closes.map((c) => c.code)).toEqual([TERM_CLOSE_PERMANENT]);
-    expect(windowPresence).not.toHaveBeenCalled();
-  });
-
-  it("believes the single-target probe when the bulk listing is unobservable", async () => {
+  it("does not believe a single query that says the window is gone", async () => {
+    // Absence has to be corroborated: the probe decides it by string-comparing
+    // display-message output, and a listing that came back short is exactly what
+    // listWindows refuses to trust. Neither is evidence on its own, so this
+    // attaches rather than reporting the terminal gone.
     const { attachTerminal } = await import("../src/daemon/termws.js");
     windowPresence.mockReturnValue("unknown");
     probeWindow.mockReturnValue("absent");
@@ -182,9 +165,64 @@ describe("attachTerminal presence check", () => {
 
     await attachTerminal(ws.asWs(), 7);
 
-    expect(ws.closes.map((c) => c.code)).toEqual([TERM_CLOSE_PERMANENT]);
-    expect(probeWindow).toHaveBeenCalledTimes(1);
+    expect(ws.closes).toEqual([]);
+    expect(ptySpawn).toHaveBeenCalledTimes(1);
+    expect(events).toEqual([
+      { kind: "terminal.presence_unobservable", agentId: 7 },
+    ]);
+
+    ws.emit("close");
+  });
+
+  it("closes retryably when both queries agree the window is gone", async () => {
+    // The agent is still live, so this clears on its own: respawn and resume
+    // both re-attach a pane. A permanent close here would leave the operator
+    // reloading the page.
+    const { attachTerminal } = await import("../src/daemon/termws.js");
+    windowPresence.mockReturnValue("absent");
+    probeWindow.mockReturnValue("absent");
+    const ws = new FakeWs();
+
+    await attachTerminal(ws.asWs(), 7);
+
+    expect(ws.closes).toEqual([{ code: undefined, reason: undefined }]);
+    expect(ws.sent).toEqual([
+      "\r\n[commandcenter] no live tmux window for this agent\r\n",
+    ]);
     expect(ptySpawn).not.toHaveBeenCalled();
+    expect(events).toEqual([{ kind: "terminal.window_absent", agentId: 7 }]);
+  });
+
+  it("closes retryably for an agent whose pane has not been created yet", async () => {
+    // spawn/respawn/resume all write tmux_target only once the pane exists, so
+    // a drawer opened in that window has to reconnect into the terminal itself.
+    const { attachTerminal } = await import("../src/daemon/termws.js");
+    tmuxTarget = null;
+    agentState = "spawning";
+    const ws = new FakeWs();
+
+    await attachTerminal(ws.asWs(), 7);
+
+    expect(ws.closes).toEqual([{ code: undefined, reason: undefined }]);
+    expect(windowPresence).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+  });
+
+  it.each([
+    ["the agent row is gone", () => (agentExists = false)],
+    ["the agent is dead", () => (agentState = "dead")],
+  ])("closes permanently when %s", async (_why, arrange) => {
+    const { attachTerminal } = await import("../src/daemon/termws.js");
+    arrange();
+    const ws = new FakeWs();
+
+    await attachTerminal(ws.asWs(), 7);
+
+    expect(ws.closes).toEqual([
+      { code: TERM_CLOSE_PERMANENT, reason: "this agent is no longer running" },
+    ]);
+    expect(windowPresence).not.toHaveBeenCalled();
+    expect(events).toEqual([{ kind: "terminal.agent_gone", agentId: 7 }]);
   });
 });
 
