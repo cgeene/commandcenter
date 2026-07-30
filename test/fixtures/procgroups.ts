@@ -31,19 +31,57 @@ import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 export const KEEPALIVE_LEADER_SEC = 600;
 export const KEEPALIVE_LOOP_SEC = 900;
 
-/** The leak shape: a keepalive loop backgrounded out of a short-lived shell. */
-export const KEEPALIVE_LOOP =
-  `(i=0; while [ $i -lt ${KEEPALIVE_LOOP_SEC} ]; do i=$((i+1)); sleep 1; done) &` +
-  ` sleep ${KEEPALIVE_LEADER_SEC}`;
+/**
+ * The leak shape: a keepalive loop backgrounded out of a short-lived shell.
+ *
+ * Parameterised so a test can assert the bound behaviourally on a short one
+ * rather than waiting out the real 900s.
+ */
+export function keepaliveLoop(loopSec: number, leaderSec: number): string {
+  return (
+    `(i=0; while [ $i -lt ${loopSec} ]; do i=$((i+1)); sleep 1; done) &` +
+    ` sleep ${leaderSec}`
+  );
+}
+
+export const KEEPALIVE_LOOP = keepaliveLoop(
+  KEEPALIVE_LOOP_SEC,
+  KEEPALIVE_LEADER_SEC,
+);
+
+/**
+ * Quote `text` so a POSIX shell passes it through verbatim.
+ *
+ * `JSON.stringify` is NOT a substitute here, and using it silently corrupted
+ * this fixture once: it produces DOUBLE quotes, inside which a shell still
+ * expands `$i` and `$((i+1))`, so the loop reached the far side as
+ * `while [  -lt 900 ]` and died on a syntax error in about 18ms. The group then
+ * still had two members (leader plus `sleep ${KEEPALIVE_LEADER_SEC}`) and so
+ * still looked healthy to a naive occupancy check, while proving nothing.
+ */
+export function shellQuote(text: string): string {
+  return `'${text.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * A `node -e <source>` command line safe to hand to a shell — which is what
+ * tmux does with a pane command. Always build it through here rather than
+ * interpolating a source string directly; see {@link shellQuote}.
+ */
+export function nodeEvalCommand(source: string): string {
+  return `${process.execPath} -e ${shellQuote(source)}`;
+}
 
 /**
  * A node one-liner for a pane process that spawns {@link KEEPALIVE_LOOP} as a
  * `detached` child — its own session and process group, no tty — and then stays
  * up. Nothing but the parent link connects that child to the pane.
+ *
+ * Pass this to a SHELL only via {@link shellQuote}; as argv it needs no quoting.
  */
 export const DETACHED_KEEPALIVE_SOURCE = `require('node:child_process').spawn('/bin/sh',['-c',${JSON.stringify(
   KEEPALIVE_LOOP,
-)}],{detached:true,stdio:'ignore'});setTimeout(()=>{},600000)`;
+)}],{detached:true,stdio:'ignore'});setTimeout(()=>{},${KEEPALIVE_LEADER_SEC * 1000})`;
 
 interface Row {
   pid: number;
@@ -118,6 +156,23 @@ export function groupMembers(pgid: number): number[] {
 }
 
 /**
+ * True once group `pgid` contains a grandchild of its leader — the `sleep` the
+ * backgrounded loop re-forks on every iteration.
+ *
+ * Occupancy alone cannot distinguish a running loop from a loop that died on a
+ * syntax error, because the leader's own foreground `sleep` keeps the count up
+ * either way. Only the loop produces a member whose parent is another member,
+ * so this is what proves the loop is actually iterating. Matching on the args
+ * string instead would be flaky: `ps` renders the child as `(sleep)` while it is
+ * still being exec'd.
+ */
+export function keepaliveLoopIsRunning(pgid: number): boolean {
+  const group = snapshot().filter((r) => r.pgid === pgid);
+  const pids = new Set(group.map((r) => r.pid));
+  return group.some((r) => r.ppid !== pgid && pids.has(r.ppid));
+}
+
+/**
  * Spawn {@link KEEPALIVE_LOOP} as its own detached process group and register
  * it. The returned child's pid is also the group id.
  */
@@ -136,10 +191,15 @@ export function spawnKeepaliveGroup(): ChildProcess {
  * undefined while the shape is still incomplete, so this composes with the
  * polling `waitFor` helpers in the test files.
  *
- * Waiting for the group's SECOND member is the point. The leader forks the
+ * Waiting for the group's THIRD member is the point. The leader forks the
  * backgrounded loop a moment after it starts, and a snapshot taken in between
  * sees only the leader; cleaning up from that snapshot kills the leader and
  * strands the loop at pid 1 forever.
+ *
+ * Three, not two: the leader plus its foreground `sleep` already make two even
+ * when the backgrounded loop never started — which is exactly what a shell that
+ * ate the loop's `$i` leaves behind. Accepting two let a corrupted fixture look
+ * healthy while proving nothing.
  */
 export function trackKeepaliveGroupUnder(rootPid: number): number | undefined {
   const procs = snapshot();
@@ -160,7 +220,7 @@ export function trackKeepaliveGroupUnder(rootPid: number): number | undefined {
     seen.add(cur.pid);
     queue.push(...(byParent.get(cur.pid) ?? []));
     // The detached leader: its own group, with the loop already forked into it.
-    if (cur.pgid === cur.pid && (groupSize.get(cur.pgid) ?? 0) >= 2) {
+    if (cur.pgid === cur.pid && (groupSize.get(cur.pgid) ?? 0) >= 3) {
       trackProcessGroup(cur.pgid);
       return cur.pgid;
     }

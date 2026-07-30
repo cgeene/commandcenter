@@ -1,11 +1,13 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { snapshotProcesses } from "../src/daemon/proctree.js";
 import {
   DETACHED_KEEPALIVE_SOURCE,
   groupMembers,
+  keepaliveLoopIsRunning,
   killTrackedGroups,
+  nodeEvalCommand,
   trackKeepaliveGroupUnder,
 } from "./fixtures/procgroups.js";
 
@@ -94,9 +96,14 @@ function descendants(root: number): number[] {
 }
 
 // A pane process that backgrounds a detached child, which itself backgrounds a
-// loop — the shape a worker produces with `(while :; do :; done) &` under a
-// harness that runs commands in their own session.
-const leakyCommand = `${process.execPath} -e ${JSON.stringify(DETACHED_KEEPALIVE_SOURCE)}`;
+// loop — the shape a worker produces with a keepalive job under a harness that
+// runs commands in their own session.
+//
+// tmux hands this string to `/bin/sh -c`, so the source has to be SHELL-quoted,
+// not JSON-quoted: JSON's double quotes still let the shell expand what is
+// inside them, which silently reduced the fixture to a leader plus a `sleep`
+// with no loop at all. `nodeEvalCommand` is the only safe way to build it.
+const leakyCommand = nodeEvalCommand(DETACHED_KEEPALIVE_SOURCE);
 
 // The fixtures below create real strays on purpose. Reap them as a GROUP, and
 // from a hook rather than inline, so a failure or a timeout above cannot leave
@@ -113,6 +120,37 @@ afterEach(() => {
 const NOHUP_LEAK = `/bin/sh -c 'nohup sleep 594 >/dev/null 2>&1 & exec sleep 595'`;
 
 let dataDir: string;
+
+// Not gated on tmux: this guards how `leakyCommand` above is BUILT, and that is
+// wrong or right regardless of whether a tmux server can be reached.
+describe("the pane command survives the shell tmux runs it through", () => {
+  it("delivers a source containing $ expansions to node verbatim", async () => {
+    // The keepalive fixture spells its bound with `$i` and `$((i+1))`. Quoted
+    // with JSON.stringify — double quotes — a shell expands both away before
+    // node ever sees them, and the loop arrives as `while [  -lt 900 ]` and dies
+    // on a syntax error. That left a group of leader plus `sleep` which still
+    // looked occupied, so the tests kept passing while proving nothing.
+    const canary = 'process.stdout.write("$i|$((i+1))|done")';
+    const out = await new Promise<string>((resolve, reject) => {
+      execFile("/bin/sh", ["-c", nodeEvalCommand(canary)], (err, stdout) =>
+        err ? reject(err) : resolve(stdout),
+      );
+    });
+    expect(out).toBe("$i|$((i+1))|done");
+  });
+
+  it("keeps the real fixture source byte-identical through the shell", async () => {
+    // The `-e` argument of the command actually handed to tmux, run back through
+    // the same single shell layer tmux adds, must arrive unchanged.
+    const evalArg = leakyCommand.slice(leakyCommand.indexOf(" -e ") + 4);
+    const delivered = await new Promise<string>((resolve, reject) => {
+      execFile("/bin/sh", ["-c", `printf '%s' ${evalArg}`], (err, stdout) =>
+        err ? reject(err) : resolve(stdout),
+      );
+    });
+    expect(delivered).toBe(DETACHED_KEEPALIVE_SOURCE);
+  });
+});
 
 describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree", () => {
   beforeAll(() => {
@@ -154,6 +192,15 @@ describe.skipIf(!tmuxAvailable)("killWindow tears down the pane's process tree",
     const leakedGroup = await waitFor(
       () => trackKeepaliveGroupUnder(panePid),
       "the pane's backgrounded keepalive loop to be forked",
+    );
+    // This is the one path that reaches the fixture through a SHELL rather than
+    // as argv, so it is the path that can silently lose the loop to parameter
+    // expansion and leave a leader plus a `sleep` behind. Everything below would
+    // still pass on that stump — a two-member group is fully reachable from a
+    // pid list — so the loop has to be proven here, not assumed.
+    await waitFor(
+      () => (keepaliveLoopIsRunning(leakedGroup) ? true : undefined),
+      "the keepalive loop to re-fork its sleep inside the pane's group",
     );
     const strays = descendants(panePid);
 

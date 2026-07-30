@@ -3,9 +3,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DETACHED_KEEPALIVE_SOURCE,
   KEEPALIVE_LEADER_SEC,
-  KEEPALIVE_LOOP,
   KEEPALIVE_LOOP_SEC,
   groupMembers,
+  keepaliveLoop,
+  keepaliveLoopIsRunning,
   killTrackedGroups,
   spawnKeepaliveGroup,
   trackGroupsOf,
@@ -155,12 +156,42 @@ describe("real-process fixture lifetime bounds", () => {
   // reaches neither `afterEach` nor a `process.on("exit")` hook. Their own
   // bounds are then the only thing that ever stops them, so an unbounded
   // keepalive here leaks one permanent process per kill.
-  it("bounds the backgrounded loop, above the leader's own lifetime", () => {
+
+  it("keeps the loop's bound above the leader's own lifetime", () => {
     // Below the leader and the loop no longer outlives it — which is the whole
     // property every real-process test in this file builds on.
     expect(KEEPALIVE_LOOP_SEC).toBeGreaterThan(KEEPALIVE_LEADER_SEC);
-    expect(KEEPALIVE_LOOP).toContain(`sleep ${KEEPALIVE_LEADER_SEC}`);
-    expect(KEEPALIVE_LOOP).not.toMatch(/while\s*:/);
+  });
+
+  it("runs a loop that ends on its own, and outlives its leader doing it", async () => {
+    // The real bound is 900s, so prove the behaviour on a short one built the
+    // same way: the group must reach the full shape (a re-forked grandchild, not
+    // merely two members), outlive its leader, and then empty with nothing
+    // killing it. A loop broken by the shell would fail the first wait; an
+    // unbounded one would fail the last.
+    const leader = spawn("/bin/sh", ["-c", keepaliveLoop(8, 3)], {
+      detached: true,
+      stdio: "ignore",
+    });
+    leader.unref();
+    const pgid = leader.pid!;
+    trackProcessGroup(pgid);
+
+    await waitFor(
+      () => (keepaliveLoopIsRunning(pgid) ? true : undefined),
+      "the short keepalive loop to re-fork its sleep",
+    );
+    await waitFor(
+      () => (alive(pgid) ? undefined : true),
+      "the leader to exit before its backgrounded loop does",
+    );
+    expect(groupMembers(pgid).length).toBeGreaterThan(0);
+
+    await waitFor(
+      () => (groupMembers(pgid).length === 0 ? true : undefined),
+      "the bounded loop to end without being killed",
+      25_000,
+    );
   });
 
   it("bounds the SIGTERM-deaf descendant", () => {
@@ -346,10 +377,13 @@ describe("sweepVanishedPaneGroup (real processes)", () => {
     const leader = spawnKeepaliveGroup();
     const pgid = leader.pid!;
     // The shell has to fork its background subshell INTO the group before the
-    // leader is killed; killing first leaves nothing to sweep.
+    // leader is killed; killing first leaves nothing to sweep. Waiting on the
+    // loop rather than on a member count: the leader's own foreground `sleep`
+    // satisfies a count of two on its own, so a group whose loop never started
+    // would pass that and then have nothing left to sweep.
     await waitFor(
-      () => (snapshotProcesses().filter((p) => p.pgid === pgid).length >= 2 ? true : undefined),
-      "the group's second member to be forked",
+      () => (keepaliveLoopIsRunning(pgid) ? true : undefined),
+      "the group's backgrounded loop to be forked",
     );
 
     // Simulate the vanished pane: the group leader dies, its children live on.
