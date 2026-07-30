@@ -48,28 +48,44 @@ describe("frontmatter emit/parse", () => {
     expect(data.empty).toBe("");
   });
 
-  it("leaves a doc with no frontmatter alone", () => {
-    const doc = "# Just a heading\n\nno metadata here.";
-    expect(hasFrontmatter(doc)).toBe(false);
-    expect(stripFrontmatter(doc)).toBe(doc);
-    expect(parseFrontmatter(doc).data).toEqual({});
-  });
+  // One table because every row asks the same two questions of a different
+  // document: does this count as frontmatter, and what survives stripping it.
+  // Only the `---` runs move between rows — a block delimiter has to be told
+  // apart from a horizontal rule in prose, at the top of the doc and inside it.
+  const DETECTION_CASES = [
+    {
+      why: "a doc with no frontmatter is left alone, and parses to no data",
+      doc: () => "# Just a heading\n\nno metadata here.",
+      hasFm: false,
+      stripped: "# Just a heading\n\nno metadata here.",
+      data: {},
+    },
+    {
+      why: "a `---` horizontal rule in prose is not frontmatter",
+      doc: () => "Intro paragraph.\n\n---\n\nAfter the rule.",
+      hasFm: false,
+      stripped: "Intro paragraph.\n\n---\n\nAfter the rule.",
+    },
+    {
+      why: "an empty frontmatter block is still a block, and strips away",
+      doc: () => "---\n---\nbody text",
+      hasFm: true,
+      stripped: "body text",
+    },
+    {
+      why: "stripping stops at the closing delimiter, keeping `---` in the body",
+      doc: () => emitFrontmatter([["title", "T"]]) + "line one\n\n---\n\nline two",
+      hasFm: true,
+      stripped: "line one\n\n---\n\nline two",
+    },
+  ] as const;
 
-  it("does not treat a `---` horizontal rule in prose as frontmatter", () => {
-    const doc = "Intro paragraph.\n\n---\n\nAfter the rule.";
-    expect(hasFrontmatter(doc)).toBe(false);
-    expect(stripFrontmatter(doc)).toBe(doc);
-  });
-
-  it("strips an empty frontmatter block", () => {
-    const doc = "---\n---\nbody text";
-    expect(hasFrontmatter(doc)).toBe(true);
-    expect(stripFrontmatter(doc)).toBe("body text");
-  });
-
-  it("preserves a body that itself contains `---` separators", () => {
-    const fm = emitFrontmatter([["title", "T"]]);
-    const body = "line one\n\n---\n\nline two";
-    expect(stripFrontmatter(fm + body)).toBe(body);
+  it("tells a frontmatter block apart from a `---` rule, and strips only the block", () => {
+    for (const c of DETECTION_CASES) {
+      const doc = c.doc();
+      expect(hasFrontmatter(doc), c.why).toBe(c.hasFm);
+      expect(stripFrontmatter(doc), c.why).toBe(c.stripped);
+      if ("data" in c) expect(parseFrontmatter(doc).data, c.why).toEqual(c.data);
+    }
   });
 });
