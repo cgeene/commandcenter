@@ -6,17 +6,35 @@ import { execFileSync, spawn, type ChildProcess } from "node:child_process";
  * Those fixtures deliberately build the production leak shape: a detached
  * `/bin/sh` leads its own process group and backgrounds a keepalive loop inside
  * it. Killing the leader's pid does NOT reap that loop — it is reparented to
- * pid 1 and then runs until the machine is rebooted. Only a process-GROUP kill
- * reaches it.
+ * pid 1 and outlives its leader. Only a process-GROUP kill reaches it.
  *
  * So every group a fixture creates is registered here and torn down as a group
  * in an `afterEach`, which still runs when the test above it failed or timed out
  * before its own cleanup. Cleaning up on the happy path only is what left 130
  * of these loops running on the development machine.
+ *
+ * That teardown cannot cover a runner that is SIGKILLed or SIGTERMed outright —
+ * a reaped agent pane, or a daemon restart, which kills an in-flight verify
+ * because the verify child shares the daemon's process group. No `afterEach`
+ * and no `process.on("exit")` hook runs on those signals, so the second line of
+ * defence is that nothing spawned here may outlive its own bound.
  */
 
+/**
+ * Lifetime bounds for the leak shape.
+ *
+ * The loop MUST outlive its leader: every test built on this fixture depends on
+ * the backgrounded loop still running once the leader's pid is gone, which is
+ * what makes a pid-list cleanup strand it. Lowering the loop below the leader
+ * inverts that and the strandable window silently disappears.
+ */
+export const KEEPALIVE_LEADER_SEC = 600;
+export const KEEPALIVE_LOOP_SEC = 900;
+
 /** The leak shape: a keepalive loop backgrounded out of a short-lived shell. */
-export const KEEPALIVE_LOOP = "(while :; do sleep 1; done) & sleep 600";
+export const KEEPALIVE_LOOP =
+  `(i=0; while [ $i -lt ${KEEPALIVE_LOOP_SEC} ]; do i=$((i+1)); sleep 1; done) &` +
+  ` sleep ${KEEPALIVE_LEADER_SEC}`;
 
 /**
  * A node one-liner for a pane process that spawns {@link KEEPALIVE_LOOP} as a

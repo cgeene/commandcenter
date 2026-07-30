@@ -2,6 +2,9 @@ import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DETACHED_KEEPALIVE_SOURCE,
+  KEEPALIVE_LEADER_SEC,
+  KEEPALIVE_LOOP,
+  KEEPALIVE_LOOP_SEC,
   groupMembers,
   killTrackedGroups,
   spawnKeepaliveGroup,
@@ -34,6 +37,20 @@ vi.setConfig({ testTimeout: 30_000 });
 afterEach(() => {
   killTrackedGroups();
 });
+
+/**
+ * A pane whose detached descendant ignores SIGTERM, so only an escalation's
+ * SIGKILL reaps it.
+ *
+ * Both timers are bounds, not delays: a runner killed outright never reaches the
+ * `afterEach` above, and a SIGTERM-deaf process left behind by that is reachable
+ * only by SIGKILL for as long as it lives. The descendant outlives the pane on
+ * purpose — that ordering is what the escalation has to cope with.
+ */
+const SIGTERM_DEAF_PANE_SOURCE =
+  `require('node:child_process').spawn(process.execPath,` +
+  `['-e','process.on("SIGTERM",()=>{});setTimeout(()=>{},900000)'],` +
+  `{detached:true,stdio:'ignore'});setTimeout(()=>{},600000)`;
 
 function row(
   pid: number,
@@ -129,6 +146,27 @@ describe("ps parsing", () => {
     expect(normalizeTty("??")).toBe("");
     expect(normalizeTty("?")).toBe("");
     expect(normalizeTty("")).toBe("");
+  });
+});
+
+describe("real-process fixture lifetime bounds", () => {
+  // The fixtures below strand real processes on purpose, and a runner killed
+  // outright (a reaped pane, a daemon restart taking its verify child with it)
+  // reaches neither `afterEach` nor a `process.on("exit")` hook. Their own
+  // bounds are then the only thing that ever stops them, so an unbounded
+  // keepalive here leaks one permanent process per kill.
+  it("bounds the backgrounded loop, above the leader's own lifetime", () => {
+    // Below the leader and the loop no longer outlives it — which is the whole
+    // property every real-process test in this file builds on.
+    expect(KEEPALIVE_LOOP_SEC).toBeGreaterThan(KEEPALIVE_LEADER_SEC);
+    expect(KEEPALIVE_LOOP).toContain(`sleep ${KEEPALIVE_LEADER_SEC}`);
+    expect(KEEPALIVE_LOOP).not.toMatch(/while\s*:/);
+  });
+
+  it("bounds the SIGTERM-deaf descendant", () => {
+    // A bare `setInterval` never lets the event loop drain, and this child
+    // ignores SIGTERM — so stranded it would be SIGKILL-only, forever.
+    expect(SIGTERM_DEAF_PANE_SOURCE).not.toContain("setInterval");
   });
 });
 
@@ -247,14 +285,9 @@ describe("terminatePaneTree (real processes)", () => {
   });
 
   it("SIGKILLs a descendant that ignores SIGTERM", async () => {
-    const pane = spawn(
-      process.execPath,
-      [
-        "-e",
-        `require('node:child_process').spawn(process.execPath,['-e','process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});setTimeout(()=>{},600000)`,
-      ],
-      { stdio: "ignore" },
-    );
+    const pane = spawn(process.execPath, ["-e", SIGTERM_DEAF_PANE_SOURCE], {
+      stdio: "ignore",
+    });
     pane.unref();
     const tree = await waitFor(
       () => paneTreeOnce(pane.pid!),
@@ -278,14 +311,9 @@ describe("terminatePaneTree (real processes)", () => {
   it("flushes a pending escalation instead of stranding it on shutdown", async () => {
     // If the daemon exits inside the grace window, a SIGTERM-ignoring child
     // would never get its SIGKILL — the exact leak this module prevents.
-    const pane = spawn(
-      process.execPath,
-      [
-        "-e",
-        `require('node:child_process').spawn(process.execPath,['-e','process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'],{detached:true,stdio:'ignore'});setTimeout(()=>{},600000)`,
-      ],
-      { stdio: "ignore" },
-    );
+    const pane = spawn(process.execPath, ["-e", SIGTERM_DEAF_PANE_SOURCE], {
+      stdio: "ignore",
+    });
     pane.unref();
     const tree = await waitFor(
       () => paneTreeOnce(pane.pid!),
