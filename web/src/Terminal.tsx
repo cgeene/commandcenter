@@ -9,6 +9,11 @@ import {
   isTouchLike,
   setComposeBarEnabled,
 } from "../../src/lib/terminal-compose";
+import {
+  isPermanentClose,
+  nextReconnectAttempt,
+  reconnectDelayMs,
+} from "../../src/lib/terminal-reconnect";
 
 const BAR_KEYS: { label: string; seq: string }[] = [
   { label: "esc", seq: "\x1b" },
@@ -239,10 +244,12 @@ export function Terminal({ agentId }: { agentId: number }) {
       );
       wsRef.current = ws;
       setConnected(false);
+      let openedAt: number | null = null;
 
       ws.onmessage = (e) => term.write(typeof e.data === "string" ? e.data : "");
       ws.onopen = () => {
         if (disposed) return;
+        openedAt = Date.now();
         setConnected(true);
         sendResize();
       };
@@ -250,13 +257,31 @@ export function Terminal({ agentId }: { agentId: number }) {
         // The close event schedules the retry; this handler only prevents an
         // unobserved websocket error from surfacing in the console.
       };
-      ws.onclose = () => {
+      ws.onclose = (e) => {
         if (wsRef.current === ws) wsRef.current = null;
         if (disposed) return;
         setConnected(false);
-        term.write("\r\n[disconnected; reconnecting]\r\n");
-        const delay = Math.min(4000, 500 * 2 ** Math.min(attempt, 3));
-        reconnectTimer = window.setTimeout(() => connect(attempt + 1), delay);
+        // The server closes this way for conditions a reconnect cannot fix
+        // (the agent has no tmux window any more). Retrying those forever
+        // hides the reason behind a terminal that flickers every few seconds.
+        if (isPermanentClose(e.code)) {
+          term.write(
+            `\r\n[disconnected: ${e.reason || "terminal unavailable"}; not reconnecting]\r\n`,
+          );
+          return;
+        }
+        // A connection that stayed up long enough to be a real session resets
+        // the backoff, so one blip on a phone left open all day does not leave
+        // it reconnecting at the ceiling forever.
+        const next = nextReconnectAttempt(
+          attempt,
+          openedAt === null ? null : Date.now() - openedAt,
+        );
+        const delay = reconnectDelayMs(next);
+        term.write(
+          `\r\n[disconnected; reconnecting in ${(delay / 1000).toFixed(1)}s]\r\n`,
+        );
+        reconnectTimer = window.setTimeout(() => connect(next), delay);
       };
     };
 
