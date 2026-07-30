@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { WebSocket } from "ws";
 
 vi.setConfig({ testTimeout: 30_000 });
 
@@ -49,6 +51,20 @@ mode="\${CC_FAKE_TMUX_MODE:-ok}"
 
 if [ "$mode" = "hang-all" ]; then
   exec sleep 60
+fi
+
+# Observation never answers, but session management and the client attach both
+# work — so one terminal can be streaming while another is still deciding
+# whether its window exists.
+if [ "$mode" = "hang-observe" ]; then
+  case " $* " in
+    *" attach "*)
+      while :; do printf 'tick\\r\\n'; sleep 1; done ;;
+  esac
+  if [ "$1" = "list-windows" ] || [ "$1" = "display-message" ]; then
+    exec sleep 60
+  fi
+  exit 0
 fi
 
 if [ "$mode" = "missing-socket" ] && [ "$1" = "has-session" ]; then
@@ -152,6 +168,40 @@ async function armHang(mode: string, boundMs = HANG_TIMEOUT_MS): Promise<void> {
   process.env.CC_FAKE_TMUX_MODE = mode;
   const { _setTmuxTimeoutForTest } = await import("../src/daemon/tmux.js");
   _setTmuxTimeoutForTest(boundMs);
+}
+
+/** The slice of the ws API attachTerminal uses, with what it did recorded. */
+class StubSocket extends EventEmitter {
+  OPEN = 1;
+  readyState = 1;
+  data: string[] = [];
+  closed = 0;
+  terminated = 0;
+  send(data: string, cb?: (err?: Error) => void): void {
+    this.data.push(data);
+    cb?.();
+  }
+  close(): void {
+    this.closed++;
+    this.readyState = 3;
+  }
+  terminate(): void {
+    this.terminated++;
+    this.readyState = 3;
+  }
+  ping(): void {}
+  asWs(): WebSocket {
+    return this as unknown as WebSocket;
+  }
+}
+
+async function until(cond: () => boolean, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (cond()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return cond();
 }
 
 function calls(): string[] {
@@ -427,6 +477,79 @@ describe("bounded daemon tmux commands", () => {
     expect(failure?.payload).toBe('{"reason":"timeout"}');
     expect(failure?.payload).not.toContain("do not log this");
     expect(failure?.payload).not.toContain("cc:@1");
+  });
+
+  it("keeps the daemon and other terminals alive while an attach waits on tmux", async () => {
+    // The interactive attach asks whether the agent's window exists, and the
+    // answer it retries on is a tmux that will not answer. Every one of those
+    // queries has to be off the event loop: a synchronous one freezes HTTP, MCP,
+    // the scheduler and every other open terminal's data pump for as long as the
+    // timeouts take — and on unblocking, sockets past their heartbeat get
+    // terminated, so one agent's unobservable tmux would disconnect all the
+    // others. That is a bigger reconnect storm than the one being fixed.
+    const { buildApp } = await import("../src/daemon/api.js");
+    const { createAgent } = await import("../src/db/agents.js");
+    const { attachTerminal } = await import("../src/daemon/termws.js");
+    const agent = createAgent({
+      kind: "worker",
+      state: "working",
+      tmux_target: "cc:@1",
+    });
+    const app = buildApp();
+    // Mixed path: new-session/set-option/select-window and the client attach all
+    // have to succeed before the hung observation queries are reached.
+    await armHang("hang-observe", MIXED_PATH_HANG_MS);
+
+    const open = new StubSocket();
+    const second = new StubSocket();
+    try {
+      await attachTerminal(open.asWs(), agent.id, { cols: 80, rows: 24 });
+      expect(await until(() => open.data.length > 0, BOUNDED_MS)).toBe(true);
+      const streamed = open.data.length;
+
+      // A 50ms pulse measures whether the loop keeps turning at all. It is the
+      // assertion that discriminates: an ordering race against /healthz does
+      // not, because a synchronous query blocks inside the call that starts the
+      // attach, i.e. before any race can be set up.
+      let pulses = 0;
+      const pulse = setInterval(() => pulses++, 50);
+      const started = Date.now();
+      let elapsed: number;
+      let health: Response;
+      try {
+        const attaching = attachTerminal(second.asWs(), agent.id, {
+          cols: 80,
+          rows: 24,
+        });
+        health = await app.request("/healthz");
+        await attaching;
+        elapsed = Date.now() - started;
+      } finally {
+        clearInterval(pulse);
+      }
+
+      expect(health.status).toBe(200);
+      // A quarter of the pulses it should have had is a wide allowance for a
+      // loaded box; a blocked loop delivers a couple in total.
+      expect(pulses).toBeGreaterThan(elapsed / 50 / 4);
+      // The whole check is budgeted, so it cannot run the timeout once per query
+      // per retry: that is 6x MIXED_PATH_HANG_MS, which would blow this.
+      expect(elapsed).toBeLessThan(12_000);
+
+      // The terminal that was already open kept streaming throughout, and was
+      // neither closed nor terminated.
+      expect(open.data.length).toBeGreaterThan(streamed);
+      expect({ closed: open.closed, terminated: open.terminated }).toEqual({
+        closed: 0,
+        terminated: 0,
+      });
+      // Both sockets stayed attached: an unobservable tmux is not evidence the
+      // window is gone.
+      expect(second.closed + second.terminated).toBe(0);
+    } finally {
+      open.emit("close");
+      second.emit("close");
+    }
   });
 
   it("does not classify an unobservable live target as a dead worker", async () => {

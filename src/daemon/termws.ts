@@ -2,8 +2,15 @@ import crypto from "node:crypto";
 import pty from "node-pty";
 import type { WebSocket } from "ws";
 import { getAgent } from "../db/agents.js";
+import { logEvent } from "../db/events.js";
+import { TERM_CLOSE_PERMANENT } from "../lib/terminal-reconnect.js";
 import { localeEnv } from "./locale.js";
-import { runTmuxCommand, windowExists } from "./tmux.js";
+import {
+  probeWindowAsync,
+  runTmuxCommand,
+  windowPresenceAsync,
+  type WindowPresence,
+} from "./tmux.js";
 
 function tmux(...args: string[]): Promise<void> {
   return runTmuxCommand(args).then(() => undefined);
@@ -27,6 +34,18 @@ async function killSession(name: string): Promise<void> {
   await tmux("kill-session", "-t", name);
 }
 
+/**
+ * Viewer sessions this daemon still holds an open socket on.
+ *
+ * The prune below must not kill one of these: two drawers on the same agent (a
+ * laptop and a phone, say) would evict each other's session, each eviction
+ * killing a PTY, closing a socket and provoking a reconnect that evicts the
+ * other again — a reconnect loop with no bottom. A socket whose client vanished
+ * without a close event is reclaimed by the heartbeat, by destroy-unattached,
+ * and by the stale-viewer sweep, so nothing depends on the prune for that.
+ */
+const liveViewers = new Set<string>();
+
 async function pruneAgentViewers(agentId: number): Promise<void> {
   const prefix = viewerPrefix(agentId);
   let out = "";
@@ -39,7 +58,7 @@ async function pruneAgentViewers(agentId: number): Promise<void> {
     out
       .split("\n")
       .map((line) => line.trim())
-      .filter((name) => name.startsWith(prefix))
+      .filter((name) => name.startsWith(prefix) && !liveViewers.has(name))
       .map((name) => killSession(name).catch(() => {})),
   );
 }
@@ -177,6 +196,114 @@ function normalizedSize(size?: { cols: number; rows: number }): {
 }
 
 /**
+ * Whole budget for deciding whether the agent's window is there — retries
+ * included. It has to stay well inside the heartbeat interval below, and inside
+ * what an operator will wait for with a drawer open, so it is a deadline rather
+ * than a retry count: the underlying tmux queries are each bounded at seconds
+ * and a few of those in series would blow any of that.
+ */
+const PRESENCE_BUDGET_MS = 4_000;
+/** Rounds of (listing, probe) to try inside that budget. */
+const PRESENCE_ATTEMPTS = 3;
+const PRESENCE_RETRY_MS = 150;
+
+/** The answer to use for a query that outlived the budget above. */
+async function withinBudget(
+  query: Promise<WindowPresence>,
+  budgetMs: number,
+): Promise<WindowPresence> {
+  let timer: NodeJS.Timeout;
+  const expiry = new Promise<WindowPresence>((resolve) => {
+    timer = setTimeout(() => resolve("unknown"), Math.max(budgetMs, 0));
+  });
+  try {
+    // The queries do not reject, but a lost race must not leave a rejection
+    // unhandled if that ever changes.
+    return await Promise.race([query.catch(() => "unknown" as const), expiry]);
+  } finally {
+    clearTimeout(timer!);
+  }
+}
+
+/**
+ * Whether the agent's window is really gone — asked the way an interactive
+ * attach has to ask it.
+ *
+ * Three things make this different from windowExists():
+ *
+ * 1. It never blocks the event loop. The synchronous queries are fine for the
+ *    watchdog, which runs on a timer, but this runs while an operator waits and
+ *    while every other terminal's data pump needs the loop; a tmux that cannot
+ *    answer would otherwise freeze the daemon for as long as the timeouts take.
+ * 2. "Could not ask" is reported as "unknown", not "absent". windowExists()'s
+ *    default is right for optional work that retries on a later pass, and wrong
+ *    here: the browser answers a close by reconnecting, so guessing "gone" turns
+ *    one failed tmux query on a loaded box into an endless flicker.
+ * 3. Absence has to be said twice, by two different tmux commands, before it is
+ *    believed — the bulk listing and the single-target probe. The probe decides
+ *    absence by comparing display-message output against the target, so a
+ *    truncated answer reads as "gone" all by itself, and the listing is exactly
+ *    the query whose short/garbled answers must never be trusted (see
+ *    listWindows). Either one alone is not evidence.
+ *
+ * "unknown" means the caller should attach anyway and let the attach fail on its
+ * own if the window is really gone.
+ */
+async function attachPresence(target: string): Promise<WindowPresence> {
+  const deadline = Date.now() + PRESENCE_BUDGET_MS;
+  const left = () => deadline - Date.now();
+  for (let attempt = 1; attempt <= PRESENCE_ATTEMPTS; attempt++) {
+    const listed = await withinBudget(windowPresenceAsync(target), left());
+    if (listed === "present") return "present";
+    if (left() <= 0) return "unknown";
+    const probed = await withinBudget(probeWindowAsync(target), left());
+    if (probed === "present") return "present";
+    if (listed === "absent" && probed === "absent") return "absent";
+    if (attempt === PRESENCE_ATTEMPTS || left() <= PRESENCE_RETRY_MS) break;
+    await new Promise((r) => setTimeout(r, PRESENCE_RETRY_MS));
+  }
+  return "unknown";
+}
+
+function sendReason(ws: WebSocket, reason: string): void {
+  try {
+    ws.send(`\r\n[commandcenter] ${reason}\r\n`);
+  } catch {
+    /* socket already gone; the close is still worth attempting */
+  }
+}
+
+/**
+ * Close with the reason, and tell the client not to come back: reconnecting
+ * cannot fix this one (see src/lib/terminal-reconnect.ts).
+ *
+ * Reserved for conditions that cannot clear on their own — no such agent, or an
+ * agent that has finished for good. Everything else, including a window that is
+ * merely missing right now, closes transiently: spawn, respawn and resume all
+ * fill in an agent's tmux_target only after the pane exists (see spawn.ts), so
+ * a drawer opened during any of those windows must still reconnect into the
+ * terminal by itself.
+ */
+function closePermanently(ws: WebSocket, reason: string): void {
+  sendReason(ws, reason);
+  try {
+    ws.close(TERM_CLOSE_PERMANENT, reason);
+  } catch {
+    /* already closing */
+  }
+}
+
+/** Close in a way the client will retry, with the reason on screen. */
+function closeTransiently(ws: WebSocket, reason: string): void {
+  sendReason(ws, reason);
+  try {
+    ws.close();
+  } catch {
+    /* already closing */
+  }
+}
+
+/**
  * Bridge a browser xterm.js to an agent's tmux window.
  *
  * Each viewer gets its own *grouped* tmux session (new-session -t) attached
@@ -195,10 +322,30 @@ export async function attachTerminal(
   size?: { cols: number; rows: number },
 ): Promise<void> {
   const agent = getAgent(agentId);
-  if (!agent?.tmux_target || !windowExists(agent.tmux_target)) {
-    ws.send("\r\n[commandcenter] no live tmux window for this agent\r\n");
-    ws.close();
+  if (!agent || agent.state === "dead") {
+    logEvent("terminal.agent_gone", { agentId });
+    closePermanently(ws, "this agent is no longer running");
     return;
+  }
+  if (!agent.tmux_target) {
+    // A live agent without a window is mid-spawn; its pane arrives shortly.
+    closeTransiently(ws, "this agent has no tmux window yet");
+    return;
+  }
+  // Only a corroborated "absent" closes, and even then only until the agent's
+  // pane comes back — a respawn or resume re-attaches one. An unobservable tmux
+  // attaches anyway: if the window really is gone the attach below fails on its
+  // own, honestly, instead of this closing a healthy terminal on no evidence.
+  const presence = await attachPresence(agent.tmux_target);
+  if (presence === "absent") {
+    logEvent("terminal.window_absent", { agentId });
+    closeTransiently(ws, "no live tmux window for this agent");
+    return;
+  }
+  if (presence === "unknown") {
+    // Rare and worth seeing: it means tmux could not answer for the whole
+    // presence budget, which is the state that used to close terminals.
+    logEvent("terminal.presence_unobservable", { agentId });
   }
 
   const [session, windowId] = agent.tmux_target.split(":");
@@ -212,6 +359,7 @@ export async function attachTerminal(
     // authoritative and bounds tmux/PTY handles.
     await pruneAgentViewers(agentId);
     await createViewerSession(viewer, session, windowId);
+    liveViewers.add(viewer);
   } catch {
     ws.send("\r\n[commandcenter] failed to create viewer session\r\n");
     ws.close();
@@ -232,6 +380,7 @@ export async function attachTerminal(
     });
   } catch {
     // e.g. node-pty spawn-helper missing exec bit — never crash the daemon
+    liveViewers.delete(viewer);
     tmux("kill-session", "-t", viewer).catch(() => {});
     ws.send("\r\n[commandcenter] terminal process failed to start\r\n");
     ws.close();
@@ -264,6 +413,7 @@ export async function attachTerminal(
     if (closed) return;
     closed = true;
     clearInterval(heartbeat);
+    liveViewers.delete(viewer);
     killSession(viewer).catch(() => {});
     try {
       term.kill();
