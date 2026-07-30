@@ -182,9 +182,14 @@ describe("observing real processes", () => {
   it("finds a real vitest-titled process in ps and attributes it correctly", async () => {
     // A real process wearing the process title vitest gives its workers. Its
     // own process group (detached) is what a separate agent's suite would have.
+    //
+    // The timer is a bound, not a delay. A runner killed outright never reaches
+    // the `afterEach` above, and this process is indistinguishable from a real
+    // foreign suite by design — stranded, it would make every later
+    // countExternalSuites() report contention that is not there.
     child = spawn(
       process.execPath,
-      ["-e", 'process.title = "node (vitest 99)"; setInterval(() => {}, 1000)'],
+      ["-e", 'process.title = "node (vitest 99)"; setTimeout(() => {}, 600000)'],
       { detached: true, stdio: "ignore" },
     );
     child.unref();
