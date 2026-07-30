@@ -846,13 +846,20 @@ export function watchdog(deps: SchedulerDeps = defaultDeps): void {
         state: "dead",
         ...(paneHandled ? { pane_pid: null } : {}),
       });
+      // Record the sweep's verdict, not just its kills: an "unreachable" one
+      // dropped the handle without being able to prove the pane left nothing
+      // running, and that is indistinguishable from a real reap unless it is
+      // written down here. This is the path a crashed pane takes, so it is the
+      // path where the distinction matters most.
       logEvent("agent.vanished", {
         agentId: agent.id,
         taskId: agent.task_id ?? undefined,
-        payload:
-          sweep && sweep.killed.length > 0
-            ? { swept_pids: sweep.killed }
-            : undefined,
+        payload: sweep
+          ? {
+              ...(sweep.killed.length > 0 ? { swept_pids: sweep.killed } : {}),
+              pane_sweep: sweep.outcome,
+            }
+          : undefined,
       });
       const task = agent.task_id ? getTask(agent.task_id) : undefined;
       if (task && ["in_progress", "claimed"].includes(task.status)) {

@@ -6,7 +6,7 @@ import path from "node:path";
 const sendText = vi.fn(async () => {});
 const killWindow = vi.fn((_target: string) => [] as number[]);
 const sweepVanishedPaneGroup = vi.fn(() => ({
-  outcome: "clean" as const,
+  outcome: "unreachable" as const,
   killed: [] as number[],
 }));
 
@@ -37,7 +37,7 @@ beforeEach(async () => {
   killWindow.mockReset();
   killWindow.mockReturnValue([]);
   sweepVanishedPaneGroup.mockReset();
-  sweepVanishedPaneGroup.mockReturnValue({ outcome: "clean", killed: [] });
+  sweepVanishedPaneGroup.mockReturnValue({ outcome: "unreachable", killed: [] });
 });
 
 afterEach(async () => {

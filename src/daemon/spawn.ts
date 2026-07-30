@@ -67,7 +67,10 @@ import {
   tmuxFailureCode,
   windowExists,
 } from "./tmux.js";
-import { sweepVanishedPaneGroup } from "./proctree.js";
+import {
+  sweepVanishedPaneGroup,
+  type PaneSweepOutcome,
+} from "./proctree.js";
 import {
   createReviewWorktree,
   createSnapshotReviewWorktree,
@@ -1223,6 +1226,11 @@ interface PaneTeardown {
   confirmed: boolean;
   /** Whether the pane pid survived this teardown, as the row now reads. */
   handleRetained: boolean;
+  /** The pane sweep's verdict, when one ran. "unreachable" is the case worth
+   *  reading in the log: the handle was spent without proving anything, so a
+   *  pane that left a setsid'd tree behind looks identical to one that left
+   *  nothing. */
+  paneSweep?: PaneSweepOutcome;
 }
 
 /**
@@ -1257,14 +1265,18 @@ function reapPaneProcesses(agent: Agent, mayHaveWindow: boolean): PaneTeardown {
   // the pane pid recorded at spawn is now the only trustworthy handle on
   // whatever the agent left running.
   let swept = false;
+  let paneSweep: PaneSweepOutcome | undefined;
   if (killed.length === 0 && agent.pane_pid) {
     const sweep = sweepVanishedPaneGroup(agent.pane_pid, paneAgeSeconds(agent));
     killed.push(...sweep.killed);
+    paneSweep = sweep.outcome;
     paneHandled = sweep.outcome !== "declined";
     swept = sweep.outcome === "swept";
   }
-  // Only give up the handle once it has actually been acted on. A declined
-  // sweep looked at a live pane (or could not look at all) and did nothing.
+  // Only give up the handle once it has actually been acted on, or once it is
+  // spent. A declined sweep looked at a live pane (or could not look at all)
+  // and did nothing, so its handle is still worth something; an "unreachable"
+  // one cannot reach any more than it just did, however often it is retried.
   const surrendered = agent.pane_pid !== null && paneHandled;
   if (surrendered) {
     updateAgent(agent.id, { pane_pid: null });
@@ -1273,6 +1285,7 @@ function reapPaneProcesses(agent: Agent, mayHaveWindow: boolean): PaneTeardown {
     killed,
     confirmed: windowSettled || swept,
     handleRetained: agent.pane_pid !== null && !surrendered,
+    paneSweep,
   };
 }
 
@@ -1323,7 +1336,12 @@ export function killAgent(
     logEvent("agent.killed", {
       agentId,
       taskId: agent.task_id ?? undefined,
-      payload: { ...opts, split_brain: true, killed_pids: killedPids },
+      payload: {
+        ...opts,
+        split_brain: true,
+        killed_pids: killedPids,
+        pane_sweep: teardown.paneSweep,
+      },
     });
     return getAgent(agentId)!;
   }
@@ -1354,7 +1372,7 @@ export function killAgent(
   logEvent("agent.killed", {
     agentId,
     taskId: agent.task_id ?? undefined,
-    payload: { ...opts, killed_pids: killedPids },
+    payload: { ...opts, killed_pids: killedPids, pane_sweep: teardown.paneSweep },
   });
   return getAgent(agentId)!;
 }

@@ -90,6 +90,36 @@ describe("killAgent process teardown", () => {
     expect(sweepVanishedPaneGroup).toHaveBeenCalledTimes(1);
     expect(sweepVanishedPaneGroup.mock.calls[0][0]).toBe(9182);
     expect(getAgent(worker.id)?.pane_pid).toBeNull();
+    const { listEvents } = await import("../src/db/events.js");
+    const killedEvent = listEvents(50).find((e) => e.kind === "agent.killed");
+    expect(JSON.parse(killedEvent!.payload!).pane_sweep).toBe("swept");
+  });
+
+  it("records an unreachable sweep on agent.killed so a blind reap is not silent", async () => {
+    // The whole point of the outcome: this teardown proved nothing, and the row
+    // is about to give up its pane pid anyway. If the verdict is not written
+    // down here, a reap that could not see the pane's processes is
+    // indistinguishable from one that stopped them.
+    const { killAgent } = await import("../src/daemon/spawn.js");
+    const { createAgent, updateAgent, getAgent } = await import("../src/db/agents.js");
+    const { listEvents } = await import("../src/db/events.js");
+    const worker = createAgent({
+      kind: "worker",
+      state: "working",
+      tmux_target: "cc:@4",
+    });
+    updateAgent(worker.id, { pane_pid: 9182 });
+    windowExists.mockReturnValue(false);
+    sweepVanishedPaneGroup.mockReturnValue({ outcome: "unreachable", killed: [] });
+
+    killAgent(worker.id);
+
+    const killedEvent = listEvents(50).find((e) => e.kind === "agent.killed");
+    const payload = JSON.parse(killedEvent!.payload!);
+    expect(payload.pane_sweep).toBe("unreachable");
+    expect(payload.killed_pids).toEqual([]);
+    // Recorded, and the spent handle still surrendered — the two go together.
+    expect(getAgent(worker.id)?.pane_pid).toBeNull();
   });
 
   it("still sweeps an agent the watchdog already marked dead without sweeping it", async () => {
@@ -128,7 +158,7 @@ describe("killAgent process teardown", () => {
     expect(getAgent(worker.id)?.pane_pid).toBe(9182);
   });
 
-  it("releases the pane pid when the sweep looked and found nothing", async () => {
+  it("releases the pane pid once the sweep reports the handle is spent", async () => {
     const { killAgent } = await import("../src/daemon/spawn.js");
     const { createAgent, updateAgent, getAgent } = await import("../src/db/agents.js");
     const worker = createAgent({
@@ -138,7 +168,7 @@ describe("killAgent process teardown", () => {
     });
     updateAgent(worker.id, { pane_pid: 9182 });
     windowExists.mockReturnValue(false);
-    sweepVanishedPaneGroup.mockReturnValue({ outcome: "clean", killed: [] });
+    sweepVanishedPaneGroup.mockReturnValue({ outcome: "unreachable", killed: [] });
 
     killAgent(worker.id);
 
